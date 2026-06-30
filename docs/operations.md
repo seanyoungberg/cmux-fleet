@@ -209,10 +209,12 @@ the agent launched.
 - **rm** drops a label from the live and archive stores. `--kill` also stops the
   process and closes its tab (for a throwaway). `--with-group` dissolves the
   agent's workspace-group by ref (closing every member surface) and sweeps all of
-  that group's members out of the registry, so no stale rows linger; worktree
-  branches are kept (use `fleet worktree clean <label>` to reclaim). Without it,
-  only this agent's own workspace goes and any remaining members are left
-  ungrouped.
+  that group's members out of the registry, so no stale rows linger. A swept
+  member's worktree dir and branch are left unmanaged: because the registry rows
+  are gone, `fleet worktree clean` cannot find them, so reclaim them manually with
+  `git worktree list` / `git worktree remove <path>` (and `git branch -D
+  fleet/<label>` if you want the branch). Without it, only this agent's own
+  workspace goes and any remaining members are left ungrouped.
 
   ```
   fleet rm scratch

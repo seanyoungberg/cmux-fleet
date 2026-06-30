@@ -811,10 +811,12 @@ def cmd_rm(argv):
     for a worktree-isolated agent tears the worktree down (refuse-if-dirty; --wip-commit to override;
     branch always kept). --with-group also dissolves the agent's workspace-group: deleting the group by
     ref closes EVERY member surface, so we then SWEEP all live+archive entries in that group out of the
-    registry (otherwise they linger as orphaned rows for dead surfaces). Worktree branches are NOT
-    touched for swept members (the worktree design always keeps branches); use `fleet worktree clean
-    <label>` to reclaim them. WITHOUT --with-group, only this agent's own workspace goes and remaining
-    members are left ungrouped."""
+    registry (otherwise they linger as orphaned rows for dead surfaces). A swept member's worktree dir
+    and branch are left UNMANAGED: their registry rows are gone, so `fleet worktree clean` (which
+    discovers from the registry) cannot find them. Reclaim manually with `git worktree list` +
+    `git worktree remove <path>` (and `git branch -D fleet/<label>` if you want the branch gone).
+    WITHOUT --with-group, only this agent's own workspace goes and remaining members are left
+    ungrouped."""
     import fleet_state as fs, signal
     kill = "--kill" in argv
     wipc = "--wip-commit" in argv
@@ -849,7 +851,9 @@ def cmd_rm(argv):
             if members:
                 group_note += f" (also removed: {', '.join(sorted(members))})"
             if wt_kept:
-                group_note += f"\n[fleet]   worktree branches KEPT for {', '.join(wt_kept)} (run: fleet worktree clean <label>)"
+                group_note += (f"\n[fleet]   worktree dirs/branches left UNMANAGED for {', '.join(wt_kept)} "
+                               f"(registry rows gone; reclaim manually: git worktree list; "
+                               f"git worktree remove <path>; git branch -D fleet/<label>)")
         else:
             group_note = f"\n[fleet] group '{gname}' not found live; nothing to dissolve"
     if kill and e.get("surface"):
@@ -867,7 +871,10 @@ def cmd_rm(argv):
         removed, msg = wt.teardown(m["repo"], m["path"], label, wip_commit_flag=wipc)
         wt_note = f"\n[fleet] worktree: {msg}"
         if not removed:
-            wt_note += f"\n[fleet]   (re-run: fleet worktree clean {label} --wip-commit)"
+            # the registry row is deleted just below, so `fleet worktree clean` can no longer find it;
+            # the tree is dirty -> reclaim manually after committing/stashing.
+            wt_note += (f"\n[fleet]   ({label}'s tree is dirty and its registry row is now gone; "
+                        f"reclaim manually: git -C {m['repo']} worktree remove {m['path']} after committing/stashing)")
     fs.live_del(label); fs.archive_del(label)
     fs.log_event("removed", label=label, role=e.get("role"), killed=kill, with_group=with_group)
     print(f"[fleet] removed {label}{' (killed + closed)' if kill else ''}{group_note}{wt_note}")
