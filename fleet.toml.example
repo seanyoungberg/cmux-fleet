@@ -1,0 +1,57 @@
+# cmux-fleet.toml — copy to $XDG_CONFIG_HOME/cmux-fleet/fleet.toml (default ~/.config/cmux-fleet/fleet.toml)
+# or point $CMUX_FLEET_TOML at it. Every block is optional; the engine runs with no file at all
+# (ad-hoc launches need no roster). Edit freely — roles are created lazily.
+
+# ----------------------------------------------------------------------------------------------
+# [fleet] — engine config. Every key is optional; shown with its effective default. Precedence
+# per key is: env var > this block > built-in default. (Resolved in scripts/config.py.)
+# ----------------------------------------------------------------------------------------------
+[fleet]
+# root         = ""                 # workspace root that relative role cwds compose against.
+#                                   #   "" -> $HOME. Set to "." or an absolute path for a project-local
+#                                   #   layout (a normal ~/.config copy does NOT make cwds config-relative).
+#                                   #   env: CMUX_FLEET_ROOT
+# state_dir    = ""                 # "" -> $XDG_STATE_HOME/cmux-fleet (~/.local/state/cmux-fleet).  env: CMUX_STATE_DIR
+# cmux_bin     = ""                 # "" -> `which cmux`, then the macOS app bundle.  env: CMUX_BIN
+# marketplace  = ""                 # dir of internal plugins for bare `plugins=` names; "" disables it
+#                                   #   (use absolute plugin paths instead, or omit plugins).  env: CMUX_FLEET_MARKETPLACE
+# floor_claudemd = ""               # CLAUDE.md symlinked into freshly-created ad-hoc cwds; "" = none.  env: CMUX_FLEET_FLOOR
+# adhoc_subdir = "agents/ad-hoc"    # where `--adhoc <name>` agents get a cwd (relative to root).  env: CMUX_FLEET_ADHOC_SUBDIR
+
+# ----------------------------------------------------------------------------------------------
+# ROSTER — role-first, tool-nested. A role owns its tool-agnostic ORCHESTRATION (cwd/place/group/
+# kind) once; thin per-tool sub-blocks carry that tool's LAUNCH CONFIG (plugins/flags/env/settings).
+#   [defaults]          default tool + orchestration floor
+#   [tool.<t>]          per-tool launch floor -> the adapter's defaults
+#   [role.<name>]       orchestration (cwd/place/group/kind) + the role's default tool
+#   [role.<name>.<t>]   that role's config for tool <t>
+# Native flags go RAW in `flags` (e.g. "--model opus --effort high"); the launcher forwards them
+# without knowing them. `cwd` is relative to [fleet].root (or absolute). AGENT_ROLE/AGENT_LABEL are
+# auto-set. `plugins` names resolve under [fleet].marketplace (or use absolute paths).
+# ----------------------------------------------------------------------------------------------
+[defaults]
+tool  = "claude"
+kind  = "child"
+place = "tab"
+
+[tool.claude]
+# plugins = ["cmux-fleet"]          # give every claude agent the conductor toolkit (needs marketplace set,
+#                                   #   or use an absolute path to this plugin dir)
+flags   = "--effort high"
+
+[tool.codex]
+# flags = "-a never -s workspace-write"   # never-prompt but sandboxed; codex's autonomous-worker posture
+
+# --- example roles ----------------------------------------------------------------------------
+[role.worker]
+kind = "child"
+place = "tab"
+cwd  = "agents/worker"
+
+[role.lead]
+kind  = "conductor"
+place = "workspace"
+group = "lead"
+cwd   = "agents/lead"
+[role.lead.claude]
+flags = "--effort xhigh"

@@ -1,0 +1,21 @@
+{
+  "//": "cmux-fleet conductor hooks. Loaded per-agent via `claude --plugin-dir <this plugin>` (the cmux-claude-wrapper deep-merges these with cmux's own lifecycle hooks; arrays concatenate, so both run). Both scripts self-identify the conductor via $CMUX_SURFACE_ID and read/write state under $CMUX_STATE_DIR (see scripts/config.py).",
+  "hooks": {
+    "UserPromptSubmit": [
+      {
+        "matcher": "",
+        "hooks": [
+          { "type": "command", "command": "python3 ${CLAUDE_PLUGIN_ROOT}/scripts/hooks/awareness.py", "timeout": 10 }
+        ]
+      }
+    ],
+    "Stop": [
+      {
+        "matcher": "",
+        "hooks": [
+          { "type": "command", "command": "python3 ${CLAUDE_PLUGIN_ROOT}/scripts/hooks/drain.py", "timeout": 10 }
+        ]
+      }
+    ]
+  }
+}

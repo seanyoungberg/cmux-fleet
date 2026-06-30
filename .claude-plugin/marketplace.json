@@ -1,0 +1,13 @@
+{
+  "name": "cmux-fleet",
+  "owner": {
+    "name": "Sean Youngberg"
+  },
+  "plugins": [
+    {
+      "name": "cmux-fleet",
+      "source": "./",
+      "strict": true
+    }
+  ]
+}

@@ -1,0 +1,11 @@
+{
+  "name": "cmux-fleet",
+  "version": "0.1.0",
+  "description": "Native cmux parent/child agent orchestration. An input-safe child-completion notify flow (awareness + drain hooks + a fleet-wide router daemon + a passive/autodrain/auto mode dial), surfaceId-keyed identity, peer-to-peer messaging, and a conductor skill for launching, placing, and driving child agents on cmux primitives. USE WHEN: cmux conductor, launch child agent, fleet orchestration, notify flow, sub-agent dispatch on cmux.",
+  "author": {
+    "name": "Sean Youngberg"
+  },
+  "homepage": "https://github.com/seanyoungberg/cmux-fleet",
+  "license": "MIT",
+  "hooks": "./hooks/hooks.json"
+}
