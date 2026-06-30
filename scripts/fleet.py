@@ -110,6 +110,11 @@ def resolve(cfg, role, tool_override, adhoc_name):
         "cwd": orch.get("cwd", ""),
         "plugins": plugins, "flags": flags, "env": env, "settings": settings,
         "enable_plugins": enable_plugins, "setting_sources": setting_sources,
+        # worktree (config-gated, default-off): isolate this agent in a git worktree off its repo cwd.
+        "worktree": bool(orch.get("worktree", False)),
+        "worktree_base": orch.get("worktree_base", ""),
+        "worktree_dir": orch.get("worktree_dir", ".worktrees"),
+        "worktree_branch_prefix": orch.get("worktree_branch_prefix", "fleet/"),
     }
 
 
@@ -348,6 +353,31 @@ def poll_session(surf, timeout=60):
     return ""
 
 
+def _surface_cwd(surf):
+    """The working directory cmux recorded for a surface's bound session, or None. Used by placement
+    reconciliation (the agent runs `cd <abs_cwd> && <tool>`, so a correctly-placed worktree session
+    reports the worktree path here)."""
+    d = _store()
+    e = (d.get("activeSessionsBySurface") or {}).get(surf) or {}
+    if e.get("cwd"):
+        return e["cwd"]
+    for s in (d.get("sessions") or {}).values():
+        if (s.get("surfaceId") or "").upper() == surf.upper() and s.get("cwd"):
+            return s["cwd"]
+    return None
+
+
+def _poll_surface_cwd(surf, want, timeout=10):
+    """Poll _surface_cwd until it matches `want` (or times out); returns the last value seen."""
+    end, last = time.time() + timeout, None
+    while time.time() < end:
+        last = _surface_cwd(surf)
+        if last and os.path.realpath(last) == os.path.realpath(want):
+            return last
+        time.sleep(0.5)
+    return last
+
+
 def register(surf, spec, parent_surface, session, ws):
     import fleet_state as fs
     parent_label = fs.label_for_surface(parent_surface) or parent_surface   # store parent LABEL (durable)
@@ -358,7 +388,10 @@ def register(surf, spec, parent_surface, session, ws):
         "session": f"claude-{session}" if spec["tool"] == "claude" else session,
         # carried so archive->revive can rebuild the launch without re-resolving the roster
         "plugins": spec["plugins"], "flags": spec["flags"], "settings": spec["settings"],
-        "group": spec["group"]})
+        "group": spec["group"],
+        # worktree bookkeeping (present only for worktree-isolated agents): repo/path/branch so
+        # `fleet worktree ls|clean` and `rm --kill` can find + tear down the tree by label.
+        "worktree": spec.get("worktree_meta")})
 
 
 # ---------------------------------------------------------------- the launch command
@@ -412,6 +445,12 @@ def cmd_launch(argv):
     ap.add_argument("--direction", default="down", help="split direction for --place pane")
     ap.add_argument("--cwd", help="override the launch cwd (absolute)")
     ap.add_argument("--plugins", help="ad-hoc: comma-separated plugin names (adds to floor)")
+    ap.add_argument("--worktree", nargs="?", const=True, default=None, metavar="BRANCH",
+                    help="isolate this agent in a git worktree off its repo cwd (overrides the roster; "
+                         "optional branch name, else fleet/<label>)")
+    ap.add_argument("--no-worktree", action="store_true",
+                    help="force-disable worktree even if the role sets worktree=true")
+    ap.add_argument("--worktree-base", help="base ref for a NEW worktree branch (default: repo default branch)")
     ap.add_argument("--dry-run", action="store_true", help="resolve + print, do NOT spawn")
     a = ap.parse_args(argv)
     if not a.role and not a.adhoc:
@@ -428,6 +467,45 @@ def cmd_launch(argv):
     if a.adhoc and a.plugins:
         spec["plugins"] = _dedup(spec["plugins"] + [p.strip() for p in a.plugins.split(",") if p.strip()])
     spec["abs_cwd"] = a.cwd or (spec["cwd"] if os.path.isabs(spec["cwd"]) else os.path.join(ROOT, spec["cwd"]))
+
+    # --- worktree (config-gated, default-off) ---------------------------------------------------
+    # Resolve whether this launch is worktree-isolated, then swap abs_cwd to the worktree path BEFORE
+    # the cwd is baked into the send command, the surface, or the registry. The fleet OWNS the tree:
+    # we strip any Claude `-w` passthrough so the agent never becomes a second owner.
+    wt_on = spec["worktree"]
+    wt_branch = None
+    if a.no_worktree:
+        wt_on = False
+    elif a.worktree is not None:
+        wt_on = True
+        if isinstance(a.worktree, str):
+            wt_branch = a.worktree
+    if a.worktree_base:
+        spec["worktree_base"] = a.worktree_base
+    spec["worktree_active"] = wt_on
+    if wt_on:
+        import worktree as wt
+        repo = wt.repo_root(spec["abs_cwd"])
+        if not repo:
+            sys.exit(f"[fleet] ABORT: --worktree set but cwd is not a git repo: {spec['abs_cwd']}")
+        branch = wt_branch or f"{spec['worktree_branch_prefix']}{spec['label']}"
+        wt_dir = spec["worktree_dir"] or ".worktrees"
+        path = wt.worktree_path(repo, wt_dir, spec["label"])
+        if not a.dry_run:                                    # dry-run never touches git
+            wt.ensure_gitignored(repo, wt_dir)
+            try:
+                wt.ensure_worktree(repo, path, branch, spec.get("worktree_base") or "")
+            except wt.WorktreeError as e:
+                sys.exit(f"[fleet] ABORT: could not prepare worktree: {e}")
+        spec["abs_cwd"] = path
+        spec["worktree_meta"] = {"repo": repo, "path": path, "branch": branch}
+        # one-owner guardrail: drop Claude's own worktree flags from the passthrough so the agent
+        # CLI never creates a nested/competing worktree. (Subagent isolation:worktree is never enabled
+        # by the fleet, so there is nothing to strip there.)
+        caller, stripped = wt.strip_owner_flags(caller)
+        if stripped:
+            print("[fleet] note: stripped Claude -w/--worktree from passthrough (the fleet owns this worktree)")
+        print(f"[fleet] worktree: {path} on branch {branch}")
 
     bin_name, args, env = adapter_compile(spec["tool"], spec, caller)
     send_cmd = render_send_cmd(bin_name, args, env, spec["abs_cwd"])
@@ -459,6 +537,20 @@ def cmd_launch(argv):
         sys.exit("[fleet] timed out waiting for session binding")
     register(surf, spec, a.parent, sid or "", ws)
     log_launch(spec, a.parent, surf, sid or "", send_cmd)
+    # post-launch placement reconciliation: confirm the surface actually came up IN the worktree (a
+    # collapsed/adopted workspace would land the agent in the wrong cwd). Fail loud with the cleanup +
+    # rerun commands; never auto-tear-down (the wrong surface might be someone else's).
+    if spec.get("worktree_active") and sid:
+        actual = _poll_surface_cwd(surf, spec["abs_cwd"], timeout=10)
+        if not actual or os.path.realpath(actual) != os.path.realpath(spec["abs_cwd"]):
+            print(f"\n[fleet] !!! PLACEMENT MISMATCH for {spec['label']}")
+            print(f"[fleet]   intended worktree cwd : {spec['abs_cwd']}")
+            print(f"[fleet]   surface reports cwd    : {actual or '(none yet)'}")
+            print(f"[fleet]   the launch likely collapsed into an existing surface. Clean up + retry:")
+            print(f"[fleet]     fleet rm {spec['label']} --kill")
+            print(f"[fleet]     fleet worktree clean {spec['label']}")
+            print(f"[fleet]     fleet launch {a.role or ('--adhoc ' + a.adhoc)} ...")
+            return 2
     if sid:
         print(f"[fleet] DONE: {spec['label']} = surface {surf} (session {sid}, place {spec['place']}, tool {spec['tool']})")
     else:
@@ -667,12 +759,15 @@ def cmd_ls(argv):
 
 
 def cmd_rm(argv):
-    """Drop a label from live/archive. --kill also stops the process + closes its tab (throwaway)."""
+    """Drop a label from live/archive. --kill also stops the process + closes its tab (throwaway), and
+    for a worktree-isolated agent tears the worktree down (refuse-if-dirty; --wip-commit to override;
+    branch always kept)."""
     import fleet_state as fs, signal
     kill = "--kill" in argv
-    args = [a for a in argv if a != "--kill"]
+    wipc = "--wip-commit" in argv
+    args = [a for a in argv if a not in ("--kill", "--wip-commit")]
     if not args:
-        sys.exit("usage: fleet rm <label> [--kill]")
+        sys.exit("usage: fleet rm <label> [--kill] [--wip-commit]")
     label = args[0]
     e = fs.live_get(label) or fs.archive_get(label)
     if not e:
@@ -685,10 +780,90 @@ def cmd_rm(argv):
             except (ProcessLookupError, PermissionError):
                 pass
         cmuxq("close-surface", "--surface", e["surface"])
+    wt_note = ""
+    if kill and e.get("worktree"):
+        import worktree as wt
+        m = e["worktree"]
+        removed, msg = wt.teardown(m["repo"], m["path"], label, wip_commit_flag=wipc)
+        wt_note = f"\n[fleet] worktree: {msg}"
+        if not removed:
+            wt_note += f"\n[fleet]   (re-run: fleet worktree clean {label} --wip-commit)"
     fs.live_del(label); fs.archive_del(label)
     fs.log_event("removed", label=label, role=e.get("role"), killed=kill)
-    print(f"[fleet] removed {label}{' (killed + closed)' if kill else ''}")
+    print(f"[fleet] removed {label}{' (killed + closed)' if kill else ''}{wt_note}")
     return 0
+
+
+def _worktree_entries():
+    """(label -> {meta, where}) for every registry entry carrying worktree bookkeeping (live + archive)."""
+    import fleet_state as fs
+    out = {}
+    for where, table in (("live", fs.live_all()), ("archive", fs.archive_all())):
+        for label, v in table.items():
+            m = v.get("worktree")
+            if m:
+                out[label] = {"meta": m, "where": where, "entry": v}
+    return out
+
+
+def cmd_worktree(argv):
+    """Manage fleet-owned git worktrees. v0.1 verbs: `ls` (list + dirty/exists state) and
+    `clean <label>` (teardown, refuse-if-dirty, keep branch)."""
+    import worktree as wt
+    if not argv or argv[0] in ("-h", "--help"):
+        print("usage: fleet worktree <ls | clean <label> [--wip-commit] [--force]>")
+        return 0
+    verb, rest = argv[0], argv[1:]
+
+    if verb == "ls":
+        ents = _worktree_entries()
+        if not ents:
+            print("no fleet worktrees registered.")
+            return 0
+        print(f"FLEET WORKTREES ({len(ents)}):  {'label':<24}{'branch':<22}{'state':<10}{'where':<9}path")
+        # cache the per-repo registered-worktree set so we can flag ones git no longer knows about
+        for label, info in sorted(ents.items()):
+            m, where = info["meta"], info["where"]
+            path, branch = m.get("path", "?"), m.get("branch", "?")
+            if not os.path.exists(path):
+                state = "GONE"
+            elif not wt.find_worktree(m.get("repo", ""), path):
+                state = "untracked"
+            elif wt.has_changes(path):
+                state = "dirty"
+            else:
+                state = "clean"
+            print(f"  {label:<24}{branch:<22}{state:<10}{where:<9}{path}")
+        print("\n(clean = removable; dirty = has changes (clean needs --wip-commit); GONE = dir missing.)")
+        return 0
+
+    if verb == "clean":
+        ap = argparse.ArgumentParser(prog="fleet worktree clean")
+        ap.add_argument("label")
+        ap.add_argument("--wip-commit", action="store_true",
+                        help="commit dirty changes as a WIP snapshot before removing (branch kept)")
+        ap.add_argument("--force", action="store_true", help="force git worktree remove (e.g. locked)")
+        a = ap.parse_args(rest)
+        ents = _worktree_entries()
+        info = ents.get(a.label)
+        if not info:
+            sys.exit(f"fleet worktree clean: no registered worktree for '{a.label}' (see `fleet worktree ls`)")
+        import fleet_state as fs
+        live = fs.live_get(a.label)
+        if info["where"] == "live" and live and fs.lifecycle(live.get("surface", "")) not in ("", "-", "ended", None):
+            sys.exit(f"fleet worktree clean: '{a.label}' is still LIVE; `fleet rm {a.label} --kill` first")
+        m = info["meta"]
+        removed, msg = wt.teardown(m["repo"], m["path"], a.label, wip_commit_flag=a.wip_commit, force=a.force)
+        print(f"[fleet] {msg}")
+        if removed:
+            # the tree is gone; null the worktree marker on the entry so `ls` stops listing it (but keep
+            # the agent entry itself — clean is about the tree, not the agent's archive record).
+            entry = info["entry"]
+            entry["worktree"] = None
+            (fs.live_put if info["where"] == "live" else fs.archive_put)(a.label, entry)
+        return 0 if removed else 1
+
+    sys.exit(f"fleet worktree: unknown verb '{verb}' (use ls | clean)")
 
 
 def cmd_archive(argv):
@@ -715,7 +890,7 @@ def cmd_archive(argv):
             pass
     cmuxq("close-surface", "--surface", surf)
     arch = {k: e[k] for k in ("role", "kind", "tool", "cwd", "parent", "place",
-                              "plugins", "flags", "settings", "group") if k in e}
+                              "plugins", "flags", "settings", "group", "worktree") if k in e}
     arch["last_session"] = e.get("session")
     arch["archived_at"] = time.time()
     if b.get("command"):                       # revive replays this like recycle (binding-first)
@@ -1307,14 +1482,15 @@ def main():
               "  broadcast \"<msg>\" [--target all|all-conductors|all-children|my-children] [--no-wake] [--expect-reply] [--dry-run]\n"
               "                                                    input-safe heads-up to live agents (e.g. after a toml/floor change); never restarts them\n"
               "  mute <label> | unmute <label>                     stop/resume pushing a child's completions to its parent (parent reads on demand)\n"
-              "  rm <label>                                        drop a label from live/archive")
+              "  rm <label> [--kill] [--wip-commit]                drop a label; --kill stops+closes (+ tears down its worktree)\n"
+              "  worktree <ls | clean <label> [--wip-commit]>      manage fleet-owned git worktrees (config-gated, default-off)")
         return 0
     sub, rest = sys.argv[1], sys.argv[2:]
     fns = {"launch": cmd_launch, "config": cmd_config, "ls": cmd_ls,
            "archive": cmd_archive, "revive": cmd_revive, "recycle": cmd_recycle,
            "_recycle-exec": cmd_recycle_exec, "broadcast": cmd_broadcast,
            "mute": lambda a: cmd_mute(a, mute=True), "unmute": lambda a: cmd_mute(a, mute=False),
-           "rm": cmd_rm}
+           "rm": cmd_rm, "worktree": cmd_worktree}
     if sub in fns:
         return fns[sub](rest)
     sys.exit(f"fleet: unknown subcommand '{sub}'")
