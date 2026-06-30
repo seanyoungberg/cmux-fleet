@@ -79,6 +79,15 @@ vault or machine.
   stubbed cmux) plus a `claude --plugin-dir` load check. One skip expected (real
   claude load, skipped when no headless `claude` is present).
 
+- **Multi-build isolation (profiles).** `fleet profile <name> [--base DIR] [--root DIR] [--init]`
+  emits a sourceable env block that pins every entrypoint (the `fleet` CLI via PATH, `CMUX_STATE_DIR`,
+  `CMUX_FLEET_TOML`, `CMUX_FLEET_ROOT`, `CMUX_FLEET_MARKETPLACE`, `CMUX_BIN`) at one build, so
+  independent builds run side by side with no shared config, state, or daemons. The launcher now
+  injects those same paths into every child it spawns (`_profile_env`), so a conductor and all its
+  descendants — and their hooks — stay on one build regardless of a child shell's ambient env (the
+  hermetic guarantee). Ships `profiles/test.fleet.toml` (a sandbox roster) and `docs/profiles.md`
+  (the permanent dev workflow for standing up an Nth build).
+
 ### Fixed
 
 - **Recycle relaunch is timing- and crash-safe.** A recycled agent relaunched

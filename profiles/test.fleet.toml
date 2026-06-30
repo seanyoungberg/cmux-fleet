@@ -1,0 +1,36 @@
+# Sample ISOLATED test roster. Used with the `test` profile (see docs/profiles.md):
+#
+#     eval "$(/path/to/cmux-fleet/bin/fleet profile test --init)"   # pins state/config/PATH at this build
+#     cp profiles/test.fleet.toml "$CMUX_FLEET_TOML"                # this roster
+#     python3 "$(dirname "$(command -v fleet)")/../scripts/router.py" --live   # the profile's OWN router
+#
+# Everything here is sandbox-only: a throwaway root, a sandbox conductor + one worker, both loading THIS
+# build's plugin. No vault, no _meta, no shared state. `fleet profile` already pinned CMUX_STATE_DIR /
+# CMUX_FLEET_TOML / CMUX_FLEET_ROOT / CMUX_FLEET_MARKETPLACE, so this file only carries the roster.
+
+[fleet]
+# root is pinned by the profile env (CMUX_FLEET_ROOT). Set it here too if you run the roster without the
+# profile env active — point it at a scratch dir, NEVER the vault.
+# root = "~/cmux-fleet-sandbox"
+
+[defaults]
+tool  = "claude"
+kind  = "child"
+place = "tab"
+
+[tool.claude]
+plugins = ["cmux-fleet"]            # resolves under CMUX_FLEET_MARKETPLACE (the build's parent) -> THIS build
+flags   = "--effort high"
+
+[role.sandbox-conductor]
+kind  = "conductor"
+place = "workspace"
+group = "cmux-fleet-sandbox"
+cwd   = "sandbox/conductor"         # relative to CMUX_FLEET_ROOT (the scratch root), created on launch
+[role.sandbox-conductor.claude]
+flags = "--effort xhigh"
+
+[role.sandbox-worker]
+kind = "child"
+place = "tab"
+cwd  = "sandbox/worker"

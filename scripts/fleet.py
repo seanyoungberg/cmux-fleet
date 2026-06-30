@@ -30,7 +30,20 @@ import argparse, json, os, shlex, subprocess, sys, time
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from config import ROOT, STATE, CMUX, MARKETPLACE, FLOOR, FLEET_TOML, ADHOC_SUBDIR  # path resolver
 
+PLUGIN_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))  # the build dir (this plugin)
 REGISTRY = os.path.join(STATE, "fleet-registry.json")
+
+
+def _profile_env():
+    """The build/profile-pinning env injected into EVERY child launch so a child — and its hooks, and any
+    sub-fleet it launches — resolve the SAME build state/config/marketplace as the launcher, instead of
+    whatever its ambient shell happens to carry. This is what makes a profile HERMETIC across the
+    parent->child boundary (the core multi-build-isolation requirement): without it a child could inherit
+    a different build's CMUX_STATE_DIR and split-brain the registry/inbox."""
+    e = {"CMUX_STATE_DIR": STATE, "CMUX_FLEET_TOML": FLEET_TOML, "CMUX_FLEET_ROOT": ROOT, "CMUX_BIN": CMUX}
+    if MARKETPLACE:
+        e["CMUX_FLEET_MARKETPLACE"] = MARKETPLACE
+    return e
 
 try:
     import tomllib
@@ -201,7 +214,7 @@ def adapter_compile(tool, spec, caller_tokens):
     for the given tool. Adding a tool = adding a branch here + a [tool.<t>] block."""
     # spec['flags'] is already a token list (tool-floor<-role); layer the caller passthrough on top.
     merged = _layer_tokens([spec["flags"], list(caller_tokens or [])])
-    env = dict(spec["env"])
+    env = {**_profile_env(), **dict(spec["env"])}            # build/profile pins first; a role's env wins
     env["AGENT_ROLE"] = spec["role"]                          # behavioral type (exposed to the agent)
     env["AGENT_LABEL"] = spec["label"]                        # unique instance -> routing/recycle
 
@@ -1139,7 +1152,8 @@ def _replay_binding_argv(argv, tool, role, label, cwd, caller_tokens, add_plugin
         base += ["--plugin-dir", pd]
     base = _layer_tokens([base, list(caller_tokens or [])])      # flag overrides
     base = _prepend_resume(base, tool, resume_session)           # claude --resume flag | codex resume subcmd
-    return render_send_cmd(tool, base, {"AGENT_ROLE": role, "AGENT_LABEL": label}, abs_cwd)
+    # profile-pin a recycled/revived child too (bindings capture null env -> re-inject the build env)
+    return render_send_cmd(tool, base, {**_profile_env(), "AGENT_ROLE": role, "AGENT_LABEL": label}, abs_cwd)
 
 
 def _compose_from_registry(label, entry, caller_tokens, add_plugins, resume_session):
@@ -1498,9 +1512,65 @@ def cmd_broadcast(argv):
     return 0
 
 
+def cmd_profile(argv):
+    """Emit a sourceable env block that pins EVERY cmux-fleet entrypoint at THIS build + a named profile,
+    so independent builds run side by side with zero shared state. Usage:
+
+        eval "$(/path/to/<build>/bin/fleet profile <name> [--base DIR] [--root DIR] [--init])"
+
+    Pins (CLI, router, hooks, --plugin-dir, AND every child launch all resolve to ONE build):
+      PATH                    <build>/bin first
+      CMUX_STATE_DIR          <base>/state    (default $XDG_STATE_HOME/cmux-fleet-<name>)
+      CMUX_FLEET_TOML         <base>/fleet.toml (default $XDG_CONFIG_HOME/cmux-fleet-<name>/fleet.toml)
+      CMUX_FLEET_ROOT         --root or $HOME
+      CMUX_FLEET_MARKETPLACE  the build's parent dir (so a roster plugins=["<build-name>"] -> this build)
+      CMUX_BIN                the resolved cmux
+    --init also creates the state dir and seeds the toml from fleet.toml.example if it's missing.
+    The launcher injects these same paths into every child it spawns (see _profile_env), so a conductor
+    and all its descendants stay on one build even if a child's shell carries different ambient env."""
+    ap = argparse.ArgumentParser(prog="fleet profile")
+    ap.add_argument("name", help="profile name; default paths derive cmux-fleet-<name>")
+    ap.add_argument("--base", default="", help="one dir holding BOTH state/ and fleet.toml (overrides XDG defaults)")
+    ap.add_argument("--root", default="", help="workspace root for relative role cwds (default $HOME)")
+    ap.add_argument("--init", action="store_true", help="create the state dir + seed fleet.toml from the example")
+    a = ap.parse_args(argv)
+
+    if a.base:
+        base = os.path.abspath(os.path.expanduser(a.base))
+        state, toml = os.path.join(base, "state"), os.path.join(base, "fleet.toml")
+    else:
+        xdg_state = os.environ.get("XDG_STATE_HOME") or os.path.expanduser("~/.local/state")
+        xdg_cfg = os.environ.get("XDG_CONFIG_HOME") or os.path.expanduser("~/.config")
+        state = os.path.join(xdg_state, f"cmux-fleet-{a.name}")
+        toml = os.path.join(xdg_cfg, f"cmux-fleet-{a.name}", "fleet.toml")
+    root = os.path.abspath(os.path.expanduser(a.root)) if a.root else os.path.expanduser("~")
+    mkt = os.path.dirname(PLUGIN_ROOT)            # plugins=["<build-name>"] -> PLUGIN_ROOT
+    binp = os.path.join(PLUGIN_ROOT, "bin")
+
+    if a.init:
+        os.makedirs(state, exist_ok=True)
+        os.makedirs(os.path.dirname(toml), exist_ok=True)
+        if not os.path.exists(toml):
+            example = os.path.join(PLUGIN_ROOT, "fleet.toml.example")
+            if os.path.exists(example):
+                import shutil
+                shutil.copyfile(example, toml)
+                sys.stderr.write(f"[fleet profile] seeded {toml} from fleet.toml.example\n")
+        sys.stderr.write(f"[fleet profile] init: state dir {state}\n")
+
+    print(f'# cmux-fleet profile "{a.name}" -> build {PLUGIN_ROOT}  (eval this to activate)')
+    print(f'export CMUX_FLEET_ROOT={shlex.quote(root)}')
+    print(f'export CMUX_STATE_DIR={shlex.quote(state)}')
+    print(f'export CMUX_FLEET_TOML={shlex.quote(toml)}')
+    print(f'export CMUX_FLEET_MARKETPLACE={shlex.quote(mkt)}')
+    print(f'export CMUX_BIN={shlex.quote(CMUX)}')
+    print(f'export PATH={shlex.quote(binp)}:"$PATH"')
+    return 0
+
+
 def main():
     if len(sys.argv) < 2 or sys.argv[1] in ("-h", "--help"):
-        print("usage: fleet <launch|config|ls|archive|revive|recycle|rm|vitals|find|graph|serve|paint|worktree> ...\n"
+        print("usage: fleet <launch|config|ls|archive|revive|recycle|rm|vitals|find|graph|serve|paint|worktree|profile> ...\n"
               "  launch <role|--adhoc NAME> [--tool t] [--place p] [--parent s] [--dry-run] [-- <tool flags>]\n"
               "  config <role|--adhoc NAME|--cwd DIR> [--tool t]   effective config (base settings + fleet adds)\n"
               "  ls                                                live fleet x hook store; flags STALE + archived\n"
@@ -1518,7 +1588,8 @@ def main():
               "  graph [--html] [--out FILE]                       fleet parentage tree (text, or self-contained HTML)\n"
               "  serve [--port N]                                  thin read-only localhost view (graph HTML + vitals.json); no daemon\n"
               "  paint                                             sync fleet state onto the cmux sidebar (status pills + ctx bars)\n"
-              "  worktree <ls | clean <label> [--wip-commit]>      manage fleet-owned git worktrees (config-gated, default-off)")
+              "  worktree <ls | clean <label> [--wip-commit]>      manage fleet-owned git worktrees (config-gated, default-off)\n"
+              "  profile <name> [--base DIR] [--root DIR] [--init]  emit env that pins ALL entrypoints at THIS build (eval it for multi-build isolation)")
         return 0
     sub, rest = sys.argv[1], sys.argv[2:]
     import fleet_features as ff
@@ -1526,7 +1597,7 @@ def main():
            "archive": cmd_archive, "revive": cmd_revive, "recycle": cmd_recycle,
            "_recycle-exec": cmd_recycle_exec, "broadcast": cmd_broadcast,
            "mute": lambda a: cmd_mute(a, mute=True), "unmute": lambda a: cmd_mute(a, mute=False),
-           "rm": cmd_rm, "worktree": cmd_worktree,
+           "rm": cmd_rm, "worktree": cmd_worktree, "profile": cmd_profile,
            "vitals": ff.cmd_vitals, "find": ff.cmd_find, "graph": ff.cmd_graph,
            "serve": ff.cmd_serve, "paint": ff.cmd_paint}
     if sub in fns:
