@@ -29,14 +29,14 @@ eval "$(/path/to/<build>/bin/fleet profile <name> --init)"
 ```
 
 `fleet profile` prints a sourceable env block (and `--init` also creates the state dir and seeds the
-roster from `fleet.toml.example`). After `eval`, that shell — and everything it launches — is pinned to
+roster from `fleet.toml.example`). After `eval`, that shell, and everything it launches, is pinned to
 that build and profile. Defaults:
 
-- `CMUX_STATE_DIR`  → `$XDG_STATE_HOME/cmux-fleet-<name>`
-- `CMUX_FLEET_TOML` → `$XDG_CONFIG_HOME/cmux-fleet-<name>/fleet.toml`
-- `CMUX_FLEET_ROOT` → `$HOME` (override with `--root DIR`)
-- `CMUX_FLEET_MARKETPLACE` → the build's parent dir, so a roster `plugins = ["<build-dirname>"]` loads this build
-- `PATH` → the build's `bin/` first
+- `CMUX_STATE_DIR`  -> `$XDG_STATE_HOME/cmux-fleet-<name>`
+- `CMUX_FLEET_TOML` -> `$XDG_CONFIG_HOME/cmux-fleet-<name>/fleet.toml`
+- `CMUX_FLEET_ROOT` -> `$HOME` (override with `--root DIR`)
+- `CMUX_FLEET_MARKETPLACE` -> the build's parent dir, so a roster `plugins = ["<build-dirname>"]` loads this build
+- `PATH` -> the build's `bin/` first
 
 Use `--base DIR` to keep one profile's state and toml together under a single dir instead of the XDG
 defaults.
@@ -75,7 +75,7 @@ sandbox agents' cwds never land in a real project.
 ## Workspace groups: one conductor = one group
 
 A conductor that launches with `place = workspace` anchors its **own** cmux workspace-group, so the
-conductor and all its children form one collapsible sidebar group — clean visual separation per build.
+conductor and all its children form one collapsible sidebar group: clean visual separation per build.
 
 - **Auto-anchor (no pre-create).** On launch, if the conductor's group does not exist, the fleet creates
   it anchored on the conductor's own new workspace (`workspace-group create --from <that workspace>`,

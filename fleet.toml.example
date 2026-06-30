@@ -1,9 +1,9 @@
-# cmux-fleet.toml — copy to $XDG_CONFIG_HOME/cmux-fleet/fleet.toml (default ~/.config/cmux-fleet/fleet.toml)
+# cmux-fleet.toml: copy to $XDG_CONFIG_HOME/cmux-fleet/fleet.toml (default ~/.config/cmux-fleet/fleet.toml)
 # or point $CMUX_FLEET_TOML at it. Every block is optional; the engine runs with no file at all
-# (ad-hoc launches need no roster). Edit freely — roles are created lazily.
+# (ad-hoc launches need no roster). Edit freely; roles are created lazily.
 
 # ----------------------------------------------------------------------------------------------
-# [fleet] — engine config. Every key is optional; shown with its effective default. Precedence
+# [fleet] engine config. Every key is optional; shown with its effective default. Precedence
 # per key is: env var > this block > built-in default. (Resolved in scripts/config.py.)
 # ----------------------------------------------------------------------------------------------
 [fleet]
@@ -19,7 +19,7 @@
 # adhoc_subdir = "agents/ad-hoc"    # where `--adhoc <name>` agents get a cwd (relative to root).  env: CMUX_FLEET_ADHOC_SUBDIR
 
 # ----------------------------------------------------------------------------------------------
-# ROSTER — role-first, tool-nested. A role owns its tool-agnostic ORCHESTRATION (cwd/place/group/
+# ROSTER: role-first, tool-nested. A role owns its tool-agnostic ORCHESTRATION (cwd/place/group/
 # kind) once; thin per-tool sub-blocks carry that tool's LAUNCH CONFIG (plugins/flags/env/settings).
 #   [defaults]          default tool + orchestration floor
 #   [tool.<t>]          per-tool launch floor -> the adapter's defaults

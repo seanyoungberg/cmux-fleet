@@ -1,5 +1,14 @@
 # Architecture
 
+The spine as-built, by file:
+
+- `scripts/config.py` resolves every path/setting (env > `[fleet]` toml > XDG default).
+- `scripts/fleet_state.py` owns the state model: the label-keyed registry, the unified inbox, the archive shelf, the hook-store union, the idle-wake gate.
+- `scripts/router.py` is the bus daemon: child `Stop` -> deliver a completion to the parent. One process serves every conductor.
+- `scripts/hooks/awareness.py` + `scripts/hooks/drain.py` surface the inbox into a conductor's context (never its input box).
+- `scripts/fleet.py` is the CLI: launch, the lifecycle verbs, peer messaging, broadcast, worktrees, profiles, and the read-only views (`scripts/fleet_features.py`).
+- `scripts/peer-msg.py`, `scripts/child-digest.py`, `scripts/drive-child.py`, `scripts/inbox-ack.py` are the agent-facing helpers.
+
 ## The division of labor
 
 cmux already provides the hard parts of a multi-agent runtime: it owns agent
@@ -130,3 +139,72 @@ under XDG, the cmux binary off `$PATH`, the marketplace and floor `CLAUDE.md`
 disabled. Tapestry- or machine-specific behavior is layered back in by pointing
 the env vars or `[fleet]` block at a vault, never the reverse. See the
 configuration table in the README for every key.
+
+## Peer messaging (A2A)
+
+Child-to-parent delivery is automatic (the router). Talking to a **peer**
+conductor is deliberate: `peer-msg.py` appends a `peer` row to the same unified
+inbox, addressed to the peer's surface, so the peer's awareness hook surfaces it
+in context. A reply protocol rides the row: a fresh message expects a reply by
+default, `--no-reply` marks it informational, `--reply-to <id>` makes a message a
+reply. Peer rows always drain at the recipient's next Stop regardless of the mode
+dial (a deliberate send should not wait on the dial), and an idle peer is woken
+through the same `wake_if_idle` gate unless `--no-wake`. `fleet broadcast` is the
+same mechanism fanned out to a target set (`all`, `all-conductors`,
+`all-children`, `my-children`); it never restarts anyone.
+
+## Lifecycle: recycle, revive, archive
+
+- **recycle** restarts a live agent in place on its own surface, same identity,
+  via cmux's `respawn-pane`. It runs detached behind a quiet-gate (idle prompt,
+  empty draft) so it can recycle the caller itself. The confirm is crash-safe:
+  the relaunch is PATH-guarded (the fresh login shell may not have finished
+  building `$PATH`, which otherwise makes the cmux wrapper exit 127), and the
+  pre-relaunch session id is snapshotted and **excluded** from the fresh-mode
+  confirm so a crashed launch resolves to "no session" instead of false-confirming
+  on a stale store entry. If no fresh session binds, it re-fires once.
+- **archive** parks a live agent: SIGINT for a clean TUI exit, close the tab,
+  move the entry to `archive.json` with the captured launch binding.
+- **revive** brings a parked agent back on a fresh surface, resuming its last
+  session by replaying that binding (with `--resume` swapped in).
+
+For a roster role, recycle and revive are toml-authoritative: they re-resolve the
+current roster, so a restart picks up role or floor changes made since launch.
+
+## Worktrees
+
+Config-gated, default-off. A role with `worktree = true` (or `--worktree`) runs
+each agent in its own git worktree at `<repo>/.worktrees/<label>` on branch
+`fleet/<label>`, instead of sharing the repo's working tree. **One owner: the
+fleet.** It runs `git worktree add` itself and launches the tool into that
+directory (`claude` plain with its `-w` stripped from passthrough; codex via the
+`cd`), and never hooks cmux's `WorktreeCreate`/`WorktreeRemove`, so two owners
+never race on one tree. Teardown refuses on a dirty tree (`--wip-commit`
+overrides) and always keeps the branch. `scripts/worktree.py` holds the logic
+(repo discovery, base-ref cascade, idempotent locked create, fail-closed
+teardown); the registry entry carries the worktree bookkeeping so recycle/revive
+reuse the tree and `rm --kill` tears it down.
+
+## Workspace groups: one conductor = one group
+
+A `place = workspace` conductor anchors its own cmux workspace-group: its
+workspace is the anchor, so the conductor and its children form one collapsible
+sidebar group. On launch, if the group does not exist, the fleet creates it on
+the conductor's own new workspace via `workspace-group create --from <that
+workspace>` (always an explicit `--from`; the implicit form adopts the caller's
+workspace). A conductor with no explicit `group` defaults it to its label; a
+`place = workspace` child joins its parent's group. Group name-to-ref resolution
+is centralized (`_group_ref`) because cmux's `new-workspace --group` and
+`workspace-group delete` take a ref, not a name. Recycle and revive preserve the
+group; `fleet rm --with-group` dissolves it by ref.
+
+## Profiles and multi-build isolation
+
+A build is a checkout directory; a profile pins every entrypoint at one build so
+independent builds run side by side with no shared config, state, or daemons.
+`fleet profile <name>` emits a sourceable env block (PATH to the build's `bin`,
+plus `CMUX_STATE_DIR`, `CMUX_FLEET_TOML`, `CMUX_FLEET_ROOT`,
+`CMUX_FLEET_MARKETPLACE`, `CMUX_BIN`). The launcher also injects those same paths
+into every child it spawns (`_profile_env`), so a conductor and all its
+descendants, including their hooks, stay on one build regardless of a child
+shell's ambient env. See `docs/profiles.md`.

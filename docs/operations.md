@@ -4,6 +4,40 @@ Day-to-day running of a cmux fleet. All commands assume `fleet` is on your
 `PATH` (via `bin/fleet`) and you are issuing them from inside a conductor's cmux
 surface, so `$CMUX_SURFACE_ID` is set.
 
+## Cheat sheet
+
+```
+# daemon
+python3 scripts/router.py --live            # start the one router (omit --live to observe)
+echo auto > "$CMUX_STATE_DIR/notify-mode"   # passive | autodrain | auto
+
+# spawn + drive
+fleet launch <role> [--place tab|pane|workspace] [--dry-run] [-- <tool flags>]
+fleet launch --adhoc <name> --tool claude -- --model opus
+python3 scripts/drive-child.py <surface> "<prompt>"
+python3 scripts/child-digest.py <session-frag> 5
+
+# inventory + lifecycle
+fleet ls                                    # live x hook store; flags STALE / pending / MUTED
+fleet recycle [label] [--resume] [--force] [-- <flags>]   # restart in place, same identity
+fleet archive <label>          / fleet revive <label>     # park / bring back
+fleet rm <label> [--kill] [--with-group] [--wip-commit]   # drop; optionally close + dissolve group
+fleet mute <label> / unmute <label>
+
+# views (read-only, no LLM)
+fleet vitals [--json] [--paint]   fleet find <query> [--turns N]   fleet graph [--html]
+fleet serve [--port N]            fleet paint
+
+# worktrees (config-gated) + multi-build
+fleet worktree ls / clean <label> [--wip-commit]
+eval "$(/path/to/<build>/bin/fleet profile <name> --init)"   # pin a build (see docs/profiles.md)
+
+# comms
+python3 scripts/peer-msg.py <to-label> "<msg>" [--reply-to <id>] [--no-reply]
+fleet broadcast "<msg>" [--target all|all-conductors|all-children|my-children]
+python3 scripts/inbox-ack.py <seq> [--peer]
+```
+
 ## Start the router
 
 One router serves every conductor on the machine. Start it once:
@@ -49,11 +83,14 @@ fleet launch --adhoc scratch --tool claude -- --model opus --effort high
 ```
 
 Anything after `--` is forwarded verbatim to the agent tool; the launcher never
-needs to know the flag. Placement is `tab`, `pane`, or `workspace` (a workspace
-needs a `--group`). An `--adhoc` agent is off-roster, gets a cwd under
-`adhoc_subdir`, and (if a floor `CLAUDE.md` is configured) inherits it via a
-symlink. Add `--dry-run` to resolve and print the launch command without
-spawning.
+needs to know the flag. Placement is `tab`, `pane`, or `workspace`. A
+`place = workspace` conductor anchors its own workspace-group: if the group does
+not exist it is auto-created on the conductor's own workspace (no manual
+`workspace-group create`), and a conductor with no explicit `group` defaults it
+to its label. A `place = workspace` child joins its parent conductor's group. An
+`--adhoc` agent is off-roster, gets a cwd under `adhoc_subdir`, and (if a floor
+`CLAUDE.md` is configured) inherits it via a symlink. Add `--dry-run` to resolve
+and print the launch command without spawning.
 
 Check what a role would launch with, base settings plus what fleet stacks on
 top, without launching:
@@ -84,7 +121,7 @@ fleet worktree clean <label>       # tear down (refuse-if-dirty; --wip-commit to
 **One owner: the fleet.** It runs `git worktree add` itself and launches the
 tool *into* that directory (`claude` plain, no `-w`; codex via the `cd`). It does
 **not** use Claude's own `-w`/`--worktree` (those are stripped from passthrough
-when `worktree=true`) and does not hook `WorktreeCreate`/`WorktreeRemove` —
+when `worktree=true`) and does not hook `WorktreeCreate`/`WorktreeRemove`,
 running two owners on one tree causes double-cleanup, lock races, and branch
 collisions.
 
@@ -92,7 +129,7 @@ Lifecycle: `launch` creates the tree (idempotent, locked, pruned first);
 `recycle`/`revive` reuse it (the cwd is replayed, the tree persists); `archive`
 keeps it; `rm --kill` tears it down. Teardown **refuses if the tree is dirty**
 (commit/stash first, or pass `--wip-commit` to snapshot as `fleet WIP: <label>`)
-and **always keeps the branch** — nothing here merges or deletes a branch. After
+and **always keeps the branch**: nothing here merges or deletes a branch. After
 a worktree launch, fleet reconciles the surface's actual cwd against the intended
 worktree path and fails loud (with cleanup + rerun commands) if the workspace
 collapsed into an existing surface.
@@ -107,6 +144,30 @@ Reconciles the live registry against cmux's hook store. It flags `STALE` (the
 registry says live but the surface has no live session, e.g. a closed tab or a
 crash) and `pending` (launched, awaiting its first turn to bind a session, which
 codex does lazily). It also lists archived, revivable agents.
+
+## Fleet views
+
+Read-only, derived from live state on every call (registry, hook stores,
+transcripts). No daemon, no stored status. Status is inferred without an LLM
+(cmux's `agentLifecycle` is authoritative, refined by keyword tables).
+
+```
+fleet vitals [--json] [--paint]      triage table, most-urgent first
+                                     (error/needs-input/review/working/done/idle),
+                                     each with context-remaining % (! flags <=30% left)
+fleet find <query> [--turns N]       find an agent by label/role/cwd, or by what it
+                                     said in the last N transcript turns
+fleet graph [--html] [--out FILE]    the parentage tree (text, or a self-contained page)
+fleet serve [--port N]               localhost view: GET / -> graph HTML, /vitals.json -> rows
+fleet paint                          push status pill + context bar onto cmux's sidebar
+```
+
+`vitals` context-remaining % assumes a window guessed from the model; set
+`CMUX_FLEET_CONTEXT_WINDOW` (or `[fleet].context_window`) for an exact number (the
+ranking holds either way). `find` matches a label/role/cwd first, then scans
+transcripts. For a dedicated board, install `sidebars/fleet.swift` into
+`~/.config/cmux/sidebars/` and `cmux sidebar open fleet`; it reads what `paint`
+writes.
 
 ## Recycling, archiving, reviving
 
@@ -146,11 +207,14 @@ re-resolve the current roster, so they pick up floor or role changes made since
 the agent launched.
 
 - **rm** drops a label from the live and archive stores. `--kill` also stops the
-  process and closes its tab (for a throwaway).
+  process and closes its tab (for a throwaway). `--with-group` dissolves the
+  agent's workspace-group by ref, closing every member; without it, only this
+  agent's own workspace goes and any remaining members are left ungrouped.
 
   ```
   fleet rm scratch
   fleet rm scratch --kill
+  fleet rm sandbox-conductor --with-group   # tear down a whole conductor group
   ```
 
 ## Muting a child
@@ -202,6 +266,22 @@ python3 scripts/inbox-ack.py <seq> --peer    # ack peer messages
 
 Acking an exact seq is race-safe: a message that arrived later has a higher seq
 and survives the ack.
+
+## Profiles and multi-build
+
+A build is a checkout directory; a profile pins every entrypoint at one build so
+two builds run side by side with separate config, state, and daemons. Activate
+one in a shell, then everything that shell launches is pinned to that build:
+
+```
+eval "$(/path/to/<build>/bin/fleet profile dev --init)"   # PATH + all CMUX_* knobs
+cp profiles/test.fleet.toml "$CMUX_FLEET_TOML"             # a starting roster
+python3 "$build"/scripts/router.py --live                 # this profile's own router
+fleet launch sandbox-conductor                            # auto-anchors its own group
+```
+
+`--init` creates the state dir and seeds the roster from `fleet.toml.example`.
+Full model and the Nth-build workflow are in `docs/profiles.md`.
 
 ## Stranger first run
 

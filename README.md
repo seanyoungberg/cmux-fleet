@@ -68,6 +68,37 @@ The router watches the bus; when the child finishes a turn, the conductor sees
 the completion in its context on its next turn (or sooner, depending on the
 mode dial below).
 
+## Commands
+
+| Verb | What it does |
+| --- | --- |
+| `fleet launch <role\|--adhoc N>` | spawn an agent (`--place tab\|pane\|workspace`, `--dry-run`, `-- <tool flags>`) |
+| `fleet ls` | live fleet reconciled against cmux's hook store (flags STALE / pending / MUTED) |
+| `fleet recycle [label]` | restart in place, same surface and identity (`--resume`, `--force`) |
+| `fleet archive` / `revive` | park a live agent / bring a parked one back |
+| `fleet rm <label>` | drop a label (`--kill` closes it, `--with-group` dissolves its group) |
+| `fleet mute` / `unmute` | stop / resume pushing a child's completions to its parent |
+| `fleet vitals` / `find` / `graph` / `serve` / `paint` | read-only views (triage, lookup, tree, localhost, sidebar) |
+| `fleet worktree ls` / `clean` | manage fleet-owned git worktrees (config-gated) |
+| `fleet broadcast "<msg>"` | input-safe heads-up to a target set of live agents |
+| `fleet profile <name>` | pin all entrypoints at this build (multi-build isolation) |
+| `peer-msg.py` / `child-digest.py` / `drive-child.py` / `inbox-ack.py` | agent-facing helpers |
+
+Full runbook in `docs/operations.md`.
+
+## Multiple builds
+
+cmux-fleet has no compile step, so a build is just a checkout directory. A
+**profile** pins every entrypoint (the `fleet` CLI on `PATH`, the router, the
+hooks, `--plugin-dir`, and every child launch) at one build, so a stable build
+and a dev build run side by side with separate config, state, and daemons:
+
+```
+eval "$(/path/to/<build>/bin/fleet profile <name> --init)"
+```
+
+See `docs/profiles.md` for the model and the workflow to stand up an Nth build.
+
 ## Configuration
 
 Every setting resolves with the precedence **environment variable > `[fleet]`
@@ -112,7 +143,7 @@ work reaches a conductor:
 
 ## Fleet views
 
-Read-only ways to see the fleet. All derive from live state every call — the
+Read-only ways to see the fleet. All derive from live state every call, the
 registry, cmux's hook stores, and the agents' transcripts. No daemon, no stored
 status. Status is inferred **without an LLM** (cmux's `agentLifecycle` is
 authoritative, refined by keyword tables); context-remaining % is read from each
@@ -134,11 +165,11 @@ fleet paint                         sync fleet state onto the cmux sidebar (a st
 `fleet vitals` is the triage view: rows are most-urgent first
 (error / needs-input / review / working / done / idle), each with its
 context-remaining % so you can see who to recycle. The window is a guess per
-model — set `CMUX_FLEET_CONTEXT_WINDOW` (or `[fleet].context_window`) to your
+model. Set `CMUX_FLEET_CONTEXT_WINDOW` (or `[fleet].context_window`) to your
 model's window for an exact number (the ranking is correct regardless).
 
 `fleet paint` writes the same state into cmux's native sidebar via `set-status` /
-`set-progress` (additive — it never recolors or renames your workspaces), on
+`set-progress` (additive, it never recolors or renames your workspaces), on
 change only. For a dedicated board, install the custom sidebar in `sidebars/`:
 
 ```
@@ -148,7 +179,7 @@ cmux sidebar validate fleet && cmux sidebar open fleet
 
 It binds to cmux's live workspace data (refreshes ~1s) and reads the context bars
 `fleet paint` writes; rows are tappable to jump. (The parentage **tree** is in
-`fleet graph` / `fleet serve` — cmux's workspace binding has no parent field.)
+`fleet graph` / `fleet serve`: cmux's workspace binding has no parent field.)
 
 Credit: the triage/near-full and no-LLM status-inference ideas are adapted from
 [agentmaster](https://github.com/Supersynergy/agentmaster); the localhost-view
@@ -162,7 +193,8 @@ Planned, not yet implemented: a packaged router/heartbeat daemon
 ## More
 
 - `docs/architecture.md` for the model (bus / hook store / transcript, the state
-  files, identity, the daemon and hooks).
+  files, identity, the daemon and hooks, recycle, worktrees, groups, profiles).
 - `docs/operations.md` for running it day to day.
+- `docs/profiles.md` for the multi-build / profile model.
 - The conductor skill under `skills/cmux-fleet/` orients an agent that is
   acting as a conductor.

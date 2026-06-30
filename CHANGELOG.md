@@ -55,22 +55,22 @@ vault or machine.
 - **Fleet views** (`scripts/fleet_features.py`). Read-only, derived from live
   state every call (no daemon, no stored status). Status is inferred **without an
   LLM** (cmux `agentLifecycle` authoritative, refined by keyword tables).
-  - `fleet vitals [--json] [--paint]` — cheapest-first triage table, most-urgent
-    first, with each agent's **context-remaining %** (`!` flags ≤30% left).
+  - `fleet vitals [--json] [--paint]`: cheapest-first triage table, most-urgent
+    first, with each agent's **context-remaining %** (`!` flags <=30% left).
     Window configurable via `CMUX_FLEET_CONTEXT_WINDOW` / `[fleet].context_window`.
-  - `fleet find <query> [--turns N] [--json]` — content-aware session lookup
+  - `fleet find <query> [--turns N] [--json]`: content-aware session lookup
     (label / role / cwd, or the agent's recent transcript).
-  - `fleet graph [--html] [--out FILE]` — parentage tree (cycle-safe), text or a
+  - `fleet graph [--html] [--out FILE]`: parentage tree (cycle-safe), text or a
     self-contained HTML page.
-  - `fleet serve [--port N]` — thin read-only localhost view (graph HTML +
+  - `fleet serve [--port N]`: thin read-only localhost view (graph HTML +
     `/vitals.json`); no daemon, no actions, no analytics.
-  - `fleet paint` — native cmux sidebar telemetry: a status pill + context
+  - `fleet paint`: native cmux sidebar telemetry: a status pill + context
     progress bar per workspace, on change only, additive.
   - Custom sidebar `sidebars/fleet.swift` (the cmux custom-sidebar mechanism) for
     a dedicated, tappable fleet board.
   - Unit tests in `tests/test_features.py`. Triage/no-LLM-status ideas adapted
     from agentmaster, the localhost-view shape from elevens (design-mined).
-- **Test suite** (`tests/`, pytest-only — the one dev dependency). Three layers:
+- **Test suite** (`tests/`, pytest-only, the one dev dependency). Three layers:
   static manifest/skill/hooks schema validators; pytest units for `fleet_state`
   transitions (inbox/registry/archive/dial), the hook stdin->exit-0 contract,
   `config.py` resolution precedence (`env > [fleet] toml > XDG`, dirname-anchor,
@@ -84,7 +84,7 @@ vault or machine.
   `CMUX_FLEET_TOML`, `CMUX_FLEET_ROOT`, `CMUX_FLEET_MARKETPLACE`, `CMUX_BIN`) at one build, so
   independent builds run side by side with no shared config, state, or daemons. The launcher now
   injects those same paths into every child it spawns (`_profile_env`), so a conductor and all its
-  descendants — and their hooks — stay on one build regardless of a child shell's ambient env (the
+  descendants, and their hooks, stay on one build regardless of a child shell's ambient env (the
   hermetic guarantee). Ships `profiles/test.fleet.toml` (a sandbox roster) and `docs/profiles.md`
   (the permanent dev workflow for standing up an Nth build).
 

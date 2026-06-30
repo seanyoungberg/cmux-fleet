@@ -13,7 +13,7 @@
 
 [fleet]
 # root is pinned by the profile env (CMUX_FLEET_ROOT). Set it here too if you run the roster without the
-# profile env active — point it at a scratch dir, NEVER the vault.
+# profile env active, point it at a scratch dir, NEVER the vault.
 # root = "~/cmux-fleet-sandbox"
 
 [defaults]
