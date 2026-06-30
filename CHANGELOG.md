@@ -52,5 +52,23 @@ vault or machine.
 - **Plugin packaging**. The repo is its own Claude Code marketplace
   (`marketplace.json` source `./`, strict), with `plugin.json`, `hooks.json`,
   and a conductor skill under `skills/`.
+- **Fleet views** (`scripts/fleet_features.py`). Read-only, derived from live
+  state every call (no daemon, no stored status). Status is inferred **without an
+  LLM** (cmux `agentLifecycle` authoritative, refined by keyword tables).
+  - `fleet vitals [--json] [--paint]` — cheapest-first triage table, most-urgent
+    first, with each agent's **context-remaining %** (`!` flags ≤30% left).
+    Window configurable via `CMUX_FLEET_CONTEXT_WINDOW` / `[fleet].context_window`.
+  - `fleet find <query> [--turns N] [--json]` — content-aware session lookup
+    (label / role / cwd, or the agent's recent transcript).
+  - `fleet graph [--html] [--out FILE]` — parentage tree (cycle-safe), text or a
+    self-contained HTML page.
+  - `fleet serve [--port N]` — thin read-only localhost view (graph HTML +
+    `/vitals.json`); no daemon, no actions, no analytics.
+  - `fleet paint` — native cmux sidebar telemetry: a status pill + context
+    progress bar per workspace, on change only, additive.
+  - Custom sidebar `sidebars/fleet.swift` (the cmux custom-sidebar mechanism) for
+    a dedicated, tappable fleet board.
+  - Unit tests in `tests/test_features.py`. Triage/no-LLM-status ideas adapted
+    from agentmaster, the localhost-view shape from elevens (design-mined).
 
 [0.1.0]: https://github.com/seanyoungberg/cmux-fleet/releases/tag/v0.1.0

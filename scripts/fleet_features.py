@@ -1,0 +1,570 @@
+#!/usr/bin/env python3
+# fleet_features.py — the read-only VIEW layer over the live fleet: vitals / find / graph / serve,
+# plus native sidebar telemetry (paint). Kept OUT of fleet.py (the lifecycle CLI) so the view code
+# is a clean, dependency-light island: it imports fleet_state + config and NOTHING from fleet.py
+# (no circular import). fleet.py just routes `vitals|find|graph|serve|paint` here.
+#
+# DESIGN: everything derives from live state every call — fleet_state's registry + cmux's per-agent
+# hook stores + the agents' transcripts. No daemon, no stored status, no analytics. Status is inferred
+# WITHOUT an LLM: cmux's agentLifecycle is authoritative, refined by cheap keyword tables (the
+# agentmaster move). Context-remaining % is read straight from the transcript's token usage (Berg's
+# fleet-management ask: see who is near-full and needs recycling).
+import html as _html
+import json
+import os
+import subprocess
+import sys
+import time
+
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+import fleet_state as fs
+from config import CMUX, STATE
+
+try:
+    from config import CONTEXT_WINDOW as _CFG_WINDOW          # optional override (env/[fleet])
+except Exception:
+    _CFG_WINDOW = 0
+
+PAINT_STATE = os.path.join(STATE, "sidebar-paint.json")       # on-change fingerprint (avoid churn)
+
+
+def _cmux(*args):
+    """Run a cmux subcommand, return stdout. Quiet, never raises."""
+    try:
+        p = subprocess.run([CMUX, *args], capture_output=True, text=True,
+                           env=dict(os.environ, CMUX_QUIET="1"))
+        return p.stdout or ""
+    except Exception:
+        return ""
+
+
+# ─── status inference (keyword tables, NO LLM) ────────────────────────────────────────────────
+# cmux's agentLifecycle (idle|running|needsInput) is the authoritative base. The keyword tables only
+# REFINE an idle agent — they tell apart "idle: finished cleanly", "idle: hit an error", "idle:
+# wants review" — from the agent's own last transcript line. Substring match, lowercased, cheap.
+ERROR_HINTS  = ("error:", "traceback", "exception", "fatal:", "panic:", "✗", "failed", "rate limit",
+                "rate-limit", "usage limit", "context low", "compact")
+BLOCK_HINTS  = ("[y/n]", "(y/n)", "approve?", "permission", "press enter", "waiting for", "shall i",
+                "do you want", "should i", "confirm")
+REVIEW_HINTS = ("diff --git", "opened pull request", "ready for review", "please review", "pr #")
+DONE_HINTS   = ("✓ done", "all tests passed", "0 errors", "complete", "finished", "done.", "✅")
+
+# state -> (sidebar pill color, SF-Symbol icon, urgency rank). Lower rank = more urgent = sorts first
+# (the "NEED YOU floats to top" triage from agentmaster). cheapest-first = act on the cheap signal.
+STATE_STYLE = {
+    "error":       ("#E5484D", "exclamationmark.triangle.fill", 0),
+    "needs-input": ("#F5A623", "hand.raised.fill",              1),
+    "review":      ("#3E63DD", "eye.fill",                      2),
+    "working":     ("#30A46C", "gearshape.fill",                3),
+    "done":        ("#46A758", "checkmark.circle.fill",         4),
+    "idle":        ("#8B8D98", "moon.zzz.fill",                 5),
+    "pending":     ("#8B8D98", "hourglass",                     6),
+    "stale":       ("#6F6E77", "questionmark.circle",           7),
+    "gone":        ("#6F6E77", "xmark.circle",                  7),
+}
+
+
+def _freshest_session(store, surf):
+    """The newest hook-store session record on a surface (transcriptPath/pid/model/sessionId/updatedAt/
+    workspaceId). A surface can carry more than one record across a recycle; newest updatedAt wins."""
+    best, best_ts = {}, -1.0
+    for s in (store.get("sessions") or {}).values():
+        if (s.get("surfaceId") or "").upper() == (surf or "").upper():
+            ts = s.get("updatedAt") or 0
+            if ts >= best_ts:
+                best, best_ts = s, ts
+    return best
+
+
+def _context_window(model):
+    """Tokens of context for a model. Configurable (CMUX_FLEET_CONTEXT_WINDOW / [fleet].context_window)
+    because the model string can't disambiguate variants (e.g. opus-4-8 ships in 200k AND 1M flavors) —
+    a fleet usually runs one window, so one knob is right. The keyword map is only a fallback guess; the
+    ABSOLUTE token count and the relative ranking are correct regardless of this denominator."""
+    if _CFG_WINDOW:
+        return int(_CFG_WINDOW)
+    m = (model or "").lower()
+    for key, win in (("haiku", 200000), ("sonnet", 200000), ("opus", 200000),
+                     ("gpt-5", 272000), ("o3", 200000), ("codex", 272000), ("gemini", 1000000)):
+        if key in m:
+            return win
+    return 200000
+
+
+def _context_used(path):
+    """Approx context tokens occupied at the agent's last turn, from its transcript. claude records
+    a per-turn usage block: input + cache_read + cache_creation = the whole prompt that turn = the live
+    context size. codex's transcript only carries a CUMULATIVE session counter (not the live window), so
+    we don't guess it — codex returns None and vitals shows '—'. Returns (tokens|None, model)."""
+    used, model = None, ""
+    if not path or not os.path.exists(path):
+        return None, ""
+    try:
+        for line in open(path):
+            try:
+                e = json.loads(line)
+            except Exception:
+                continue
+            if e.get("type") == "assistant":                         # claude only (see docstring)
+                msg = e.get("message") or {}
+                model = msg.get("model") or model
+                u = msg.get("usage") or {}
+                if u:
+                    used = (u.get("input_tokens", 0) + u.get("cache_read_input_tokens", 0)
+                            + u.get("cache_creation_input_tokens", 0))
+    except Exception:
+        return None, model
+    return used, model
+
+
+def _classify(life, has_session, last_text):
+    """PURE state classifier, NO LLM (unit-testable). cmux's agentLifecycle is authoritative for live
+    work; the keyword tables only REFINE an idle agent from its last transcript line. Stateless (no
+    stickiness in v0.1)."""
+    if life == "running":
+        return "working"
+    if life == "needsInput":
+        return "needs-input"
+    if life in ("", "ended", "unknown"):
+        return "pending" if not has_session else "stale"
+    text = (last_text or "").lower()                          # life == "idle": refine from last words
+    if any(h in text for h in ERROR_HINTS):
+        return "error"
+    if any(h in text for h in BLOCK_HINTS):
+        return "needs-input"
+    if any(h in text for h in REVIEW_HINTS):
+        return "review"
+    if any(h in text for h in DONE_HINTS):
+        return "done"
+    return "idle"
+
+
+def _infer_state(entry, session):
+    """state for one agent: read live signals, then classify (the impure edge over _classify)."""
+    return _classify(fs.lifecycle(entry.get("surface", "")), bool(entry.get("session")),
+                     fs.last_agent_text(session.get("transcriptPath", ""), cap=400))
+
+
+def snapshot():
+    """The whole live fleet as a list of view-rows, cheapest signals first. One row per live agent:
+        label role kind tool parent surface ws state rank ctx_used ctx_pct_remaining window
+        model last_text last_age_s
+    Pure derive: registry + hook store + transcripts. No cmux screen reads (keeps it cheap)."""
+    store = fs.read_hook_store()
+    now = time.time()
+    rows = []
+    for label, e in fs.live_all().items():
+        surf = e.get("surface", "")
+        sess = _freshest_session(store, surf)
+        state = _infer_state(e, sess)
+        used, model = _context_used(sess.get("transcriptPath", ""))
+        window = _context_window(model or e.get("tool", ""))
+        pct_remaining = None if used is None else max(0, round(100 * (1 - used / window)))
+        updated = sess.get("updatedAt") or 0
+        rows.append({
+            "label": label, "role": e.get("role", "-"), "kind": e.get("kind", "-"),
+            "tool": e.get("tool", "-"), "parent": e.get("parent", ""), "surface": surf,
+            "ws": sess.get("workspaceId", ""), "state": state,
+            "rank": STATE_STYLE.get(state, ("", "", 9))[2],
+            "ctx_used": used, "ctx_pct_remaining": pct_remaining, "window": window,
+            "model": model, "muted": bool(e.get("muted")),
+            "last_text": fs.last_agent_text(sess.get("transcriptPath", ""), cap=120),
+            "last_age_s": (now - updated) if updated else None,
+        })
+    # cheapest-first triage: most-urgent state first, then longest-idle (oldest activity) within a state
+    rows.sort(key=lambda r: (r["rank"], -(r["last_age_s"] or 0)))
+    return rows
+
+
+# ─── helpers for rendering ────────────────────────────────────────────────────────────────────
+def _age(secs):
+    if secs is None:
+        return "—"
+    secs = int(secs)
+    if secs < 90:
+        return f"{secs}s"
+    if secs < 5400:
+        return f"{secs // 60}m"
+    return f"{secs // 3600}h{(secs % 3600) // 60:02d}"
+
+
+def _ctx(r):
+    if r["ctx_used"] is None:
+        return "—"
+    k = r["ctx_used"] / 1000.0
+    pct = r["ctx_pct_remaining"]
+    flag = "!" if (pct is not None and pct <= 30) else ""
+    return f"{k:.0f}k {pct}%{flag}"
+
+
+def _fit(s, w):
+    """Truncate s to width w (keeping columns aligned even with long labels/roles)."""
+    s = str(s)
+    return s if len(s) <= w else s[:w - 1] + "…"
+
+
+# ─── vitals: cheapest-first triage table (+ context-remaining %) ───────────────────────────────
+def cmd_vitals(argv):
+    """fleet vitals [--json] [--paint]   one-glance triage: who needs you, who's near-full.
+    Rows are most-urgent first (error/needs-input/review/working/done/idle). `ctx` is context-REMAINING
+    % from each agent's transcript token usage — a `!` marks <=30% left (recycle candidate, Berg's ask)."""
+    as_json = "--json" in argv
+    paint = "--paint" in argv
+    rows = snapshot()
+    if paint:
+        _paint(rows)
+    if as_json:
+        print(json.dumps(rows, indent=2))
+        return 0
+    if not rows:
+        print("(no live agents)")
+        return 0
+    win = rows[0]["window"]
+    print(f"FLEET VITALS ({len(rows)})   window≈{win // 1000}k   "
+          f"{'label':<22}{'role':<14}{'state':<13}{'ctx-left':<11}{'idle':<7}{'tool':<7}last")
+    for r in rows:
+        glyph = {"error": "✗", "needs-input": "◍", "review": "⊙", "working": "▶",
+                 "done": "✓", "idle": "·", "pending": "…", "stale": "?", "gone": "✗"}.get(r["state"], "·")
+        muted = " M" if r["muted"] else ""
+        print(f"  {glyph} {_fit(r['label'], 20):<20}{_fit(r['role'], 14):<14}{r['state']:<13}{_ctx(r):<11}"
+              f"{_age(r['last_age_s']):<7}{_fit(r['tool'], 7):<7}{_fit(r['last_text'], 42)}{muted}")
+    near = [r for r in rows if r["ctx_pct_remaining"] is not None and r["ctx_pct_remaining"] <= 30]
+    if near:
+        print(f"\n  ! {len(near)} near-full (<=30% ctx left): "
+              + ", ".join(r["label"] for r in near) + "  — recycle candidates")
+    print(f"\n(ctx = context REMAINING %; assumes window {win // 1000}k — set CMUX_FLEET_CONTEXT_WINDOW "
+          "or [fleet].context_window to match your model.)")
+    return 0
+
+
+# ─── find: content-aware session lookup ────────────────────────────────────────────────────────
+def cmd_find(argv):
+    """fleet find <query> [--turns N] [--json]   find an agent by label/role/cwd OR by what it has been
+    SAYING. Scans live + archived agents and the last N turns of each transcript for the query, prints
+    the match + the line it hit. The "which session was working on X" lookup."""
+    args = [a for a in argv if not a.startswith("-")]
+    as_json = "--json" in argv
+    turns = 6
+    if "--turns" in argv:
+        try:
+            turns = int(argv[argv.index("--turns") + 1])
+        except (ValueError, IndexError):
+            pass
+    if not args:
+        sys.exit("usage: fleet find <query> [--turns N] [--json]")
+    q = " ".join(args).lower()
+    store = fs.read_hook_store()
+    hits = []
+    pools = [("live", fs.live_all()), ("archived", fs.archive_all())]
+    for where, pool in pools:
+        for label, e in pool.items():
+            fields = {"label": label, "role": e.get("role", ""), "cwd": e.get("cwd", "")}
+            why, snip = "", ""
+            for f, val in fields.items():
+                if q in str(val).lower():
+                    why, snip = f, str(val)
+                    break
+            if not why:
+                surf = e.get("surface", "")
+                sess = _freshest_session(store, surf) if surf else {}
+                path = sess.get("transcriptPath", "") or _archive_transcript(e)
+                line = _scan_transcript(path, q, turns)
+                if line:
+                    why, snip = "transcript", line
+            if why:
+                hits.append({"label": label, "where": where, "role": e.get("role", ""),
+                             "match": why, "snippet": snip[:160]})
+    if as_json:
+        print(json.dumps(hits, indent=2))
+        return 0
+    if not hits:
+        print(f"(no agent matched '{q}')")
+        return 1
+    print(f"FIND '{q}' ({len(hits)} match):")
+    for h in hits:
+        print(f"  {h['label']:<22}[{h['where']}/{h['match']}]  {h['snippet']}")
+    return 0
+
+
+def _archive_transcript(entry):
+    """Best-effort transcript path for a PARKED agent from its captured last_session id."""
+    import glob
+    sid = fs.bare_uuid(entry.get("last_session", "") or "")
+    if not sid:
+        return ""
+    for pat in (f"~/.claude/projects/*/*{sid}*.jsonl", f"~/.codex/sessions/*/*/*/*{sid}*.jsonl"):
+        paths = glob.glob(os.path.expanduser(pat))
+        if paths:
+            return max(paths, key=os.path.getmtime)
+    return ""
+
+
+def _scan_transcript(path, q, turns):
+    """Return the most-recent transcript text line containing q (within the last `turns` messages)."""
+    if not path or not os.path.exists(path):
+        return ""
+    texts = []
+    try:
+        for line in open(path):
+            try:
+                e = json.loads(line)
+            except Exception:
+                continue
+            typ = e.get("type")
+            t = ""
+            if typ in ("user", "assistant"):
+                c = (e.get("message") or {}).get("content")
+                t = c if isinstance(c, str) else (
+                    " ".join(b.get("text", "") for b in c if isinstance(b, dict) and b.get("type") == "text")
+                    if isinstance(c, list) else "")
+            elif typ == "event_msg":
+                pl = e.get("payload") or {}
+                if pl.get("type") in ("user_message", "agent_message"):
+                    t = pl.get("message", "")
+            if t and t.strip():
+                texts.append(t.strip().replace("\n", " "))
+    except Exception:
+        return ""
+    for t in reversed(texts[-turns:]):
+        if q in t.lower():
+            i = t.lower().index(q)
+            return t[max(0, i - 40):i + 80]
+    return ""
+
+
+# ─── graph: text + HTML fleet tree from parentage ──────────────────────────────────────────────
+def _tree(rows):
+    """Build the parentage forest from live rows. Each row's `parent` is the parent's LABEL (the registry
+    key), so nest by label directly. Roots = agents whose parent isn't a live label. NOTE the parentage
+    graph CAN contain cycles (two conductors that list each other) — callers walk with a visited guard,
+    and _emit_order() promotes any cycle-orphan (a node unreachable from a root) to a pseudo-root so no
+    agent is ever dropped."""
+    labels = {r["label"] for r in rows}
+    children = {r["label"]: [] for r in rows}
+    parent_of = {}
+    for r in rows:
+        p = r["parent"]
+        if p in labels and p != r["label"]:
+            parent_of[r["label"]] = p
+            children[p].append(r["label"])
+    roots = [r["label"] for r in rows if r["label"] not in parent_of]
+    return roots, children, {r["label"]: r for r in rows}
+
+
+def _reach(label, children):
+    """Count of nodes reachable from label via children (cycle-safe). Used to pick the best pseudo-root
+    when the graph has no true root (a pure parentage cycle): the node with the most descendants is the
+    natural top, so leaves don't get promoted ahead of their own ancestors."""
+    seen = set()
+
+    def dfs(x):
+        if x in seen:
+            return
+        seen.add(x)
+        for k in children.get(x, []):
+            dfs(k)
+    dfs(label)
+    return len(seen)
+
+
+def _pseudo_root_order(rows, children):
+    """Cycle-orphans ordered ancestor-first: most descendants first, label as tiebreak."""
+    return sorted((r["label"] for r in rows),
+                  key=lambda lbl: (-_reach(lbl, children), lbl))
+
+
+def _emit_order(rows):
+    """(label, depth) pairs in display order: true roots first (DFS), then any cycle-orphans promoted
+    ancestor-first. Visited guard makes cycles terminate; nothing is ever dropped. Shared by the text
+    and HTML renderers so they agree."""
+    roots, children, byl = _tree(rows)
+    seen, order = set(), []
+
+    def walk(label, depth):
+        if label in seen:
+            return
+        seen.add(label)
+        order.append((label, depth))
+        for k in sorted(children.get(label, [])):
+            walk(k, depth + 1)
+
+    for root in sorted(roots):
+        walk(root, 0)
+    for label in _pseudo_root_order(rows, children):         # cycle-orphans, ancestor-first
+        if label not in seen:
+            walk(label, 0)
+    return order, children, byl
+
+
+def _graph_text(rows):
+    order, children, byl = _emit_order(rows)
+    if not order:
+        return "(no live agents)"
+    out = []
+    for label, depth in order:
+        r = byl[label]
+        indent = "  " * depth
+        tip = "└─ " if depth else ""
+        out.append(f"{indent}{tip}{r['state']:<12} {label:<22} ctx {_ctx(r)}  [{r['role']}/{r['tool']}]")
+    return "\n".join(out)
+
+
+def _graph_html(rows):
+    roots, children, byl = _tree(rows)
+    seen = set()
+
+    def node(label):
+        if label in seen:                                    # cycle guard
+            return ""
+        seen.add(label)
+        r = byl[label]
+        color = STATE_STYLE.get(r["state"], ("#8B8D98",))[0]
+        ctx = _html.escape(_ctx(r))
+        last = _html.escape(r["last_text"][:90])
+        kids = [node(k) for k in sorted(children.get(label, []))]
+        sub = ("<ul>" + "".join(k for k in kids if k) + "</ul>") if any(kids) else ""
+        return (f'<li><div class="n"><span class="dot" style="background:{color}"></span>'
+                f'<span class="lbl">{_html.escape(label)}</span>'
+                f'<span class="state" style="color:{color}">{_html.escape(r["state"])}</span>'
+                f'<span class="meta">{_html.escape(r["role"])}/{_html.escape(r["tool"])} · ctx {ctx}</span>'
+                f'<div class="last">{last}</div></div>{sub}</li>')
+
+    items = [node(r) for r in sorted(roots)]
+    items += [node(lbl) for lbl in _pseudo_root_order(rows, children)     # cycle-orphans, ancestor-first
+              if lbl not in seen]
+    body = "".join(i for i in items if i) or "<li><em>no live agents</em></li>"
+    ts = time.strftime("%Y-%m-%d %H:%M:%S")
+    # self-contained, dark, zero-dependency — design tokens echo the cmux visual-guide vocabulary.
+    return f"""<!doctype html><html><head><meta charset=utf-8>
+<title>cmux-fleet graph</title>
+<style>
+:root{{--bg:#0A0C10;--fg:#E6E6E6;--mut:#8B8D98;--line:#23262E;--accent:#FFD24A}}
+*{{box-sizing:border-box}}
+body{{background:var(--bg);color:var(--fg);font:14px/1.5 'JetBrains Mono',ui-monospace,Menlo,monospace;margin:0;padding:28px}}
+h1{{font-size:16px;margin:0 0 4px;font-weight:600}}
+.sub{{color:var(--mut);font-size:12px;margin-bottom:20px}}
+ul{{list-style:none;margin:0;padding-left:22px;border-left:1px solid var(--line)}}
+body>ul{{border-left:none;padding-left:0}}
+li{{margin:6px 0}}
+.n{{padding:6px 10px;border:1px solid var(--line);border-radius:8px;background:#0E1117;display:inline-block;min-width:340px}}
+.dot{{display:inline-block;width:9px;height:9px;border-radius:50%;margin-right:8px;vertical-align:middle}}
+.lbl{{font-weight:600}}
+.state{{margin-left:10px;font-size:12px;text-transform:uppercase;letter-spacing:.04em}}
+.meta{{color:var(--mut);font-size:12px;margin-left:10px}}
+.last{{color:var(--mut);font-size:12px;margin-top:3px;max-width:520px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}}
+</style></head><body>
+<h1>⚓ cmux-fleet</h1><div class=sub>{len(rows)} live agent(s) · generated {ts} · read-only</div>
+<ul>{body}</ul>
+</body></html>"""
+
+
+def cmd_graph(argv):
+    """fleet graph [--html] [--out FILE]   the fleet as a parentage tree. Text by default; --html writes
+    a self-contained dark page (default $STATE/fleet-graph.html) and prints its path."""
+    rows = snapshot()
+    if "--html" not in argv:
+        print(_graph_text(rows))
+        return 0
+    out = os.path.join(STATE, "fleet-graph.html")
+    if "--out" in argv:
+        try:
+            out = os.path.expanduser(argv[argv.index("--out") + 1])
+        except IndexError:
+            pass
+    os.makedirs(os.path.dirname(out), exist_ok=True)
+    with open(out, "w") as f:
+        f.write(_graph_html(rows))
+    print(out)
+    return 0
+
+
+# ─── serve: THIN read-only localhost view (no daemon, no buttons, no analytics) ────────────────
+def cmd_serve(argv):
+    """fleet serve [--port N]   a THIN foreground localhost server: GET / -> the live graph HTML,
+    GET /vitals.json -> the vitals rows. Regenerated from live state per request. No daemon, no actions,
+    no analytics, no event engine. Ctrl-C to stop."""
+    from http.server import BaseHTTPRequestHandler, HTTPServer
+    port = 0
+    if "--port" in argv:
+        try:
+            port = int(argv[argv.index("--port") + 1])
+        except (ValueError, IndexError):
+            pass
+
+    class H(BaseHTTPRequestHandler):
+        def log_message(self, *a):
+            pass
+
+        def _send(self, body, ctype):
+            b = body.encode()
+            self.send_response(200)
+            self.send_header("Content-Type", ctype)
+            self.send_header("Content-Length", str(len(b)))
+            self.end_headers()
+            self.wfile.write(b)
+
+        def do_GET(self):
+            rows = snapshot()
+            if self.path.rstrip("/") in ("", ""):
+                self._send(_graph_html(rows), "text/html; charset=utf-8")
+            elif self.path.startswith("/vitals.json"):
+                self._send(json.dumps(rows, indent=2), "application/json")
+            else:
+                self.send_response(404)
+                self.end_headers()
+
+    srv = HTTPServer(("127.0.0.1", port), H)
+    url = f"http://127.0.0.1:{srv.server_address[1]}/"
+    print(f"[fleet serve] read-only fleet view at {url}  (vitals: {url}vitals.json)\n"
+          f"[fleet serve] Ctrl-C to stop.")
+    try:
+        srv.serve_forever()
+    except KeyboardInterrupt:
+        print("\n[fleet serve] stopped.")
+    finally:
+        srv.server_close()
+    return 0
+
+
+# ─── paint: native cmux sidebar telemetry (set-status / set-progress) ──────────────────────────
+def _paint(rows):
+    """Push each live agent's state onto its cmux workspace as a sidebar pill (`set-status`) + a context
+    progress bar (`set-progress`). On-change-only via a fingerprint file so we never repaint-churn. Key
+    'fleet' so we own exactly one pill per workspace. The custom sidebar (sidebars/fleet.swift) then
+    renders these natively. Returns the count painted."""
+    try:
+        prev = json.load(open(PAINT_STATE))
+    except Exception:
+        prev = {}
+    cur, painted = {}, 0
+    for r in rows:
+        ws = r["ws"]
+        if not ws:
+            continue
+        color, icon, rank = STATE_STYLE.get(r["state"], ("#8B8D98", "circle", 9))
+        pct = r["ctx_pct_remaining"]
+        prog = "" if pct is None else f"{(100 - pct) / 100:.2f}"
+        fp = f"{r['state']}|{color}|{prog}"
+        cur[ws] = fp
+        if prev.get(ws) == fp:
+            continue                                          # unchanged -> skip (no churn)
+        _cmux("set-status", "fleet", r["state"], "--icon", icon, "--color", color,
+              "--priority", str(100 - rank), "--workspace", ws)
+        if prog:
+            _cmux("set-progress", prog, "--label", f"ctx {pct}% left", "--workspace", ws)
+        painted += 1
+    try:
+        os.makedirs(STATE, exist_ok=True)
+        json.dump(cur, open(PAINT_STATE, "w"))
+    except Exception:
+        pass
+    return painted
+
+
+def cmd_paint(argv):
+    """fleet paint   sync the live fleet onto the cmux sidebar (status pills + context progress bars),
+    once. Cheapest visualization — runs off live state, on-change-only. Re-run (or `vitals --paint`) to
+    refresh; pair with the custom sidebar `fleet.swift` for the native tree-view."""
+    n = _paint(snapshot())
+    print(f"[fleet paint] synced sidebar ({n} workspace(s) updated)")
+    return 0

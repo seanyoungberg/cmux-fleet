@@ -99,3 +99,6 @@ MARKETPLACE = _resolve_path("CMUX_FLEET_MARKETPLACE", "marketplace",    "")     
 FLOOR       = _resolve_path("CMUX_FLEET_FLOOR",       "floor_claudemd", "")          # "" -> no ad-hoc CLAUDE.md symlink
 HOOKSTORE   = _resolve_path("CMUX_HOOKSTORE_DIR",     "hookstore_dir",  os.path.expanduser("~/.cmuxterm"))   # cmux-owned, $HOME-relative
 ADHOC_SUBDIR = _resolve("CMUX_FLEET_ADHOC_SUBDIR",   "adhoc_subdir",   "agents/ad-hoc")                # relative to ROOT (intentionally not anchored)
+# `fleet vitals` context-remaining % denominator. 0 -> fleet_features guesses from the model string
+# (a fleet usually runs one window, so one knob is right; the model string can't tell 200k from 1M).
+CONTEXT_WINDOW = int(_resolve("CMUX_FLEET_CONTEXT_WINDOW", "context_window", "0") or "0")

@@ -85,6 +85,7 @@ no vault assumption, marketplace and floor disabled.
 | `CMUX_FLEET_FLOOR` | `floor_claudemd` | `""` (no ad-hoc `CLAUDE.md` symlink) |
 | `CMUX_HOOKSTORE_DIR` | `hookstore_dir` | `~/.cmuxterm` (cmux-owned) |
 | `CMUX_FLEET_ADHOC_SUBDIR` | `adhoc_subdir` | `agents/ad-hoc` (relative to root) |
+| `CMUX_FLEET_CONTEXT_WINDOW` | `context_window` | `0` (guess per model; set to your window, e.g. `200000` / `1000000`, for an exact `vitals` ctx %) |
 
 `CMUX_FLEET_ROOT` is the workspace root that a role's relative `cwd` composes
 against. It defaults to `$HOME`, so a config file in `~/.config` does not silently
@@ -109,12 +110,54 @@ work reaches a conductor:
 - **auto**: autodrain, plus the router wakes a genuinely idle conductor (at the
   prompt, empty draft) to handle pending completions now.
 
+## Fleet views
+
+Read-only ways to see the fleet. All derive from live state every call — the
+registry, cmux's hook stores, and the agents' transcripts. No daemon, no stored
+status. Status is inferred **without an LLM** (cmux's `agentLifecycle` is
+authoritative, refined by keyword tables); context-remaining % is read from each
+agent's transcript token usage.
+
+```
+fleet vitals [--json] [--paint]     cheapest-first triage table: who needs you,
+                                    who's near-full (ctx %, ! marks <=30% left)
+fleet find <query> [--turns N]      content-aware lookup: matches a label/role/cwd
+                                    OR what an agent has been saying in its transcript
+fleet graph [--html] [--out FILE]   the fleet as a parentage tree (text, or a
+                                    self-contained dark HTML page)
+fleet serve [--port N]              thin read-only localhost view: GET / -> the graph
+                                    HTML, GET /vitals.json -> the rows. No daemon.
+fleet paint                         sync fleet state onto the cmux sidebar (a status
+                                    pill + a context progress bar per workspace)
+```
+
+`fleet vitals` is the triage view: rows are most-urgent first
+(error / needs-input / review / working / done / idle), each with its
+context-remaining % so you can see who to recycle. The window is a guess per
+model — set `CMUX_FLEET_CONTEXT_WINDOW` (or `[fleet].context_window`) to your
+model's window for an exact number (the ranking is correct regardless).
+
+`fleet paint` writes the same state into cmux's native sidebar via `set-status` /
+`set-progress` (additive — it never recolors or renames your workspaces), on
+change only. For a dedicated board, install the custom sidebar in `sidebars/`:
+
+```
+cp sidebars/fleet.swift ~/.config/cmux/sidebars/fleet.swift
+cmux sidebar validate fleet && cmux sidebar open fleet
+```
+
+It binds to cmux's live workspace data (refreshes ~1s) and reads the context bars
+`fleet paint` writes; rows are tappable to jump. (The parentage **tree** is in
+`fleet graph` / `fleet serve` — cmux's workspace binding has no parent field.)
+
+Credit: the triage/near-full and no-LLM status-inference ideas are adapted from
+[agentmaster](https://github.com/Supersynergy/agentmaster); the localhost-view
+shape from [elevens](https://github.com/hummer98/elevens). Design-mined, not copied.
+
 ## Roadmap
 
-These are planned, not yet implemented: `fleet vitals` (a triage table),
-`fleet find` (content-aware session lookup), `fleet graph` (a fleet tree),
-`fleet serve` (a localhost live view), native cmux sidebar telemetry, and
-config-gated git worktree isolation per workstream.
+Planned, not yet implemented: a packaged router/heartbeat daemon
+(`fleet daemon start|stop|status`).
 
 ## More
 

@@ -1470,7 +1470,7 @@ def cmd_broadcast(argv):
 
 def main():
     if len(sys.argv) < 2 or sys.argv[1] in ("-h", "--help"):
-        print("usage: fleet <launch|config|ls|archive|revive|recycle|rm> ...\n"
+        print("usage: fleet <launch|config|ls|archive|revive|recycle|rm|vitals|find|graph|serve|paint|worktree> ...\n"
               "  launch <role|--adhoc NAME> [--tool t] [--place p] [--parent s] [--dry-run] [-- <tool flags>]\n"
               "  config <role|--adhoc NAME|--cwd DIR> [--tool t]   effective config (base settings + fleet adds)\n"
               "  ls                                                live fleet x hook store; flags STALE + archived\n"
@@ -1483,14 +1483,22 @@ def main():
               "                                                    input-safe heads-up to live agents (e.g. after a toml/floor change); never restarts them\n"
               "  mute <label> | unmute <label>                     stop/resume pushing a child's completions to its parent (parent reads on demand)\n"
               "  rm <label> [--kill] [--wip-commit]                drop a label; --kill stops+closes (+ tears down its worktree)\n"
+              "  vitals [--json] [--paint]                         cheapest-first triage table + each agent's context-remaining %\n"
+              "  find <query> [--turns N] [--json]                 content-aware session lookup (label/role/cwd or transcript)\n"
+              "  graph [--html] [--out FILE]                       fleet parentage tree (text, or self-contained HTML)\n"
+              "  serve [--port N]                                  thin read-only localhost view (graph HTML + vitals.json); no daemon\n"
+              "  paint                                             sync fleet state onto the cmux sidebar (status pills + ctx bars)\n"
               "  worktree <ls | clean <label> [--wip-commit]>      manage fleet-owned git worktrees (config-gated, default-off)")
         return 0
     sub, rest = sys.argv[1], sys.argv[2:]
+    import fleet_features as ff
     fns = {"launch": cmd_launch, "config": cmd_config, "ls": cmd_ls,
            "archive": cmd_archive, "revive": cmd_revive, "recycle": cmd_recycle,
            "_recycle-exec": cmd_recycle_exec, "broadcast": cmd_broadcast,
            "mute": lambda a: cmd_mute(a, mute=True), "unmute": lambda a: cmd_mute(a, mute=False),
-           "rm": cmd_rm, "worktree": cmd_worktree}
+           "rm": cmd_rm, "worktree": cmd_worktree,
+           "vitals": ff.cmd_vitals, "find": ff.cmd_find, "graph": ff.cmd_graph,
+           "serve": ff.cmd_serve, "paint": ff.cmd_paint}
     if sub in fns:
         return fns[sub](rest)
     sys.exit(f"fleet: unknown subcommand '{sub}'")
