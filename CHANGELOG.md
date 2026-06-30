@@ -79,4 +79,16 @@ vault or machine.
   stubbed cmux) plus a `claude --plugin-dir` load check. One skip expected (real
   claude load, skipped when no headless `claude` is present).
 
+### Fixed
+
+- **Recycle relaunch is timing- and crash-safe.** A recycled agent relaunched
+  into a fresh login shell whose `PATH` had not finished resolving the real
+  binary, so the cmux wrapper exited 127 (`claude not found in PATH`); the
+  fresh-mode confirm then matched a stale hook-store session id and reported
+  success, priming a dead shell. Now the relaunch is `PATH`-guarded
+  (`~/.local/bin` + homebrew prepended), the pre-relaunch session id is snapshotted
+  and excluded from the fresh-mode confirm (a crashed launch resolves to "no
+  session" instead of false success), the launch self-heals by re-firing once if
+  no fresh session binds, and the post-respawn settle is 2s -> 3s.
+
 [0.1.0]: https://github.com/seanyoungberg/cmux-fleet/releases/tag/v0.1.0

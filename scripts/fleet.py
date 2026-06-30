@@ -1053,7 +1053,7 @@ def _latest_handover(abs_cwd):
     return max(files, key=os.path.getmtime) if files else ""
 
 
-def _poll_session_back(surf, old_sid, mode, timeout=90):
+def _poll_session_back(surf, old_sid, mode, timeout=90, exclude=None):
     """Confirm the recycled agent re-bound a session to `surf`. respawn-pane fully REMOVES the old
     session entry from cmux's hook store (session-end), then the relaunch re-creates it:
       FRESH  -> a brand-new session id (sid != old_sid).
@@ -1063,12 +1063,15 @@ def _poll_session_back(surf, old_sid, mode, timeout=90):
                 comes); we wait for the surface to carry a live (non-empty) lifecycle again, which
                 only happens once resume's session-start fires. activeSessionsBySurface stays null
                 until the first turn, so we rely on poll_session's sessions[] fallback + lifecycle.
+    `exclude` is a set of sids that do NOT count as a fresh bind (old_sid plus any stale store entry
+    lingering on the surface post-respawn) -- prevents a crashed launch from false-confirming.
     Returns the bound sid, or '' on timeout."""
     import fleet_state as fs
+    exclude = exclude or {old_sid}
     end = time.time() + timeout
     while time.time() < end:
         sid = poll_session(surf, timeout=1)
-        if sid and (sid != old_sid if mode == "fresh"
+        if sid and (sid not in exclude if mode == "fresh"
                     else fs.lifecycle(surf) not in ("", "-", "ended")):
             return sid
         time.sleep(1)
@@ -1294,13 +1297,30 @@ def cmd_recycle_exec(argv):
     # it as a fresh INTERACTIVE login shell (not the agent directly): cmux exposes `claude` as a zsh
     # FUNCTION via its shell integration, so the agent must launch from a shell that sourced ~/.zshrc
     # -- a bare `/bin/sh -c claude` fails with 'claude not found'. Then we `send` the launch into it.
+    # NOTE: the login shell's PATH is built incrementally during init; the send below PATH-guards the
+    # command so a too-early send can't crash on an unready PATH (see `guarded`).
     log("quiet; respawn-pane -> fresh interactive shell (cmux kills the old agent in place)")
     out = cmuxq("respawn-pane", "--surface", surf, "--command", "exec /bin/zsh -il")
     log(f"respawn-pane -> {out.strip()}")
-    time.sleep(2)                                        # let the login shell source its integration
-    log("launching agent into the fresh shell")
-    cmuxq("send", "--surface", surf, send_cmd)
-    cmuxq("send-key", "--surface", surf, "enter")
+    # SNAPSHOT the surface's store sid right after respawn but BEFORE relaunch. cmux's session-end on
+    # respawn does NOT reliably drop the old entry from sessions[] (poll_session's fallback still sees
+    # it), so a fresh-mode confirm could match this STALE sid and falsely report success even when the
+    # launch crashed -- then prime/wakes get typed into a dead shell (the 'claude not found' incident).
+    # Excluding pre_sid makes a crash correctly resolve to '' (no new session) -> WARN + no prime.
+    pre_sid = poll_session(surf, timeout=1)
+    time.sleep(3)                                        # let the login shell source its integration
+    # PATH-GUARD the launch: the cmux claude-wrapper's find_real_claude walks $PATH for the real binary
+    # (~/.local/bin/claude, added by ~/.zshenv). If the send lands before the shell finished building
+    # PATH, the wrapper exits 127 'claude not found in PATH'. Prepending the standard dirs makes the
+    # binary resolvable regardless of shell-init timing (harmless no-op for codex/other tools).
+    guarded = 'export PATH="$HOME/.local/bin:/opt/homebrew/bin:$PATH"; ' + send_cmd
+
+    def _fire_launch():
+        log("launching agent into the fresh shell")
+        cmuxq("send", "--surface", surf, guarded)
+        cmuxq("send-key", "--surface", surf, "enter")
+
+    _fire_launch()
 
     # CONFIRM is tool-aware. claude binds a session at BOOT -> poll for it (a NEW sid for fresh, the
     # surface live again for resume). codex (and others) bind LAZILY on their first turn AND fire no
@@ -1321,9 +1341,19 @@ def cmd_recycle_exec(argv):
         if prime:
             time.sleep(8)                                # codex boots slower than claude; let the TUI come up
     else:
-        sid = _poll_session_back(surf, old_sid, mode, 90)
+        # exclude pre_sid (the stale store entry snapshotted post-respawn) so a crashed launch can't
+        # false-confirm on it; fresh requires a sid that is neither old_sid nor pre_sid.
+        exclude = {old_sid, pre_sid} if mode == "fresh" else {old_sid}
+        sid = _poll_session_back(surf, old_sid, mode, 90, exclude=exclude)
+        if not sid and mode == "fresh":
+            # SELF-HEAL: the launch likely crashed into the bare shell (e.g. PATH not ready -> wrapper
+            # 'claude not found'). The shell is fully initialized by now, so re-fire ONCE -- mirrors the
+            # manual recovery (re-running the same command succeeds) instead of leaving a dead pane.
+            log("no fresh session bound; re-firing launch once (shell now settled)")
+            _fire_launch()
+            sid = _poll_session_back(surf, old_sid, mode, 60, exclude=exclude)
         if not sid:
-            log(f"WARN: no {'resumed' if mode == 'resume' else 'fresh'} session bound within 90s; check the surface manually")
+            log(f"WARN: no {'resumed' if mode == 'resume' else 'fresh'} session bound; check the surface manually")
         else:
             log(f"{'resumed' if mode == 'resume' else 'fresh'} session {sid} bound")
             e = fs.live_get(label) or {}
