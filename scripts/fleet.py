@@ -197,7 +197,7 @@ def adapter_compile(tool, spec, caller_tokens):
     # spec['flags'] is already a token list (tool-floor<-role); layer the caller passthrough on top.
     merged = _layer_tokens([spec["flags"], list(caller_tokens or [])])
     env = dict(spec["env"])
-    env["AGENT_ROLE"] = spec["role"]                          # behavioral type -> vault frontmatter
+    env["AGENT_ROLE"] = spec["role"]                          # behavioral type (exposed to the agent)
     env["AGENT_LABEL"] = spec["label"]                        # unique instance -> routing/recycle
 
     if tool == "claude":

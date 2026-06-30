@@ -7,7 +7,11 @@
     {
       "name": "cmux-fleet",
       "source": "./",
-      "strict": true
+      "strict": true,
+      "version": "0.1.0",
+      "description": "Native cmux parent/child agent orchestration: an input-safe completion + peer notify flow, surfaceId-keyed identity, and a conductor skill for launching and driving child agents.",
+      "repository": "https://github.com/seanyoungberg/cmux-fleet",
+      "license": "MIT"
     }
   ]
 }

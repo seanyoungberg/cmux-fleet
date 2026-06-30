@@ -9,7 +9,7 @@ You are a **conductor**: a long-lived agent that spawns and coordinates child ag
 
 ## At a glance — the everyday flow
 The common loop is **launch → drive → (completions arrive on their own) → digest**, then **recycle or retire**. `fleet` is on PATH; the helper scripts live in `${CLAUDE_PLUGIN_ROOT}/scripts/`. Exact invocations are in the sections below.
-- **Spawn + task a worker:** `fleet launch <role> --parent $CMUX_SURFACE_ID` → `drive-child.sh <child-surface> "<task>"`
+- **Spawn + task a worker:** `fleet launch <role> --parent $CMUX_SURFACE_ID` → `drive-child.py <child-surface> "<task>"`
 - **Read what it did:** `child-digest.py <session-frag> 5` — a child's *completion* also reaches you automatically via the notify flow; you don't poll for it.
 - **Restart yourself clean:** write a handover (`/cmux-handover`) → `fleet recycle` → end your turn.
 - **Park vs throw away:** `fleet archive <label>` (durable, revivable) · `fleet rm <label> --kill` (throwaway).
@@ -66,7 +66,7 @@ Dispatch a child to a **dedicated workspace in the conductor's group** (same top
 Otherwise (the common case) children are tabs in the conductor's bottom pane. `--place workspace --group <conductor-group>` for the dedicated case; `--place pane` + fold for the tab case.
 
 ## Drive a child
-`bash ${CLAUDE_PLUGIN_ROOT}/scripts/drive-child.sh <child-surface-uuid> "<prompt>"` — sends the text then a SEPARATE `send-key enter`. A trailing `\n` in `cmux send` only inserts a newline; it does NOT submit. Always target by surface UUID, never a bare `surface:N` ref.
+`python3 ${CLAUDE_PLUGIN_ROOT}/scripts/drive-child.py <child-surface-uuid> "<prompt>"` — sends the text then a SEPARATE `send-key enter`. A trailing `\n` in `cmux send` only inserts a newline; it does NOT submit. It fails loud (non-zero) if a cmux call errors. Always target by surface UUID, never a bare `surface:N` ref.
 
 ## Retrieve a child's output
 `python3 ${CLAUDE_PLUGIN_ROOT}/scripts/child-digest.py <session-frag> <N>` → last N transcript turns (the reliable source). Do NOT trust the hook store's `lastBody` for content — the cmux Notification hook clobbers it right after Stop.

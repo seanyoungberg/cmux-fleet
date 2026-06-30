@@ -30,7 +30,7 @@ vault or machine.
   inbox into context each turn. `drain.py` (Stop) auto-continues a turn to
   process pending work, gated by the mode dial.
 - **Peer messaging** (`scripts/peer-msg.py`) and supporting helpers
-  (`scripts/child-digest.py`, `scripts/inbox-ack.py`, `scripts/drive-child.sh`).
+  (`scripts/child-digest.py`, `scripts/inbox-ack.py`, `scripts/drive-child.py`).
 - **`config.py` decoupling**. One path/setting resolver, precedence
   `env > [fleet] toml > XDG default`. Introduces `CMUX_FLEET_ROOT`; moves state
   under `$XDG_STATE_HOME` (`CMUX_STATE_DIR`); resolves the cmux binary via

@@ -78,7 +78,7 @@ no vault assumption, marketplace and floor disabled.
 | Env var | `[fleet]` key | Default |
 | --- | --- | --- |
 | `CMUX_FLEET_TOML` | (locates itself) | `$XDG_CONFIG_HOME/cmux-fleet/fleet.toml` (`~/.config/cmux-fleet/fleet.toml`) |
-| `CMUX_FLEET_ROOT` | `root` | the toml's directory if it exists, else `$HOME` |
+| `CMUX_FLEET_ROOT` | `root` | `$HOME` (set `root = "."` for the toml's own directory) |
 | `CMUX_STATE_DIR` | `state_dir` | `$XDG_STATE_HOME/cmux-fleet` (`~/.local/state/cmux-fleet`) |
 | `CMUX_BIN` | `cmux_bin` | `which cmux`, else `/Applications/cmux.app/Contents/Resources/bin/cmux` |
 | `CMUX_FLEET_MARKETPLACE` | `marketplace` | `""` (internal `--plugin-dir` name resolution disabled) |
@@ -87,8 +87,11 @@ no vault assumption, marketplace and floor disabled.
 | `CMUX_FLEET_ADHOC_SUBDIR` | `adhoc_subdir` | `agents/ad-hoc` (relative to root) |
 
 `CMUX_FLEET_ROOT` is the workspace root that a role's relative `cwd` composes
-against. `CMUX_HOOKSTORE_DIR` points at cmux's own per-agent hook stores (this
-plugin reads them, cmux writes them).
+against. It defaults to `$HOME`, so a config file in `~/.config` does not silently
+make role cwds resolve there. For a project-local layout, set `root = "."` (a
+relative `[fleet]` path anchors to the toml's own directory) or give an absolute
+path. `CMUX_HOOKSTORE_DIR` points at cmux's own per-agent hook stores (this plugin
+reads them, cmux writes them).
 
 The roster and per-tool launch config live in the same toml; see
 `fleet.toml.example` for the role-first, tool-nested layout.
