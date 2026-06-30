@@ -39,5 +39,13 @@ vault or machine.
 - **Plugin packaging**. The repo is its own Claude Code marketplace
   (`marketplace.json` source `./`, strict), with `plugin.json`, `hooks.json`,
   and a conductor skill under `skills/`.
+- **Test suite** (`tests/`, pytest-only — the one dev dependency). 64 tests in
+  three layers: static manifest/skill/hooks schema validators; pytest units for
+  `fleet_state` transitions (inbox/registry/archive/dial), the hook
+  stdin->exit-0 contract, and `config.py` resolution precedence
+  (`env > [fleet] toml > XDG`, dirname-anchor, malformed-warn); and an e2e CLI
+  lifecycle (`ls`/`archive`/`revive`/`rm` against a throwaway state with a
+  stubbed cmux) plus a `claude --plugin-dir` load check. 63 passed, 1 skipped
+  (real claude load, skipped when no headless `claude` is present).
 
 [0.1.0]: https://github.com/seanyoungberg/cmux-fleet/releases/tag/v0.1.0
