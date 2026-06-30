@@ -175,6 +175,31 @@ def test_scan_transcript_respects_turn_window(tmp_path):
     assert ff._scan_transcript(str(p), "needle", 3) == ""     # outside the last 3 turns -> not found
 
 
+# ── find arg parsing: the --turns value must not leak into the query ───────────────────────────
+def test_find_turns_value_not_folded_into_query(capsys):
+    ff = _ff()
+    import fleet_state as fs
+    fs.live_put("alpha", {"role": "r", "kind": "child", "tool": "claude", "cwd": "",
+                          "surface": "", "parent": "", "status": "live"})
+    # the OLD bug collected every non-dash token, so the query became "alpha 3" and matched nothing.
+    rc = ff.cmd_find(["alpha", "--turns", "3"])
+    out = capsys.readouterr().out
+    assert rc == 0 and "alpha" in out           # query parsed as "alpha" -> matches the label
+
+
+def test_find_turns_value_reaches_scanner(monkeypatch):
+    ff = _ff()
+    import fleet_state as fs
+    fs.live_put("w1", {"role": "r", "kind": "child", "tool": "claude", "cwd": "",
+                       "surface": "S1", "parent": "", "status": "live"})
+    seen = {}
+    monkeypatch.setattr(ff, "_freshest_session", lambda store, surf: {"transcriptPath": "x.jsonl"})
+    monkeypatch.setattr(ff, "_scan_transcript", lambda path, q, turns: seen.update(q=q, turns=turns) or "")
+    # query "zzz" matches no label/role/cwd -> falls through to the transcript scan
+    ff.cmd_find(["zzz", "--turns", "9"])
+    assert seen == {"q": "zzz", "turns": 9}      # N is the turn count, not part of the query
+
+
 # ── small formatters ──────────────────────────────────────────────────────────────────────────
 def test_ctx_flags_near_full():
     ff = _ff()

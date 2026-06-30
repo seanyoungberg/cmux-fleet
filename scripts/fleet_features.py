@@ -9,6 +9,7 @@
 # WITHOUT an LLM: cmux's agentLifecycle is authoritative, refined by cheap keyword tables (the
 # agentmaster move). Context-remaining % is read straight from the transcript's token usage (Berg's
 # fleet-management ask: see who is near-full and needs recycling).
+import argparse
 import html as _html
 import json
 import os
@@ -242,17 +243,15 @@ def cmd_find(argv):
     """fleet find <query> [--turns N] [--json]   find an agent by label/role/cwd OR by what it has been
     SAYING. Scans live + archived agents and the last N turns of each transcript for the query, prints
     the match + the line it hit. The "which session was working on X" lookup."""
-    args = [a for a in argv if not a.startswith("-")]
-    as_json = "--json" in argv
-    turns = 6
-    if "--turns" in argv:
-        try:
-            turns = int(argv[argv.index("--turns") + 1])
-        except (ValueError, IndexError):
-            pass
-    if not args:
-        sys.exit("usage: fleet find <query> [--turns N] [--json]")
-    q = " ".join(args).lower()
+    # argparse so an OPTION VALUE (the N after --turns) is never folded into the query: a bare
+    # `[a for a in argv if not a.startswith('-')]` made `find alpha --turns 3` search for "alpha 3".
+    ap = argparse.ArgumentParser(prog="fleet find", add_help=True)
+    ap.add_argument("query", nargs="+", help="text to match against label/role/cwd or transcript")
+    ap.add_argument("--turns", type=int, default=6, help="transcript turns to scan per agent (default 6)")
+    ap.add_argument("--json", action="store_true")
+    a = ap.parse_args(argv)
+    turns, as_json = a.turns, a.json
+    q = " ".join(a.query).lower()
     store = fs.read_hook_store()
     hits = []
     pools = [("live", fs.live_all()), ("archived", fs.archive_all())]
