@@ -302,6 +302,21 @@ def _term_surface_in(ws_uuid, pane_ref=None):
     return ""
 
 
+def _group_ref(name_or_ref):
+    """Resolve a workspace-group NAME to its ref (`workspace_group:N`), or '' if no such group exists.
+    A value already in ref form is returned unchanged. cmux's `new-workspace --group` and
+    `workspace-group delete` both take a REF, never a name, so every group op routes through here."""
+    if not name_or_ref:
+        return ""
+    if name_or_ref.startswith("workspace_group:"):
+        return name_or_ref
+    try:
+        gd = json.loads(cmuxq("workspace-group", "list", "--json"))
+        return next((g["ref"] for g in gd.get("groups", []) if g.get("name") == name_or_ref), "")
+    except Exception:
+        return ""
+
+
 def create_surface(spec, parent_surf, direction):
     """Create the target surface per spec['place']; return (ws_uuid, surf_uuid). Aborts (None) on any
     unresolved UUID -- never send blind."""
@@ -330,21 +345,30 @@ def create_surface(spec, parent_surf, direction):
         group = spec["group"]
         if not group:
             print("[fleet] ABORT: place=workspace needs a group"); return None, None
-        gref = group
-        if not group.startswith("workspace_group:"):
-            try:
-                gd = json.loads(cmuxq("workspace-group", "list", "--json"))
-                gref = next((g["ref"] for g in gd.get("groups", []) if g.get("name") == group), "")
-            except Exception:
-                gref = ""
-        if not gref:
-            print(f"[fleet] ABORT: cannot resolve group '{group}' to a ref"); return None, None
-        out = cmuxq("new-workspace", "--group", gref, "--name", spec["label"],
-                    "--cwd", spec["abs_cwd"], "--focus", "false")
+        gref = _group_ref(group)
+        if gref:                                              # group EXISTS -> join it
+            out = cmuxq("new-workspace", "--group", gref, "--name", spec["label"],
+                        "--cwd", spec["abs_cwd"], "--focus", "false")
+            m = re.search(r"(workspace:\d+)", out)
+            if not m:
+                print(f"[fleet] ABORT: new-workspace gave no workspace ref: {out.strip()}"); return None, None
+            ws = _ref_to_uuid("workspace", m.group(1))
+            return ws, _term_surface_in(ws)
+        # group does NOT exist -> BOOTSTRAP it, anchored on this agent's OWN new workspace (one
+        # conductor = one group). Create the workspace standalone, THEN `workspace-group create --from
+        # <that ref>` with an ALWAYS-EXPLICIT --from: the implicit form adopts the CALLER's workspace
+        # (a known footgun). Closing this anchor later dissolves the whole group.
+        out = cmuxq("new-workspace", "--name", spec["label"], "--cwd", spec["abs_cwd"], "--focus", "false")
         m = re.search(r"(workspace:\d+)", out)
         if not m:
-            print(f"[fleet] ABORT: new-workspace gave no workspace ref: {out.strip()}"); return None, None
-        ws = _ref_to_uuid("workspace", m.group(1))
+            print(f"[fleet] ABORT: new-workspace (anchor) gave no workspace ref: {out.strip()}"); return None, None
+        anchor_ref = m.group(1)
+        cmuxq("workspace-group", "create", "--name", group, "--from", anchor_ref)
+        if _group_ref(group):
+            print(f"[fleet] created group '{group}' anchored on {spec['label']} ({anchor_ref})")
+        else:
+            print(f"[fleet] warn: group '{group}' did not register; {spec['label']} workspace is standalone")
+        ws = _ref_to_uuid("workspace", anchor_ref)
         return ws, _term_surface_in(ws)
 
     print(f"[fleet] ABORT: unknown place '{place}'"); return None, None
@@ -479,6 +503,16 @@ def cmd_launch(argv):
         spec["label"] = a.label
     if a.adhoc and a.plugins:
         spec["plugins"] = _dedup(spec["plugins"] + [p.strip() for p in a.plugins.split(",") if p.strip()])
+    # one conductor = one group: a place=workspace conductor with no explicit group anchors its OWN group
+    # (named for its label); a place=workspace child with no explicit group joins its parent's group.
+    if spec["place"] == "workspace" and not spec["group"]:
+        if spec["kind"] == "conductor":
+            spec["group"] = spec["label"]
+        elif a.parent:
+            import fleet_state as fs
+            pe = fs.entry_for_surface(a.parent)
+            if pe and pe.get("group"):
+                spec["group"] = pe["group"]
     spec["abs_cwd"] = a.cwd or (spec["cwd"] if os.path.isabs(spec["cwd"]) else os.path.join(ROOT, spec["cwd"]))
 
     # --- worktree (config-gated, default-off) ---------------------------------------------------
@@ -523,7 +557,8 @@ def cmd_launch(argv):
     bin_name, args, env = adapter_compile(spec["tool"], spec, caller)
     send_cmd = render_send_cmd(bin_name, args, env, spec["abs_cwd"])
 
-    print(f"[fleet] tool={spec['tool']} role/label={spec['label']} kind={spec['kind']} place={spec['place']}")
+    print(f"[fleet] tool={spec['tool']} role/label={spec['label']} kind={spec['kind']} place={spec['place']}"
+          + (f" group={spec['group']}" if spec['place'] == 'workspace' else ""))
     print(f"[fleet] cwd={spec['abs_cwd']}")
     print(f"[fleet] launch: {send_cmd}")
     if a.dry_run:
@@ -774,17 +809,28 @@ def cmd_ls(argv):
 def cmd_rm(argv):
     """Drop a label from live/archive. --kill also stops the process + closes its tab (throwaway), and
     for a worktree-isolated agent tears the worktree down (refuse-if-dirty; --wip-commit to override;
-    branch always kept)."""
+    branch always kept). --with-group also dissolves the agent's workspace-group (deletes the whole
+    group by ref -> closes every member); WITHOUT it, only this agent's own workspace is removed and any
+    remaining members are left ungrouped."""
     import fleet_state as fs, signal
     kill = "--kill" in argv
     wipc = "--wip-commit" in argv
-    args = [a for a in argv if a not in ("--kill", "--wip-commit")]
+    with_group = "--with-group" in argv
+    args = [a for a in argv if a not in ("--kill", "--wip-commit", "--with-group")]
     if not args:
-        sys.exit("usage: fleet rm <label> [--kill] [--wip-commit]")
+        sys.exit("usage: fleet rm <label> [--kill] [--wip-commit] [--with-group]")
     label = args[0]
     e = fs.live_get(label) or fs.archive_get(label)
     if not e:
         sys.exit(f"fleet rm: no such label '{label}'")
+    group_note = ""
+    if with_group and e.get("group"):
+        gref = _group_ref(e["group"])
+        if gref:
+            cmuxq("workspace-group", "delete", gref)         # delete takes a REF, not a name
+            group_note = f"\n[fleet] group '{e['group']}' dissolved ({gref}); all members closed"
+        else:
+            group_note = f"\n[fleet] group '{e['group']}' not found live; nothing to dissolve"
     if kill and e.get("surface"):
         pid = _pid_for_surface(e["surface"])
         if pid:
@@ -802,8 +848,8 @@ def cmd_rm(argv):
         if not removed:
             wt_note += f"\n[fleet]   (re-run: fleet worktree clean {label} --wip-commit)"
     fs.live_del(label); fs.archive_del(label)
-    fs.log_event("removed", label=label, role=e.get("role"), killed=kill)
-    print(f"[fleet] removed {label}{' (killed + closed)' if kill else ''}{wt_note}")
+    fs.log_event("removed", label=label, role=e.get("role"), killed=kill, with_group=with_group)
+    print(f"[fleet] removed {label}{' (killed + closed)' if kill else ''}{group_note}{wt_note}")
     return 0
 
 
@@ -1582,7 +1628,7 @@ def main():
               "  broadcast \"<msg>\" [--target all|all-conductors|all-children|my-children] [--no-wake] [--expect-reply] [--dry-run]\n"
               "                                                    input-safe heads-up to live agents (e.g. after a toml/floor change); never restarts them\n"
               "  mute <label> | unmute <label>                     stop/resume pushing a child's completions to its parent (parent reads on demand)\n"
-              "  rm <label> [--kill] [--wip-commit]                drop a label; --kill stops+closes (+ tears down its worktree)\n"
+              "  rm <label> [--kill] [--wip-commit] [--with-group] drop a label; --kill stops+closes (+ worktree); --with-group dissolves its workspace-group\n"
               "  vitals [--json] [--paint]                         cheapest-first triage table + each agent's context-remaining %\n"
               "  find <query> [--turns N] [--json]                 content-aware session lookup (label/role/cwd or transcript)\n"
               "  graph [--html] [--out FILE]                       fleet parentage tree (text, or self-contained HTML)\n"

@@ -88,6 +88,15 @@ vault or machine.
   hermetic guarantee). Ships `profiles/test.fleet.toml` (a sandbox roster) and `docs/profiles.md`
   (the permanent dev workflow for standing up an Nth build).
 
+- **Built-in workspace-group handling (one conductor = one group).** A `place = workspace` conductor
+  now anchors its own cmux workspace-group instead of aborting when the group does not exist: the fleet
+  creates it on the conductor's own new workspace via `workspace-group create --from <that workspace>`
+  (always an explicit `--from`, never the caller-adopting implicit form). A conductor with no explicit
+  `group` defaults it to its label; a `place = workspace` child joins its parent conductor's group.
+  Group name->ref resolution is centralized (`_group_ref`) so teardown uses a ref as cmux requires.
+  `recycle`/`revive` preserve the group; `fleet rm <label> --with-group` dissolves it (default leaves
+  members ungrouped). The sandbox profile is now turnkey (no manual `workspace-group create`).
+
 ### Fixed
 
 - **Recycle relaunch is timing- and crash-safe.** A recycled agent relaunched

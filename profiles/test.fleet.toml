@@ -3,10 +3,13 @@
 #     eval "$(/path/to/cmux-fleet/bin/fleet profile test --init)"   # pins state/config/PATH at this build
 #     cp profiles/test.fleet.toml "$CMUX_FLEET_TOML"                # this roster
 #     python3 "$(dirname "$(command -v fleet)")/../scripts/router.py" --live   # the profile's OWN router
+#     fleet launch sandbox-conductor                                # auto-anchors its OWN group (no pre-create)
 #
 # Everything here is sandbox-only: a throwaway root, a sandbox conductor + one worker, both loading THIS
 # build's plugin. No vault, no _meta, no shared state. `fleet profile` already pinned CMUX_STATE_DIR /
 # CMUX_FLEET_TOML / CMUX_FLEET_ROOT / CMUX_FLEET_MARKETPLACE, so this file only carries the roster.
+# TURNKEY: the sandbox conductor anchors its OWN workspace-group on launch (one conductor = one group),
+# so no manual `workspace-group create` is needed. Its children join that group automatically.
 
 [fleet]
 # root is pinned by the profile env (CMUX_FLEET_ROOT). Set it here too if you run the roster without the
@@ -25,7 +28,8 @@ flags   = "--effort high"
 [role.sandbox-conductor]
 kind  = "conductor"
 place = "workspace"
-group = "cmux-fleet-sandbox"
+group = "cmux-fleet-sandbox"        # auto-created + anchored on this conductor's workspace at launch.
+                                    # OMIT `group` and it defaults to the conductor's label, same effect.
 cwd   = "sandbox/conductor"         # relative to CMUX_FLEET_ROOT (the scratch root), created on launch
 [role.sandbox-conductor.claude]
 flags = "--effort xhigh"

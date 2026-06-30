@@ -72,6 +72,27 @@ the profile's router, then exercise `launch` / `recycle` / `vitals` / `find` / `
 with zero effect on any other build's state. Point `CMUX_FLEET_ROOT` (`--root`) at a scratch dir so the
 sandbox agents' cwds never land in a real project.
 
+## Workspace groups: one conductor = one group
+
+A conductor that launches with `place = workspace` anchors its **own** cmux workspace-group, so the
+conductor and all its children form one collapsible sidebar group — clean visual separation per build.
+
+- **Auto-anchor (no pre-create).** On launch, if the conductor's group does not exist, the fleet creates
+  it anchored on the conductor's own new workspace (`workspace-group create --from <that workspace>`,
+  always with an explicit `--from` so it never adopts the caller's workspace). If the group already
+  exists, the agent just joins it.
+- **Default group name.** A conductor with no explicit `group` defaults it to the conductor's **label**,
+  so every conductor gets its own group with zero config. Set `group = "..."` for a friendlier name.
+- **Children join the parent's group.** `place = tab|pane` children live in the conductor's workspace
+  already; a `place = workspace` child with no explicit group joins its parent conductor's group.
+- **Lifecycle.** `recycle` and `revive` preserve the group (the surface stays in place, or is recreated
+  into the existing group). `fleet rm <conductor>` removes only that workspace by default and leaves any
+  other members ungrouped; `fleet rm <conductor> --with-group` dissolves the whole group (deletes it by
+  ref, which closes every member).
+
+So a second build's sandbox conductor lands in its own separate group, and tearing the build down is one
+`fleet rm sandbox-conductor --with-group`.
+
 ## Gotchas
 
 - Always start the router **inside** the activated shell (so it reads the profile's `CMUX_STATE_DIR`).
