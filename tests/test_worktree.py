@@ -163,3 +163,25 @@ def test_launch_no_worktree_override(repo, tmp_path):
     r = _fleet(toml, state, "launch", "coder", "--parent", "fake", "--no-worktree", "--dry-run")
     assert r.returncode == 0, r.stderr
     assert ".worktrees" not in r.stdout
+
+
+# --- `fleet worktree clean` precondition (needs the registry row; refuses while live) -------------
+def test_worktree_clean_refuses_while_live(monkeypatch):
+    import fleet, fleet_state as fs
+    fs.live_put("wc-live", {"role": "r", "kind": "child", "tool": "claude", "surface": "S1",
+                            "status": "live",
+                            "worktree": {"repo": "/r", "path": "/r/.worktrees/wc-live", "branch": "fleet/wc-live"}})
+    monkeypatch.setattr(fs, "lifecycle", lambda s: "running")
+    with pytest.raises(SystemExit):                      # live -> refuse (archive or rm --kill instead)
+        fleet.cmd_worktree(["clean", "wc-live"])
+
+
+def test_worktree_clean_works_on_archived(monkeypatch):
+    import fleet, fleet_state as fs
+    fs.archive_put("wc-arch", {"role": "r", "kind": "child", "tool": "claude", "status": "archived",
+                               "worktree": {"repo": "/r", "path": "/r/.worktrees/wc-arch", "branch": "fleet/wc-arch"}})
+    monkeypatch.setattr(wt, "teardown",
+                        lambda repo, path, label, wip_commit_flag=False, force=False: (True, "removed"))
+    rc = fleet.cmd_worktree(["clean", "wc-arch"])        # archived row exists -> supported reclaim path
+    assert rc == 0
+    assert (fs.archive_get("wc-arch") or {}).get("worktree") is None   # tree marker nulled, archive row kept

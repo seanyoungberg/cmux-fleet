@@ -10,8 +10,8 @@ python3 -m venv .venv && .venv/bin/pip install pytest   # one-time
 .venv/bin/python -m pytest tests/ -q
 ```
 
-Latest: **110 tests.** All pass where a headless-runnable `claude` is on PATH; otherwise the one real
-`claude --plugin-dir` load test skips, leaving **109 passed, 1 skipped**.
+Latest: **112 tests.** All pass where a headless-runnable `claude` is on PATH; otherwise the one real
+`claude --plugin-dir` load test skips, leaving **111 passed, 1 skipped**.
 
 ## Layers
 

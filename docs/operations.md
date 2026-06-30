@@ -115,7 +115,8 @@ fleet launch coder --worktree feat # ad-hoc: name the branch (else fleet/<label>
 fleet launch coder --worktree-base release/2.0
 fleet launch coder --no-worktree   # force-disable for a worktree=true role
 fleet worktree ls                  # branch / state (clean|dirty|GONE) / path per agent
-fleet worktree clean <label>       # tear down (refuse-if-dirty; --wip-commit to override)
+fleet archive coder                # park it (keeps the registry row + worktree record)
+fleet worktree clean coder         # then tear the tree down (refuse-if-dirty; --wip-commit to override)
 ```
 
 **One owner: the fleet.** It runs `git worktree add` itself and launches the
@@ -133,6 +134,16 @@ and **always keeps the branch**: nothing here merges or deletes a branch. After
 a worktree launch, fleet reconciles the surface's actual cwd against the intended
 worktree path and fails loud (with cleanup + rerun commands) if the workspace
 collapsed into an existing surface.
+
+**Reclaiming a worktree:** `fleet worktree clean <label>` needs the agent's
+registry row and refuses while the agent is still live, so it works on an
+**archived** entry (archive keeps the row and the worktree record) or a stale one
+whose surface is gone. The supported path is `fleet archive <label>` then `fleet
+worktree clean <label>`. `rm --kill` is the other route: it drops the agent and,
+in the same step, tears down its (clean) worktree. Note that `rm --kill`,
+`rm --with-group`, and a placement-mismatch cleanup all **delete** the registry
+row, so after them `fleet worktree clean` can no longer find the tree: reclaim it
+manually with `git worktree remove <path>` (and `git branch -D fleet/<label>`).
 
 ## Inspecting the fleet
 

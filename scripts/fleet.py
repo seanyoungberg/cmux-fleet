@@ -594,9 +594,11 @@ def cmd_launch(argv):
             print(f"\n[fleet] !!! PLACEMENT MISMATCH for {spec['label']}")
             print(f"[fleet]   intended worktree cwd : {spec['abs_cwd']}")
             print(f"[fleet]   surface reports cwd    : {actual or '(none yet)'}")
+            wm = spec.get("worktree_meta") or {}
             print(f"[fleet]   the launch likely collapsed into an existing surface. Clean up + retry:")
-            print(f"[fleet]     fleet rm {spec['label']} --kill")
-            print(f"[fleet]     fleet worktree clean {spec['label']}")
+            print(f"[fleet]     fleet rm {spec['label']} --kill   # drops the agent, closes the surface, AND tears down its (clean) worktree")
+            print(f"[fleet]       (if the tree shows changes, rm --kill refuses it; reclaim manually: "
+                  f"git -C {wm.get('repo', '<repo>')} worktree remove {wm.get('path', spec['abs_cwd'])})")
             print(f"[fleet]     fleet launch {a.role or ('--adhoc ' + a.adhoc)} ...")
             return 2
     if sid:
@@ -938,7 +940,9 @@ def cmd_worktree(argv):
         import fleet_state as fs
         live = fs.live_get(a.label)
         if info["where"] == "live" and live and fs.lifecycle(live.get("surface", "")) not in ("", "-", "ended", None):
-            sys.exit(f"fleet worktree clean: '{a.label}' is still LIVE; `fleet rm {a.label} --kill` first")
+            sys.exit(f"fleet worktree clean: '{a.label}' is still LIVE. Either `fleet archive {a.label}` "
+                     f"then `fleet worktree clean {a.label}`, or `fleet rm {a.label} --kill` (which itself "
+                     f"tears the worktree down).")
         m = info["meta"]
         removed, msg = wt.teardown(m["repo"], m["path"], a.label, wip_commit_flag=a.wip_commit, force=a.force)
         print(f"[fleet] {msg}")
