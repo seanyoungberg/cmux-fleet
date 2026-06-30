@@ -70,5 +70,13 @@ vault or machine.
     a dedicated, tappable fleet board.
   - Unit tests in `tests/test_features.py`. Triage/no-LLM-status ideas adapted
     from agentmaster, the localhost-view shape from elevens (design-mined).
+- **Test suite** (`tests/`, pytest-only — the one dev dependency). Three layers:
+  static manifest/skill/hooks schema validators; pytest units for `fleet_state`
+  transitions (inbox/registry/archive/dial), the hook stdin->exit-0 contract,
+  `config.py` resolution precedence (`env > [fleet] toml > XDG`, dirname-anchor,
+  malformed-warn), `scripts/worktree.py`, and the `fleet_features` views; and an
+  e2e CLI lifecycle (`ls`/`archive`/`revive`/`rm` against a throwaway state with a
+  stubbed cmux) plus a `claude --plugin-dir` load check. One skip expected (real
+  claude load, skipped when no headless `claude` is present).
 
 [0.1.0]: https://github.com/seanyoungberg/cmux-fleet/releases/tag/v0.1.0

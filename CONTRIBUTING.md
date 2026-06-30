@@ -33,17 +33,24 @@ manifest version.
 
 ## Tests
 
-Three layers (the suite under `tests/` is being built in P3.2, so some entries
-may currently be stubs; state the pass count in your PR):
+Run the suite (pytest is the one dev dependency; see `tests/README.md`):
+
+```sh
+python3 -m venv .venv && .venv/bin/pip install pytest
+.venv/bin/python -m pytest tests/ -q
+```
+
+64 tests, three layers. State the pass count in your PR.
 
 1. **Static validators** check the manifests, skill, and `hooks.json` for
    well-formed JSON and the expected schema.
 2. **pytest units** cover state transitions (inbox, registry, archive), the
    hook stdin-to-exit-code contract (inject a throwaway `$CMUX_STATE_DIR`), and
    `config.py` resolution precedence.
-3. **e2e** drives the CLI lifecycle (`launch` -> `ls` -> `recycle` -> `archive`
-   -> `revive` -> `rm`) against a throwaway cmux, plus a stranger-first-run pass
-   (a fresh `$CMUX_STATE_DIR`, no config file, no vault).
+3. **e2e** drives the CLI lifecycle (`ls` -> `archive` -> `revive` -> `rm`)
+   against a throwaway state with a stubbed cmux (launch/revive spawning is
+   exercised via `--dry-run`), plus the `claude --plugin-dir` load when a
+   headless `claude` is available.
 
 ## Python style
 

@@ -1,5 +1,8 @@
 __pycache__/
 *.pyc
 .DS_Store
+# test runner virtualenv (pytest is the one dev dep; see tests/README.md)
+.venv/
+.pytest_cache/
 # local mining clones / scratch (never committed)
 _mining/

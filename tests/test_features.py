@@ -14,10 +14,17 @@ sys.path.insert(0, SCRIPTS)
 
 @pytest.fixture(autouse=True)
 def _throwaway_state(tmp_path, monkeypatch):
-    # isolate config so importing fleet_features never touches a real state dir
+    # isolate config so importing fleet_features never touches a real state dir. These modules read
+    # their paths from the env AT IMPORT, so they're popped before this test re-imports them under the
+    # throwaway env — AND popped again on teardown, so the next test file re-imports cleanly under the
+    # restored (session) env instead of inheriting this test's now-deleted tmp_path state dir.
+    mods = ("config", "fleet_state", "fleet_features")
     monkeypatch.setenv("CMUX_STATE_DIR", str(tmp_path / "state"))
     monkeypatch.setenv("CMUX_FLEET_TOML", str(tmp_path / "none.toml"))
-    for m in ("config", "fleet_state", "fleet_features"):
+    for m in mods:
+        sys.modules.pop(m, None)
+    yield
+    for m in mods:
         sys.modules.pop(m, None)
 
 
