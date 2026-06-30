@@ -55,3 +55,17 @@ group = "lead"
 cwd   = "agents/lead"
 [role.lead.claude]
 flags = "--effort xhigh"
+
+# A worktree-isolated CODE worker. Config-gated and DEFAULT-OFF: set worktree=true only on roles whose
+# `cwd` is a git repo you want each agent to edit in its own branch. The fleet owns the worktree end to
+# end (creates <repo>/.worktrees/<label> on branch fleet/<label>, launches the tool there, tears it down
+# on `rm --kill`). Pairs naturally with place="workspace". Leave it off for doc/notes roles.
+[role.coder]
+kind     = "child"
+place    = "workspace"
+group    = "coders"
+cwd      = "code/myrepo"           # a git repo root (relative to [fleet].root, or absolute)
+worktree = true                    # opt in. default false. CLI: --worktree / --no-worktree / --worktree-base
+# worktree_base          = "main"  # base ref for a NEW branch (default: repo default branch)
+# worktree_dir           = ".worktrees"   # where trees live under the repo (gitignored automatically)
+# worktree_branch_prefix = "fleet/"       # branch = <prefix><label>

@@ -12,6 +12,19 @@ vault or machine.
 
 ### Added
 
+- **Git worktrees** (`scripts/worktree.py`, config-gated, default-off). A role
+  with `worktree = true` (or `fleet launch ... --worktree`) runs each agent in
+  its own worktree at `<repo>/.worktrees/<label>` on branch `fleet/<label>`. The
+  fleet is the sole owner: it runs `git worktree add` itself and launches the
+  tool into the directory (`claude` plain, no `-w`; codex via `cd`), strips
+  Claude's `-w`/`--worktree` from passthrough, and never hooks
+  `WorktreeCreate`/`WorktreeRemove`. Idempotent create under a per-repo lock;
+  teardown refuses on a dirty tree (`--wip-commit` overrides) and always keeps
+  the branch. New verbs `fleet worktree ls`/`clean <label>`; `fleet rm --kill`
+  tears the tree down; post-launch placement reconciliation fails loud if a
+  workspace collapsed off the worktree. Roster keys `worktree`/`worktree_base`/
+  `worktree_dir`/`worktree_branch_prefix`; CLI `--worktree [BRANCH]`/
+  `--no-worktree`/`--worktree-base`.
 - **`fleet` CLI** (`scripts/fleet.py`, on PATH via `bin/fleet`). Tool-agnostic
   command builder over cmux primitives. Verbs: `launch`, `config`, `ls`,
   `archive`, `revive`, `recycle`, `broadcast`, `mute`/`unmute`, `rm`. Roster is

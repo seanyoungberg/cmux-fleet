@@ -63,6 +63,40 @@ fleet config <role>
 fleet config --adhoc scratch --cwd /some/dir
 ```
 
+## Worktrees (code repos)
+
+Config-gated and **default-off.** For a role whose `cwd` is a git repo, set
+`worktree = true` and each agent runs in its own git worktree at
+`<repo>/.worktrees/<label>` on branch `fleet/<label>`, instead of sharing the
+repo's working tree. This keeps parallel code agents off each other's `git
+status`, branches, and build artifacts. The vault (one big doc repo) leaves it
+off; code repos opt in.
+
+```
+fleet launch coder                 # worktree=true role -> launches in its own worktree
+fleet launch coder --worktree feat # ad-hoc: name the branch (else fleet/<label>)
+fleet launch coder --worktree-base release/2.0
+fleet launch coder --no-worktree   # force-disable for a worktree=true role
+fleet worktree ls                  # branch / state (clean|dirty|GONE) / path per agent
+fleet worktree clean <label>       # tear down (refuse-if-dirty; --wip-commit to override)
+```
+
+**One owner: the fleet.** It runs `git worktree add` itself and launches the
+tool *into* that directory (`claude` plain, no `-w`; codex via the `cd`). It does
+**not** use Claude's own `-w`/`--worktree` (those are stripped from passthrough
+when `worktree=true`) and does not hook `WorktreeCreate`/`WorktreeRemove` —
+running two owners on one tree causes double-cleanup, lock races, and branch
+collisions.
+
+Lifecycle: `launch` creates the tree (idempotent, locked, pruned first);
+`recycle`/`revive` reuse it (the cwd is replayed, the tree persists); `archive`
+keeps it; `rm --kill` tears it down. Teardown **refuses if the tree is dirty**
+(commit/stash first, or pass `--wip-commit` to snapshot as `fleet WIP: <label>`)
+and **always keeps the branch** — nothing here merges or deletes a branch. After
+a worktree launch, fleet reconciles the surface's actual cwd against the intended
+worktree path and fails loud (with cleanup + rerun commands) if the workspace
+collapsed into an existing surface.
+
 ## Inspecting the fleet
 
 ```
