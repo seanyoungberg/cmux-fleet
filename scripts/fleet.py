@@ -809,9 +809,12 @@ def cmd_ls(argv):
 def cmd_rm(argv):
     """Drop a label from live/archive. --kill also stops the process + closes its tab (throwaway), and
     for a worktree-isolated agent tears the worktree down (refuse-if-dirty; --wip-commit to override;
-    branch always kept). --with-group also dissolves the agent's workspace-group (deletes the whole
-    group by ref -> closes every member); WITHOUT it, only this agent's own workspace is removed and any
-    remaining members are left ungrouped."""
+    branch always kept). --with-group also dissolves the agent's workspace-group: deleting the group by
+    ref closes EVERY member surface, so we then SWEEP all live+archive entries in that group out of the
+    registry (otherwise they linger as orphaned rows for dead surfaces). Worktree branches are NOT
+    touched for swept members (the worktree design always keeps branches); use `fleet worktree clean
+    <label>` to reclaim them. WITHOUT --with-group, only this agent's own workspace goes and remaining
+    members are left ungrouped."""
     import fleet_state as fs, signal
     kill = "--kill" in argv
     wipc = "--wip-commit" in argv
@@ -825,12 +828,30 @@ def cmd_rm(argv):
         sys.exit(f"fleet rm: no such label '{label}'")
     group_note = ""
     if with_group and e.get("group"):
-        gref = _group_ref(e["group"])
+        gname = e["group"]
+        gref = _group_ref(gname)
         if gref:
-            cmuxq("workspace-group", "delete", gref)         # delete takes a REF, not a name
-            group_note = f"\n[fleet] group '{e['group']}' dissolved ({gref}); all members closed"
+            cmuxq("workspace-group", "delete", gref)         # delete takes a REF -> closes ALL members
+            # SWEEP the registry: every other live/archive entry in the dissolved group is now a stale
+            # row for a closed surface. Collect them BEFORE deleting (so we can report kept worktrees),
+            # then clear each. The selected `label` itself is cleared below by the normal path.
+            members = {}
+            for tbl in (fs.live_all(), fs.archive_all()):
+                for lbl, v in tbl.items():
+                    if lbl != label and v.get("group") == gname:
+                        members.setdefault(lbl, v)
+            for lbl, v in members.items():
+                fs.live_del(lbl); fs.archive_del(lbl)
+                fs.log_event("removed", label=lbl, role=v.get("role"), via="group-dissolve")
+            wt_kept = sorted([lbl for lbl, v in members.items() if v.get("worktree")]
+                             + ([label] if e.get("worktree") and not kill else []))
+            group_note = f"\n[fleet] group '{gname}' dissolved ({gref}); closed + cleared {1 + len(members)} member(s)"
+            if members:
+                group_note += f" (also removed: {', '.join(sorted(members))})"
+            if wt_kept:
+                group_note += f"\n[fleet]   worktree branches KEPT for {', '.join(wt_kept)} (run: fleet worktree clean <label>)"
         else:
-            group_note = f"\n[fleet] group '{e['group']}' not found live; nothing to dissolve"
+            group_note = f"\n[fleet] group '{gname}' not found live; nothing to dissolve"
     if kill and e.get("surface"):
         pid = _pid_for_surface(e["surface"])
         if pid:

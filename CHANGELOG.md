@@ -94,8 +94,9 @@ vault or machine.
   (always an explicit `--from`, never the caller-adopting implicit form). A conductor with no explicit
   `group` defaults it to its label; a `place = workspace` child joins its parent conductor's group.
   Group name->ref resolution is centralized (`_group_ref`) so teardown uses a ref as cmux requires.
-  `recycle`/`revive` preserve the group; `fleet rm <label> --with-group` dissolves it (default leaves
-  members ungrouped). The sandbox profile is now turnkey (no manual `workspace-group create`).
+  `recycle`/`revive` preserve the group; `fleet rm <label> --with-group` dissolves it and sweeps all of
+  the group's members out of the registry (worktree branches are kept), while plain `rm` leaves members
+  ungrouped. The sandbox profile is now turnkey (no manual `workspace-group create`).
 
 ### Fixed
 

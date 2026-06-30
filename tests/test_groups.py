@@ -83,6 +83,25 @@ def test_rm_with_group_dissolves_by_ref(monkeypatch):
     assert fs.live_get("cond") is None
 
 
+def test_rm_with_group_sweeps_all_members(monkeypatch):
+    # the orphan bug: dissolving the group closed every member surface, but only the SELECTED label was
+    # cleared from the registry, leaving siblings as stale rows. rm --with-group must sweep them all.
+    import fleet_state as fs
+    fs.live_put("cond", {"role": "c", "kind": "conductor", "tool": "claude", "group": "g",
+                         "surface": "SC", "status": "live"})
+    fs.live_put("child", {"role": "w", "kind": "child", "tool": "claude", "group": "g",
+                          "parent": "cond", "surface": "SW", "status": "live"})
+    fs.live_put("other", {"role": "w", "kind": "child", "tool": "claude", "group": "other-g",
+                          "surface": "SX", "status": "live"})
+    monkeypatch.setattr(fleet, "cmuxq", lambda *a: "")
+    monkeypatch.setattr(fleet, "_group_ref", lambda g: "workspace_group:1")
+    monkeypatch.setattr(fleet, "_pid_for_surface", lambda s: None)
+    fleet.cmd_rm(["cond", "--with-group"])
+    assert fs.live_get("cond") is None         # the selected conductor is gone
+    assert fs.live_get("child") is None         # ...and so is its group sibling (the swept orphan)
+    assert fs.live_get("other") is not None     # a DIFFERENT group is untouched
+
+
 def test_rm_without_group_leaves_group_intact(monkeypatch):
     import fleet_state as fs
     fs.live_put("cond2", {"role": "r", "kind": "conductor", "tool": "claude", "group": "gg",

@@ -208,8 +208,11 @@ the agent launched.
 
 - **rm** drops a label from the live and archive stores. `--kill` also stops the
   process and closes its tab (for a throwaway). `--with-group` dissolves the
-  agent's workspace-group by ref, closing every member; without it, only this
-  agent's own workspace goes and any remaining members are left ungrouped.
+  agent's workspace-group by ref (closing every member surface) and sweeps all of
+  that group's members out of the registry, so no stale rows linger; worktree
+  branches are kept (use `fleet worktree clean <label>` to reclaim). Without it,
+  only this agent's own workspace goes and any remaining members are left
+  ungrouped.
 
   ```
   fleet rm scratch
@@ -276,7 +279,7 @@ one in a shell, then everything that shell launches is pinned to that build:
 ```
 eval "$(/path/to/<build>/bin/fleet profile dev --init)"   # PATH + all CMUX_* knobs
 cp profiles/test.fleet.toml "$CMUX_FLEET_TOML"             # a starting roster
-python3 "$build"/scripts/router.py --live                 # this profile's own router
+python3 "$(dirname "$(command -v fleet)")/../scripts/router.py" --live   # this profile's own router
 fleet launch sandbox-conductor                            # auto-anchors its own group
 ```
 

@@ -88,7 +88,8 @@ conductor and all its children form one collapsible sidebar group: clean visual 
 - **Lifecycle.** `recycle` and `revive` preserve the group (the surface stays in place, or is recreated
   into the existing group). `fleet rm <conductor>` removes only that workspace by default and leaves any
   other members ungrouped; `fleet rm <conductor> --with-group` dissolves the whole group (deletes it by
-  ref, which closes every member).
+  ref, closing every member) and sweeps all of the group's members out of the registry. Worktree
+  branches are kept; reclaim them with `fleet worktree clean <label>`.
 
 So a second build's sandbox conductor lands in its own separate group, and tearing the build down is one
 `fleet rm sandbox-conductor --with-group`.
