@@ -1080,6 +1080,8 @@ def cmd_revive(argv):
     if not ws or not surf:
         sys.exit(1)
     cmuxq("send", "--workspace", ws, "--surface", surf, send_cmd + "\n")
+    if sess and tool == "claude":                                 # full-resume: dismiss the summary menu
+        _dismiss_resume_summary_prompt(surf, lambda m: print(f"[fleet] {m}"))
     sid = poll_session(surf)
     if not sid:
         sys.exit("[fleet] timed out waiting for session binding")
@@ -1370,6 +1372,32 @@ def cmd_recycle(argv):
     return 0
 
 
+def _dismiss_resume_summary_prompt(surf, log, timeout=30):
+    """`claude --resume` on an OLD/LARGE session shows an interactive menu before resuming:
+         1. Resume from summary (recommended)   2. Resume full session as-is   3. Don't ask me again
+    A respawn/recycle has NO human to choose, so the agent HANGS at the menu (and the resume-confirm
+    false-passes on the bound-but-stuck session). Policy: ALWAYS resume FULL, never summarize/compact.
+    No claude flag/setting/env var exists to suppress this or force full (GitHub #46751, verified), so a
+    keystroke is the only lever: the cursor defaults to option 1, so DOWN -> option 2 ('full as-is'),
+    then ENTER. Poll the pane until the menu renders; bail early (no keystrokes) if the agent already
+    resumed straight to a running prompt. Returns True iff it dismissed a menu."""
+    end = time.time() + timeout
+    while time.time() < end:
+        pane = cmuxq("capture-pane", "--surface", surf) or ""
+        if "Resume full session as-is" in pane or "Resuming the full session" in pane:
+            log("resume-summary menu detected -> picking 'Resume full session as-is' (full, never compact)")
+            cmuxq("send-key", "--surface", surf, "down")
+            time.sleep(0.5)
+            cmuxq("send-key", "--surface", surf, "enter")
+            return True
+        # small session resumed straight to a running prompt -> no menu, nothing to dismiss
+        if "Context Remaining" in pane or "bypass permissions" in pane:
+            return False
+        time.sleep(1)
+    log("WARN: resume launched but no summary-menu and no running prompt seen within timeout")
+    return False
+
+
 def cmd_recycle_exec(argv):
     """DETACHED worker (internal verb): quiet-gate -> respawn-pane -> confirm new session -> update
     registry -> auto-prime. Never half-kills: aborts before respawn if the surface won't go quiet."""
@@ -1433,6 +1461,9 @@ def cmd_recycle_exec(argv):
         if prime:
             time.sleep(8)                                # codex boots slower than claude; let the TUI come up
     else:
+        if mode == "resume":
+            # full-resume the session (dismiss claude's summary-vs-full menu before it hangs the confirm)
+            _dismiss_resume_summary_prompt(surf, log)
         # exclude pre_sid (the stale store entry snapshotted post-respawn) so a crashed launch can't
         # false-confirm on it; fresh requires a sid that is neither old_sid nor pre_sid.
         exclude = {old_sid, pre_sid} if mode == "fresh" else {old_sid}
