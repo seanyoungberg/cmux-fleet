@@ -50,3 +50,66 @@ def test_resume_waits_while_lifecycle_dead(monkeypatch):
     monkeypatch.setattr(fleet_state, "lifecycle", lambda surf: "ended")
     got = fleet._poll_session_back("S", "old", "resume", timeout=0.05, exclude={"old"})
     assert got == ""
+
+
+# --- resume-summary menu dismiss (Fix 2: PURE TIMING gate, event-driven poll, scaled ceiling) -----
+def test_resume_menu_timeout_scales_with_plugin_count():
+    # base is generous even at 0 plugins; heavier loadouts stretch it, bounded by the ceiling.
+    assert fleet._resume_menu_timeout(0) == 60
+    assert fleet._resume_menu_timeout(6) == 60 + 8 * 6          # homelab-weight -> longer window
+    assert fleet._resume_menu_timeout(0) < fleet._resume_menu_timeout(6)
+    assert fleet._resume_menu_timeout(1000) == 120             # capped at the ceiling
+    assert fleet._count_plugin_dirs("x --plugin-dir a y --plugin-dir b") == 2
+
+
+def test_dismiss_picks_full_when_menu_present(monkeypatch):
+    monkeypatch.setattr(fleet.time, "sleep", lambda *_: None)
+    keys = []
+    def fake_cmuxq(*args):
+        if args[:1] == ("capture-pane",):
+            return "... 2. Resume full session as-is ..."     # menu is up
+        keys.append(args)
+        return ""
+    monkeypatch.setattr(fleet, "cmuxq", fake_cmuxq)
+    got = fleet._dismiss_resume_summary_prompt("S", lambda m: None, timeout=5)
+    assert got == fleet.RESUME_DISMISSED
+    # DOWN (option 1 -> 2) then ENTER = 'Resume full session as-is'
+    assert ("send-key", "--surface", "S", "down") in keys
+    assert ("send-key", "--surface", "S", "enter") in keys
+
+
+def test_dismiss_ready_when_running_prompt(monkeypatch):
+    monkeypatch.setattr(fleet.time, "sleep", lambda *_: None)
+    monkeypatch.setattr(fleet, "cmuxq",
+                        lambda *a: "Context Remaining 42%" if a[:1] == ("capture-pane",) else "")
+    got = fleet._dismiss_resume_summary_prompt("S", lambda m: None, timeout=5)
+    assert got == fleet.RESUME_READY                          # no menu -> nothing to dismiss
+
+
+def test_dismiss_times_out_when_still_booting(monkeypatch):
+    # neither menu nor prompt within the ceiling (heavy loadout still booting) -> TIMEOUT, not READY.
+    monkeypatch.setattr(fleet.time, "sleep", lambda *_: None)
+    monkeypatch.setattr(fleet, "cmuxq",
+                        lambda *a: "loading plugins..." if a[:1] == ("capture-pane",) else "")
+    got = fleet._dismiss_resume_summary_prompt("S", lambda m: None, timeout=0.05)
+    assert got == fleet.RESUME_TIMEOUT
+
+
+def test_gate_blocks_bind_on_timeout(monkeypatch):
+    # THE register-skipped path: a timed-out dismiss -> gate False -> caller must NOT bind/register.
+    monkeypatch.setattr(fleet, "_dismiss_resume_summary_prompt",
+                        lambda *a, **k: fleet.RESUME_TIMEOUT)
+    assert fleet._resume_and_gate("S", "cmd --plugin-dir a", "claude", "sess", lambda m: None) is False
+
+
+def test_gate_allows_bind_when_resolved(monkeypatch):
+    # dismissed OR already-ready both clear the gate; fresh / non-claude launches are a no-op pass.
+    monkeypatch.setattr(fleet, "_dismiss_resume_summary_prompt",
+                        lambda *a, **k: fleet.RESUME_DISMISSED)
+    assert fleet._resume_and_gate("S", "cmd", "claude", "sess", lambda m: None) is True
+    monkeypatch.setattr(fleet, "_dismiss_resume_summary_prompt",
+                        lambda *a, **k: fleet.RESUME_READY)
+    assert fleet._resume_and_gate("S", "cmd", "claude", "sess", lambda m: None) is True
+    # non-claude tool / no session -> gate never runs the dismiss, always safe to proceed
+    assert fleet._resume_and_gate("S", "cmd", "codex", "sess", lambda m: None) is True
+    assert fleet._resume_and_gate("S", "cmd", "claude", "", lambda m: None) is True
