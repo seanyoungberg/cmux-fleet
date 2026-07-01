@@ -13,7 +13,7 @@
 #                      status:"live",surface,session}. Only running agents.
 #   archive.json       PARKED agents, label-keyed: {role,kind,tool,cwd,last_session,parent,archived_at}.
 #   log.jsonl          append-only EVENT ledger: {ts,event,label,role,...}. Source-of-truth timeline.
-#   notify-mode        the dial: passive | autodrain | auto.
+#   notify-mode        the wake dial, now a MUTE switch: passive (mute) | auto (default, wake-now).
 #   router.seq         bus cursor (cmux events --cursor-file). router.log — the router trace.
 #
 # Identity: kind(child|conductor) / role(type, ->AGENT_ROLE, owns the dir) / label(unique instance,
@@ -30,6 +30,8 @@ LIVE = os.path.join(STATE, "fleet.json")
 ARCHIVE = os.path.join(STATE, "archive.json")
 LOG = os.path.join(STATE, "log.jsonl")
 MODEFILE = os.path.join(STATE, "notify-mode")
+DRAFTMODE = os.path.join(STATE, "draft-through")        # policy override: 'clobber' | 'preserve' (default 'stale')
+DRAFTMARKS = os.path.join(STATE, "draft-marks.json")    # {surface: {text, since}} — stale-draft-gate age tracking
 
 # Agent-helper command hints emitted into conductor context by the awareness/drain hooks. Phase 2
 # folded the four standalone plugin scripts into `fleet <verb>` subcommands, so these are now the app
@@ -84,20 +86,31 @@ def _read_jsonl(path):
     return out
 
 
-# --- the dial ------------------------------------------------------------------------------
+# --- the dial (DEMOTED to a mute switch — design 2.1) --------------------------------------
+# Wake-now is the DEFAULT. The dial's ONLY job now is the 'passive' override, which suppresses
+# idle-wake AND auto-drain fleet-wide (notify + inbox only). Everything non-'passive' — including no
+# file and the retired 'autodrain' value — normalizes to 'auto' (wake-now). This INVERTS the old
+# default (was 'passive'; wake needed an explicit 'auto'); see NOTIFICATIONS-REDESIGN 2.1 and the loud
+# behavior-change note in the report.
 def mode():
     try:
-        return open(MODEFILE).read().strip() or "passive"
+        v = open(MODEFILE).read().strip()
     except OSError:
-        return "passive"
+        v = ""
+    return "passive" if v == "passive" else "auto"
 
 
 def autodrain_on():
-    return mode() in ("autodrain", "auto")
+    # Auto-drain (the Stop hook auto-continuing the turn to process pending completions) is on by
+    # default; only 'passive' mutes it. The old distinct 'autodrain' value (drain-without-wake) is
+    # retired — with wake-now default the single override is 'passive'.
+    return mode() != "passive"
 
 
 def idlewake_on():
-    return mode() == "auto"
+    # Idle-wake is on by default; only 'passive' mutes it. maybe_idle_wake (router) and the heartbeat
+    # backstop both gate on this, so 'passive' is a coherent fleet-wide wake mute.
+    return mode() != "passive"
 
 
 # --- inbox (unified completions + peer) ----------------------------------------------------
@@ -173,7 +186,7 @@ def inbox_ack(surface, kind, seq):
 
 
 # --- EPHEMERAL drain loop-guard (blocks; per-kind, separate nukeable file) ------------------
-# Child drain is mode-gated (autodrain/auto); peer drain fires ALWAYS (critic issue #4). The two
+# Child drain is mode-gated (on unless 'passive'); peer drain fires ALWAYS (critic issue #4). The two
 # advance on different triggers, so the block-mark is per-kind, and lives apart from the durable ack.
 def block_get(surface, kind):
     return int(_read_json(BLOCKS, {}).get(surface, {}).get(kind, 0))
@@ -383,18 +396,131 @@ def lifecycle(surface):
     return best
 
 
-def wake_if_idle(surface, msg):
-    """Inject+submit a wake ONLY if the surface is at the prompt with an empty draft; else leave it
-    (it sees the inbox next turn). Returns True if it woke. The ONE copy of the wake gate, shared by
-    the router's idle-wake and peer-msg (simplify #4). Two guards: (1) busy = lifecycle 'running' ->
-    never interrupt; (2) a human draft (bottom-most prompt line with text after the marker) -> never
-    clobber."""
-    if lifecycle(surface) == "running":
-        return False
-    screen = _cmux("read-screen", "--surface", surface, "--lines", "40")
-    prompts = [ln for ln in screen.splitlines() if "❯" in ln]   # ❯
-    if prompts and prompts[-1].split("❯", 1)[1].strip():
-        return False
+# --- wake-gate liveness: staleness + bound-session cross-check (design 2.2a) ----------------
+# lifecycle() above returns the freshest record's RAW agentLifecycle (for display: `fleet ls`, vitals,
+# the cli.py liveness checks). The WAKE GATE needs a stricter question — "is this surface in a GENUINE,
+# live, mid-turn 'running' state I must not interrupt?" — because a STALE/orphaned 'running' record
+# (a cmux reboot-replay, a move-surface binding desync, a pre-fix summarizer stomp) must NOT read as
+# busy: if it does, guard #1 trips on every event and the surface is silenced forever (the cmux-advisor
+# stall, root-caused 2026-07-01). We keep lifecycle()'s contract intact (cli.py/features.py depend on
+# it) and answer the wake question with a dedicated, hardened predicate.
+LIFECYCLE_STALE_S = 90   # a 'running' record that has not ticked within this window is not a live turn
+
+
+def surface_busy(surface, now=None):
+    """True ONLY when `surface` is genuinely mid-turn (a fresh, live 'running' record) — the single case
+    the wake gate must never interrupt. Hardened two ways against the stale read that stalled
+    cmux-advisor:
+      - liveness cross-check: prefer the record for the fleet's OWN bound session (registry truth, kept
+        honest by the reconciliation lane) over 'max updatedAt across all records on the surface'. The
+        pointer that lied in the incident was cmux's activeSessionsBySurface, not the fleet binding, so
+        resolving against the binding defeats the orphaned-'running' record directly.
+      - staleness guard: a 'running' record that has not ticked within LIFECYCLE_STALE_S is treated as
+        NOT a live turn (a real turn re-stamps continuously; a frozen one is an orphan).
+    Leans to NOT-busy on any ambiguity/read error: wake_if_idle then confirms an actual clean idle
+    prompt on screen before injecting, so a false 'not busy' can never corrupt a real turn, while a
+    false 'busy' — the failure we are killing — can never silence an idle surface."""
+    now = time.time() if now is None else now
+    try:
+        recs = [s for s in (read_hook_store().get("sessions") or {}).values()
+                if s.get("surfaceId") == surface]
+        if not recs:
+            return False                        # nothing claims this surface -> not provably busy
+        bound = bare_uuid((entry_for_surface(surface) or {}).get("session", ""))
+        rec = None
+        if bound:
+            rec = next((s for s in recs if bare_uuid(s.get("sessionId", "")) == bound), None)
+        if rec is None:                         # no fleet-bound record -> fall back to the freshest
+            rec = max(recs, key=lambda s: s.get("updatedAt") or 0)
+        if rec.get("agentLifecycle") != "running":
+            return False
+        return (now - (rec.get("updatedAt") or 0)) <= LIFECYCLE_STALE_S
+    except Exception:
+        return False                            # fail-open to not-busy; the screen read is the arbiter
+
+
+# --- draft-through: tier 3 of the wake ladder (design 2.3 / 3c, E1) -------------------------
+DRAFT_STALE_S = 90   # a draft UNCHANGED this long reads as walked-away (abandoned), not active typing
+
+
+def draft_through():
+    """Draft-through policy for tier 3 of the wake ladder:
+      'stale' (DEFAULT) — the stale-draft gate: clobber a WALKED-AWAY draft (unchanged >= DRAFT_STALE_S)
+              so it can't silence the surface indefinitely, but PRESERVE a fresh draft (protects active
+              typing). Meets the redesign's 'never an indefinite silent stall' WITHOUT depending on the
+              unvalidated save/clear/RESTORE round-trip (Berg: clobber > silence for an abandoned draft).
+      'clobber' — immediate clobber-with-log on ANY draft (no wait); the aggressive opt-in.
+      'preserve' — never clobber (fully conservative; a walked-away draft just waits in the inbox).
+    Override via `$CMUX_STATE_DIR/draft-through` = 'clobber' | 'preserve'; absent/other = 'stale'."""
+    try:
+        v = open(DRAFTMODE).read().strip()
+    except OSError:
+        v = ""
+    return v if v in ("clobber", "preserve") else "stale"
+
+
+def _draft_age(surface, draft, now):
+    """Seconds `draft` has sat UNCHANGED in `surface`'s input box (0 when new or just changed). Persisted
+    to DRAFTMARKS so the age accrues across router/heartbeat/peer calls; active typing (changed text)
+    resets the clock, so only a genuinely walked-away draft ever crosses DRAFT_STALE_S."""
+    m = _read_json(DRAFTMARKS, {})
+    e = m.get(surface)
+    if e and e.get("text") == draft:
+        return max(0.0, now - float(e.get("since") or now))
+    m[surface] = {"text": draft, "since": now}          # new/changed draft -> (re)start the clock
+    _atomic_write(DRAFTMARKS, json.dumps(m, indent=2))
+    return 0.0
+
+
+def _clear_draft_mark(surface):
+    m = _read_json(DRAFTMARKS, {})
+    if surface in m:
+        m.pop(surface, None)
+        _atomic_write(DRAFTMARKS, json.dumps(m, indent=2))
+
+
+def _wake_through_draft(surface, msg, draft):
+    """Tier 3: the surface is idle but a human draft sits in the input box. Per draft_through():
+    'preserve' never wakes; 'clobber' wakes immediately; 'stale' (default) waits until the draft is
+    unchanged for DRAFT_STALE_S (walked away) then wakes — preserving a fresh draft. The clobber
+    best-effort CLEARs the input (send-key ctrl+u; degrades to a mashed submit, never a silent stall)
+    then wakes and audits the overwrite. Returns True iff it woke."""
+    mode = draft_through()
+    if mode == "preserve":
+        return False                                   # never clobber a draft
+    if mode == "stale" and _draft_age(surface, draft, time.time()) < DRAFT_STALE_S:
+        return False                                   # fresh draft (maybe active typing) -> preserve for now
+    _cmux("send-key", "--surface", surface, "ctrl+u")  # best-effort clear (TUI-validate for 3a; degrades to mashed submit)
     _cmux("send", "--surface", surface, msg)
+    _cmux("send-key", "--surface", surface, "enter")
+    _clear_draft_mark(surface)                          # draft consumed -> reset the age clock
+    log_event("draft_clobbered", surface=surface, mode=mode)   # audit: a human draft was overwritten to wake
+    return True
+
+
+def wake_if_idle(surface, msg):
+    """Inject+submit a wake ONLY when the surface is sitting at a clean prompt with an empty draft;
+    otherwise leave it (the item is already durable in the inbox — it is seen next turn). Returns True
+    iff it woke. The ONE wake gate, shared by the router idle-wake, peer-msg, broadcast, and the
+    heartbeat backstop, so its tier ladder (design 2.3) covers every path:
+      1. genuinely mid-turn (surface_busy) -> queue, never interrupt;
+      2. idle + empty draft                -> wake now (the common path);
+      3. idle + non-empty draft            -> draft-through policy: preserve by default; opt-in
+                                              clobber-with-log (design 2.3 tier 3; see draft_through()).
+    The SCREEN is ground truth for 'idle at a prompt': a stale/empty/garbage store read must never
+    outrank a visibly-idle prompt (that is the whole stall fix), and — the converse — we never inject
+    when NO clean prompt is visible (mid-render, a running tool, needsInput), which keeps a wake off a
+    busy pane even when surface_busy leaned not-busy on a bad read."""
+    if surface_busy(surface):
+        return False                                   # tier 1 — never interrupt a live turn
+    screen = _cmux("read-screen", "--surface", surface, "--lines", "40")
+    prompts = [ln for ln in screen.splitlines() if "❯" in ln]   # ❯ = the compose-prompt marker
+    if not prompts:
+        return False                                   # no visible prompt -> not idle-at-prompt -> don't inject
+    draft = prompts[-1].split("❯", 1)[1].strip()
+    if draft:
+        return _wake_through_draft(surface, msg, draft)   # tier 3 — human draft present
+    _clear_draft_mark(surface)                         # clean prompt -> any prior draft is gone; reset the clock
+    _cmux("send", "--surface", surface, msg)           # tier 2 — clean empty prompt -> wake now
     _cmux("send-key", "--surface", surface, "enter")
     return True

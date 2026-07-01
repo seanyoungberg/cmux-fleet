@@ -73,6 +73,36 @@ def test_peer_msg_unknown_label_exits(two_peers):
         fh.cmd_peer_msg(["nobody", "hi", "--no-wake"])
 
 
+def test_peer_msg_muted_by_passive(two_peers, monkeypatch, capsys):
+    # 'passive' is the fleet-wide wake mute (codex BLOCKER): peer-msg must NOT wake, but STILL queues.
+    fs = two_peers
+    with open(fs.MODEFILE, "w") as f:
+        f.write("passive")
+    called = []
+    monkeypatch.setattr(fs, "wake_if_idle", lambda surf, msg: called.append(surf) or True)
+    rc = fh.cmd_peer_msg(["recipient", "hello while muted"])    # NO --no-wake
+    assert rc == 0
+    assert called == []                                         # muted -> wake_if_idle never invoked
+    assert len(fs.inbox_pending("RCP", kind="peer")) == 1       # but the row IS queued
+    assert "passive" in capsys.readouterr().out
+
+
+def test_broadcast_muted_by_passive(fs, monkeypatch, capsys):
+    # 'passive' also mutes broadcast wakes (codex BLOCKER): no wake, rows still queued.
+    fs.live_put("sender", {"surface": "SND", "kind": "conductor", "role": "c"})
+    fs.live_put("c1", {"surface": "C1", "kind": "conductor", "role": "c"})
+    monkeypatch.setenv("CMUX_SURFACE_ID", "SND")
+    with open(fs.MODEFILE, "w") as f:
+        f.write("passive")
+    called = []
+    monkeypatch.setattr(fs, "wake_if_idle", lambda surf, msg: called.append(surf) or True)
+    rc = fleet.cmd_broadcast(["heads up", "--target", "all-conductors"])
+    assert rc == 0
+    assert called == []                                         # muted -> no wake attempted
+    assert len(fs.inbox_pending("C1", kind="peer")) == 1        # the row IS queued
+    assert "passive" in capsys.readouterr().out
+
+
 # --- inbox-ack guards ----------------------------------------------------------------------------
 def test_inbox_ack_requires_surface(monkeypatch):
     monkeypatch.delenv("CMUX_SURFACE_ID", raising=False)

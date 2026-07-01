@@ -39,8 +39,11 @@ METAFILE = os.path.join(STATE, "router.daemon.json")
 LOG = os.path.join(STATE, "router.log")
 ROUTER_SEQ = os.path.join(STATE, "router.seq")
 ROUTER_LOCK = os.path.join(STATE, "router.live.lock")   # the router's bus-level singleton flock
+ROUTER_HEALTH = os.path.join(STATE, "router.health")    # the router's bus-consumption liveness stamp
 MANAGER_LOCK = os.path.join(STATE, "router.daemon.lock")  # the daemon MANAGER lock (start/ownership)
 DEFAULT_HEARTBEAT = 540                              # 9 min, within the spec's 8-10 min window
+HEALTH_STALE_S = 60          # a live router silent on the bus longer than this (bus HB ~15s) is WEDGED
+HEALTH_CHECK_S = 30          # how often the supervisor re-checks the router is still consuming the bus
 
 _manager_lock_fd = None   # supervisor keeps its manager-lock fd here so the flock survives for its life
 
@@ -290,14 +293,22 @@ def _run_daemon(heartbeat_secs):
     signal.signal(signal.SIGINT, _term)
 
     next_tick = time.time() + heartbeat_secs if heartbeat_secs else None
+    next_health = time.time() + HEALTH_CHECK_S        # router-wedge check runs regardless of --heartbeat
     while proc.poll() is None and not stopping["v"]:
         time.sleep(1)
-        if next_tick and time.time() >= next_tick:
+        now = time.time()
+        if next_tick and now >= next_tick:
             try:
                 _heartbeat_tick()
             except Exception as e:                   # a bad tick must never kill the daemon
                 print(f"[heartbeat] tick error: {e}", flush=True)
-            next_tick = time.time() + heartbeat_secs
+            next_tick = now + heartbeat_secs
+        if now >= next_health:
+            try:
+                _check_router_health(proc.pid)       # surface an alive-but-wedged router (silent-loss class)
+            except Exception as e:                   # a bad health check must never kill the daemon
+                print(f"[health] check error: {e}", flush=True)
+            next_health = now + HEALTH_CHECK_S
 
     if proc.poll() is None:                           # ensure the router is down before we exit
         proc.terminate()
@@ -314,8 +325,12 @@ def _run_daemon(heartbeat_secs):
 def _heartbeat_tick():
     """Tier-1 nudge ONLY (Berg 2026-06-30): re-nudge LIVE-IDLE conductors that have a pending inbox.
     wake_if_idle is the input-safe gate (skips running surfaces and a non-empty human draft); we also
-    skip muted agents. NO dead-session detection / auto-recycle."""
+    skip muted agents. NO dead-session detection / auto-recycle. The whole backstop honors the dial:
+    'notify-mode passive' is a fleet-wide wake mute (design 2.1), so the tick no-ops under it."""
     from . import state as fs
+    if not fs.idlewake_on():                          # 'passive' mutes the backstop too (coherent mute)
+        print("[heartbeat] tick: muted (notify-mode=passive)", flush=True)
+        return
     nudged = 0
     for label, e in fs.live_all().items():
         if e.get("kind") != "conductor" or e.get("muted"):
@@ -327,6 +342,39 @@ def _heartbeat_tick():
             nudged += 1
             print(f"[heartbeat] nudged {label} ({surf[:8]})", flush=True)
     print(f"[heartbeat] tick: {nudged} nudge(s)", flush=True)
+
+
+# --- router bus-consumption health (the wedge detector) ------------------------------------------
+def _router_health():
+    try:
+        return json.load(open(ROUTER_HEALTH))
+    except Exception:
+        return {}
+
+
+def _router_wedged(router_pid):
+    """True iff the router process is ALIVE but has not consumed a bus frame within HEALTH_STALE_S — the
+    'alive but not processing the bus' wedge that silently drops completions fleet-wide (the recurrent
+    daemon-WEDGE class). Fail-open: an absent / foreign-pid / timestamp-less health record returns False
+    (never cry wolf), so only a genuinely stale stamp under the CURRENT router pid trips it."""
+    if not router_pid or not _alive(router_pid):
+        return False
+    h = _router_health()
+    if h.get("pid") != router_pid or not h.get("ts"):
+        return False
+    return (time.time() - h["ts"]) > HEALTH_STALE_S
+
+
+def _check_router_health(router_pid):
+    """Surface a wedged router as UNHEALTHY in the daemon log so it doesn't just silently eat completions.
+    Detection only — recovery stays a human `fleet daemon restart` (auto-restart is out of scope)."""
+    if not _router_wedged(router_pid):
+        return False
+    age = round(time.time() - (_router_health().get("ts") or 0))
+    print(f"[health] WEDGED: router pid {router_pid} is ALIVE but has not consumed a bus frame in ~{age}s "
+          f"(>{HEALTH_STALE_S}s; bus heartbeat is ~15s) — completions may be dropping silently. "
+          f"Run `fleet daemon restart`.", flush=True)
+    return True
 
 
 # --- verbs ----------------------------------------------------------------------------------------
@@ -482,6 +530,15 @@ def _status():
     print(f"  uptime   : {up}")
     print(f"  heartbeat: {('every %ds' % hb) if hb else 'off'}")
     print(f"  bus seq  : {seq or '(none yet)'}")
+    rpid = _lock_holder_pid()                          # the live router pid (holds the bus singleton lock)
+    h = _router_health()
+    if h.get("pid") == rpid and h.get("ts"):
+        age = int(time.time() - h["ts"])
+        hp = ("WEDGED — not consuming the bus; `fleet daemon restart`" if age > HEALTH_STALE_S
+              else "consuming bus")
+        print(f"  router hp: {hp} (last bus frame ~{age}s ago)")
+    else:
+        print(f"  router hp: (no fresh stamp yet)")
     print(f"  log      : {LOG}")
     return 0
 

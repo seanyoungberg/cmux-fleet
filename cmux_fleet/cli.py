@@ -2453,14 +2453,18 @@ def cmd_broadcast(argv):
             "from_label": from_label, "msg_id": bid, "reply_to": None,
             "reply_expected": expect_reply, "body": body,
         })
-        if not no_wake and fs.wake_if_idle(surf, "(broadcast-wake) a fleet broadcast is waiting in your context; handle it"):
-            woke.append(label)
+        if not no_wake and fs.idlewake_on() and fs.wake_if_idle(surf, "(broadcast-wake) a fleet broadcast is waiting in your context; handle it"):
+            woke.append(label)                          # 'passive' mutes the wake fleet-wide; the inbox rows are still written
     fs.log_event("broadcast", **{"from": from_label, "target": target, "count": len(sel), "msg_id": bid})
     print(f"[broadcast] {from_label} -> {len(sel)} agent(s) (target {target}, msg {bid}, "
           f"reply: {'expected' if expect_reply else 'none'})")
     for label, v in sel:
         print(f"  {label:<24}{v.get('kind','-'):<11}{(v.get('surface') or '')[:8]}{'  (woke)' if label in woke else ''}")
-    if not no_wake:
+    if no_wake:
+        pass
+    elif not fs.idlewake_on():
+        print(f"  no wake (notify-mode passive); all {len(sel)} see it on their next turn")
+    else:
         print(f"  woke {len(woke)} idle agent(s); the rest see it on their next turn")
     return 0
 

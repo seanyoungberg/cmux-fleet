@@ -86,6 +86,56 @@ def test_heartbeat_nudges_only_idle_conductors_with_pending(monkeypatch):
     assert "SW" not in attempted                   # a child -> never nudged (conductors only)
 
 
+def test_heartbeat_muted_when_passive(monkeypatch):
+    # 'passive' is a fleet-wide wake mute (design 2.1): the backstop no-ops under it, even with an
+    # idle conductor that has pending inbox items.
+    from cmux_fleet import state as fs
+    with open(fs.MODEFILE, "w") as f:
+        f.write("passive")
+    fs.live_put("cond", {"role": "c", "kind": "conductor", "tool": "claude", "surface": "SC", "status": "live"})
+    fs.inbox_put("completion", "SC", {"gist": "x", "label": "k"})
+    attempted = []
+    monkeypatch.setattr(fs, "wake_if_idle", lambda surf, msg: attempted.append(surf) or False)
+    fd._heartbeat_tick()
+    assert attempted == []                          # muted -> never even reaches the gate
+
+
+# --- router bus-consumption health / wedge detection (Phase 4) -----------------------------------
+def test_router_wedged_detects_stale_live_router(monkeypatch):
+    # the fleet-wide silent-completion-loss class: router process ALIVE but not consuming the bus.
+    monkeypatch.setattr(fd, "_alive", lambda pid: True)
+    with open(fd.ROUTER_HEALTH, "w") as f:
+        json.dump({"pid": 4242, "ts": time.time() - (fd.HEALTH_STALE_S + 30), "frames": 9}, f)
+    assert fd._router_wedged(4242) is True          # alive + stale stamp -> wedged
+
+
+def test_router_not_wedged_when_fresh(monkeypatch):
+    monkeypatch.setattr(fd, "_alive", lambda pid: True)
+    with open(fd.ROUTER_HEALTH, "w") as f:
+        json.dump({"pid": 4242, "ts": time.time() - 5, "frames": 30}, f)
+    assert fd._router_wedged(4242) is False         # fresh stamp -> consuming
+
+
+def test_router_wedged_fails_open(monkeypatch):
+    # never cry wolf: no health file, a foreign-pid stamp, or a dead pid must NOT read as 'wedged'.
+    monkeypatch.setattr(fd, "_alive", lambda pid: True)
+    assert fd._router_wedged(4242) is False         # no health file at all
+    with open(fd.ROUTER_HEALTH, "w") as f:
+        json.dump({"pid": 9999, "ts": time.time() - 999, "frames": 1}, f)   # a DIFFERENT router's stamp
+    assert fd._router_wedged(4242) is False         # foreign pid -> can't judge this router
+    monkeypatch.setattr(fd, "_alive", lambda pid: False)                     # dead pid = 'down', not 'wedged'
+    with open(fd.ROUTER_HEALTH, "w") as f:
+        json.dump({"pid": 4242, "ts": time.time() - 999, "frames": 1}, f)
+    assert fd._router_wedged(4242) is False
+
+
+def test_check_router_health_logs_when_wedged(monkeypatch, capsys):
+    monkeypatch.setattr(fd, "_router_wedged", lambda pid: True)
+    monkeypatch.setattr(fd, "_router_health", lambda: {"pid": 4242, "ts": time.time() - 200})
+    assert fd._check_router_health(4242) is True
+    assert "WEDGED" in capsys.readouterr().out       # surfaced, not silently eaten
+
+
 # --- stray-router reap (bus singleton, daemon side) ----------------------------------------------
 def test_lock_holder_pid_detects_held_and_free():
     os.makedirs(os.path.dirname(fd.ROUTER_LOCK), exist_ok=True)

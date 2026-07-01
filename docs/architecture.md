@@ -67,7 +67,7 @@ throwaway state dir gives you a clean run.
   it is rebuilt). Kept separate from the durable ack cursors.
 - `log.jsonl`: an append-only event ledger (`launched`, `archived`, `revived`,
   `recycled`, `removed`, `broadcast`, ...). The source-of-truth timeline.
-- `notify-mode`: the dial: `passive` | `autodrain` | `auto`.
+- `notify-mode`: the wake **mute switch**: `passive` (mute) | `auto` (default, wake-now).
 - `router.seq`: the bus replay cursor, distinct from the inbox seq.
 - `router.pid` / `router.daemon.json` / `router.log`: the daemon manager's
   pidfile (the supervisor pid), its metadata (state dir, start time, heartbeat
@@ -134,8 +134,8 @@ both run). Both self-identify via `$CMUX_SURFACE_ID`, read and write under
   peers ack independently.
 - **drain.py** (`Stop`): the auto-continue path. Returns
   `{decision: block, reason: ...}` so the agent continues the turn and processes
-  pending work instead of stopping. Child completions drain here only in
-  `autodrain`/`auto` mode; peer messages drain here always. A per-kind
+  pending work instead of stopping. Child completions drain here unless the dial
+  is `passive` (wake-now default); peer messages drain here always. A per-kind
   block-mark stops an un-acked set from re-blocking forever (it falls back to
   the awareness hook).
 

@@ -70,7 +70,7 @@ def cmd_hook_awareness(argv):
 
 def cmd_hook_drain(argv):
     """Stop: return {decision:block, reason:...} so the turn auto-continues to process pending work.
-      - child completions: drained ONLY in autodrain/auto mode (the dial governs chasing children).
+      - child completions: drained unless the dial is 'passive' (wake-now default; passive mutes).
       - peer messages: drained ALWAYS (a deliberate peer send wants attention now).
     Per-kind block-mark guard prevents re-blocking an un-acked set forever. Blank = don't block. Fails open."""
     _read_stdin()

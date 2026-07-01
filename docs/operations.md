@@ -10,7 +10,7 @@ them from inside a conductor's cmux surface, so `$CMUX_SURFACE_ID` is set.
 # daemon
 fleet daemon start [--heartbeat]            # detached router (survives shell exit + recycle)
 fleet daemon status | stop | restart
-echo auto > "$CMUX_STATE_DIR/notify-mode"   # passive | autodrain | auto
+echo auto > "$CMUX_STATE_DIR/notify-mode"   # passive (mute) | auto (default, wake-now)
 
 # spawn + drive
 fleet launch <role> [--place tab|pane|workspace] [--dry-run] [-- <tool flags>]
@@ -102,18 +102,44 @@ off. To observe without acting, run it directly: `python -m cmux_fleet.router`
 The dial is the file `$CMUX_STATE_DIR/notify-mode`. Read or set it directly:
 
 ```
-cat "$CMUX_STATE_DIR/notify-mode"            # current mode
-echo passive   > "$CMUX_STATE_DIR/notify-mode"
-echo autodrain > "$CMUX_STATE_DIR/notify-mode"
-echo auto      > "$CMUX_STATE_DIR/notify-mode"
+cat "$CMUX_STATE_DIR/notify-mode"            # current mode ('auto' when absent)
+echo passive > "$CMUX_STATE_DIR/notify-mode" # the one mute
+echo auto    > "$CMUX_STATE_DIR/notify-mode" # explicit wake-now (same as absent)
 ```
 
-- **passive** (the default when the file is absent or empty): pending work waits
-  in the inbox and surfaces via context on the conductor's next turn.
-- **autodrain**: the Stop hook auto-continues the conductor to process pending
-  child completions. Peer messages drain at Stop in every mode.
-- **auto**: autodrain plus router idle-wake of a conductor that is sitting idle
-  at an empty prompt.
+- **auto** (the default when the file is absent or empty): the router idle-wakes a
+  conductor sitting idle at an empty prompt to handle a completion/peer now, and the
+  Stop hook auto-continues it to drain pending work at a turn's end.
+- **passive**: the single mute — suppresses idle-wake AND auto-drain fleet-wide;
+  pending work waits in the inbox and surfaces via context on the next turn.
+
+The retired `autodrain` value normalizes to `auto`. Peer messages drain at Stop in
+every mode; `peer-msg --no-wake` is the per-message opt-out for acks/FYIs.
+
+## Draft-through — waking through a human draft
+
+When an idle conductor has a **human draft** in its input box, the wake gate applies
+the `draft-through` policy (`$CMUX_STATE_DIR/draft-through`):
+
+```
+cat  "$CMUX_STATE_DIR/draft-through"                 # current policy ('stale' when absent)
+echo clobber  > "$CMUX_STATE_DIR/draft-through"      # clobber ANY draft immediately (no wait)
+echo preserve > "$CMUX_STATE_DIR/draft-through"      # never clobber (a walked-away draft just waits)
+```
+
+- **stale** (the default): the **stale-draft gate**. A *walked-away* draft — one left
+  **unchanged for ≥ 90s** — is clobbered (input cleared via `send-key ctrl+u`, wake
+  injected, `draft_clobbered` logged) so it can't silence the conductor indefinitely;
+  a **fresh** draft (active typing) is preserved. Meets "never an indefinite silent
+  stall" while protecting a human mid-thought.
+- **clobber**: aggressive — clobber-with-log on *any* draft, no stale wait.
+- **preserve**: conservative — never clobber; a walked-away draft waits in the inbox
+  until the human returns.
+
+The input-clear (`ctrl+u`) is **best-effort** (it degrades to a mashed submit, never a
+silent stall) and still wants a live-TUI prototype for multi-line / pasted-image
+drafts; the elegant save/clear/wake/**restore** path (preserve the draft across the
+wake) is the planned follow-up.
 
 ## Launching agents
 
