@@ -9,7 +9,7 @@
 #
 #   python3 router.py            # OBSERVE: log decisions, write/send nothing
 #   python3 router.py --live     # ACTIVE: write inbox + notify; idle-wake unless notify-mode==passive
-import fcntl, json, os, pty, subprocess, sys, time
+import fcntl, json, os, pty, subprocess, sys, threading, time
 from datetime import datetime
 
 from .config import CMUX  # path resolver
@@ -27,6 +27,15 @@ _lock_fd = None   # module-global so the flock survives for the whole process (c
 # needs surface->entry on each Stop, so build the inverse once per reload — critic issue #6).
 _reg = {"mtime": 0, "by_label": {}, "by_surface": {}}
 _last = {}   # surface -> last-handled event ts (debounce the ~2 Stops/turn)
+
+# Event-driven idle-wake retry (design 2.2b): when an idle-wake is skipped because the parent was
+# genuinely mid-turn AT EVENT TIME, re-attempt the wake a few times over the next ~30s so latency is
+# seconds — not up to the 2m heartbeat. Re-fires the WAKE ONLY: the completion is already durable in
+# the inbox, so nothing is re-delivered and no duplicate rows are created. Bounded + deduped per
+# surface; the heartbeat is the backstop for anything past the cap.
+RETRY_BACKOFF_S = (5, 10, 15)   # re-check at +5s, +15s, +30s after a skip, then defer to the heartbeat
+_retrying = set()               # surfaces with an in-flight retry loop (dedup guard)
+_retry_lock = threading.Lock()
 
 
 def cmux(*args, timeout=10):
@@ -99,7 +108,39 @@ def maybe_idle_wake(parent_surface, label):
     if fs.wake_if_idle(parent_surface, "(auto-wake) handle your pending child completions"):
         log(f"[IDLE-WAKE] {label}: empty prompt -> submitted wake trigger")
     else:
-        log(f"[idle-wake] skip {label}: busy or has a draft")
+        log(f"[idle-wake] skip {label}: busy or has a draft -> scheduling bounded retry")
+        _schedule_idle_wake_retry(parent_surface, label)
+
+
+def _schedule_idle_wake_retry(surface, label):
+    """Spawn ONE bounded background retry loop per surface (deduped). Non-blocking by design: the bus
+    loop must keep processing other Stops while a mid-turn parent finishes its current turn."""
+    with _retry_lock:
+        if surface in _retrying:
+            return                                      # a retry is already chasing this surface
+        _retrying.add(surface)
+    threading.Thread(target=_idle_wake_retry_loop, args=(surface, label), daemon=True).start()
+
+
+def _idle_wake_retry_loop(surface, label):
+    """Re-attempt the idle-wake over RETRY_BACKOFF_S, stopping as soon as it wakes, the inbox drains,
+    or the dial goes passive. Re-fires the WAKE ONLY (content stays durable) — never re-delivers."""
+    try:
+        for delay in RETRY_BACKOFF_S:
+            time.sleep(delay)
+            if not fs.idlewake_on():                    # dial muted mid-retry -> stop
+                return
+            if not fs.inbox_pending(surface, kind="completion"):
+                log(f"[idle-wake-retry] {label}: inbox drained before wake -> done")
+                return                                  # handled meanwhile (woken elsewhere / acked)
+            if fs.wake_if_idle(surface, "(auto-wake) handle your pending child completions"):
+                log(f"[idle-wake-retry] {label}: woke after ~{delay}s backoff")
+                return
+        log(f"[idle-wake-retry] {label}: still not wakeable after {len(RETRY_BACKOFF_S)} tries; "
+            f"heartbeat is the backstop")
+    finally:
+        with _retry_lock:
+            _retrying.discard(surface)
 
 
 def deliver(parent_surface, parent_label, child_entry, child_surface):
