@@ -383,18 +383,70 @@ def lifecycle(surface):
     return best
 
 
+# --- wake-gate liveness: staleness + bound-session cross-check (design 2.2a) ----------------
+# lifecycle() above returns the freshest record's RAW agentLifecycle (for display: `fleet ls`, vitals,
+# the cli.py liveness checks). The WAKE GATE needs a stricter question — "is this surface in a GENUINE,
+# live, mid-turn 'running' state I must not interrupt?" — because a STALE/orphaned 'running' record
+# (a cmux reboot-replay, a move-surface binding desync, a pre-fix summarizer stomp) must NOT read as
+# busy: if it does, guard #1 trips on every event and the surface is silenced forever (the cmux-advisor
+# stall, root-caused 2026-07-01). We keep lifecycle()'s contract intact (cli.py/features.py depend on
+# it) and answer the wake question with a dedicated, hardened predicate.
+LIFECYCLE_STALE_S = 90   # a 'running' record that has not ticked within this window is not a live turn
+
+
+def surface_busy(surface, now=None):
+    """True ONLY when `surface` is genuinely mid-turn (a fresh, live 'running' record) — the single case
+    the wake gate must never interrupt. Hardened two ways against the stale read that stalled
+    cmux-advisor:
+      - liveness cross-check: prefer the record for the fleet's OWN bound session (registry truth, kept
+        honest by the reconciliation lane) over 'max updatedAt across all records on the surface'. The
+        pointer that lied in the incident was cmux's activeSessionsBySurface, not the fleet binding, so
+        resolving against the binding defeats the orphaned-'running' record directly.
+      - staleness guard: a 'running' record that has not ticked within LIFECYCLE_STALE_S is treated as
+        NOT a live turn (a real turn re-stamps continuously; a frozen one is an orphan).
+    Leans to NOT-busy on any ambiguity/read error: wake_if_idle then confirms an actual clean idle
+    prompt on screen before injecting, so a false 'not busy' can never corrupt a real turn, while a
+    false 'busy' — the failure we are killing — can never silence an idle surface."""
+    now = time.time() if now is None else now
+    try:
+        recs = [s for s in (read_hook_store().get("sessions") or {}).values()
+                if s.get("surfaceId") == surface]
+        if not recs:
+            return False                        # nothing claims this surface -> not provably busy
+        bound = bare_uuid((entry_for_surface(surface) or {}).get("session", ""))
+        rec = None
+        if bound:
+            rec = next((s for s in recs if bare_uuid(s.get("sessionId", "")) == bound), None)
+        if rec is None:                         # no fleet-bound record -> fall back to the freshest
+            rec = max(recs, key=lambda s: s.get("updatedAt") or 0)
+        if rec.get("agentLifecycle") != "running":
+            return False
+        return (now - (rec.get("updatedAt") or 0)) <= LIFECYCLE_STALE_S
+    except Exception:
+        return False                            # fail-open to not-busy; the screen read is the arbiter
+
+
 def wake_if_idle(surface, msg):
-    """Inject+submit a wake ONLY if the surface is at the prompt with an empty draft; else leave it
-    (it sees the inbox next turn). Returns True if it woke. The ONE copy of the wake gate, shared by
-    the router's idle-wake and peer-msg (simplify #4). Two guards: (1) busy = lifecycle 'running' ->
-    never interrupt; (2) a human draft (bottom-most prompt line with text after the marker) -> never
-    clobber."""
-    if lifecycle(surface) == "running":
-        return False
+    """Inject+submit a wake ONLY when the surface is sitting at a clean prompt with an empty draft;
+    otherwise leave it (the item is already durable in the inbox — it is seen next turn). Returns True
+    iff it woke. The ONE wake gate, shared by the router idle-wake, peer-msg, broadcast, and the
+    heartbeat backstop, so its tier ladder (design 2.3) covers every path:
+      1. genuinely mid-turn (surface_busy) -> queue, never interrupt;
+      2. idle + empty draft                -> wake now (the common path);
+      3. idle + non-empty draft            -> preserve the human draft; skip for now (Phase 4 upgrades
+                                              this to save/clear/wake/restore, else clobber-with-log).
+    The SCREEN is ground truth for 'idle at a prompt': a stale/empty/garbage store read must never
+    outrank a visibly-idle prompt (that is the whole stall fix), and — the converse — we never inject
+    when NO clean prompt is visible (mid-render, a running tool, needsInput), which keeps a wake off a
+    busy pane even when surface_busy leaned not-busy on a bad read."""
+    if surface_busy(surface):
+        return False                                   # tier 1 — never interrupt a live turn
     screen = _cmux("read-screen", "--surface", surface, "--lines", "40")
-    prompts = [ln for ln in screen.splitlines() if "❯" in ln]   # ❯
-    if prompts and prompts[-1].split("❯", 1)[1].strip():
-        return False
-    _cmux("send", "--surface", surface, msg)
+    prompts = [ln for ln in screen.splitlines() if "❯" in ln]   # ❯ = the compose-prompt marker
+    if not prompts:
+        return False                                   # no visible prompt -> not idle-at-prompt -> don't inject
+    if prompts[-1].split("❯", 1)[1].strip():
+        return False                                   # tier 3 — human draft present -> preserve it
+    _cmux("send", "--surface", surface, msg)           # tier 2 — clean empty prompt -> wake now
     _cmux("send-key", "--surface", surface, "enter")
     return True
