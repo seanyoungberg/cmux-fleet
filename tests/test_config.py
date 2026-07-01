@@ -31,6 +31,11 @@ def _resolve(env=None, toml_text=None, toml_dir=None, cwd=None):
         with open(path, "w") as f:
             f.write(toml_text)
         e["CMUX_FLEET_TOML"] = path
+    else:
+        # Hermeticity: strip of CMUX_* + XDG_CONFIG_HOME would otherwise let config fall back to the
+        # HOST's real ~/.config/cmux-fleet/fleet.toml. Point at an absent path so config resolves pure
+        # built-in defaults regardless of any machine config (e.g. a cutover-created fleet.toml).
+        e["CMUX_FLEET_TOML"] = os.path.join(toml_dir or cwd or os.getcwd(), "__no_such_fleet__.toml")
     if env:
         e.update(env)
     p = subprocess.run([sys.executable, "-c", _DUMP], env=e, cwd=cwd, capture_output=True, text=True)

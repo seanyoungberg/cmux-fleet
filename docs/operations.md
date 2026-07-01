@@ -8,7 +8,8 @@ surface, so `$CMUX_SURFACE_ID` is set.
 
 ```
 # daemon
-python3 scripts/router.py --live            # start the one router (omit --live to observe)
+fleet daemon start [--heartbeat]            # detached router (survives shell exit + recycle)
+fleet daemon status | stop | restart
 echo auto > "$CMUX_STATE_DIR/notify-mode"   # passive | autodrain | auto
 
 # spawn + drive
@@ -38,22 +39,38 @@ fleet broadcast "<msg>" [--target all|all-conductors|all-children|my-children]
 python3 scripts/inbox-ack.py <seq> [--peer]
 ```
 
-## Start the router
+## The router daemon
 
-One router serves every conductor on the machine. Start it once:
+One router serves every conductor on the machine. Run it as a managed daemon:
 
 ```
-python3 scripts/router.py --live
+fleet daemon start                 # detached router; survives shell exit + conductor recycle
+fleet daemon start --heartbeat     # also nudge live-idle conductors with pending work (every 540s)
+fleet daemon status                # running? which state dir, uptime, bus seq
+fleet daemon stop
+fleet daemon restart               # preserves the running --heartbeat setting unless overridden
 ```
 
-`--live` writes to the inbox, fires `cmux notify` banners, and (in `auto` mode)
-wakes idle conductors. Omit `--live` to observe: it logs what it would do and
-changes nothing, which is the way to confirm wiring before going live. The
-router prints its mode, the notify-mode, and the resolved state dir on startup,
-then logs each registry reload and each delivery.
+`start` double-forks with `setsid` so the router is fully detached (own session,
+no controlling terminal, its own process group) and reparented to init. That is
+what lets it survive the starting shell exiting, an agent's Bash-tool
+process-group cleanup, and a conductor self-recycle (a bare `nohup &` router does
+not: it dies with the pane's process group). It writes `<state>/router.pid` and
+`<state>/router.daemon.json`, logs to `<state>/router.log`, refuses to start if
+one is already running, and cleans a stale pidfile (dead pid). The daemon is
+per-state, so under a profile it manages that profile's router (see
+`docs/profiles.md`).
 
-It tails the cmux agent bus with a replay cursor (`router.seq`), so a restart
-resumes where it left off rather than replaying old events.
+`--heartbeat [SECS]` adds a periodic tick (default 540s) that re-nudges only
+LIVE-IDLE conductors that have a pending inbox, through the same input-safe
+`wake_if_idle` gate (never a busy surface, never a human draft); muted agents and
+non-conductors are skipped. There is no dead-session detection or auto-recycle.
+
+Under the hood the daemon runs `router.py --live`, which writes to the inbox,
+fires `cmux notify` banners, and (in `auto` mode) wakes idle conductors, tailing
+the cmux agent bus with a replay cursor (`router.seq`) so a restart resumes where
+it left off. To observe without acting, run it directly: `python3
+scripts/router.py` (no `--live`) logs what it would do and changes nothing.
 
 ## The mode dial
 
@@ -298,6 +315,18 @@ fleet launch sandbox-conductor                            # auto-anchors its own
 
 `--init` creates the state dir and seeds the roster from `fleet.toml.example`.
 Full model and the Nth-build workflow are in `docs/profiles.md`.
+
+### Gotcha: a recycled agent bakes `CMUX_STATE_DIR` into its env
+
+Config precedence is **env > `[fleet]` toml > default**, and a recycled or revived
+agent carries the `CMUX_STATE_DIR` (and the other `CMUX_*` paths) that were in its
+launch command's env, re-injected on every respawn. So changing `state_dir` in the
+toml alone does **not** move an already-running agent: its baked env var shadows
+the toml value silently. To relocate state (for example the `.cmux-state` to XDG
+cutover), recycle the agents with an explicit override, e.g.
+`fleet recycle <label> -- ...` from a shell whose `CMUX_STATE_DIR` points at the
+new location, or unset the baked var so the toml/default applies. A future
+`fleet migrate` should rebake the env as part of the move.
 
 ## Stranger first run
 

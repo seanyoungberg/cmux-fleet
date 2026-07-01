@@ -1679,7 +1679,7 @@ def cmd_profile(argv):
 
 def main():
     if len(sys.argv) < 2 or sys.argv[1] in ("-h", "--help"):
-        print("usage: fleet <launch|config|ls|archive|revive|recycle|rm|vitals|find|graph|serve|paint|worktree|profile> ...\n"
+        print("usage: fleet <launch|config|ls|archive|revive|recycle|rm|vitals|find|graph|serve|paint|worktree|profile|daemon> ...\n"
               "  launch <role|--adhoc NAME> [--tool t] [--place p] [--parent s] [--dry-run] [-- <tool flags>]\n"
               "  config <role|--adhoc NAME|--cwd DIR> [--tool t]   effective config (base settings + fleet adds)\n"
               "  ls                                                live fleet x hook store; flags STALE + archived\n"
@@ -1698,15 +1698,17 @@ def main():
               "  serve [--port N]                                  thin read-only localhost view (graph HTML + vitals.json); no daemon\n"
               "  paint                                             sync fleet state onto the cmux sidebar (status pills + ctx bars)\n"
               "  worktree <ls | clean <label> [--wip-commit]>      manage fleet-owned git worktrees (config-gated, default-off)\n"
-              "  profile <name> [--base DIR] [--root DIR] [--init]  emit env that pins ALL entrypoints at THIS build (eval it for multi-build isolation)")
+              "  profile <name> [--base DIR] [--root DIR] [--init]  emit env that pins ALL entrypoints at THIS build (eval it for multi-build isolation)\n"
+              "  daemon <start|stop|status|restart> [--heartbeat [SECS]]  run the router as a detached daemon (survives shell exit + recycle)")
         return 0
     sub, rest = sys.argv[1], sys.argv[2:]
     import fleet_features as ff
+    import fleet_daemon as fd
     fns = {"launch": cmd_launch, "config": cmd_config, "ls": cmd_ls,
            "archive": cmd_archive, "revive": cmd_revive, "recycle": cmd_recycle,
            "_recycle-exec": cmd_recycle_exec, "broadcast": cmd_broadcast,
            "mute": lambda a: cmd_mute(a, mute=True), "unmute": lambda a: cmd_mute(a, mute=False),
-           "rm": cmd_rm, "worktree": cmd_worktree, "profile": cmd_profile,
+           "rm": cmd_rm, "worktree": cmd_worktree, "profile": cmd_profile, "daemon": fd.cmd_daemon,
            "vitals": ff.cmd_vitals, "find": ff.cmd_find, "graph": ff.cmd_graph,
            "serve": ff.cmd_serve, "paint": ff.cmd_paint}
     if sub in fns:

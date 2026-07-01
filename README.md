@@ -82,6 +82,7 @@ mode dial below).
 | `fleet worktree ls` / `clean` | manage fleet-owned git worktrees (config-gated) |
 | `fleet broadcast "<msg>"` | input-safe heads-up to a target set of live agents |
 | `fleet profile <name>` | pin all entrypoints at this build (multi-build isolation) |
+| `fleet daemon start\|stop\|status\|restart` | run the router as a detached daemon (survives shell exit + recycle); `--heartbeat` to nudge idle conductors |
 | `peer-msg.py` / `child-digest.py` / `drive-child.py` / `inbox-ack.py` | agent-facing helpers |
 
 Full runbook in `docs/operations.md`.
@@ -187,8 +188,9 @@ shape from [elevens](https://github.com/hummer98/elevens). Design-mined, not cop
 
 ## Roadmap
 
-Planned, not yet implemented: a packaged router/heartbeat daemon
-(`fleet daemon start|stop|status`).
+Planned, not yet implemented: `fleet daemon install-launchd` (a LaunchAgent for
+cross-reboot persistence; the daemon already survives sessions and recycles
+without it).
 
 ## More
 

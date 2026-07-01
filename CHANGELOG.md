@@ -98,6 +98,16 @@ vault or machine.
   the group's members out of the registry (worktree branches are kept), while plain `rm` leaves members
   ungrouped. The sandbox profile is now turnkey (no manual `workspace-group create`).
 
+- **Router daemon** (`scripts/fleet_daemon.py`). `fleet daemon start|stop|status|restart` runs the
+  router as a properly detached daemon: `start` double-forks with `setsid` (its own session, no
+  controlling terminal) and leads its own process group, so it survives the starting shell exiting, an
+  agent Bash-tool process-group cleanup, and a conductor self-recycle (a bare `nohup &` router does
+  not). Pidfile + meta + log under `$CMUX_STATE_DIR` (per state/profile); refuses to double-start,
+  cleans a stale pidfile, and `stop` signals the whole process group (router included). `--heartbeat
+  [SECS]` adds a Tier-1 tick (default 540s) that re-nudges only LIVE-IDLE conductors with a pending
+  inbox through the input-safe `wake_if_idle` gate (skips busy/human-draft/muted/non-conductor); no
+  dead-session detection or auto-recycle.
+
 ### Fixed
 
 - **Recycle relaunch is timing- and crash-safe.** A recycled agent relaunched

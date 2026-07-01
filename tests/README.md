@@ -10,8 +10,8 @@ python3 -m venv .venv && .venv/bin/pip install pytest   # one-time
 .venv/bin/python -m pytest tests/ -q
 ```
 
-Latest: **112 tests.** All pass where a headless-runnable `claude` is on PATH; otherwise the one real
-`claude --plugin-dir` load test skips, leaving **111 passed, 1 skipped**.
+Latest: **117 tests.** All pass where a headless-runnable `claude` is on PATH; otherwise the one real
+`claude --plugin-dir` load test skips, leaving **116 passed, 1 skipped**.
 
 ## Layers
 
@@ -44,6 +44,9 @@ Latest: **112 tests.** All pass where a headless-runnable `claude` is on PATH; o
   - `test_groups.py`: workspace-group name->ref resolution; bootstrap uses an explicit `--from`;
     join-when-exists doesn't recreate; conductor group defaults to label; `rm --with-group` dissolves
     by ref, without it leaves the group intact.
+  - `test_daemon.py`: `fleet daemon` pidfile/liveness (status-not-running, stale-pidfile cleanup,
+    start-refuses-if-running, stop-when-not-running) and the heartbeat filter (nudges only idle
+    conductors with pending inbox; skips busy/muted/child). The double-fork daemonize is smoke-tested.
 - **e2e**
   - `test_e2e_cli.py`: the CLI lifecycle `ls -> archive -> revive -> rm` driven as real subprocess
     invocations against the throwaway state with a **stubbed cmux binary**. Real launch/revive need a
