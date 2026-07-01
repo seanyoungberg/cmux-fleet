@@ -462,6 +462,46 @@ def render_send_cmd(bin_name, args, env, abs_cwd):
     return " ".join(parts)
 
 
+# markers that an agent TUI has taken over the surface (booting or up) — used to STOP re-kicking Enter
+# into a launch that already started (so a slow-booting agent is never spammed with stray keystrokes).
+_TUI_MARKERS = ("Context Remaining", "bypass permissions", "esc to interrupt",
+                "auto-accept edits", "? for shortcuts", "Welcome to Claude")
+
+
+def _agent_surfaced(surf):
+    """True once an agent TUI is visible on the surface (booting or running). While False, the surface
+    is still at the shell — an injected command that hasn't started, i.e. the enter-race symptom."""
+    pane = cmuxq("capture-pane", "--surface", surf) or ""
+    return any(m in pane for m in _TUI_MARKERS)
+
+
+def _send_launch_and_confirm(ws, surf, send_cmd, lazy, timeout):
+    """Inject the launch command + Enter, then VERIFY it actually started and RE-KICK Enter if the
+    terminating newline lost the paste-settle race (the injected command sits unexecuted at the shell —
+    the intermittent 'dead launch': surface exists, no agent). The success signal is the strongest
+    readback available — a bound session for claude; for a lazy tool (binds on its first turn) an agent
+    TUI appearing. Re-kicks are bounded and suppressed once a TUI is on-screen, so a slow boot is never
+    spammed. Returns the bound sid, or '' (normal for a lazy tool). Retries the ENTER, never the paste."""
+    cmuxq("send", "--workspace", ws, "--surface", surf, send_cmd + "\n")
+    end = time.time() + timeout
+    kicks, max_kicks = 0, 5
+    while time.time() < end:
+        sid = poll_session(surf, timeout=1)
+        if sid:
+            return sid                                       # claude bound -> definitively started
+        surfaced = _agent_surfaced(surf)
+        if lazy and surfaced:
+            return ""                                        # lazy tool is up; it binds on its 1st turn
+        if not surfaced and kicks < max_kicks:
+            # still at the shell -> the Enter didn't land; re-kick it, then let the paste settle.
+            cmuxq("send-key", "--surface", surf, "enter")
+            kicks += 1
+            time.sleep(2)
+        else:
+            time.sleep(1)
+    return ""
+
+
 def cmd_launch(argv):
     # split launcher args | verbatim tool passthrough on the first standalone `--`
     caller = []
@@ -574,15 +614,17 @@ def cmd_launch(argv):
     if not ws or not surf:
         sys.exit(1)
     print(f"[fleet] target ws={ws} surface={surf}")
-    cmuxq("send", "--workspace", ws, "--surface", surf, send_cmd + "\n")
     # claude binds a session at BOOT; codex (and the other cmux agents) register LAZILY on their first
     # turn. So poll briefly but DON'T fail if there's no session yet -> register the surface now and let
     # the session BACKFILL on the child's first turn (the router does this when it sees the first Stop).
+    # _send_launch_and_confirm injects the command and RE-KICKS the terminating Enter if it lost the
+    # paste-settle race (the injected cmd otherwise sits unexecuted at the shell -> no agent ever starts).
     lazy = spec["tool"] != "claude"
     print(f"[fleet] waiting for cmux to bind a session to {surf} ...")
-    sid = poll_session(surf, timeout=8 if lazy else 60)
+    sid = _send_launch_and_confirm(ws, surf, send_cmd, lazy, timeout=8 if lazy else 60)
     if not sid and not lazy:
-        sys.exit("[fleet] timed out waiting for session binding")
+        sys.exit(f"[fleet] timed out waiting for session binding; the injected command may not have "
+                 f"started. Inspect the surface: cmux capture-pane --surface {surf}")
     register(surf, spec, a.parent, sid or "", ws)
     log_launch(spec, a.parent, surf, sid or "", send_cmd)
     # post-launch placement reconciliation: confirm the surface actually came up IN the worktree (a
@@ -1098,56 +1140,128 @@ def cmd_revive(argv):
 
 
 # ---------------------------------------------------------------- register (manual escape hatch)
+def _launchcmd(rec):
+    """The launchCommand of a session record as a STRING. cmux normally records a string, but some
+    builds store a structured object (dict/list) — passing THAT to re.search raised 'expected string or
+    bytes-like object, got dict', the `fleet register` crash. json.dumps a non-string so an AGENT_LABEL=/
+    AGENT_ROLE= substring still matches, instead of exploding; a scalar with no command -> ''."""
+    v = rec.get("launchCommand") if isinstance(rec, dict) else rec
+    if isinstance(v, str):
+        return v
+    if isinstance(v, (dict, list)):
+        try:
+            return json.dumps(v)
+        except Exception:
+            return ""
+    return ""
+
+
+def _sessions_on_surface(d, surf):
+    """All session records in store `d` bound to `surf`, freshest (updatedAt) first."""
+    su = (surf or "").upper()
+    recs = [s for s in (d.get("sessions") or {}).values() if (s.get("surfaceId") or "").upper() == su]
+    recs.sort(key=lambda s: s.get("updatedAt") or 0, reverse=True)
+    return recs
+
+
+def _live_session_for(surf):
+    """The single CURRENTLY-LIVE session record for `surf`, or None. Unlike poll_session (which happily
+    returns a HISTORICAL sessions[] entry), this REFUSES an ended/stale surface — the register-specific
+    live gate (codex P1) so `fleet register` can't bind + archive_del onto a dead surface. Order:
+      1. activeSessionsBySurface[surf] — cmux's own 'bound right now' index (resolved to the full
+         sessions[] record by sessionId for tool/cwd/role; the index entry itself is the fallback);
+      2. else the freshest sessions[] record for the surface whose agentLifecycle is not in
+         ('','-','ended') AND whose surface still resolves live in the tree (surface_loc()[0] present)."""
+    d = _store()
+    active = d.get("activeSessionsBySurface") or {}
+    ae = active.get(surf) or active.get((surf or "").upper()) or {}
+    if ae.get("sessionId"):
+        for s in (d.get("sessions") or {}).values():
+            if (s.get("sessionId") or "") == ae["sessionId"]:
+                return s
+        return ae
+    live_recs = [s for s in _sessions_on_surface(d, surf)
+                 if (s.get("agentLifecycle") or "") not in ("", "-", "ended")]
+    if live_recs and surface_loc(surf)[0]:
+        return live_recs[0]
+    return None
+
+
+def _poll_live_session(surf, timeout=5):
+    """Poll _live_session_for until the surface is live (a just-launched agent may take a beat to bind),
+    or timeout. Returns the validated live record, or None."""
+    end = time.time() + timeout
+    while True:
+        rec = _live_session_for(surf)
+        if rec or time.time() >= end:
+            return rec
+        time.sleep(1)
+
+
 def _discover_surface_for(label, abs_cwd):
-    """Find a LIVE agent's surface UUID in the cmux hook store WITHOUT the registry (that's the whole
-    point — it's unregistered). Prefer an exact AGENT_LABEL match in the recorded launchCommand (fleet
-    injects AGENT_LABEL=<label> into every launch); fall back to a cwd match. Returns '' if ambiguous/none."""
+    """Discover a LIVE agent's surface UUID from the cmux hook store WITHOUT the registry (it's
+    unregistered — the whole point). Considers only NON-ENDED surfaces. An exact AGENT_LABEL match in the
+    launchCommand (fleet injects AGENT_LABEL=<label> into every launch) wins outright; else fall back to
+    cwd, but ONLY if EXACTLY ONE surface matches. Returns (surf, cwd_candidates): surf is '' when nothing
+    matched or the cwd match is ambiguous, and cwd_candidates lists the tied surfaces so the caller can
+    show them and ask for --surface (codex P2: the old code returned the FIRST cwd match despite the
+    docstring promising ambiguity -> '')."""
     import re
     d = _store()
     needle = re.compile(rf"AGENT_LABEL=['\"]?{re.escape(label)}['\"]?(\s|$)")
-    by_cwd = ""
+    by_cwd = []
     for s in (d.get("sessions") or {}).values():
         surf = s.get("surfaceId") or ""
-        if not surf:
-            continue
-        if needle.search(s.get("launchCommand") or ""):
-            return surf                                        # exact label match wins outright
+        if not surf or (s.get("agentLifecycle") or "") in ("-", "ended"):
+            continue                                           # skip ended/stale surfaces
+        if needle.search(_launchcmd(s)):
+            return surf, []                                    # exact label match wins outright
         if abs_cwd and s.get("cwd") and os.path.realpath(s["cwd"]) == os.path.realpath(abs_cwd):
-            by_cwd = by_cwd or surf
-    return by_cwd
+            if surf not in by_cwd:
+                by_cwd.append(surf)
+    if len(by_cwd) == 1:
+        return by_cwd[0], []
+    return "", by_cwd                                          # 0 or >1 cwd matches -> ambiguous/none
 
 
 def _tool_for_surface(surf):
-    """Which agent tool (claude/codex/...) owns this surface, DERIVED from cmux's PER-tool hook stores
-    (~/.cmuxterm/<tool>-hook-sessions.json) — a live-binding fact, not a guess. '' if not found."""
+    """Which agent tool (claude/codex/...) owns this surface RIGHT NOW, from cmux's PER-tool hook stores
+    (~/.cmuxterm/<tool>-hook-sessions.json). On the rare cross-tool surface reuse we do NOT pick
+    alphabetically (the old bug: a stale codex record shadowing a live claude one) — prefer the tool
+    whose store lists the surface as ACTIVE, else the tool with the freshest non-ended record. '' if no
+    store (live-)knows the surface."""
     import glob
     from config import HOOKSTORE
     su = (surf or "").upper()
     suffix = "-hook-sessions.json"
+    best_tool, best_rank = "", None                            # rank = (is_active, freshest_updatedAt)
     for path in sorted(glob.glob(os.path.join(HOOKSTORE, "*" + suffix))):
         try:
             d = json.load(open(path))
         except Exception:
             continue
-        hit = any((k or "").upper() == su for k in (d.get("activeSessionsBySurface") or {})) or \
-              any((s.get("surfaceId") or "").upper() == su for s in (d.get("sessions") or {}).values())
-        if hit:
-            base = os.path.basename(path)
-            return base[:-len(suffix)] if base.endswith(suffix) else ""
-    return ""
+        active = any((k or "").upper() == su for k in (d.get("activeSessionsBySurface") or {}))
+        ts = None
+        for s in (d.get("sessions") or {}).values():
+            if (s.get("surfaceId") or "").upper() == su and (s.get("agentLifecycle") or "") != "ended":
+                t = s.get("updatedAt") or 0
+                ts = t if ts is None else max(ts, t)
+        if not active and ts is None:
+            continue                                           # this store doesn't live-know the surface
+        base = os.path.basename(path)
+        tool = base[:-len(suffix)] if base.endswith(suffix) else ""
+        rank = (1 if active else 0, ts or 0)
+        if best_rank is None or rank > best_rank:
+            best_tool, best_rank = tool, rank
+    return best_tool
 
 
-def _role_from_binding(surf):
-    """AGENT_ROLE the surface was launched with (parsed from its recorded launchCommand), or ''. Lets an
-    OFF-ROSTER agent's spec be rebuilt from the live surface itself when no archive/registry entry exists."""
+def _role_from_launchcmd(rec):
+    """AGENT_ROLE parsed from a session record's launchCommand (str-coerced), or ''. Lets an OFF-ROSTER
+    agent's role be rebuilt from the live surface's own binding when no archive/registry entry exists."""
     import re
-    d = _store()
-    for s in (d.get("sessions") or {}).values():
-        if (s.get("surfaceId") or "").upper() == (surf or "").upper():
-            m = re.search(r"AGENT_ROLE=['\"]?([\w.\-]+)", s.get("launchCommand") or "")
-            if m:
-                return m.group(1)
-    return ""
+    m = re.search(r"AGENT_ROLE=['\"]?([\w.\-]+)", _launchcmd(rec))
+    return m.group(1) if m else ""
 
 
 def cmd_register(argv):
@@ -1184,29 +1298,43 @@ def cmd_register(argv):
             pass
     prelim_abs = (prelim_cwd if os.path.isabs(prelim_cwd)
                   else os.path.join(ROOT, prelim_cwd)) if prelim_cwd else ""
-    surf = a.surface or _discover_surface_for(label, prelim_abs)
+    surf = a.surface
     if not surf:
-        sys.exit(f"[fleet] register: no --surface and could not discover one for '{label}' (no "
-                 f"AGENT_LABEL/cwd match in the hook store). Pass --surface <uuid> (copy it from cmux).")
+        surf, candidates = _discover_surface_for(label, prelim_abs)
+        if not surf:
+            hint = (f" Live candidates in this cwd: {', '.join(candidates)}. Pass one as --surface."
+                    if candidates else " Pass --surface <uuid> (copy it from cmux).")
+            reason = ("ambiguous — several live surfaces share this cwd" if candidates
+                      else "no AGENT_LABEL/cwd match in the hook store")
+            sys.exit(f"[fleet] register: could not discover a surface for '{label}' ({reason}).{hint}")
 
-    # validate: don't hijack a label already live on a DIFFERENT surface; require a bound session.
+    # validate: don't hijack a label already live on a DIFFERENT surface.
     if live and live.get("surface") and live["surface"].upper() != surf.upper():
         sys.exit(f"[fleet] register: '{label}' is already live under a DIFFERENT surface "
                  f"({live['surface']}); refusing to move it to {surf}. `fleet rm {label}` first if that "
                  f"entry is stale, or re-run with the correct --surface.")
-    session = a.session or fs.bare_uuid(poll_session(surf, timeout=5))
+
+    # LIVE GATE (codex P1): require the surface be CURRENTLY live, not just present in cmux's historical
+    # sessions[] — otherwise register would bind + archive_del onto a dead surface. Derive session/tool/
+    # workspace/cwd/role from this ONE validated record (codex P2: no more stale cross-record mixing).
+    rec = _poll_live_session(surf, timeout=5)
+    if not rec:
+        sys.exit(f"[fleet] register: surface {surf} is not CURRENTLY live — no active/bound session "
+                 f"(it may have ended, or the agent hasn't come up yet). Refusing to register a dead "
+                 f"surface. If the agent IS up, wait for its first turn to bind, then re-run.")
+    session = a.session or fs.bare_uuid(rec.get("sessionId") or "")
     if not session:
-        sys.exit(f"[fleet] register: surface {surf} is not bound to a session (agent not up yet?). "
+        sys.exit(f"[fleet] register: surface {surf} is live but has no session id yet. "
                  f"Wait for its first turn to bind, or pass --session <id>.")
 
-    # derive tool + workspace + cwd from the LIVE surface (bindings, not flags).
+    # derive tool + workspace + cwd from the SAME validated live record (bindings, not flags).
     tool = _tool_for_surface(surf) or src.get("tool", "claude")
-    ws = ws_uuid_for_surface(surf) or (surface_loc(surf)[0] or "")
-    surf_cwd = _surface_cwd(surf) or ""
+    ws = rec.get("workspaceId") or ws_uuid_for_surface(surf) or (surface_loc(surf)[0] or "")
+    surf_cwd = rec.get("cwd") or _surface_cwd(surf) or ""
 
     # rebuild the spec: roster role (toml-authoritative, berg's proven recipe) > archive/live entry >
     # the surface's own binding for a truly off-roster agent.
-    role = src.get("role") or _role_from_binding(surf) or label
+    role = src.get("role") or _role_from_launchcmd(rec) or label
     if _is_roster(role):
         spec = resolve(load_config(), role, tool, None)
         spec["label"] = label
@@ -1554,9 +1682,15 @@ def _dismiss_resume_summary_prompt(surf, log, timeout=None, plugin_count=0):
     if timeout is None:
         timeout = _resume_menu_timeout(plugin_count)
     end = time.time() + timeout
+    resuming = False                    # saw the POST-selection 'Resuming ...' state (menu already gone)
     while time.time() < end:
         pane = cmuxq("capture-pane", "--surface", surf) or ""
-        if "Resume full session as-is" in pane or "Resuming the full session" in pane:
+        # ONLY the LIVE menu is actionable — it shows BOTH option labels at once
+        # ('1. Resume from summary' AND '2. Resume full session as-is'). The old check also fired on
+        # "Resuming the full session", but that is the POST-selection / in-progress banner: the menu is
+        # already gone, so a down/enter there lands a STRAY keystroke on a no-longer-menu surface. Match
+        # only the real menu; treat 'Resuming the full session' as in-progress and keep polling.
+        if "Resume from summary" in pane and "Resume full session as-is" in pane:
             log("resume-summary menu detected -> picking 'Resume full session as-is' (full, never compact)")
             cmuxq("send-key", "--surface", surf, "down")
             time.sleep(0.5)
@@ -1565,7 +1699,14 @@ def _dismiss_resume_summary_prompt(surf, log, timeout=None, plugin_count=0):
         # small session resumed straight to a running prompt -> no menu, nothing to dismiss
         if "Context Remaining" in pane or "bypass permissions" in pane:
             return RESUME_READY
+        if "Resuming the full session" in pane:
+            resuming = True             # menu was already resolved -> resume is underway; don't touch keys
         time.sleep(1)
+    if resuming:
+        # the resume got past the menu on its own (a human, or a prior dismiss) and is loading the full
+        # session; it just hadn't reached a running prompt before the ceiling. Safe to bind.
+        log("resume in progress (summary menu already cleared); proceeding to bind")
+        return RESUME_READY
     log(f"WARN: resume launched but neither the summary-menu nor a running prompt appeared within "
         f"{timeout:.0f}s (plugin_count={plugin_count}); NOT binding -- surface is still booting or "
         f"wedged behind the menu. Re-run once it settles.")

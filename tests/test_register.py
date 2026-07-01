@@ -16,11 +16,14 @@ import fleet  # noqa: E402
 
 
 def _patch_cmux(monkeypatch, session="SESS", ws="WS-1", store=None, tool="claude", surf_cwd="",
-                roster=False):
+                roster=False, live=True):
     # derive tool/session/workspace/cwd from the "live surface" — all cmux reads are stubbed so the
     # unit tests never touch the host's real ~/.cmuxterm hook store. `roster` pins _is_roster (the test
     # env otherwise falls back to the host's real ~/.config/cmux-fleet/fleet.toml, breaking hermeticity).
-    monkeypatch.setattr(fleet, "poll_session", lambda surf, timeout=60: session)
+    # `_live_session_for` is THE register live gate (codex P1): a truthy record means the surface is
+    # CURRENTLY live; None means dead/stale -> register must refuse. Stub it so tests don't poll the host.
+    rec = {"sessionId": session, "workspaceId": ws, "cwd": surf_cwd} if live else None
+    monkeypatch.setattr(fleet, "_live_session_for", lambda surf: rec)
     monkeypatch.setattr(fleet, "ws_uuid_for_surface", lambda surf: ws)
     monkeypatch.setattr(fleet, "_tool_for_surface", lambda surf: tool)
     monkeypatch.setattr(fleet, "_surface_cwd", lambda surf: surf_cwd)
@@ -72,11 +75,76 @@ def test_register_errors_without_discoverable_surface(fs, monkeypatch):
 
 
 def test_register_errors_without_session(fs, monkeypatch):
+    # surface is live but hasn't bound a session id yet -> refuse (wait for the first turn / --session).
     fs.archive_put("nosess", {"role": "nosess", "cwd": "/x"})
-    monkeypatch.setattr(fleet, "poll_session", lambda surf, timeout=60: "")   # nothing bound
-    monkeypatch.setattr(fleet, "ws_uuid_for_surface", lambda surf: "WS")
+    _patch_cmux(monkeypatch, session="", ws="WS")             # live=True but empty sessionId
     with pytest.raises(SystemExit):
         fleet.cmd_register(["nosess", "--surface", "SURF-X", "--parent", "P"])
+    assert fs.live_get("nosess") is None                      # nothing registered
+    assert fs.archive_get("nosess") is not None               # archive NOT deleted (no bind)
+
+
+def test_register_refuses_stale_ended_surface(fs, monkeypatch):
+    # codex P1: register must NOT bind + archive_del onto a dead/ended surface. _live_session_for
+    # returns None for a stale surface -> abort, archive shelf left intact.
+    fs.archive_put("dead", {"role": "dead", "tool": "claude", "cwd": "/x", "place": "tab"})
+    monkeypatch.setattr(fleet.time, "sleep", lambda *_: None)  # don't sit through the 5s live-poll
+    _patch_cmux(monkeypatch, live=False)                       # surface not currently live
+    with pytest.raises(SystemExit):
+        fleet.cmd_register(["dead", "--surface", "SURF-DEAD", "--parent", "P"])
+    assert fs.live_get("dead") is None                        # not promoted to live
+    assert fs.archive_get("dead") is not None                 # archive_del did NOT run
+
+
+def test_live_session_for_refuses_ended_record(fs, monkeypatch):
+    # the gate itself: a sessions[] record on the surface but agentLifecycle 'ended' -> not live.
+    store = {"activeSessionsBySurface": {},
+             "sessions": {"s1": {"surfaceId": "SURF-E", "sessionId": "S1",
+                                 "agentLifecycle": "ended", "updatedAt": 5}}}
+    monkeypatch.setattr(fleet, "_store", lambda: store)
+    assert fleet._live_session_for("SURF-E") is None
+    # active-index entry -> live (cmux says bound right now), resolved to the full record
+    store["activeSessionsBySurface"] = {"SURF-E": {"sessionId": "S1"}}
+    got = fleet._live_session_for("SURF-E")
+    assert got and got.get("sessionId") == "S1"
+
+
+def test_register_ambiguous_cwd_asks_for_surface(fs, monkeypatch):
+    # codex P2: two live surfaces share the cwd and no AGENT_LABEL match -> discovery is ambiguous,
+    # returns '' + candidates, and register aborts asking for --surface (never picks the first).
+    fs.archive_put("amb", {"role": "amb", "cwd": "/shared"})
+    store = {"activeSessionsBySurface": {},
+             "sessions": {"a": {"surfaceId": "SURF-A", "cwd": "/shared", "launchCommand": "claude"},
+                          "b": {"surfaceId": "SURF-B", "cwd": "/shared", "launchCommand": "claude"}}}
+    monkeypatch.setattr(fleet, "_store", lambda: store)
+    monkeypatch.setattr(fleet, "_is_roster", lambda role: False)
+    surf, cands = fleet._discover_surface_for("amb", "/shared")
+    assert surf == "" and set(cands) == {"SURF-A", "SURF-B"}   # ambiguous -> no pick
+    with pytest.raises(SystemExit):
+        fleet.cmd_register(["amb", "--parent", "P"])           # no --surface -> abort
+    assert fs.live_get("amb") is None
+
+
+def test_register_typeerror_repro_dict_launchcommand(fs, monkeypatch):
+    # THE crash repro: a fully UNREGISTERED agent (no archive/live entry) whose cmux launchCommand is a
+    # dict. The old code did re.search(pattern, dict) while deriving the role from the binding ->
+    # 'expected string or bytes-like object, got dict'. _launchcmd coerces it now -> no crash, role
+    # falls back to the label. Exercises the real recovery path (src is empty, so the binding IS parsed).
+    store = {"activeSessionsBySurface": {"SURF-KG": {"sessionId": "SESS-KG"}},
+             "sessions": {"s": {"surfaceId": "SURF-KG", "sessionId": "SESS-KG",
+                                "agentLifecycle": "idle", "cwd": "/x", "workspaceId": "WS-KG",
+                                "launchCommand": {"argv": ["claude"], "env": {"AGENT_ROLE": "kg"}}}}}
+    monkeypatch.setattr(fleet, "_store", lambda: store)
+    monkeypatch.setattr(fleet, "_tool_for_surface", lambda surf: "claude")
+    monkeypatch.setattr(fleet, "ws_uuid_for_surface", lambda surf: "WS-KG")
+    monkeypatch.setattr(fleet, "_surface_cwd", lambda surf: "/x")
+    monkeypatch.setattr(fleet, "_is_roster", lambda role: False)
+    # must NOT raise TypeError; deriving role from the dict binding coerces it and falls back to the label
+    rc = fleet.cmd_register(["kg-practices", "--surface", "SURF-KG", "--parent", "P"])
+    assert rc == 0
+    e = fs.live_get("kg-practices")
+    assert e and e["surface"] == "SURF-KG" and e["session"] == "claude-SESS-KG"
+    assert e["role"] == "kg-practices"                        # dict binding not parseable -> label fallback
 
 
 def test_register_idempotent_updates_same_surface_in_place(fs, monkeypatch):

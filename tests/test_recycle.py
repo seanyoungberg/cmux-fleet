@@ -67,7 +67,8 @@ def test_dismiss_picks_full_when_menu_present(monkeypatch):
     keys = []
     def fake_cmuxq(*args):
         if args[:1] == ("capture-pane",):
-            return "... 2. Resume full session as-is ..."     # menu is up
+            # the LIVE menu shows BOTH option labels at once
+            return "1. Resume from summary (recommended)\n2. Resume full session as-is\n3. Don't ask again"
         keys.append(args)
         return ""
     monkeypatch.setattr(fleet, "cmuxq", fake_cmuxq)
@@ -76,6 +77,23 @@ def test_dismiss_picks_full_when_menu_present(monkeypatch):
     # DOWN (option 1 -> 2) then ENTER = 'Resume full session as-is'
     assert ("send-key", "--surface", "S", "down") in keys
     assert ("send-key", "--surface", "S", "enter") in keys
+
+
+def test_dismiss_does_not_fire_keys_on_in_progress_banner(monkeypatch):
+    # FIX 4: 'Resuming the full session' is the POST-selection / in-progress state, NOT the menu. The
+    # old check fired down/enter on it -> a stray keystroke into a no-longer-menu surface. Now we must
+    # NEVER send keys for it; the resume is underway, so the gate resolves READY (safe to bind).
+    monkeypatch.setattr(fleet.time, "sleep", lambda *_: None)
+    keys = []
+    def fake_cmuxq(*args):
+        if args[:1] == ("capture-pane",):
+            return "Resuming the full session as-is..."       # in-progress banner, menu already gone
+        keys.append(args)
+        return ""
+    monkeypatch.setattr(fleet, "cmuxq", fake_cmuxq)
+    got = fleet._dismiss_resume_summary_prompt("S", lambda m: None, timeout=0.05)
+    assert got == fleet.RESUME_READY                          # in-progress -> proceed, not TIMEOUT
+    assert not any(a[:1] == ("send-key",) for a in keys)      # no stray down/enter fired
 
 
 def test_dismiss_ready_when_running_prompt(monkeypatch):

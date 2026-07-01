@@ -73,6 +73,20 @@ def test_marketplace_and_floor_default_empty():
     assert c["FLOOR"] == ""
 
 
+def test_adhoc_subdir_default_under_meta():
+    # FIX 3: the SHIPPED default lives under _meta/ (alongside the other agent homes), not at the vault
+    # root — an unconfigured `fleet launch --adhoc` must not create a fresh agents/ tree at <root>/.
+    c, _ = _resolve()
+    assert c["ADHOC_SUBDIR"] == "_meta/agents/ad-hoc"
+
+
+def test_adhoc_subdir_env_and_toml_override(tmp_path):
+    c, _ = _resolve(env={"CMUX_FLEET_ADHOC_SUBDIR": "custom/adhoc"})
+    assert c["ADHOC_SUBDIR"] == "custom/adhoc"
+    c, _ = _resolve(toml_text='[fleet]\nadhoc_subdir = "from/toml"\n', toml_dir=str(tmp_path))
+    assert c["ADHOC_SUBDIR"] == "from/toml"
+
+
 # --- the dirname anchor (relative toml path -> toml's dir) --------------------------------------
 def test_toml_relative_dot_anchors_to_toml_dir(tmp_path):
     c, _ = _resolve(toml_text='[fleet]\nroot = "."\n', toml_dir=str(tmp_path))

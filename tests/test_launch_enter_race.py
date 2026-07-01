@@ -1,0 +1,116 @@
+# tests/test_launch_enter_race.py — FIX 1: the paste-settle ENTER-RACE on launch + drive.
+# After an injected command (launch) or a pasted prompt (drive), the terminating Enter is often
+# processed BEFORE the terminal finishes rendering the paste, so it never submits — the command/prompt
+# sits unexecuted. Both paths now VERIFY-then-RETRY the Enter. These are pure units: the cmux reads
+# (cmuxq / capture-pane / poll_session) are stubbed, so nothing touches a real surface.
+import importlib.util
+import os
+import sys
+
+from conftest import SCRIPTS
+
+sys.path.insert(0, SCRIPTS)
+import fleet  # noqa: E402
+
+
+def _load_drive():
+    """Import the hyphenated drive-child.py as a module (not importable by name)."""
+    path = os.path.join(SCRIPTS, "drive-child.py")
+    spec = importlib.util.spec_from_file_location("drive_child", path)
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    return mod
+
+
+# --- launch: _send_launch_and_confirm re-kicks the Enter until the session binds ------------------
+def test_launch_rekicks_enter_until_session_binds(monkeypatch):
+    monkeypatch.setattr(fleet.time, "sleep", lambda *_: None)
+    calls = []
+    state = {"polls": 0}
+
+    def fake_poll(surf, timeout=60):
+        state["polls"] += 1
+        return "SID-1" if state["polls"] >= 3 else ""     # binds only after a couple of re-kicks
+
+    def fake_cmuxq(*args):
+        calls.append(args)
+        if args[:1] == ("capture-pane",):
+            return "user@host cd /x && claude --foo"       # no TUI marker -> still at the shell
+        return ""
+
+    monkeypatch.setattr(fleet, "poll_session", fake_poll)
+    monkeypatch.setattr(fleet, "cmuxq", fake_cmuxq)
+    sid = fleet._send_launch_and_confirm("WS", "SURF", "cd /x && claude --foo", lazy=False, timeout=30)
+    assert sid == "SID-1"
+    # the command was injected once (with the terminating newline) ...
+    assert ("send", "--workspace", "WS", "--surface", "SURF", "cd /x && claude --foo\n") in calls
+    # ... and the lost Enter was re-kicked at least once while the shell still sat unexecuted.
+    assert [c for c in calls if c == ("send-key", "--surface", "SURF", "enter")]
+
+
+def test_launch_never_kicks_enter_into_a_booted_tui(monkeypatch):
+    # once the agent TUI is on-screen the launch already started -> we must NOT spam Enter into it.
+    monkeypatch.setattr(fleet.time, "sleep", lambda *_: None)
+    monkeypatch.setattr(fleet, "poll_session", lambda surf, timeout=60: "")
+    calls = []
+
+    def fake_cmuxq(*args):
+        calls.append(args)
+        return "Context Remaining 80%" if args[:1] == ("capture-pane",) else ""
+
+    monkeypatch.setattr(fleet, "cmuxq", fake_cmuxq)
+    sid = fleet._send_launch_and_confirm("WS", "SURF", "cmd", lazy=True, timeout=5)
+    assert sid == ""                                        # lazy tool up; it binds on its first turn
+    assert not any(c == ("send-key", "--surface", "SURF", "enter") for c in calls)
+
+
+# --- drive: _submit settles then verifies + retries the Enter ------------------------------------
+def test_drive_retries_enter_until_box_clears(monkeypatch):
+    drive = _load_drive()
+    monkeypatch.setattr(drive.time, "sleep", lambda *_: None)
+    calls = []
+    state = {"enters": 0}
+
+    def fake_cmux(*args):
+        calls.append(args)
+        if args[:1] == ("send-key",):
+            state["enters"] += 1
+        return None
+
+    def fake_capture(surf):
+        # the draft sits in the input box until the SECOND Enter finally submits it (the enter-race)
+        return "❯ " if state["enters"] >= 2 else "❯ please do the thing now"
+
+    monkeypatch.setattr(drive, "cmux", fake_cmux)
+    monkeypatch.setattr(drive, "_capture", fake_capture)
+    assert drive._submit("SURF", "please do the thing now") is True
+    enters = [c for c in calls if c[:1] == ("send-key",)]
+    assert len(enters) >= 2                                 # first Enter lost the race -> retried
+
+
+def test_drive_submits_on_first_enter(monkeypatch):
+    drive = _load_drive()
+    monkeypatch.setattr(drive.time, "sleep", lambda *_: None)
+    calls = []
+    state = {"enters": 0}
+
+    def fake_cmux(*args):
+        calls.append(args)
+        if args[:1] == ("send-key",):
+            state["enters"] += 1
+        return None
+
+    monkeypatch.setattr(drive, "cmux", fake_cmux)
+    # box holds the draft until the first Enter, then clears
+    monkeypatch.setattr(drive, "_capture",
+                        lambda surf: "❯ " if state["enters"] >= 1 else "❯ do the thing")
+    assert drive._submit("SURF", "do the thing") is True
+    assert len([c for c in calls if c[:1] == ("send-key",)]) == 1
+
+
+def test_drive_reports_failure_when_box_never_clears(monkeypatch):
+    drive = _load_drive()
+    monkeypatch.setattr(drive.time, "sleep", lambda *_: None)
+    monkeypatch.setattr(drive, "cmux", lambda *a: None)
+    monkeypatch.setattr(drive, "_capture", lambda surf: "❯ stuck prompt text here")  # never clears
+    assert drive._submit("SURF", "stuck prompt text here") is False
