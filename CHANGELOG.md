@@ -37,6 +37,22 @@ Post-v0.1.0 work, not yet tagged. Candidate for v0.1.1.
 
 ### Fixed
 
+- **`fleet profile` works from an installed wheel (packaging P1.1).** Phase 1's
+  package move broke `fleet profile` for a `uv tool install`/venv install: it
+  derived a checkout-style `PLUGIN_ROOT` by walking up from `cli.py`, so a wheel
+  install emitted a nonexistent `site-packages/bin` on PATH, pointed
+  `CMUX_FLEET_MARKETPLACE` at the Python lib dir, and silently skipped the
+  `fleet.toml` seed. Now three concepts are resolved separately: the PATH pin
+  comes from the actual invoked `fleet` (`$CMUX_FLEET_BIN` > `sys.argv[0]` >
+  `which fleet`, checkout `bin/` only for a real plugin checkout); the
+  marketplace pin is emitted only from explicit config or a real checkout (never
+  inferred from a wheel's site-packages — omitted otherwise); and the seed roster
+  is read via `importlib.resources` (force-included in the wheel), falling back to
+  the repo-root example for a checkout. New `tests/test_packaging_smoke.py` builds
+  a real wheel, installs it into a throwaway venv, and asserts the installed
+  `fleet profile --init` pins the installed console-script dir, seeds the roster,
+  and never emits a lib-dir path.
+
 - **Router bus singleton guard (no more double-processing).** A stray
   `router.py --live` on the same bus double-processed every event (during the
   cutover, 3 strays triple-processed the bus and duplicate child completions

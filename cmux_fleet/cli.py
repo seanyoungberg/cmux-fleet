@@ -31,9 +31,75 @@ from .config import ROOT, STATE, CMUX, MARKETPLACE, FLOOR, FLEET_TOML, ADHOC_SUB
 
 # The checkout/build root: the dir that holds bin/, .claude-plugin/, fleet.toml.example next to the
 # cmux_fleet package. In a repo/editable install this is the repo root (unchanged from the flat layout,
-# where it was dirname(dirname(scripts/fleet.py))); `fleet profile` pins entrypoints to it.
+# where it was dirname(dirname(scripts/fleet.py))). In a WHEEL/venv install it is site-packages — which
+# holds NONE of bin/, .claude-plugin/, or a repo-root fleet.toml.example — so `fleet profile` must NOT
+# derive its pins from it there (see _fleet_bin_dir / _marketplace_pin / _seed_example_text below, and
+# the codex P1.1 fix). PLUGIN_ROOT stays only as the checkout-detection anchor + editable-install seed
+# path; it is never emitted as a marketplace or bin dir unless it is provably a real plugin checkout.
 PLUGIN_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 REGISTRY = os.path.join(STATE, "fleet-registry.json")
+
+
+def _is_plugin_checkout(root=PLUGIN_ROOT):
+    """True only when `root` is a real cmux-fleet plugin CHECKOUT (has .claude-plugin/marketplace.json
+    next to the package). False for a wheel/venv install, where PLUGIN_ROOT is site-packages."""
+    return os.path.exists(os.path.join(root, ".claude-plugin", "marketplace.json"))
+
+
+def _fleet_bin_dir():
+    """The dir to prepend to PATH so `fleet` (and its `python -m cmux_fleet`) resolve to THIS build.
+    Three concepts kept separate from the plugin root (codex P1.1):
+      - explicit override: $CMUX_FLEET_BIN (a fleet executable path OR its containing dir);
+      - checkout: the repo's bin/ dev shim (bin/fleet), the historical multi-build-isolation pin;
+      - wheel/venv: the dir of the INSTALLED `fleet` console script (never site-packages/bin, which
+        does not exist). Falls back to which()/argv[0].
+    Returns "" if no real app bin dir can be resolved (caller then omits the PATH pin rather than
+    emitting a bogus site-packages path)."""
+    env = os.environ.get("CMUX_FLEET_BIN", "").strip()
+    if env:
+        env = os.path.abspath(os.path.expanduser(env))
+        return env if os.path.isdir(env) else os.path.dirname(env)
+    checkout_bin = os.path.join(PLUGIN_ROOT, "bin")
+    if _is_plugin_checkout() and os.path.exists(os.path.join(checkout_bin, "fleet")):
+        return checkout_bin                            # dev shim, real checkout (not a build-cache copy)
+    # Installed console script: sys.argv[0] IS the exact invoked `fleet` path -> the most reliable pin
+    # (an absolute `.../bin/fleet`). Falls back to which() for a bare-name invocation.
+    argv0 = sys.argv[0] if sys.argv and sys.argv[0] else ""
+    if argv0 and os.path.sep in argv0 and os.path.basename(argv0).startswith("fleet"):
+        return os.path.dirname(os.path.abspath(argv0))
+    import shutil as _sh
+    exe = _sh.which("fleet")
+    return os.path.dirname(exe) if exe else ""
+
+
+def _marketplace_pin():
+    """The dir to emit as $CMUX_FLEET_MARKETPLACE (so a roster's plugins=["<build-name>"] resolves to
+    THIS build's plugin). EXPLICIT config wins; else inferred ONLY from a real checkout — NEVER from a
+    wheel's site-packages (codex P1.1). Returns "" -> caller omits the pin (internal --plugin-dir
+    resolution stays disabled, which is correct for a wheel install with no bundled plugin)."""
+    if MARKETPLACE:                                   # env CMUX_FLEET_MARKETPLACE / [fleet].marketplace
+        return MARKETPLACE
+    if _is_plugin_checkout():
+        return os.path.dirname(PLUGIN_ROOT)           # parent holds the build dir; plugins=["<name>"] -> it
+    return ""
+
+
+def _seed_example_text():
+    """The bundled fleet.toml.example seed roster text, or None. Read via importlib.resources for a
+    WHEEL install (force-included at cmux_fleet/fleet.toml.example), falling back to the repo-root
+    fleet.toml.example for a CHECKOUT/editable install (where it lives outside the package)."""
+    try:
+        from importlib.resources import files
+        r = files("cmux_fleet").joinpath("fleet.toml.example")
+        if r.is_file():
+            return r.read_text()
+    except (ModuleNotFoundError, FileNotFoundError, OSError):
+        pass
+    p = os.path.join(PLUGIN_ROOT, "fleet.toml.example")
+    if os.path.exists(p):
+        with open(p) as f:
+            return f.read()
+    return None
 
 
 def _profile_env():
@@ -1988,27 +2054,38 @@ def cmd_profile(argv):
         state = os.path.join(xdg_state, f"cmux-fleet-{a.name}")
         toml = os.path.join(xdg_cfg, f"cmux-fleet-{a.name}", "fleet.toml")
     root = os.path.abspath(os.path.expanduser(a.root)) if a.root else os.path.expanduser("~")
-    mkt = os.path.dirname(PLUGIN_ROOT)            # plugins=["<build-name>"] -> PLUGIN_ROOT
-    binp = os.path.join(PLUGIN_ROOT, "bin")
+    mkt = _marketplace_pin()                      # explicit config, or a real checkout's parent; "" -> omit
+    binp = _fleet_bin_dir()                        # THIS build's fleet dir (checkout bin/ or installed script)
 
     if a.init:
         os.makedirs(state, exist_ok=True)
         os.makedirs(os.path.dirname(toml), exist_ok=True)
         if not os.path.exists(toml):
-            example = os.path.join(PLUGIN_ROOT, "fleet.toml.example")
-            if os.path.exists(example):
-                import shutil
-                shutil.copyfile(example, toml)
+            seed = _seed_example_text()
+            if seed is not None:
+                with open(toml, "w") as f:
+                    f.write(seed)
                 sys.stderr.write(f"[fleet profile] seeded {toml} from fleet.toml.example\n")
+            else:
+                sys.stderr.write("[fleet profile] warning: no bundled fleet.toml.example found; roster not seeded\n")
         sys.stderr.write(f"[fleet profile] init: state dir {state}\n")
 
-    print(f'# cmux-fleet profile "{a.name}" -> build {PLUGIN_ROOT}  (eval this to activate)')
+    build_label = PLUGIN_ROOT if _is_plugin_checkout() else (binp or "installed app")
+    print(f'# cmux-fleet profile "{a.name}" -> build {build_label}  (eval this to activate)')
     print(f'export CMUX_FLEET_ROOT={shlex.quote(root)}')
     print(f'export CMUX_STATE_DIR={shlex.quote(state)}')
     print(f'export CMUX_FLEET_TOML={shlex.quote(toml)}')
-    print(f'export CMUX_FLEET_MARKETPLACE={shlex.quote(mkt)}')
+    if mkt:
+        print(f'export CMUX_FLEET_MARKETPLACE={shlex.quote(mkt)}')
+    else:
+        sys.stderr.write("[fleet profile] note: no plugin marketplace pinned (wheel install / no explicit "
+                         "$CMUX_FLEET_MARKETPLACE); install the plugin separately and set it if you use plugins=[...]\n")
     print(f'export CMUX_BIN={shlex.quote(CMUX)}')
-    print(f'export PATH={shlex.quote(binp)}:"$PATH"')
+    if binp:
+        print(f'export PATH={shlex.quote(binp)}:"$PATH"')
+    else:
+        sys.stderr.write("[fleet profile] warning: could not resolve THIS build's fleet bin dir; PATH not pinned "
+                         "(set $CMUX_FLEET_BIN to the installed fleet path)\n")
     return 0
 
 
