@@ -30,6 +30,7 @@ LIVE = os.path.join(STATE, "fleet.json")
 ARCHIVE = os.path.join(STATE, "archive.json")
 LOG = os.path.join(STATE, "log.jsonl")
 MODEFILE = os.path.join(STATE, "notify-mode")
+DRAFTMODE = os.path.join(STATE, "draft-through")        # opt-in: 'clobber' wakes THROUGH a human draft (E1)
 
 # Agent-helper command hints emitted into conductor context by the awareness/drain hooks. Phase 2
 # folded the four standalone plugin scripts into `fleet <verb>` subcommands, so these are now the app
@@ -437,6 +438,40 @@ def surface_busy(surface, now=None):
         return False                            # fail-open to not-busy; the screen read is the arbiter
 
 
+# --- draft-through: tier 3 of the wake ladder (design 2.3, E1) ------------------------------
+DRAFT_STALE_S = 90   # (reserved for the 3c gate) a draft idle this long reads as walked-away, not active typing
+
+
+def draft_through():
+    """Draft-through policy for tier 3 of the wake ladder — OPT-IN, default OFF:
+      'preserve' (default) — never clobber a human draft; it holds, the item waits in the inbox.
+      'clobber'  (set `$CMUX_STATE_DIR/draft-through` to 'clobber') — Berg's 'clobber > silence': clear
+                 the draft, wake, and LOG the overwrite so a walked-away draft can't silence the surface.
+    Default is 'preserve' because the input-CLEAR step is not yet validated against the live cmux TUI for
+    multi-line / pasted-image drafts (design 2.3: prototype before committing). Both follow-ups are gated
+    on that prototype: 3a save/clear/wake/RESTORE (preserve the draft across the wake, borrowing
+    drive-child's settle/verify) and 3c a stale-draft gate (only clobber a draft idle > DRAFT_STALE_S)."""
+    try:
+        return "clobber" if open(DRAFTMODE).read().strip() == "clobber" else "preserve"
+    except OSError:
+        return "preserve"
+
+
+def _wake_through_draft(surface, msg):
+    """Tier 3: the surface is idle but a human draft sits in the input box. Preserve it (default) or —
+    when draft-through is opted into 'clobber' — best-effort CLEAR the input, wake, and audit the
+    overwrite. The clear (send-key ctrl+u = kill-line) is best-effort and wants a live-TUI prototype for
+    multi-line / pasted-image drafts; worst case it degrades to a mashed premature submit — never a
+    silent stall. Returns True iff it woke."""
+    if draft_through() != "clobber":
+        return False                                   # preserve — never clobber a draft
+    _cmux("send-key", "--surface", surface, "ctrl+u")  # best-effort clear (TUI-validate before enabling)
+    _cmux("send", "--surface", surface, msg)
+    _cmux("send-key", "--surface", surface, "enter")
+    log_event("draft_clobbered", surface=surface)      # audit: a human draft was overwritten to wake
+    return True
+
+
 def wake_if_idle(surface, msg):
     """Inject+submit a wake ONLY when the surface is sitting at a clean prompt with an empty draft;
     otherwise leave it (the item is already durable in the inbox — it is seen next turn). Returns True
@@ -444,8 +479,8 @@ def wake_if_idle(surface, msg):
     heartbeat backstop, so its tier ladder (design 2.3) covers every path:
       1. genuinely mid-turn (surface_busy) -> queue, never interrupt;
       2. idle + empty draft                -> wake now (the common path);
-      3. idle + non-empty draft            -> preserve the human draft; skip for now (Phase 4 upgrades
-                                              this to save/clear/wake/restore, else clobber-with-log).
+      3. idle + non-empty draft            -> draft-through policy: preserve by default; opt-in
+                                              clobber-with-log (design 2.3 tier 3; see draft_through()).
     The SCREEN is ground truth for 'idle at a prompt': a stale/empty/garbage store read must never
     outrank a visibly-idle prompt (that is the whole stall fix), and — the converse — we never inject
     when NO clean prompt is visible (mid-render, a running tool, needsInput), which keeps a wake off a
@@ -457,7 +492,7 @@ def wake_if_idle(surface, msg):
     if not prompts:
         return False                                   # no visible prompt -> not idle-at-prompt -> don't inject
     if prompts[-1].split("❯", 1)[1].strip():
-        return False                                   # tier 3 — human draft present -> preserve it
+        return _wake_through_draft(surface, msg)       # tier 3 — human draft present
     _cmux("send", "--surface", surface, msg)           # tier 2 — clean empty prompt -> wake now
     _cmux("send-key", "--surface", surface, "enter")
     return True

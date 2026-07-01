@@ -116,6 +116,26 @@ echo auto    > "$CMUX_STATE_DIR/notify-mode" # explicit wake-now (same as absent
 The retired `autodrain` value normalizes to `auto`. Peer messages drain at Stop in
 every mode; `peer-msg --no-wake` is the per-message opt-out for acks/FYIs.
 
+## Draft-through — waking through a human draft (opt-in)
+
+When an idle conductor has a **human draft** in its input box, the wake gate
+**preserves** it by default (never clobbered; the item waits in the inbox). A
+separate file opts a surface's draft into being woken *through*:
+
+```
+cat  "$CMUX_STATE_DIR/draft-through"                 # current policy ('preserve' when absent)
+echo clobber  > "$CMUX_STATE_DIR/draft-through"      # clear the draft, wake, log the overwrite
+echo preserve > "$CMUX_STATE_DIR/draft-through"      # default: never clobber a draft
+```
+
+`clobber` is the "clobber > silence" policy for a *walked-away* draft: it clears the
+input (`send-key ctrl+u`), wakes, and records a `draft_clobbered` event in
+`log.jsonl`. **Default is `preserve`** because the input-clear step is not yet
+validated against the live cmux TUI for multi-line / pasted-image drafts —
+prototype on a sandbox before enabling fleet-wide. The elegant
+save/clear/wake/**restore** path (preserve the draft across the wake) and a
+stale-draft gate (only clobber a draft idle > 90s) are the planned follow-ups.
+
 ## Launching agents
 
 ```

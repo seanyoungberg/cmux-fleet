@@ -89,6 +89,8 @@ A fleet-wide daemon (`router.py --live`, run separately) watches the bus. When a
 
 Key fact: a completion or peer **wakes a flat-idle conductor by default** (wake-now); only `passive` mutes that. A Stop hook fires only on a turn you're already taking, so the router's idle-wake + the heartbeat backstop are what reach you while you sit idle. Build around the Stop *event* + your captured state, not the upstream live status field (it's unreliable).
 
+- **Draft-through** `$CMUX_STATE_DIR/draft-through` (opt-in, default `preserve`): a human draft in your input box is **never clobbered** by default — the wake is declined and the item waits in your inbox. Set it to `clobber` to let a *walked-away* draft be cleared + woken (audited as a `draft_clobbered` event) rather than silence you. The input-clear is best-effort and wants a live-TUI prototype first; save/restore + a stale-draft gate are follow-ups.
+
 ## Talk to a peer conductor (A2A)
 Child→parent comms are automatic; talking to a **peer** conductor is a **deliberate choice**, and the peer is NOT expecting it. Same input-safe delivery as the notify flow, on a separate `peer-inbox` channel, never the input box. Because a peer send is deliberate, it reaches the recipient **promptly in both states** (see Delivery).
 - **Send:** `fleet peer-msg <peer-label> "<body>"` (peers resolve by label from the fleet registry). The message reaches the peer carrying the `@<peer>: [<you>]` identity markers.

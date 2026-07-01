@@ -358,3 +358,37 @@ def test_surface_busy_survives_summarizer_stomp_shape(fs, monkeypatch):
         _rec("S", _ORPHAN, "running", age_s=1),         # the summarizer's fresh nested 'running' stomp
         _rec("S", _BOUND, "idle", age_s=20)))           # the conductor's real bound session, idle
     assert fs.surface_busy("S") is False                # not fooled -> the wake still fires
+
+
+# --- draft-through: tier 3, opt-in clobber-with-log (design 2.3, Phase 4) -------------------------
+def test_draft_through_defaults_preserve(fs):
+    assert fs.draft_through() == "preserve"
+
+
+def test_draft_through_clobber_is_opt_in(fs):
+    with open(fs.DRAFTMODE, "w") as f:
+        f.write("clobber")
+    assert fs.draft_through() == "clobber"
+
+
+def test_wake_preserves_human_draft_by_default(fs, monkeypatch):
+    # default draft-through=preserve -> a human draft is never clobbered (wake declines, no injection).
+    monkeypatch.setattr(fs, "surface_busy", lambda s: False)
+    sink = []
+    monkeypatch.setattr(fs, "_cmux", _fake_cmux("❯ my half-typed draft", sink))
+    assert fs.wake_if_idle("S", "wake") is False
+    assert [a for a in sink if a[0] in ("send", "send-key")] == []
+
+
+def test_wake_clobbers_draft_when_opted_in(fs, monkeypatch):
+    # opt-in draft-through=clobber -> clear (ctrl+u) + send + enter, and AUDIT the overwrite in the ledger.
+    with open(fs.DRAFTMODE, "w") as f:
+        f.write("clobber")
+    monkeypatch.setattr(fs, "surface_busy", lambda s: False)
+    sink = []
+    monkeypatch.setattr(fs, "_cmux", _fake_cmux("❯ my half-typed draft", sink))
+    assert fs.wake_if_idle("S", "wake") is True
+    assert ("send-key", "--surface", "S", "ctrl+u") in sink          # cleared the draft first
+    assert any(a[0] == "send" for a in sink)                         # then injected the wake
+    events = [json.loads(l) for l in open(fs.LOG) if l.strip()]
+    assert any(e["event"] == "draft_clobbered" for e in events)      # ledger audit of the overwrite
