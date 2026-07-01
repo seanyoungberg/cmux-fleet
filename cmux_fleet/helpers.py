@@ -143,6 +143,9 @@ def cmd_peer_msg(argv):
 
     if flags["no_wake"]:
         return 0
+    if not fs.idlewake_on():                            # 'passive' is the fleet-wide wake mute; the inbox row is already written
+        print(f"[peer-msg] no wake (notify-mode passive): {to_label} sees it on its next turn")
+        return 0
     if fs.wake_if_idle(to_surface, "(peer-wake) you have a new peer message waiting in your context; handle it"):
         print(f"[peer-msg] woke {to_label} to process it now")
     else:
