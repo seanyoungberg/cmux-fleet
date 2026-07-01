@@ -158,24 +158,36 @@ def test_archive_then_revive_transition(fs):
     assert fs.live_get("w1")["surface"] == "SURF2"
 
 
-# --- the notify-mode dial ------------------------------------------------------------------------
-def test_mode_defaults_passive(fs):
-    assert fs.mode() == "passive"
-    assert fs.autodrain_on() is False
-    assert fs.idlewake_on() is False
-
-
-def test_mode_autodrain(fs):
-    with open(fs.MODEFILE, "w") as f:
-        f.write("autodrain\n")
-    assert fs.mode() == "autodrain"
+# --- the notify-mode dial (DEMOTED to a mute switch — design 2.1) --------------------------------
+def test_mode_defaults_to_wake_now(fs):
+    # no file -> wake-now default (INVERTED from the old 'passive' default).
+    assert fs.mode() == "auto"
     assert fs.autodrain_on() is True
+    assert fs.idlewake_on() is True
+
+
+def test_mode_passive_is_the_single_mute(fs):
+    with open(fs.MODEFILE, "w") as f:
+        f.write("passive\n")
+    assert fs.mode() == "passive"
+    assert fs.autodrain_on() is False        # 'passive' suppresses drain AND idle-wake fleet-wide
     assert fs.idlewake_on() is False
 
 
-def test_mode_auto(fs):
+def test_mode_auto_wakes(fs):
     with open(fs.MODEFILE, "w") as f:
         f.write("auto")
+    assert fs.mode() == "auto"
+    assert fs.autodrain_on() is True
+    assert fs.idlewake_on() is True
+
+
+def test_legacy_autodrain_folds_into_wake_now(fs):
+    # the retired 'autodrain' value normalizes to wake-now (design 2.1: delete autodrain, keep passive
+    # as the single override) — it no longer means drain-without-wake.
+    with open(fs.MODEFILE, "w") as f:
+        f.write("autodrain\n")
+    assert fs.mode() == "auto"
     assert fs.autodrain_on() is True
     assert fs.idlewake_on() is True
 

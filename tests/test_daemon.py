@@ -86,6 +86,20 @@ def test_heartbeat_nudges_only_idle_conductors_with_pending(monkeypatch):
     assert "SW" not in attempted                   # a child -> never nudged (conductors only)
 
 
+def test_heartbeat_muted_when_passive(monkeypatch):
+    # 'passive' is a fleet-wide wake mute (design 2.1): the backstop no-ops under it, even with an
+    # idle conductor that has pending inbox items.
+    from cmux_fleet import state as fs
+    with open(fs.MODEFILE, "w") as f:
+        f.write("passive")
+    fs.live_put("cond", {"role": "c", "kind": "conductor", "tool": "claude", "surface": "SC", "status": "live"})
+    fs.inbox_put("completion", "SC", {"gist": "x", "label": "k"})
+    attempted = []
+    monkeypatch.setattr(fs, "wake_if_idle", lambda surf, msg: attempted.append(surf) or False)
+    fd._heartbeat_tick()
+    assert attempted == []                          # muted -> never even reaches the gate
+
+
 # --- stray-router reap (bus singleton, daemon side) ----------------------------------------------
 def test_lock_holder_pid_detects_held_and_free():
     os.makedirs(os.path.dirname(fd.ROUTER_LOCK), exist_ok=True)

@@ -3,12 +3,12 @@
 #
 # Split awareness from activation (input-safe): a child Stop -> append a `completion` to the unified
 # inbox + a `cmux notify` banner (never the input box); the parent's awareness hook surfaces it next
-# turn. The ONLY input-injecting action is idle-wake (auto mode, human away), via the shared
-# fleet_state.wake_if_idle gate. Trigger = the bus (agent.hook.Stop); truth = cmux's hook store;
+# turn. The ONLY input-injecting action is idle-wake (wake-now default; notify-mode passive mutes),
+# via the shared fleet_state.wake_if_idle gate. Trigger = the bus (agent.hook.Stop); truth = cmux's hook store;
 # org chart = fleet.json (label-keyed live store). Only registered live members are acted on.
 #
 #   python3 router.py            # OBSERVE: log decisions, write/send nothing
-#   python3 router.py --live     # ACTIVE: write inbox + notify; idle-wake iff notify-mode==auto
+#   python3 router.py --live     # ACTIVE: write inbox + notify; idle-wake unless notify-mode==passive
 import fcntl, json, os, pty, subprocess, sys, time
 from datetime import datetime
 

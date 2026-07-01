@@ -83,12 +83,11 @@ Otherwise (the common case) children are tabs in the conductor's bottom pane. Fo
 ## The notify flow (how children's completions reach you)
 A fleet-wide daemon (`router.py --live`, run separately) watches the bus. When a child finishes, it appends the completion to the queue + fires a `cmux notify` banner. It NEVER types into your input. You become aware of it through your hooks:
 - **awareness** (every turn): pending completions are injected into your context as a `[fleet] N pending` note, each with a `fleet child-digest` command and an ack command. Handle them, then ack: `fleet inbox-ack <seq>` so they stop re-surfacing.
-- **The mode dial** `$CMUX_STATE_DIR/notify-mode` (read live, no restart):
-  - `passive` — awareness only; you pick up pending work on your next turn. Calm, human-driven.
-  - `autodrain` — your Stop hook auto-continues you to process pending at the end of any turn.
-  - `auto` — the router also idle-wakes you (when your input is empty) so you catch completions even while idle and unattended.
+- **The mode dial** `$CMUX_STATE_DIR/notify-mode` (read live, no restart) — a **mute switch**; wake-now is the default:
+  - *(default — no file)* or `auto` — the router **idle-wakes you** (when your input is empty) so you catch completions/peers even while idle and unattended, and your Stop hook auto-continues you to drain pending at the end of any turn.
+  - `passive` — the one mute: awareness only, nothing auto-driven or woken. Calm, human-driven ("leave me alone, I'll drain on my own"). *(The old `autodrain` value is retired — it now behaves as `auto`.)*
 
-Key fact: nothing wakes a flat-idle conductor except `auto` mode (a Stop hook only fires on a turn you're already taking). Build around the Stop *event* + your captured state, not the upstream live status field (it's unreliable).
+Key fact: a completion or peer **wakes a flat-idle conductor by default** (wake-now); only `passive` mutes that. A Stop hook fires only on a turn you're already taking, so the router's idle-wake + the heartbeat backstop are what reach you while you sit idle. Build around the Stop *event* + your captured state, not the upstream live status field (it's unreliable).
 
 ## Talk to a peer conductor (A2A)
 Child→parent comms are automatic; talking to a **peer** conductor is a **deliberate choice**, and the peer is NOT expecting it. Same input-safe delivery as the notify flow, on a separate `peer-inbox` channel, never the input box. Because a peer send is deliberate, it reaches the recipient **promptly in both states** (see Delivery).

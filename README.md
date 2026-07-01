@@ -161,16 +161,20 @@ The roster and per-tool launch config live in the same toml; see
 
 ## The mode dial
 
-A single file, `$CMUX_STATE_DIR/notify-mode`, controls how aggressively pending
-work reaches a conductor:
+A single file, `$CMUX_STATE_DIR/notify-mode`, is the wake **mute switch**.
+Wake-now is the **default**; the dial exists only to opt out:
 
-- **passive** (default): completions and peers wait in the inbox; the conductor
-  sees them via context on its next turn. Nothing is auto-driven.
-- **autodrain**: at a turn's end (the Stop hook), the conductor auto-continues
-  to process pending child completions instead of stopping. Peer messages always
-  drain at Stop regardless of mode.
-- **auto**: autodrain, plus the router wakes a genuinely idle conductor (at the
-  prompt, empty draft) to handle pending completions now.
+- **auto** (the default — no file needed): a completed child, or a peer message,
+  **wakes a genuinely idle conductor** (at the prompt, empty draft) to handle it
+  now, and at a turn's end (the Stop hook) the conductor auto-continues to drain
+  pending work instead of stopping.
+- **passive**: the single mute. Completions and peers wait in the inbox and
+  surface via context on the conductor's next turn; nothing is auto-driven or
+  woken — for a "leave me alone, I'll drain on my own" or debugging conductor.
+
+(The old `autodrain` mode is retired — with wake-now default the one override is
+`passive`. Peer messages still drain at Stop regardless, and `peer-msg --no-wake`
+is the per-message opt-out for acks/FYIs.)
 
 ## Fleet views
 

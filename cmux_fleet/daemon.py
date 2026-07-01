@@ -314,8 +314,12 @@ def _run_daemon(heartbeat_secs):
 def _heartbeat_tick():
     """Tier-1 nudge ONLY (Berg 2026-06-30): re-nudge LIVE-IDLE conductors that have a pending inbox.
     wake_if_idle is the input-safe gate (skips running surfaces and a non-empty human draft); we also
-    skip muted agents. NO dead-session detection / auto-recycle."""
+    skip muted agents. NO dead-session detection / auto-recycle. The whole backstop honors the dial:
+    'notify-mode passive' is a fleet-wide wake mute (design 2.1), so the tick no-ops under it."""
     from . import state as fs
+    if not fs.idlewake_on():                          # 'passive' mutes the backstop too (coherent mute)
+        print("[heartbeat] tick: muted (notify-mode=passive)", flush=True)
+        return
     nudged = 0
     for label, e in fs.live_all().items():
         if e.get("kind") != "conductor" or e.get("muted"):

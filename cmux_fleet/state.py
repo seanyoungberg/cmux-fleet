@@ -13,7 +13,7 @@
 #                      status:"live",surface,session}. Only running agents.
 #   archive.json       PARKED agents, label-keyed: {role,kind,tool,cwd,last_session,parent,archived_at}.
 #   log.jsonl          append-only EVENT ledger: {ts,event,label,role,...}. Source-of-truth timeline.
-#   notify-mode        the dial: passive | autodrain | auto.
+#   notify-mode        the wake dial, now a MUTE switch: passive (mute) | auto (default, wake-now).
 #   router.seq         bus cursor (cmux events --cursor-file). router.log — the router trace.
 #
 # Identity: kind(child|conductor) / role(type, ->AGENT_ROLE, owns the dir) / label(unique instance,
@@ -84,20 +84,31 @@ def _read_jsonl(path):
     return out
 
 
-# --- the dial ------------------------------------------------------------------------------
+# --- the dial (DEMOTED to a mute switch — design 2.1) --------------------------------------
+# Wake-now is the DEFAULT. The dial's ONLY job now is the 'passive' override, which suppresses
+# idle-wake AND auto-drain fleet-wide (notify + inbox only). Everything non-'passive' — including no
+# file and the retired 'autodrain' value — normalizes to 'auto' (wake-now). This INVERTS the old
+# default (was 'passive'; wake needed an explicit 'auto'); see NOTIFICATIONS-REDESIGN 2.1 and the loud
+# behavior-change note in the report.
 def mode():
     try:
-        return open(MODEFILE).read().strip() or "passive"
+        v = open(MODEFILE).read().strip()
     except OSError:
-        return "passive"
+        v = ""
+    return "passive" if v == "passive" else "auto"
 
 
 def autodrain_on():
-    return mode() in ("autodrain", "auto")
+    # Auto-drain (the Stop hook auto-continuing the turn to process pending completions) is on by
+    # default; only 'passive' mutes it. The old distinct 'autodrain' value (drain-without-wake) is
+    # retired — with wake-now default the single override is 'passive'.
+    return mode() != "passive"
 
 
 def idlewake_on():
-    return mode() == "auto"
+    # Idle-wake is on by default; only 'passive' mutes it. maybe_idle_wake (router) and the heartbeat
+    # backstop both gate on this, so 'passive' is a coherent fleet-wide wake mute.
+    return mode() != "passive"
 
 
 # --- inbox (unified completions + peer) ----------------------------------------------------
@@ -173,7 +184,7 @@ def inbox_ack(surface, kind, seq):
 
 
 # --- EPHEMERAL drain loop-guard (blocks; per-kind, separate nukeable file) ------------------
-# Child drain is mode-gated (autodrain/auto); peer drain fires ALWAYS (critic issue #4). The two
+# Child drain is mode-gated (on unless 'passive'); peer drain fires ALWAYS (critic issue #4). The two
 # advance on different triggers, so the block-mark is per-kind, and lives apart from the durable ack.
 def block_get(surface, kind):
     return int(_read_json(BLOCKS, {}).get(surface, {}).get(kind, 0))
