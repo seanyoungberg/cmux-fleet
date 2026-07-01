@@ -2,13 +2,13 @@
 
 The spine as-built, by file:
 
-- `scripts/config.py` resolves every path/setting (env > `[fleet]` toml > XDG default).
-- `scripts/fleet_state.py` owns the state model: the label-keyed registry, the unified inbox, the archive shelf, the hook-store union, the idle-wake gate.
+- `cmux_fleet/config.py` resolves every path/setting (env > `[fleet]` toml > XDG default).
+- `cmux_fleet/state.py` owns the state model: the label-keyed registry, the unified inbox, the archive shelf, the hook-store union, the idle-wake gate.
 - `cmux_fleet/router.py` is the bus router: child `Stop` -> deliver a completion to the parent. One process serves every conductor.
-- `scripts/fleet_daemon.py` is the daemon manager (`fleet daemon start|stop|status|restart`): it double-forks `router.py --live` into a detached supervisor so the router survives shell exit, Bash-tool cleanup, and a conductor recycle.
-- `scripts/hooks/awareness.py` + `scripts/hooks/drain.py` surface the inbox into a conductor's context (never its input box).
-- `scripts/fleet.py` is the CLI: launch, the lifecycle verbs, peer messaging, broadcast, worktrees, profiles, and the read-only views (`scripts/fleet_features.py`).
-- `fleet peer-msg`, `fleet child-digest`, `fleet drive-child`, `fleet inbox-ack` are the agent-facing helpers.
+- `cmux_fleet/daemon.py` is the daemon manager (`fleet daemon start|stop|status|restart` + `start --foreground` for launchd): it double-forks `router.py --live` into a detached supervisor so the router survives shell exit, Bash-tool cleanup, and a conductor recycle.
+- `cmux_fleet/hookverbs.py` holds the `fleet hook-awareness` / `fleet hook-drain` logic that surfaces the inbox into a conductor's context (never its input box); the plugin hook files are thin fail-open shims (`scripts/hooks/_shim.py`) that shell into those verbs.
+- `cmux_fleet/cli.py` is the CLI: launch, the lifecycle verbs, peer messaging, broadcast, worktrees, profiles, and the read-only views (`cmux_fleet/features.py`).
+- `fleet peer-msg`, `fleet child-digest`, `fleet drive-child`, `fleet inbox-ack` are the agent-facing helper verbs (`cmux_fleet/helpers.py`).
 
 ## The division of labor
 
@@ -92,7 +92,7 @@ read to answer "who am I" and "what is in my inbox".
 ## The router daemon
 
 `cmux_fleet/router.py` is one long-lived process, not a hook, and serves every
-conductor on the machine. It runs under `fleet daemon` (`scripts/fleet_daemon.py`),
+conductor on the machine. It runs under `fleet daemon` (`cmux_fleet/daemon.py`),
 which double-forks with `setsid` so the router keeps its own session and process
 group and survives the starting shell exiting, an agent's Bash-tool process-group
 cleanup, and a conductor self-recycle. The manager writes `<state>/router.pid`
@@ -146,7 +146,7 @@ draft pending.
 
 ## config.py: resolution precedence
 
-`scripts/config.py` is the one path and setting resolver; every other script
+`cmux_fleet/config.py` is the one path and setting resolver; every other module
 imports its constants and nothing else hardcodes a path. Each key resolves in
 order: **environment variable, then the `[fleet]` block in the toml, then a
 built-in default** (an XDG path, a `which` lookup, or a skip). The defaults make
