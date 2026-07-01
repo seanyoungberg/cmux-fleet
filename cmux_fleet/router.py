@@ -132,12 +132,14 @@ def handle(ev):
     entry = registry()["by_surface"].get(surface)
     if not entry:
         return                                          # not a registered live member -> ignore
-    if not entry.get("session"):                        # lazily-registered at launch (codex binds on
-        e = fs.live_get(entry["label"]) or {}           # its 1st turn) -> backfill the bound session now
-        if e:
-            e["session"] = f"claude-{sid_bare}" if e.get("tool", "claude") == "claude" else sid_bare
-            fs.live_put(entry["label"], e)
-            log(f"[backfill] {entry['label']}: session {sid_bare[:12]} bound on first turn")
+    # Keep the registry `session` honest against cmux's live id on EVERY Stop: empty -> backfill (codex
+    # binds on its 1st turn); DIVERGED -> reconcile (a fresh respawn re-issues the conversation id, or a
+    # bridge id was stored at bind -> the "No conversation found" class on a later archive/revive).
+    action = fs.reconcile_session(entry["label"], sid_bare, entry.get("tool", "claude"))
+    if action == "backfill":
+        log(f"[backfill] {entry['label']}: session {sid_bare[:12]} bound on first turn")
+    elif action == "reconcile":
+        log(f"[reconcile] {entry['label']}: registry session -> {sid_bare[:12]} (was stale/bridge id)")
 
     try:
         ts = datetime.fromisoformat(ev.get("occurred_at", "").replace("Z", "+00:00"))

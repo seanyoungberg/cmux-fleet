@@ -226,6 +226,27 @@ def entry_for_surface(surface):
     return None
 
 
+def reconcile_session(label, sid_bare, tool=None):
+    """Refresh a live member's stored `session` to the GROUND-TRUTH bound id `sid_bare` when it's either
+    empty (lazy first-turn backfill: codex binds on its 1st turn) OR DIVERGED from what the surface
+    actually carries. Divergence is the "No conversation found" class: a fresh respawn re-issues the
+    conversation id on its first turn, and a bridge id can get stored at bind — so the registry `session`
+    drifts from cmux's real live id. The router sees the real id on every Stop, so calling this there keeps
+    the registry honest continuously. No-op (returns '') when already in sync or `sid_bare` is empty, so
+    it's safe to call unconditionally. Returns the action taken: 'backfill' | 'reconcile' | ''.
+    `tool` defaults to the entry's own tool (claude sessions store the `claude-` prefixed form)."""
+    e = live_get(label)
+    if not e or not sid_bare:
+        return ""
+    stored = bare_uuid(e.get("session") or "")
+    if stored == sid_bare:
+        return ""
+    t = tool or e.get("tool", "claude")
+    e["session"] = f"claude-{sid_bare}" if t == "claude" else sid_bare
+    live_put(label, e)
+    return "backfill" if not stored else "reconcile"
+
+
 # --- identity: the ARCHIVE shelf (parked, revivable) ---------------------------------------
 def archive_all():
     return _read_json(ARCHIVE, {})

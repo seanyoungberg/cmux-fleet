@@ -1,0 +1,70 @@
+"""Phase 3d — bulk / cross-conductor recycle selectors + the shared per-target plan.
+
+Hermetic: seeds the live registry via the `fs` fixture; no cmux/subprocess. Covers selector filtering
+(all/conductors/children/my-children), the ALWAYS-exclude-self rule (external recycle is the safe
+topology), muted/human-driven skipping + --include-muted, unbound skipping, and that `_recycle_plan`
+threads mode/prime correctly.
+"""
+from cmux_fleet import cli
+
+
+def _seed(fs):
+    fs.live_put("me",      {"kind": "conductor", "surface": "SELF", "tool": "claude"})
+    fs.live_put("peer",    {"kind": "conductor", "surface": "PEER", "tool": "claude"})
+    fs.live_put("kidA",    {"kind": "child", "surface": "A", "parent": "me", "tool": "claude"})
+    fs.live_put("kidB",    {"kind": "child", "surface": "B", "parent": "peer", "tool": "claude"})
+    fs.live_put("muted1",  {"kind": "child", "surface": "M", "parent": "me", "tool": "claude", "muted": True})
+    fs.live_put("unbound", {"kind": "child", "surface": "", "parent": "me", "tool": "claude"})
+
+
+def test_all_excludes_self_and_unbound_and_muted(fs):
+    _seed(fs)
+    sel, skipped = cli._bulk_targets("all", "SELF", "me", include_muted=False)
+    labels = [l for l, _ in sel]
+    assert "me" not in labels           # self always excluded
+    assert "unbound" not in labels      # no surface -> excluded
+    assert "muted1" not in labels       # muted -> skipped by default
+    assert set(labels) == {"peer", "kidA", "kidB"}
+    assert [l for l, _ in skipped] == ["muted1"]
+
+
+def test_conductors_selector(fs):
+    _seed(fs)
+    sel, _ = cli._bulk_targets("conductors", "SELF", "me", include_muted=False)
+    assert [l for l, _ in sel] == ["peer"]   # not self, not children
+
+
+def test_children_selector(fs):
+    _seed(fs)
+    sel, _ = cli._bulk_targets("children", "SELF", "me", include_muted=False)
+    assert set(l for l, _ in sel) == {"kidA", "kidB"}   # both children, muted excluded
+
+
+def test_my_children_selector(fs):
+    _seed(fs)
+    sel, _ = cli._bulk_targets("my-children", "SELF", "me", include_muted=False)
+    assert [l for l, _ in sel] == ["kidA"]   # kidB's parent is peer, muted1 is muted
+
+
+def test_include_muted_keeps_them(fs):
+    _seed(fs)
+    sel, skipped = cli._bulk_targets("my-children", "SELF", "me", include_muted=True)
+    assert set(l for l, _ in sel) == {"kidA", "muted1"}
+    assert skipped == []
+
+
+# --- the shared per-target plan ------------------------------------------------------------------
+def test_recycle_plan_fresh_primes_from_handover(fs, monkeypatch):
+    monkeypatch.setattr(cli, "_compose_recycle_cmd", lambda *a, **k: ("claude ...", ""))
+    monkeypatch.setattr(cli, "_latest_handover", lambda cwd: "/x/handover/h.md")
+    entry = {"kind": "child", "surface": "A", "tool": "claude", "role": "w", "cwd": "/x", "session": "claude-s"}
+    p = cli._recycle_plan("kidA", entry, [], [], "fresh", "", False, None, False)
+    assert p["mode"] == "fresh" and p["surface"] == "A" and p["old_session"] == "s"
+    assert p["prime"] and "FRESH" in p["prime"] and "h.md" in p["prime"]
+
+
+def test_recycle_plan_resume_has_no_prime(fs, monkeypatch):
+    monkeypatch.setattr(cli, "_compose_recycle_cmd", lambda *a, **k: ("claude --resume s ...", ""))
+    entry = {"kind": "child", "surface": "A", "tool": "claude", "role": "w", "cwd": "/x", "session": "claude-s"}
+    p = cli._recycle_plan("kidA", entry, [], [], "resume", "", False, None, False)
+    assert p["mode"] == "resume" and p["prime"] is None

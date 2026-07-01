@@ -1092,7 +1092,12 @@ def cmd_archive(argv):
     cmuxq("close-surface", "--surface", surf)
     arch = {k: e[k] for k in ("role", "kind", "tool", "cwd", "parent", "place",
                               "plugins", "flags", "settings", "group", "worktree") if k in e}
-    arch["last_session"] = e.get("session")
+    # last_session = the id `fleet revive` will `--resume`. Prefer cmux's CHECKPOINT (ground truth, read
+    # off the binding above) over the registry `session`, which can be a stale bridge id from bind time
+    # (the registry-vs-real divergence -> "No conversation found" on revive). Falls back to the registry
+    # session when cmux exposes no checkpoint. The router keeps `session` fresh in the live case, but a
+    # never-took-a-turn-since-divergence agent (e.g. berg-sandbox this morning) still needs this.
+    arch["last_session"] = (b.get("checkpoint_id") or "").strip() or e.get("session")
     arch["archived_at"] = time.time()
     if b.get("command"):                       # revive replays this like recycle (binding-first)
         arch["binding_cmd"] = b["command"]
@@ -1134,6 +1139,9 @@ def cmd_revive(argv):
     ap.add_argument("label")
     ap.add_argument("--parent", default=os.environ.get("CMUX_SURFACE_ID", ""))
     ap.add_argument("--place")
+    ap.add_argument("--session", default="", metavar="ID",
+                    help="resume an ARBITRARY prior session id (default: the archived last_session); "
+                         "list with `fleet sessions <label>`")
     ap.add_argument("--add-plugin", action="append", default=[], metavar="NAME",
                     help="union a marketplace plugin into this identity (repeatable)")
     ap.add_argument("--dry-run", action="store_true")
@@ -1142,7 +1150,11 @@ def cmd_revive(argv):
     if not e:
         sys.exit(f"fleet revive: no archived label '{a.label}'")
     tool = e.get("tool", "claude")
-    sess = (e.get("last_session") or "").replace("claude-", "")   # --resume wants the bare uuid
+    # an explicit --session targets an arbitrary prior session directly; else the archived last_session.
+    if a.session and not _known_session(e, "", a.session):   # archived -> no live surface, encode the cwd
+        sys.exit(f"[fleet] revive: session '{a.session}' not found under {a.label}'s projects dir; "
+                 f"`fleet sessions {a.label}` to list resumable ids.")
+    sess = (a.session or e.get("last_session") or "").replace("claude-", "")   # --resume wants the bare uuid
     # Authoritative cwd/place/group: roster toml > archived entry > captured binding. NEVER let cwd fall
     # to "" -> os.path.join(ROOT,"") = ROOT root, which lands the agent off its session (claude --resume
     # then exits "No conversation found"). Self-heals a sparse shelf archived before the backfill existed.
@@ -1200,6 +1212,7 @@ def cmd_revive(argv):
     sid = poll_session(surf)
     if not sid:
         sys.exit("[fleet] timed out waiting for session binding")
+    sid = _resume_binding(surf).get("checkpoint_id", "") or sid   # ground-truth session over a bridge poll id
     register(surf, spec, a.parent, sid, ws)
     fs.archive_del(a.label)
     fs.log_event("revived", label=a.label, role=spec["role"], surface=surf, session=sid)
@@ -1429,6 +1442,140 @@ def cmd_register(argv):
     return 0
 
 
+# ---------------------------------------------------------------- sessions (list resumable priors)
+def _project_dir_for_surface(surf):
+    """The ~/.claude/projects/<enc-cwd>/ folder holding EVERY session jsonl for the surface's cwd. cmux
+    records each session's transcriptPath; its parent dir is that folder — EXACT (no cwd re-encoding)
+    whenever a live/historical record for the surface carries a transcriptPath."""
+    if not surf:
+        return ""
+    for s in _sessions_on_surface(_store(), surf):
+        tp = s.get("transcriptPath") or ""
+        if tp:
+            return os.path.dirname(tp)
+    return ""
+
+
+def _encode_project_dir(abs_cwd):
+    """Claude Code's ~/.claude/projects/<dir> encoding: every non-alphanumeric char of the ABS cwd -> '-'
+    (verified live: '/', '.', '_' all collapse; 'cmux-fleet/.worktrees' -> 'cmux-fleet--worktrees',
+    'tapestry/_meta' -> 'tapestry--meta'). Fallback for a parked agent with no live surface/transcript."""
+    import re
+    enc = re.sub(r"[^a-zA-Z0-9]", "-", abs_cwd or "")
+    return os.path.join(os.path.expanduser("~/.claude/projects"), enc) if enc else ""
+
+
+def _projects_dir_for(entry, surf):
+    """Resolve an agent's ~/.claude/projects dir: the surface's transcriptPath dir (exact) else the
+    encoded cwd. '' if neither resolves."""
+    pdir = _project_dir_for_surface(surf)
+    if pdir:
+        return pdir
+    cwd = (entry or {}).get("cwd", "")
+    abs_cwd = cwd if os.path.isabs(cwd) else os.path.join(ROOT, cwd)
+    return _encode_project_dir(abs_cwd)
+
+
+def _session_snippet(path, cap=64):
+    """First user message of a session jsonl (the 'what was this session' hint), one line, capped."""
+    try:
+        for line in open(path):
+            try:
+                e = json.loads(line)
+            except Exception:
+                continue
+            if e.get("type") != "user":
+                continue
+            c = (e.get("message") or {}).get("content")
+            t = c if isinstance(c, str) else (
+                " ".join(b.get("text", "") for b in c if isinstance(b, dict) and b.get("type") == "text")
+                if isinstance(c, list) else "")
+            if t and t.strip():
+                return t.strip().replace("\n", " ")[:cap]
+    except OSError:
+        pass
+    return ""
+
+
+def _list_sessions(entry, surf):
+    """[(session_id, mtime, size, jsonl_path)] for an agent's cwd, freshest first. Empty if the projects
+    dir doesn't resolve/exist. Pure filesystem read — the shared source for `fleet sessions` AND the
+    --session validator."""
+    pdir = _projects_dir_for(entry, surf)
+    if not pdir or not os.path.isdir(pdir):
+        return []
+    import glob as _glob
+    out = []
+    for f in sorted(_glob.glob(os.path.join(pdir, "*.jsonl")), key=os.path.getmtime, reverse=True):
+        try:
+            st = os.stat(f)
+        except OSError:
+            continue
+        out.append((os.path.basename(f)[:-6], st.st_mtime, st.st_size, f))   # strip .jsonl
+    return out
+
+
+def _human_size(n):
+    for unit in ("B", "K", "M", "G"):
+        if n < 1024 or unit == "G":
+            return f"{n:.0f}{unit}" if unit == "B" else f"{n:.1f}{unit}"
+        n /= 1024.0
+
+
+def _known_session(entry, surf, sid):
+    """True if `sid` matches a session jsonl under the agent's projects dir (bare-uuid compare). Guards
+    `--session` against the "No conversation found" footgun: refuse an id claude can't resume, with the
+    `fleet sessions` hint. Fails OPEN (True) when the projects dir can't be enumerated, so a genuine id
+    is never blocked by a discovery gap."""
+    from . import state as fs
+    rows = _list_sessions(entry, surf)
+    if not rows:
+        return True
+    want = fs.bare_uuid(sid)
+    return any(fs.bare_uuid(s) == want for s, *_ in rows)
+
+
+def cmd_sessions(argv):
+    """List resumable prior claude sessions for an agent's surface (freshest first) so an operator can
+    pick an id for `fleet recycle --resume --session <id>` / `fleet revive --session <id>` without
+    hand-hunting under ~/.claude/projects. Marks the CURRENTLY-bound session with '*'. Works for a live
+    OR archived label."""
+    from . import state as fs
+    from . import features as ff                                  # reuse the vitals age formatter
+    ap = argparse.ArgumentParser(prog="fleet sessions")
+    ap.add_argument("label", help="registry label (live or archived)")
+    ap.add_argument("--all", action="store_true", help="list every session (default: 20 most recent)")
+    ap.add_argument("--json", action="store_true")
+    a = ap.parse_args(argv)
+    entry = fs.live_get(a.label) or fs.archive_get(a.label)
+    if not entry:
+        sys.exit(f"[fleet] sessions: no live/archived label '{a.label}'")
+    surf = entry.get("surface", "")
+    rows = _list_sessions(entry, surf)
+    if not rows:
+        sys.exit(f"[fleet] sessions: no ~/.claude/projects sessions found for '{a.label}' "
+                 f"(dir: {_projects_dir_for(entry, surf) or '(unresolved)'})")
+    # currently-bound session to mark: cmux checkpoint (ground truth) if present, else registry session
+    cur = fs.bare_uuid(_resume_binding(surf).get("checkpoint_id", "")
+                       or (entry.get("session") or "").replace("claude-", ""))
+    shown = rows if a.all else rows[:20]
+    if a.json:
+        print(json.dumps([{"session": s, "mtime": mt, "size": sz,
+                           "current": fs.bare_uuid(s) == cur, "snippet": _session_snippet(p)}
+                          for s, mt, sz, p in shown], indent=2))
+        return 0
+    print(f"RESUMABLE SESSIONS for {a.label} ({len(rows)} total, showing {len(shown)}):")
+    print(f"  dir: {_projects_dir_for(entry, surf)}")
+    now = time.time()
+    for s, mt, sz, p in shown:
+        mark = "*" if fs.bare_uuid(s) == cur else " "
+        print(f" {mark} {s:<38}{ff._age(now - mt):>7} ago {_human_size(sz):>8}  {_session_snippet(p)}")
+    if any(fs.bare_uuid(s) == cur for s, *_ in shown):
+        print(" (* = currently bound)")
+    print(f" resume: fleet recycle {a.label} --resume --session <id>   |   fleet revive {a.label} --session <id>")
+    return 0
+
+
 # ---------------------------------------------------------------- recycle (live->live, same surface)
 # Restart an agent IN PLACE on its OWN surface via cmux's native `respawn-pane` (the tmux-compat
 # kill+restart: cmux tears down the surface's current process and runs a fresh command in the SAME
@@ -1616,7 +1763,7 @@ def _is_roster(role):
         return False
 
 
-def _compose_recycle_cmd(label, entry, caller_tokens, add_plugins, mode):
+def _compose_recycle_cmd(label, entry, caller_tokens, add_plugins, mode, explicit_session=""):
     """Recompose the recycle launch. ROSTER agents (role in the toml) are TOML-AUTHORITATIVE: re-resolve
     the current toml so a recycle picks up floor/role changes since launch. AD-HOC / off-roster agents
     have no toml to resolve -> reproduce from cmux's ground-truth binding (registry spec as last resort).
@@ -1626,8 +1773,10 @@ def _compose_recycle_cmd(label, entry, caller_tokens, add_plugins, mode):
     role = entry.get("role")
     b = _resume_binding(entry.get("surface", ""))
     checkpoint = b.get("checkpoint_id", "")
-    # the session to resume: cmux's checkpoint if it has one, else the registry's recorded session
-    resume_session = (checkpoint or (entry.get("session") or "").replace("claude-", "")) if mode == "resume" else None
+    # the session to resume: an EXPLICIT --session target wins (resume an arbitrary prior session, no
+    # cmux-checkpoint surgery); else cmux's checkpoint if it has one; else the registry's recorded session.
+    resume_session = ((explicit_session or checkpoint or (entry.get("session") or "").replace("claude-", ""))
+                      if mode == "resume" else None)
     if _is_roster(role):                                          # ROSTER -> re-resolve the toml (truth)
         return _compose_from_roster(role, tool, label, caller_tokens, add_plugins, resume_session), checkpoint
     argv = _binding_argv(b.get("command", ""))                    # AD-HOC / off-roster -> reproduce
@@ -1638,8 +1787,57 @@ def _compose_recycle_cmd(label, entry, caller_tokens, add_plugins, mode):
     return send_cmd, checkpoint
 
 
+def _recycle_plan(label, entry, caller, add_plugin, mode, session, force, prime_override, no_prime):
+    """Compose ONE recycle payload (the dict the detached exec consumes). Shared by single + bulk recycle
+    so the mode/session/prime logic lives in exactly one place. FRESH boots clean -> auto-prime from the
+    latest handover; RESUME carries its context -> no prime unless asked."""
+    surf = entry.get("surface", "")
+    old_sid = (entry.get("session") or "").replace("claude-", "")
+    send_cmd, _checkpoint = _compose_recycle_cmd(label, entry, caller, add_plugin, mode, session)
+    prime = None
+    if not no_prime:
+        if prime_override:
+            prime = prime_override
+        elif mode == "fresh":
+            abs_cwd = entry.get("cwd", "")
+            abs_cwd = abs_cwd if os.path.isabs(abs_cwd) else os.path.join(ROOT, abs_cwd)
+            ho = _latest_handover(abs_cwd)
+            prime = (f"You were just recycled into a FRESH session (same identity: label '{label}', "
+                     f"role '{entry.get('role')}', same surface). Re-orient from your latest handover"
+                     + (f" at {ho}" if ho else " under ./handover/")
+                     + ", then continue where it left off.")
+    return {"label": label, "surface": surf, "send_cmd": send_cmd, "mode": mode,
+            "tool": entry.get("tool", "claude"), "force": force, "prime": prime, "old_session": old_sid}
+
+
+def _bulk_targets(target, from_surface, from_label, include_muted):
+    """Live agents matching a bulk selector, mirroring `broadcast`'s target vocabulary. ALWAYS excludes
+    self + unbound surfaces (external recycle is the safe topology — a conductor can't respawn its own
+    surface from its own turn). Muted / human-driven agents (homelab, resume-research) are SKIPPED by
+    default; --include-muted keeps them. Returns (selected [(label,entry)], skipped [(label,reason)])."""
+    from . import state as fs
+    sel, skipped = [], []
+    for label, v in fs.live_all().items():
+        surf = v.get("surface")
+        if not surf or surf == from_surface:                 # self / unbound -> never
+            continue
+        kind = v.get("kind")
+        if target == "conductors" and kind != "conductor":
+            continue
+        if target == "children" and kind != "child":
+            continue
+        if target == "my-children" and not (kind == "child" and v.get("parent") == from_label):
+            continue
+        if v.get("muted") and not include_muted:
+            skipped.append((label, "muted/human-driven")); continue
+        sel.append((label, v))
+    sel.sort()
+    return sel, skipped
+
+
 def cmd_recycle(argv):
-    """Restart THIS (or a named) agent in place on the same surface, same identity. See block comment."""
+    """Restart THIS (or a named) agent in place on the same surface, same identity. A bulk SELECTOR
+    (--all/--conductors/--children/--my-children) restarts many, sequentially + gated. See block comment."""
     from . import state as fs
     caller = []
     if "--" in argv:
@@ -1647,13 +1845,33 @@ def cmd_recycle(argv):
     ap = argparse.ArgumentParser(prog="fleet recycle", add_help=True)
     ap.add_argument("label", nargs="?", help="registry label (default: self, via $CMUX_SURFACE_ID)")
     ap.add_argument("--resume", action="store_true", help="continue the session (default: fresh)")
+    ap.add_argument("--session", default="", metavar="ID",
+                    help="resume an ARBITRARY prior session id directly (implies --resume; list with "
+                         "`fleet sessions <label>`) — no cmux-checkpoint surgery; single-target only")
     ap.add_argument("--force", action="store_true", help="skip the empty-draft guard (intentional go-live)")
     ap.add_argument("--add-plugin", action="append", default=[], metavar="NAME",
                     help="union a marketplace plugin into this identity (repeatable; persisted)")
     ap.add_argument("--prime", help="override the post-fresh-boot priming prompt")
     ap.add_argument("--no-prime", action="store_true", help="don't send any priming prompt")
     ap.add_argument("--dry-run", action="store_true", help="resolve + print, do NOT recycle")
+    # bulk / cross-conductor selectors (mirror broadcast); sequential + gated, external-recycle is safe
+    ap.add_argument("--all", action="store_true", help="bulk: recycle every live agent (except self)")
+    ap.add_argument("--conductors", action="store_true", help="bulk: recycle live conductors")
+    ap.add_argument("--children", action="store_true", help="bulk: recycle live children")
+    ap.add_argument("--my-children", action="store_true", help="bulk: recycle live children whose parent is me")
+    ap.add_argument("--include-muted", action="store_true",
+                    help="bulk: also recycle muted/human-driven agents (skipped by default)")
     a = ap.parse_args(argv)
+
+    mode = "resume" if (a.resume or a.session) else "fresh"      # a --session target implies resume
+    selectors = {"all": a.all, "conductors": a.conductors, "children": a.children, "my-children": a.my_children}
+    chosen = [k for k, on in selectors.items() if on]
+    if chosen:
+        if len(chosen) > 1:
+            sys.exit(f"[fleet] recycle: pick ONE bulk selector, got {chosen}")
+        if a.label or a.session:
+            sys.exit("[fleet] recycle: a bulk selector can't combine with a <label> or --session (per-target)")
+        return _recycle_bulk(chosen[0], mode, caller, a)
 
     label = a.label or fs.label_for_surface(os.environ.get("CMUX_SURFACE_ID", ""))
     if not label:
@@ -1664,37 +1882,21 @@ def cmd_recycle(argv):
     surf = entry.get("surface", "")
     if not surf:
         sys.exit(f"[fleet] recycle: label '{label}' has no surface on its registry entry")
-    tool = entry.get("tool", "claude")
-    mode = "resume" if a.resume else "fresh"
-    old_sid = (entry.get("session") or "").replace("claude-", "")
-    send_cmd, checkpoint = _compose_recycle_cmd(label, entry, caller, a.add_plugin, mode)
+    if a.session and not _known_session(entry, surf, a.session):
+        sys.exit(f"[fleet] recycle: session '{a.session}' not found under {label}'s projects dir; "
+                 f"`fleet sessions {label}` to list resumable ids.")
+    payload = _recycle_plan(label, entry, caller, a.add_plugin, mode, a.session, a.force, a.prime, a.no_prime)
 
-    # fresh boots clean -> prime from the handover; resume carries context -> no prime unless asked
-    prime = None
-    if not a.no_prime:
-        if a.prime:
-            prime = a.prime
-        elif mode == "fresh":
-            abs_cwd = entry.get("cwd", "")
-            abs_cwd = abs_cwd if os.path.isabs(abs_cwd) else os.path.join(ROOT, abs_cwd)
-            ho = _latest_handover(abs_cwd)
-            prime = (f"You were just recycled into a FRESH session (same identity: label '{label}', "
-                     f"role '{entry.get('role')}', same surface). Re-orient from your latest handover"
-                     + (f" at {ho}" if ho else " under ./handover/")
-                     + ", then continue where it left off.")
-
-    print(f"[fleet] recycle {label} (mode={mode}, tool={tool}, surface={surf})")
-    print(f"[fleet] launch: {send_cmd}")
+    print(f"[fleet] recycle {label} (mode={mode}, tool={entry.get('tool','claude')}, surface={surf})")
+    print(f"[fleet] launch: {payload['send_cmd']}")
     if a.add_plugin or caller:
         print("[fleet] overrides applied (persist for free: cmux re-captures this as the new binding)")
-    print(f"[fleet] prime: {prime if prime else '(none)'}")
+    print(f"[fleet] prime: {payload['prime'] if payload['prime'] else '(none)'}")
     if a.dry_run:
         print("[fleet] dry-run (omit --dry-run to recycle)")
         return 0
 
     # hand to a DETACHED worker (own session) so it outlives this process and can respawn our own surface
-    payload = {"label": label, "surface": surf, "send_cmd": send_cmd, "mode": mode, "tool": tool,
-               "force": a.force, "prime": prime, "old_session": old_sid}
     os.makedirs(STATE, exist_ok=True)
     pf = os.path.join(STATE, f".recycle-{label}.json")
     with open(pf, "w") as fh:
@@ -1706,6 +1908,44 @@ def cmd_recycle(argv):
     gate = "idle" if a.force else "idle + empty draft"
     print(f"[fleet] recycle SCHEDULED (detached) for {label} on {surf}; mode={mode}.")
     print(f"[fleet]   waits for the surface to go quiet ({gate}), then respawns in place. log: {log}")
+    return 0
+
+
+def _recycle_bulk(target, mode, caller, a):
+    """Restart a SET of agents SEQUENTIALLY (one respawn at a time — never thundering-herd the box), each
+    independently quiet-gated. Self is always excluded (external recycle avoids the can't-respawn-own-
+    surface footgun); muted/human-driven agents skipped unless --include-muted. --dry-run prints the plan."""
+    from . import state as fs
+    from_surface = os.environ.get("CMUX_SURFACE_ID", "")
+    from_label = fs.label_for_surface(from_surface) or (from_surface[:8] if from_surface else "fleet")
+    if target == "my-children" and not from_surface:
+        sys.exit("[fleet] recycle --my-children needs $CMUX_SURFACE_ID (run inside a conductor)")
+    sel, skipped = _bulk_targets(target, from_surface, from_label, a.include_muted)
+    if not sel:
+        print(f"[fleet] recycle --{target}: no live targets"
+              + (f" ({len(skipped)} skipped: {', '.join(l for l, _ in skipped)})" if skipped else ""))
+        return 0
+    print(f"[fleet] recycle --{target} (mode={mode}) from {from_label}: {len(sel)} target(s), sequential + gated")
+    payloads = []
+    for label, entry in sel:
+        payload = _recycle_plan(label, entry, caller, a.add_plugin, mode, "", a.force, a.prime, a.no_prime)
+        payloads.append(payload)
+        print(f"   {label:<24}{entry.get('kind','-'):<11}{(entry.get('surface') or '')[:8]}  mode={mode}")
+    for label, reason in skipped:
+        print(f"   {label:<24}SKIP ({reason}; --include-muted to force)")
+    if a.dry_run:
+        print("[fleet] dry-run (omit --dry-run to recycle these sequentially)")
+        return 0
+    os.makedirs(STATE, exist_ok=True)
+    pf = os.path.join(STATE, ".recycle-bulk.json")
+    with open(pf, "w") as fh:
+        json.dump(payloads, fh)
+    log = os.path.join(STATE, "recycle.log")
+    subprocess.Popen([sys.executable, "-m", "cmux_fleet", "_recycle-bulk-exec", pf],
+                     stdout=open(log, "a"), stderr=subprocess.STDOUT, stdin=subprocess.DEVNULL,
+                     start_new_session=True)
+    print(f"[fleet] bulk recycle SCHEDULED (detached, sequential) for {len(payloads)} agent(s). log: {log}")
+    print(f"[fleet]   each waits for its surface to go quiet, respawns, then the next. Watch: tail -f {log}")
     return 0
 
 
@@ -1793,11 +2033,12 @@ def _resume_and_gate(surf, send_cmd, tool, sess, log):
     return status != RESUME_TIMEOUT
 
 
-def cmd_recycle_exec(argv):
-    """DETACHED worker (internal verb): quiet-gate -> respawn-pane -> confirm new session -> update
-    registry -> auto-prime. Never half-kills: aborts before respawn if the surface won't go quiet."""
+def _recycle_exec_one(p):
+    """Run ONE recycle: quiet-gate -> respawn-pane -> confirm new session -> reconcile the registry ->
+    auto-prime. Never half-kills: aborts before respawn if the surface won't go quiet. Shared by the
+    single `_recycle-exec` verb and the sequential `_recycle-bulk-exec` orchestrator. Returns 0 when the
+    respawn proceeded (bound or lazy), 1 on a pre-respawn / resume-gate abort."""
     from . import state as fs
-    p = json.load(open(argv[0]))
     surf, send_cmd, label = p["surface"], p["send_cmd"], p["label"]
     mode, force, prime, old_sid = p["mode"], p["force"], p.get("prime"), p.get("old_session") or ""
 
@@ -1879,6 +2120,11 @@ def cmd_recycle_exec(argv):
         if not sid:
             log(f"WARN: no {'resumed' if mode == 'resume' else 'fresh'} session bound; check the surface manually")
         else:
+            if mode == "resume":
+                # prefer cmux's CHECKPOINT (the id it will `--resume`) over a possibly-bridge poll id, so
+                # the registry records the SAME id a later archive/revive resumes — killing the divergence
+                # at the source. The router reconciles again on the next turn as a continuous backstop.
+                sid = _resume_binding(surf).get("checkpoint_id", "") or sid
             log(f"{'resumed' if mode == 'resume' else 'fresh'} session {sid} bound")
             e = fs.live_get(label) or {}
             e["surface"] = surf
@@ -1892,11 +2138,40 @@ def cmd_recycle_exec(argv):
         cmuxq("send", "--surface", surf, prime)
         cmuxq("send-key", "--surface", surf, "enter")
         log("primed")
+    log("DONE")
+    return 0
+
+
+def cmd_recycle_exec(argv):
+    """DETACHED worker (internal verb): one recycle from a payload file, then clean up the file."""
+    rc = _recycle_exec_one(json.load(open(argv[0])))
     try:
         os.remove(argv[0])
     except OSError:
         pass
-    log("DONE")
+    return rc
+
+
+def cmd_recycle_bulk_exec(argv):
+    """DETACHED orchestrator (internal verb): recycle a LIST of payloads SEQUENTIALLY — one respawn at a
+    time so a fleet-wide restart never thundering-herds the box. Each target is independently quiet-gated;
+    a single target's abort/error does not stop the sweep. Cleans up the payload file at the end."""
+    payloads = json.load(open(argv[0]))
+    n = len(payloads)
+    print(f"[recycle-bulk {time.strftime('%H:%M:%S')}] start: {n} target(s), sequential", flush=True)
+    ok = 0
+    for i, p in enumerate(payloads, 1):
+        print(f"[recycle-bulk] === {i}/{n}: {p.get('label')} ===", flush=True)
+        try:
+            if _recycle_exec_one(p) == 0:
+                ok += 1
+        except Exception as e:                     # one target's failure must not abort the rest
+            print(f"[recycle-bulk] {p.get('label')}: ERROR {e}", flush=True)
+    print(f"[recycle-bulk {time.strftime('%H:%M:%S')}] DONE: {ok}/{n} proceeded", flush=True)
+    try:
+        os.remove(argv[0])
+    except OSError:
+        pass
     return 0
 
 
@@ -2096,12 +2371,15 @@ def main():
               "  config <role|--adhoc NAME|--cwd DIR> [--tool t]   effective config (base settings + fleet adds)\n"
               "  ls                                                live fleet x hook store; flags STALE + archived\n"
               "  archive <label>                                   park a live agent (revivable)\n"
-              "  revive <label> [--place p] [--parent s] [--add-plugin N] [-- <flags>]\n"
-              "                                                    bring a parked agent back (replays the captured binding, claude --resume)\n"
+              "  revive <label> [--session id] [--place p] [--parent s] [--add-plugin N] [-- <flags>]\n"
+              "                                                    bring a parked agent back (replays the captured binding, claude --resume; --session targets an arbitrary prior session)\n"
               "  register <label> [--surface UUID] [--parent s] [--session id]\n"
               "                                                    pull a LIVE-but-unregistered agent into the registry (recovery for a skipped auto-register)\n"
-              "  recycle [label] [--resume] [--force] [--add-plugin N] [--prime T|--no-prime] [-- <flags>]\n"
+              "  recycle [label] [--resume] [--session id] [--force] [--add-plugin N] [--prime T|--no-prime] [-- <flags>]\n"
               "                                                    restart in place, same surface/identity (default self+fresh)\n"
+              "  recycle --all|--conductors|--children|--my-children [--include-muted] [--resume] [--dry-run]\n"
+              "                                                    BULK restart (sequential + gated, skips self + muted); cross-conductor = the safe topology\n"
+              "  sessions <label> [--all] [--json]                 list resumable prior sessions for the agent's surface (id, age, size, snippet)\n"
               "  broadcast \"<msg>\" [--target all|all-conductors|all-children|my-children] [--no-wake] [--expect-reply] [--dry-run]\n"
               "                                                    input-safe heads-up to live agents (e.g. after a toml/floor change); never restarts them\n"
               "  mute <label> | unmute <label>                     stop/resume pushing a child's completions to its parent (parent reads on demand)\n"
@@ -2131,7 +2409,9 @@ def main():
     from . import helpers as fh
     fns = {"launch": cmd_launch, "config": cmd_config, "ls": cmd_ls,
            "archive": cmd_archive, "revive": cmd_revive, "register": cmd_register, "recycle": cmd_recycle,
-           "_recycle-exec": cmd_recycle_exec, "broadcast": cmd_broadcast,
+           "sessions": cmd_sessions,
+           "_recycle-exec": cmd_recycle_exec, "_recycle-bulk-exec": cmd_recycle_bulk_exec,
+           "broadcast": cmd_broadcast,
            "mute": lambda a: cmd_mute(a, mute=True), "unmute": lambda a: cmd_mute(a, mute=False),
            "rm": cmd_rm, "worktree": cmd_worktree, "profile": cmd_profile, "daemon": fd.cmd_daemon,
            "vitals": ff.cmd_vitals, "find": ff.cmd_find, "graph": ff.cmd_graph,
