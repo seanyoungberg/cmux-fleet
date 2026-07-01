@@ -6,7 +6,13 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
-Post-v0.1.0 work, not yet tagged. Candidate for v0.1.1.
+## [0.2.0] - 2026-07-01
+
+Packaging release. cmux-fleet is now an installable **uv tool** (`fleet` CLI + a
+supervised, launchd-persistent router daemon) with a **thin, fail-open Claude
+plugin** (hook shims resolve `fleet` on PATH; no baked app spec). Folds in the
+daemon-hardening, resume-menu gate, and `fleet register` work landed since v0.1.0.
+This is the version the live fleet was cut over to on 2026-07-01.
 
 ### Added
 

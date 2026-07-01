@@ -8,6 +8,8 @@ __pycache__/
 uv.lock
 # local mining clones / scratch (never committed)
 _mining/
+# memsearch index dir dropped by a memsearch-enabled agent running with cwd=repo
+.memsearch/
 # uv/hatchling build artifacts
 dist/
 build/
