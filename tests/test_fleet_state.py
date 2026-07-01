@@ -361,34 +361,72 @@ def test_surface_busy_survives_summarizer_stomp_shape(fs, monkeypatch):
 
 
 # --- draft-through: tier 3, opt-in clobber-with-log (design 2.3, Phase 4) -------------------------
-def test_draft_through_defaults_preserve(fs):
-    assert fs.draft_through() == "preserve"
+def test_draft_through_defaults_stale(fs):
+    assert fs.draft_through() == "stale"                 # default = the stale-draft gate (not preserve)
 
 
-def test_draft_through_clobber_is_opt_in(fs):
+def test_draft_through_clobber_and_preserve_are_opt_in(fs):
     with open(fs.DRAFTMODE, "w") as f:
         f.write("clobber")
     assert fs.draft_through() == "clobber"
+    with open(fs.DRAFTMODE, "w") as f:
+        f.write("preserve")
+    assert fs.draft_through() == "preserve"
 
 
-def test_wake_preserves_human_draft_by_default(fs, monkeypatch):
-    # default draft-through=preserve -> a human draft is never clobbered (wake declines, no injection).
+def test_wake_preserves_fresh_draft_by_default(fs, monkeypatch):
+    # default 'stale' gate: a FRESH draft (just appeared) is preserved -> protects active typing.
     monkeypatch.setattr(fs, "surface_busy", lambda s: False)
     sink = []
     monkeypatch.setattr(fs, "_cmux", _fake_cmux("❯ my half-typed draft", sink))
     assert fs.wake_if_idle("S", "wake") is False
-    assert [a for a in sink if a[0] in ("send", "send-key")] == []
+    assert [a for a in sink if a[0] in ("send", "send-key")] == []   # not clobbered while fresh
 
 
-def test_wake_clobbers_draft_when_opted_in(fs, monkeypatch):
-    # opt-in draft-through=clobber -> clear (ctrl+u) + send + enter, and AUDIT the overwrite in the ledger.
+def test_wake_clobbers_stale_draft_by_default(fs, monkeypatch):
+    # default 'stale' gate: a WALKED-AWAY draft (unchanged >= DRAFT_STALE_S) is clobbered + woken so it
+    # can never silence the surface indefinitely (the codex should-fix acceptance).
+    draft = "my half-typed draft"
+    with open(fs.DRAFTMARKS, "w") as f:                  # seed the mark: draft has sat unchanged, abandoned
+        json.dump({"S": {"text": draft, "since": time.time() - (fs.DRAFT_STALE_S + 30)}}, f)
+    monkeypatch.setattr(fs, "surface_busy", lambda s: False)
+    sink = []
+    monkeypatch.setattr(fs, "_cmux", _fake_cmux(f"❯ {draft}", sink))
+    assert fs.wake_if_idle("S", "wake") is True
+    assert ("send-key", "--surface", "S", "ctrl+u") in sink          # best-effort clear
+    assert any(a[0] == "send" for a in sink)                         # then woke
+    events = [json.loads(l) for l in open(fs.LOG) if l.strip()]
+    assert any(e["event"] == "draft_clobbered" for e in events)      # ledger audit
+
+
+def test_draft_age_resets_when_draft_changes(fs):
+    # active typing (changed text) restarts the clock -> a person who keeps typing is never clobbered.
+    now = time.time()
+    assert fs._draft_age("S", "abc", now) == 0.0                     # first sight -> 0
+    assert fs._draft_age("S", "abc", now + 100) == 100               # unchanged -> accrues
+    assert fs._draft_age("S", "abcd", now + 101) == 0.0             # changed -> reset to 0
+
+
+def test_wake_clobbers_any_draft_when_clobber_opt_in(fs, monkeypatch):
+    # 'clobber' opt-in -> immediate clobber even for a FRESH draft (no stale wait).
     with open(fs.DRAFTMODE, "w") as f:
         f.write("clobber")
     monkeypatch.setattr(fs, "surface_busy", lambda s: False)
     sink = []
-    monkeypatch.setattr(fs, "_cmux", _fake_cmux("❯ my half-typed draft", sink))
+    monkeypatch.setattr(fs, "_cmux", _fake_cmux("❯ fresh draft", sink))
     assert fs.wake_if_idle("S", "wake") is True
-    assert ("send-key", "--surface", "S", "ctrl+u") in sink          # cleared the draft first
-    assert any(a[0] == "send" for a in sink)                         # then injected the wake
-    events = [json.loads(l) for l in open(fs.LOG) if l.strip()]
-    assert any(e["event"] == "draft_clobbered" for e in events)      # ledger audit of the overwrite
+    assert ("send-key", "--surface", "S", "ctrl+u") in sink
+
+
+def test_wake_preserve_opt_in_never_clobbers(fs, monkeypatch):
+    # 'preserve' opt-in -> never clobber, even a long-stale draft (the fully conservative choice).
+    draft = "left this here"
+    with open(fs.DRAFTMODE, "w") as f:
+        f.write("preserve")
+    with open(fs.DRAFTMARKS, "w") as f:
+        json.dump({"S": {"text": draft, "since": time.time() - (fs.DRAFT_STALE_S + 999)}}, f)
+    monkeypatch.setattr(fs, "surface_busy", lambda s: False)
+    sink = []
+    monkeypatch.setattr(fs, "_cmux", _fake_cmux(f"❯ {draft}", sink))
+    assert fs.wake_if_idle("S", "wake") is False
+    assert [a for a in sink if a[0] in ("send", "send-key")] == []
