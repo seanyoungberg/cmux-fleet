@@ -20,8 +20,11 @@ os.makedirs(fs.STATE, exist_ok=True)
 CURSOR_FILE = os.path.join(fs.STATE, "router.seq")     # bus replay cursor (distinct from inbox.seq)
 LOCKFILE = os.path.join(fs.STATE, "router.live.lock")  # bus-level singleton lock (one --live router)
 DEBOUNCE_S = 3.0
+HEALTH_FILE = os.path.join(fs.STATE, "router.health")  # liveness proof: stamped on each consumed bus frame
+HEALTH_STAMP_THROTTLE_S = 5.0                           # cap health writes to <=1/5s on a busy bus
 
 _lock_fd = None   # module-global so the flock survives for the whole process (closing the fd drops it)
+_health = {"ts": 0.0, "frames": 0}   # router.health write-throttle + a rough consumed-frame counter
 
 # registry cache + a materialized surface->entry index (the live store is label-keyed; the router
 # needs surface->entry on each Stop, so build the inverse once per reload — critic issue #6).
@@ -255,15 +258,36 @@ def acquire_singleton_lock():
     _lock_fd = fd   # keep the fd (and thus the lock) alive for the process lifetime
 
 
+def _stamp_health(force=False):
+    """Prove the router is CONSUMING the bus (not merely alive): stamp router.health on each frame read
+    from the events stream. Bus heartbeat frames (~15s) keep it fresh even when no child is completing,
+    so a STALE stamp under a live router pid = wedged — the fleet-wide silent-completion-loss class the
+    daemon now surfaces as unhealthy. Throttled to <=1 write / HEALTH_STAMP_THROTTLE_S; best-effort."""
+    _health["frames"] += 1
+    now = time.time()
+    if not force and (now - _health["ts"]) < HEALTH_STAMP_THROTTLE_S:
+        return
+    _health["ts"] = now
+    try:
+        tmp = f"{HEALTH_FILE}.{os.getpid()}.tmp"
+        with open(tmp, "w") as f:
+            json.dump({"pid": os.getpid(), "ts": now, "frames": _health["frames"]}, f)
+        os.replace(tmp, HEALTH_FILE)
+    except Exception:
+        pass
+
+
 def main():
     if LIVE:
         acquire_singleton_lock()                       # hard invariant: one live bus processor
     log(f"[router] mode={'LIVE' if LIVE else 'OBSERVE'} notify-mode={fs.mode()} state={fs.STATE}")
     registry()
+    if LIVE:
+        _stamp_health(force=True)      # baseline stamp so the daemon's wedge check has ground truth at once
     master, slave = pty.openpty()      # PTY or cmux block-buffers a low-volume stream (proven gotcha)
     proc = subprocess.Popen(
         [CMUX, "events", "--category", "agent", "--reconnect",
-         "--cursor-file", CURSOR_FILE, "--no-heartbeat", "--no-ack"],
+         "--cursor-file", CURSOR_FILE, "--no-ack"],    # heartbeat frames ON = a ~15s bus-liveness tick
         stdout=slave, stderr=slave, close_fds=True)
     os.close(slave)
     buf = b""
@@ -279,6 +303,8 @@ def main():
             while b"\n" in buf:
                 raw, buf = buf.split(b"\n", 1)
                 line = raw.decode("utf-8", "replace").strip()
+                if LIVE:
+                    _stamp_health()        # each consumed frame (event OR ~15s heartbeat) proves liveness
                 if line.startswith("{"):
                     try:
                         handle(json.loads(line))

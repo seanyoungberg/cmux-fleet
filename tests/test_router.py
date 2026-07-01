@@ -162,3 +162,15 @@ def test_schedule_idle_wake_retry_dedups(monkeypatch):
     router._schedule_idle_wake_retry("S", "cond")                     # same surface, retry in flight
     assert len(spawned) == 1                                          # only one loop spawned
     router._retrying.discard("S")                                     # cleanup (FakeThread never clears)
+
+
+# --- router bus-consumption health stamp (design enrichment: wedge-detection, Phase 4) -----------
+def test_stamp_health_writes_fresh_pid_and_ts():
+    # the router stamps its OWN pid + a recent ts on each consumed bus frame so the daemon can prove it
+    # is processing the bus (not merely alive) and flag a wedge.
+    import json, os, time
+    router._health["ts"] = 0.0                                        # reset the write-throttle
+    router._stamp_health(force=True)
+    h = json.load(open(router.HEALTH_FILE))
+    assert h["pid"] == os.getpid()
+    assert abs(h["ts"] - time.time()) < 5

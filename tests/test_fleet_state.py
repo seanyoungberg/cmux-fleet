@@ -344,3 +344,17 @@ def test_genuine_midturn_still_not_woken(fs, monkeypatch):
     monkeypatch.setattr(fs, "_cmux", _fake_cmux("❯ ", sink))
     assert fs.wake_if_idle("S", "x") is False
     assert sink == []
+
+
+def test_surface_busy_survives_summarizer_stomp_shape(fs, monkeypatch):
+    # The memsearch summarizer stomp (and any nested-claude Agent subagent) is the SAME class as the
+    # reboot-orphan: a NON-live nested session leaves a FRESH 'running' record on the parent's surface,
+    # outranking the parent's real (idle) bound session by max-updatedAt. The upstream fix is
+    # `env -u CMUX_SURFACE_ID` in memsearch's stop.sh (out of THIS repo, still active per the design);
+    # this asserts the wake gate is ROBUST to the stomp even if that isolation ever regresses — the
+    # bound-session cross-check keeps the foreign fresh-'running' record from reading as busy.
+    fs.live_put("advisor", {"surface": "S", "session": f"claude-{_BOUND}", "kind": "conductor"})
+    monkeypatch.setattr(fs, "read_hook_store", lambda: _store(
+        _rec("S", _ORPHAN, "running", age_s=1),         # the summarizer's fresh nested 'running' stomp
+        _rec("S", _BOUND, "idle", age_s=20)))           # the conductor's real bound session, idle
+    assert fs.surface_busy("S") is False                # not fooled -> the wake still fires
