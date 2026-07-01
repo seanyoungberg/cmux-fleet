@@ -110,9 +110,11 @@ def maybe_idle_wake(parent_surface, label):
         return
     if fs.wake_if_idle(parent_surface, "(auto-wake) handle your pending child completions"):
         log(f"[IDLE-WAKE] {label}: empty prompt -> submitted wake trigger")
-    else:
-        log(f"[idle-wake] skip {label}: busy or has a draft -> scheduling bounded retry")
+    elif fs.surface_busy(parent_surface):               # skip-on-RUNNING -> parent goes idle soon -> retry
+        log(f"[idle-wake] skip {label}: mid-turn -> scheduling bounded retry")
         _schedule_idle_wake_retry(parent_surface, label)
+    else:                                               # draft / no clean prompt -> heartbeat is the backstop
+        log(f"[idle-wake] skip {label}: draft or no clean prompt -> heartbeat backstop (no retry)")
 
 
 def _schedule_idle_wake_retry(surface, label):
@@ -138,6 +140,10 @@ def _idle_wake_retry_loop(surface, label):
                 return                                  # handled meanwhile (woken elsewhere / acked)
             if fs.wake_if_idle(surface, "(auto-wake) handle your pending child completions"):
                 log(f"[idle-wake-retry] {label}: woke after ~{delay}s backoff")
+                return
+            if not fs.surface_busy(surface):            # turn ended but still not wakeable (draft/no prompt)
+                log(f"[idle-wake-retry] {label}: parent idle but not wakeable (draft/no clean prompt) "
+                    f"-> heartbeat backstop")
                 return
         log(f"[idle-wake-retry] {label}: still not wakeable after {len(RETRY_BACKOFF_S)} tries; "
             f"heartbeat is the backstop")

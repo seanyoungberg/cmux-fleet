@@ -72,15 +72,30 @@ def test_lock_is_reusable_after_release():
 from cmux_fleet import state as fs  # noqa: E402
 
 
-def test_maybe_idle_wake_schedules_retry_on_skip(monkeypatch):
+def test_maybe_idle_wake_schedules_retry_on_skip_on_running(monkeypatch):
     monkeypatch.setattr(router, "LIVE", True)
     monkeypatch.setattr(fs, "idlewake_on", lambda: True)
     monkeypatch.setattr(fs, "inbox_pending", lambda surf, kind=None: [{"seq": 1}])
-    monkeypatch.setattr(fs, "wake_if_idle", lambda surf, msg: False)     # skipped (busy)
+    monkeypatch.setattr(fs, "wake_if_idle", lambda surf, msg: False)     # skipped
+    monkeypatch.setattr(fs, "surface_busy", lambda s: True)             # ...because genuinely mid-turn
     scheduled = []
     monkeypatch.setattr(router, "_schedule_idle_wake_retry", lambda surf, label: scheduled.append(surf))
     router.maybe_idle_wake("S", "cond")
-    assert scheduled == ["S"]
+    assert scheduled == ["S"]                                           # retry (parent goes idle soon)
+
+
+def test_maybe_idle_wake_no_retry_on_draft_or_noprompt_skip(monkeypatch):
+    # codex: a draft / no-clean-prompt skip must NOT spawn a guaranteed-useless retry loop (heartbeat
+    # is the backstop). Only skip-on-running retries.
+    monkeypatch.setattr(router, "LIVE", True)
+    monkeypatch.setattr(fs, "idlewake_on", lambda: True)
+    monkeypatch.setattr(fs, "inbox_pending", lambda surf, kind=None: [{"seq": 1}])
+    monkeypatch.setattr(fs, "wake_if_idle", lambda surf, msg: False)     # skipped
+    monkeypatch.setattr(fs, "surface_busy", lambda s: False)           # ...NOT mid-turn (draft/no prompt)
+    scheduled = []
+    monkeypatch.setattr(router, "_schedule_idle_wake_retry", lambda surf, label: scheduled.append(surf))
+    router.maybe_idle_wake("S", "cond")
+    assert scheduled == []                                              # no useless retry spin
 
 
 def test_maybe_idle_wake_no_retry_on_success(monkeypatch):
@@ -99,6 +114,7 @@ def test_idle_wake_retry_loop_wakes_then_stops(monkeypatch):
     monkeypatch.setattr(router.time, "sleep", lambda s: None)           # no real waiting
     monkeypatch.setattr(fs, "idlewake_on", lambda: True)
     monkeypatch.setattr(fs, "inbox_pending", lambda surf, kind=None: [{"seq": 1}])
+    monkeypatch.setattr(fs, "surface_busy", lambda s: True)             # still mid-turn between tries
     n = {"wake": 0}
     def wake(surf, msg):
         n["wake"] += 1
@@ -130,6 +146,7 @@ def test_idle_wake_retry_loop_never_redelivers_content(monkeypatch):
     monkeypatch.setattr(fs, "idlewake_on", lambda: True)
     monkeypatch.setattr(fs, "inbox_pending", lambda surf, kind=None: [{"seq": 1}])
     monkeypatch.setattr(fs, "wake_if_idle", lambda surf, msg: False)    # never wakes -> exhausts backoff
+    monkeypatch.setattr(fs, "surface_busy", lambda s: True)            # still mid-turn (don't early-stop)
     put = []
     monkeypatch.setattr(fs, "inbox_put", lambda *a, **k: put.append(a))
     router._retrying.add("S")
