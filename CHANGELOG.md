@@ -6,6 +6,20 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [0.3.1] - 2026-07-01
+
+### Fixed
+
+- **Moved-child completion routing (root cause #3, the v0.3.0 known issue).** When a
+  child's Stop arrives but its hook-store `sessions{}` record has vanished — a running
+  child whose surface was moved across workspaces loses its live session record,
+  leaving only a frozen `activeSessionsBySurface` pointer — the router no longer
+  silently drops the completion. It falls back to fleet-registry truth
+  (`_member_by_session`, tool-aware + fail-open), recovers the member's surface +
+  parent, and runs the normal queue/notify/wake path; a thin/empty gist is used if the
+  cmux transcript is gone rather than dropping. Completes the notifications root-cause
+  set (with the v0.3.0 stale-`running` wake-gate fix). Adds a router regression test.
+
 ## [0.3.0] - 2026-07-01
 
 Lifecycle + notifications hardening. Two reviewed features (each went through a
