@@ -65,6 +65,37 @@ def test_recycle_compose_explicit_session_beats_checkpoint(monkeypatch):
     assert "CKPT" not in resume and "REGID" not in resume
 
 
+# --- roster cwd change: RESUME pins the session's original cwd, FRESH adopts the moved toml cwd --------
+def _roster_resolve_to(cwd):
+    return lambda cfg, role, tool, adhoc: {
+        "tool": "claude", "role": "w", "label": "w", "kind": "child", "place": "tab", "group": "",
+        "cwd": cwd, "plugins": [], "flags": [], "env": {}, "settings": "",
+        "enable_plugins": [], "setting_sources": ""}
+
+
+def test_compose_from_roster_resume_pins_cwd_override(monkeypatch):
+    monkeypatch.setattr(cli, "load_config", lambda: {"role": {"w": {}}})
+    monkeypatch.setattr(cli, "resolve", _roster_resolve_to("/NEW/cwd"))
+    resume = cli._compose_from_roster("w", "claude", "w", [], [], "SID", cwd_override="/OLD/cwd")
+    assert "cd /OLD/cwd" in resume and "--resume SID" in resume          # resume runs where the session lives
+    fresh = cli._compose_from_roster("w", "claude", "w", [], [], None, cwd_override="")
+    assert "cd /NEW/cwd" in fresh and "--resume" not in fresh            # fresh adopts the moved toml cwd
+
+
+def test_recycle_roster_resume_uses_original_cwd_not_moved_toml(monkeypatch):
+    # the codex-flagged trap: role cwd moved since launch; default RESUME must resume from the OLD cwd
+    # (where the session's project dir is), not the re-resolved NEW cwd -> else "No conversation found".
+    monkeypatch.setattr(cli, "_is_roster", lambda role: True)
+    monkeypatch.setattr(cli, "_resume_binding", lambda surf: {})
+    monkeypatch.setattr(cli, "load_config", lambda: {"role": {"w": {}}})
+    monkeypatch.setattr(cli, "resolve", _roster_resolve_to("/NEW/cwd"))
+    entry = {"tool": "claude", "role": "w", "cwd": "/OLD/cwd", "session": "claude-SID", "surface": "S"}
+    resume, _ = cli._compose_recycle_cmd("w", entry, [], [], "resume", "")
+    assert "cd /OLD/cwd" in resume and "--resume SID" in resume
+    fresh, _ = cli._compose_recycle_cmd("w", entry, [], [], "fresh", "")
+    assert "cd /NEW/cwd" in fresh and "--resume" not in fresh
+
+
 # --- compose: revive (roster = toml-authoritative, resume replayed) ------------------------------
 def test_revive_roster_compose_resumes(monkeypatch):
     # a roster revive re-resolves the toml and prepends --resume <sess>. Patch the roster resolve so the

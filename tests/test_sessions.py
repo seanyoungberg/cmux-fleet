@@ -70,9 +70,20 @@ def test_known_session_matches_and_rejects(tmp_path, monkeypatch):
     assert cli._known_session({}, "S", "deadbeef-0000-0000-0000-000000000000") is False
 
 
-def test_known_session_fails_open_when_no_dir(monkeypatch):
+def test_project_dir_is_tool_scoped(monkeypatch):
+    # a reused surface's cross-tool history must not leak: only the entry's OWN tool store is read.
+    monkeypatch.setattr(cli, "_tool_store", lambda tool: {
+        "sessions": {"s1": {"surfaceId": "S", "transcriptPath": "/p/enc/abc.jsonl", "updatedAt": 1}},
+        "activeSessionsBySurface": {}} if tool == "claude" else {"sessions": {}, "activeSessionsBySurface": {}})
+    assert cli._project_dir_for_surface("S", "claude") == "/p/enc"
+    assert cli._project_dir_for_surface("S", "codex") == ""     # codex store has nothing -> no wrong-tool dir
+
+
+def test_known_session_fails_closed_when_no_dir(monkeypatch):
+    # FAIL CLOSED: when the projects dir can't be resolved/enumerated we CANNOT confirm the id exists, so
+    # an explicit --session must be refused (not silently proceed into `claude --resume <bad-id>`).
     monkeypatch.setattr(cli, "_projects_dir_for", lambda entry, surf: "")
-    assert cli._known_session({}, "S", "whatever") is True   # can't enumerate -> never block a real id
+    assert cli._known_session({}, "S", "whatever") is False   # can't verify -> refuse (--force-session to override)
 
 
 # --- --session composes an arbitrary --resume ----------------------------------------------------

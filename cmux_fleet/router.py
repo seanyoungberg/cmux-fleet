@@ -140,13 +140,21 @@ def handle(ev):
     # codex-store id must never overwrite a claude agent's session (berg-sandbox's stale 019f144d was a
     # codex id on a now-claude agent).
     entry_tool = entry.get("tool", "claude")
-    action = fs.reconcile_session(entry["label"], sid_bare, entry_tool, event_tool=fs.bus_tool(raw_sid))
-    if action == "backfill":
-        log(f"[backfill] {entry['label']}: session {sid_bare[:12]} bound on first turn")
-    elif action == "reconcile":
-        log(f"[reconcile] {entry['label']}: registry session -> {sid_bare[:12]} (was stale/bridge id)")
-    elif action == "skip-tool":
-        log(f"[reconcile] skip {entry['label']}: {fs.bus_tool(raw_sid)} Stop on a {entry_tool} agent (no cross-tool id write)")
+    ev_tool = fs.bus_tool(raw_sid)
+    if LIVE:                                             # OBSERVE mode holds no singleton lock -> writes NOTHING
+        action = fs.reconcile_session(entry["label"], sid_bare, entry_tool, event_tool=ev_tool)
+        if action == "backfill":
+            log(f"[backfill] {entry['label']}: session {sid_bare[:12]} bound on first turn")
+        elif action == "reconcile":
+            log(f"[reconcile] {entry['label']}: registry session -> {sid_bare[:12]} (was stale/bridge id)")
+        elif action == "skip-tool":
+            log(f"[reconcile] skip {entry['label']}: {ev_tool} Stop on a {entry_tool} agent (no cross-tool id write)")
+    else:
+        # observe: report what a LIVE router would reconcile, mutate nothing (respects the observe contract
+        # + the singleton-lock invariant — an unlocked observer racing the daemon on fleet.json is the bug).
+        stored = fs.bare_uuid(entry.get("session") or "")
+        if sid_bare and stored != sid_bare and not (ev_tool and ev_tool != entry_tool):
+            log(f"[reconcile] (observe) would set {entry['label']} session -> {sid_bare[:12]} (was {stored[:12] or 'unbound'})")
 
     try:
         ts = datetime.fromisoformat(ev.get("occurred_at", "").replace("Z", "+00:00"))

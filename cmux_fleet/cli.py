@@ -25,7 +25,7 @@
 #   [role.<name>.<t>]     that role's config for tool <t> (plugins/flags/env/settings)
 # Resolution for `launch <role>`: tool = --tool | role.tool | defaults.tool. Merge
 # [defaults] (orchestration) -> [role] scalars -> tool config [tool.<t>] -> [role.<t>] -> caller `--`.
-import argparse, json, os, shlex, subprocess, sys, time
+import argparse, json, os, shlex, subprocess, sys, tempfile, time
 
 from .config import ROOT, STATE, CMUX, MARKETPLACE, FLOOR, FLEET_TOML, ADHOC_SUBDIR  # path resolver
 
@@ -590,6 +590,9 @@ def cmd_launch(argv):
     ap.add_argument("--direction", default="down", help="split direction for --place pane")
     ap.add_argument("--cwd", help="override the launch cwd (absolute)")
     ap.add_argument("--plugins", help="ad-hoc: comma-separated plugin names (adds to floor)")
+    ap.add_argument("--effort", default="", metavar="LEVEL",
+                    help="session-preference override (low|medium|high|xhigh|max); layers over the loadout")
+    ap.add_argument("--model", default="", metavar="MODEL", help="session-preference override; layers over the loadout")
     ap.add_argument("--worktree", nargs="?", const=True, default=None, metavar="BRANCH",
                     help="isolate this agent in a git worktree off its repo cwd (overrides the roster; "
                          "optional branch name, else fleet/<label>)")
@@ -600,6 +603,12 @@ def cmd_launch(argv):
     a = ap.parse_args(argv)
     if not a.role and not a.adhoc:
         ap.error("need a <role> or --adhoc <name>")
+    # first-class session-preference overrides funnel into the caller-token layer (highest precedence),
+    # so `fleet launch role --effort max` works without a `-- --effort max` passthrough.
+    if a.effort:
+        caller += ["--effort", a.effort]
+    if a.model:
+        caller += ["--model", a.model]
 
     cfg = load_config()
     spec = resolve(cfg, a.role, a.tool, a.adhoc)
@@ -1154,6 +1163,8 @@ def cmd_revive(argv):
     ap.add_argument("--session", default="", metavar="ID",
                     help="resume an ARBITRARY prior session id (default: the archived last_session); "
                          "list with `fleet sessions <label>`")
+    ap.add_argument("--force-session", action="store_true",
+                    help="skip the --session existence check (id known-good but its projects dir can't be enumerated)")
     ap.add_argument("--add-plugin", action="append", default=[], metavar="NAME",
                     help="union a marketplace plugin into this identity (repeatable)")
     ap.add_argument("--dry-run", action="store_true")
@@ -1165,9 +1176,12 @@ def cmd_revive(argv):
     if a.fresh and a.session:
         sys.exit("[fleet] revive: --fresh and --session are contradictory (fresh drops the session; --session resumes one)")
     # --fresh drops the session; an explicit --session targets an arbitrary prior one; else last_session.
-    if a.session and not _known_session(e, "", a.session):   # archived -> no live surface, encode the cwd
-        sys.exit(f"[fleet] revive: session '{a.session}' not found under {a.label}'s projects dir; "
-                 f"`fleet sessions {a.label}` to list resumable ids.")
+    # FAIL CLOSED (archived -> no live surface, so the encoded cwd is the only source; if it can't be
+    # enumerated we refuse rather than resume a possibly-dead id) unless --force-session.
+    if a.session and not a.force_session and not _known_session(e, "", a.session):
+        sys.exit(f"[fleet] revive: could not verify session '{a.session}' under {a.label}'s projects dir "
+                 f"(bad id, or the dir couldn't be resolved/enumerated). `fleet sessions {a.label}` to list "
+                 f"resumable ids; add --force-session to skip this check if you're sure the id is valid.")
     sess = "" if a.fresh else (a.session or e.get("last_session") or "").replace("claude-", "")   # bare uuid
     # Authoritative cwd/place/group: roster toml > archived entry > captured binding. NEVER let cwd fall
     # to "" -> os.path.join(ROOT,"") = ROOT root, which lands the agent off its session (claude --resume
@@ -1193,7 +1207,9 @@ def cmd_revive(argv):
 
     binding_argv = _binding_argv(e.get("binding_cmd", ""))
     if _is_roster(e.get("role")):                                 # ROSTER -> re-resolve the toml (truth)
-        send_cmd = _compose_from_roster(e.get("role"), tool, a.label, caller, a.add_plugin, sess)
+        # RESUME pins the archived (original) cwd so the session is findable; FRESH adopts the toml cwd.
+        send_cmd = _compose_from_roster(e.get("role"), tool, a.label, caller, a.add_plugin, sess,
+                                        cwd_override=(cwd if sess else ""))
         source = "toml"
     elif binding_argv:                                            # AD-HOC: replay the captured binding
         cwd = e.get("binding_cwd") or spec["cwd"]
@@ -1467,13 +1483,25 @@ def cmd_register(argv):
 
 
 # ---------------------------------------------------------------- sessions (list resumable priors)
-def _project_dir_for_surface(surf):
+def _tool_store(tool):
+    """Just ONE tool's hook store (~/.cmuxterm/<tool>-hook-sessions.json), for TOOL-SCOPED surface reads —
+    so a reused surface's cross-tool history can't select the wrong session dir or list another tool's
+    sessions. Falls back to an empty store on any read error."""
+    from .config import HOOKSTORE
+    try:
+        return json.load(open(os.path.join(HOOKSTORE, f"{tool}-hook-sessions.json")))
+    except Exception:
+        return {"sessions": {}, "activeSessionsBySurface": {}}
+
+
+def _project_dir_for_surface(surf, tool="claude"):
     """The ~/.claude/projects/<enc-cwd>/ folder holding EVERY session jsonl for the surface's cwd. cmux
     records each session's transcriptPath; its parent dir is that folder — EXACT (no cwd re-encoding)
-    whenever a live/historical record for the surface carries a transcriptPath."""
+    whenever a live/historical record for the surface carries a transcriptPath. TOOL-SCOPED: reads only
+    the entry's own tool store, so a surface that hosted two tools can't return the other tool's dir."""
     if not surf:
         return ""
-    for s in _sessions_on_surface(_store(), surf):
+    for s in _sessions_on_surface(_tool_store(tool), surf):
         tp = s.get("transcriptPath") or ""
         if tp:
             return os.path.dirname(tp)
@@ -1490,9 +1518,10 @@ def _encode_project_dir(abs_cwd):
 
 
 def _projects_dir_for(entry, surf):
-    """Resolve an agent's ~/.claude/projects dir: the surface's transcriptPath dir (exact) else the
-    encoded cwd. '' if neither resolves."""
-    pdir = _project_dir_for_surface(surf)
+    """Resolve an agent's ~/.claude/projects dir: the surface's (tool-scoped) transcriptPath dir (exact)
+    else the encoded cwd. '' if neither resolves."""
+    tool = (entry or {}).get("tool", "claude")
+    pdir = _project_dir_for_surface(surf, tool)
     if pdir:
         return pdir
     cwd = (entry or {}).get("cwd", "")
@@ -1547,16 +1576,15 @@ def _human_size(n):
 
 
 def _known_session(entry, surf, sid):
-    """True if `sid` matches a session jsonl under the agent's projects dir (bare-uuid compare). Guards
-    `--session` against the "No conversation found" footgun: refuse an id claude can't resume, with the
-    `fleet sessions` hint. Fails OPEN (True) when the projects dir can't be enumerated, so a genuine id
-    is never blocked by a discovery gap."""
+    """True IFF `sid` matches a session jsonl under the agent's TOOL-SCOPED projects dir (bare-uuid
+    compare). FAILS CLOSED: when the projects dir can't be resolved/enumerated (sparse archive, moved cwd,
+    no transcriptPath) `_list_sessions` is empty and this returns False — we CANNOT confirm the id exists,
+    so an explicit `--session` must not silently proceed into `claude --resume <bad-id>` = "No conversation
+    found" (the exact footgun the flag exists to kill). Operators who KNOW the id is good bypass the
+    check with `--force-session`."""
     from . import state as fs
-    rows = _list_sessions(entry, surf)
-    if not rows:
-        return True
     want = fs.bare_uuid(sid)
-    return any(fs.bare_uuid(s) == want for s, *_ in rows)
+    return any(fs.bare_uuid(s) == want for s, *_ in _list_sessions(entry, surf))
 
 
 def cmd_sessions(argv):
@@ -1760,20 +1788,25 @@ def _compose_from_registry(label, entry, caller_tokens, add_plugins, resume_sess
     return render_send_cmd(bin_name, args, env, abs_cwd)
 
 
-def _compose_from_roster(role, tool, label, caller_tokens, add_plugins, resume_session):
+def _compose_from_roster(role, tool, label, caller_tokens, add_plugins, resume_session, cwd_override=""):
     """TOML-AUTHORITATIVE compose for a ROSTER role: re-resolve the CURRENT toml (floor + role config,
     incl. setting_sources / enable_plugins), compile it exactly as `fleet launch` does, then prepend the
     resume per tool. This is the source-of-truth path -- a recycle/revive of a rostered agent PICKS UP
     floor/role changes made since it launched (a frozen binding or a sparse registry can't, and the
     registry never even stored the newer keys). Identity (label/surface/parent/session) stays in the
     registry; only the LOADOUT is re-resolved. One-off caller `--` flags apply this invocation only
-    (to persist a change, edit the toml)."""
+    (to persist a change, edit the toml).
+    `cwd_override` pins the launch cwd (used on RESUME): a claude session lives in the project dir of the
+    cwd it was CREATED in, so a resume must run from THAT cwd — not a re-resolved toml cwd that may have
+    moved (or the repo cwd for a worktree agent) -> otherwise `claude --resume` hits 'No conversation
+    found'. FRESH passes no override and adopts the current toml cwd."""
     cfg = load_config()
     spec = resolve(cfg, role, tool, None)
     spec["label"] = label                                        # registry label (resolve defaults to role)
     if add_plugins:
         spec["plugins"] = _dedup(spec["plugins"] + list(add_plugins))
-    abs_cwd = spec["cwd"] if os.path.isabs(spec["cwd"]) else os.path.join(ROOT, spec["cwd"])
+    cwd = cwd_override or spec["cwd"]
+    abs_cwd = cwd if os.path.isabs(cwd) else os.path.join(ROOT, cwd)
     bin_name, args, env = adapter_compile(tool, spec, caller_tokens)
     args = _prepend_resume(args, tool, resume_session)
     return render_send_cmd(bin_name, args, env, abs_cwd)
@@ -1803,7 +1836,11 @@ def _compose_recycle_cmd(label, entry, caller_tokens, add_plugins, mode, explici
     resume_session = ((explicit_session or checkpoint or (entry.get("session") or "").replace("claude-", ""))
                       if mode == "resume" else None)
     if _is_roster(role):                                          # ROSTER -> re-resolve the toml (truth)
-        return _compose_from_roster(role, tool, label, caller_tokens, add_plugins, resume_session), checkpoint
+        # RESUME pins the session's original cwd (registry) so a moved-role / worktree agent resumes where
+        # its session actually lives; FRESH adopts the current toml cwd (picks up an intentional move).
+        cwd_override = entry.get("cwd", "") if mode == "resume" else ""
+        return (_compose_from_roster(role, tool, label, caller_tokens, add_plugins, resume_session, cwd_override),
+                checkpoint)
     argv = _binding_argv(b.get("command", ""))                    # AD-HOC / off-roster -> reproduce
     if not argv:                                                  # no cmux binding -> registry fallback
         return _compose_from_registry(label, entry, caller_tokens, add_plugins, resume_session), checkpoint
@@ -1892,6 +1929,11 @@ def _bulk_targets(target, from_surface, from_label, include_muted):
             continue
         if v.get("muted") and not include_muted:
             skipped.append((label, "muted/human-driven")); continue
+        # STALE/non-live (same signal `fleet ls` shows): surface has no live session -> respawn-pane would
+        # target a gone UUID, or the quiet-gate would burn its timeout on a dead surface. Skip it (revive
+        # it explicitly instead). Matches cmd_ls: STALE = a recorded session but lifecycle ''/'-'/'ended'.
+        if fs.lifecycle(surf) in ("", "-", "ended") and v.get("session"):
+            skipped.append((label, "stale/non-live")); continue
         sel.append((label, v))
     sel.sort()
     return sel, skipped
@@ -1914,6 +1956,9 @@ def cmd_recycle(argv):
     ap.add_argument("--session", default="", metavar="ID",
                     help="resume an ARBITRARY prior session id directly (list with `fleet sessions "
                          "<label>`) — no cmux-checkpoint surgery; single-target only")
+    ap.add_argument("--force-session", action="store_true",
+                    help="skip the --session existence check (use when the id is known-good but its "
+                         "projects dir can't be enumerated)")
     ap.add_argument("--effort", default="", metavar="LEVEL",
                     help="session-preference override for THIS restart (low|medium|high|xhigh|max); layers "
                          "over the composed loadout. Durable per-agent effort belongs in the role's toml.")
@@ -1939,6 +1984,8 @@ def cmd_recycle(argv):
     # old --resume is kept as an accepted no-op alias so muscle-memory/scripts don't break.
     if a.fresh and a.session:
         sys.exit("[fleet] recycle: --fresh and --session are contradictory (fresh sheds context; --session resumes one)")
+    if a.fresh and a.resume:
+        sys.exit("[fleet] recycle: --fresh and --resume are contradictory (shed vs preserve context) — pick one")
     mode = "fresh" if a.fresh else "resume"
     # session-preference overrides funnel into the caller-token layer (highest precedence over the composed
     # floor/role loadout) — applies to the single AND bulk paths.
@@ -1964,9 +2011,10 @@ def cmd_recycle(argv):
     surf = entry.get("surface", "")
     if not surf:
         sys.exit(f"[fleet] recycle: label '{label}' has no surface on its registry entry")
-    if a.session and not _known_session(entry, surf, a.session):
-        sys.exit(f"[fleet] recycle: session '{a.session}' not found under {label}'s projects dir; "
-                 f"`fleet sessions {label}` to list resumable ids.")
+    if a.session and not a.force_session and not _known_session(entry, surf, a.session):
+        sys.exit(f"[fleet] recycle: could not verify session '{a.session}' under {label}'s projects dir "
+                 f"(bad id, or the dir couldn't be resolved/enumerated). `fleet sessions {label}` to list "
+                 f"resumable ids; add --force-session to skip this check if you're sure the id is valid.")
     payload = _recycle_plan(label, entry, caller, a.add_plugin, mode, a.session, a.force, a.prime, a.no_prime)
     provline, provwarn = _session_pref_provenance(entry.get("role"), entry.get("tool", "claude"),
                                                    payload["send_cmd"], a.effort, a.model)
@@ -1984,10 +2032,13 @@ def cmd_recycle(argv):
         print("[fleet] dry-run (omit --dry-run to recycle)")
         return 0
 
-    # hand to a DETACHED worker (own session) so it outlives this process and can respawn our own surface
+    # hand to a DETACHED worker (own session) so it outlives this process and can respawn our own surface.
+    # UNIQUE payload path (mkstemp): a fixed .recycle-<label>.json would let two concurrent recycles of the
+    # same label clobber each other's payload before the detached worker reads it.
     os.makedirs(STATE, exist_ok=True)
-    pf = os.path.join(STATE, f".recycle-{label}.json")
-    with open(pf, "w") as fh:
+    _lbl = "".join(c if (c.isalnum() or c in "_.-") else "_" for c in label)
+    fd, pf = tempfile.mkstemp(prefix=f".recycle-{_lbl}-", suffix=".json", dir=STATE)
+    with os.fdopen(fd, "w") as fh:
         json.dump(payload, fh)
     log = os.path.join(STATE, "recycle.log")
     subprocess.Popen([sys.executable, "-m", "cmux_fleet", "_recycle-exec", pf],
@@ -2021,13 +2072,16 @@ def _recycle_bulk(target, mode, caller, a):
         payloads.append(payload)
         print(f"   {label:<24}{entry.get('kind','-'):<11}{(entry.get('surface') or '')[:8]}  mode={mode}")
     for label, reason in skipped:
-        print(f"   {label:<24}SKIP ({reason}; --include-muted to force)")
+        hint = "; --include-muted to force" if reason.startswith("muted") else "; `fleet revive`/`recycle` it directly"
+        print(f"   {label:<24}SKIP ({reason}{hint})")
     if a.dry_run:
         print("[fleet] dry-run (omit --dry-run to recycle these sequentially)")
         return 0
+    # UNIQUE payload path (mkstemp): a fixed .recycle-bulk.json lets two concurrent bulk restarts clobber
+    # each other's target list before the detached worker reads it (A's --children worker runs B's targets).
     os.makedirs(STATE, exist_ok=True)
-    pf = os.path.join(STATE, ".recycle-bulk.json")
-    with open(pf, "w") as fh:
+    fd, pf = tempfile.mkstemp(prefix=".recycle-bulk-", suffix=".json", dir=STATE)
+    with os.fdopen(fd, "w") as fh:
         json.dump(payloads, fh)
     log = os.path.join(STATE, "recycle.log")
     subprocess.Popen([sys.executable, "-m", "cmux_fleet", "_recycle-bulk-exec", pf],
@@ -2456,7 +2510,7 @@ def cmd_profile(argv):
 def main():
     if len(sys.argv) < 2 or sys.argv[1] in ("-h", "--help"):
         print("usage: fleet <launch|config|ls|archive|revive|register|recycle|rm|vitals|find|graph|serve|paint|worktree|profile|daemon> ...\n"
-              "  launch <role|--adhoc NAME> [--tool t] [--place p] [--parent s] [--dry-run] [-- <tool flags>]\n"
+              "  launch <role|--adhoc NAME> [--tool t] [--place p] [--parent s] [--effort L] [--model M] [--dry-run] [-- <tool flags>]\n"
               "  config <role|--adhoc NAME|--cwd DIR> [--tool t]   effective config (base settings + fleet adds)\n"
               "  ls                                                live fleet x hook store; flags STALE + archived\n"
               "  archive <label>                                   park a live agent (revivable)\n"

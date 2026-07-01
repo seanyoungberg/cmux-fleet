@@ -53,6 +53,17 @@ def test_include_muted_keeps_them(fs):
     assert skipped == []
 
 
+def test_bulk_skips_stale_non_live(fs, monkeypatch):
+    # a child whose surface is gone (lifecycle ended) but still recorded a session = STALE -> bulk must
+    # skip it (else respawn-pane targets a gone UUID / the quiet-gate burns on a dead surface).
+    fs.live_put("kidA", {"kind": "child", "surface": "A", "parent": "me", "tool": "claude", "session": "claude-x"})
+    fs.live_put("kidB", {"kind": "child", "surface": "B", "parent": "me", "tool": "claude", "session": "claude-y"})
+    monkeypatch.setattr(fs, "lifecycle", lambda surf: "ended" if surf == "A" else "idle")
+    sel, skipped = cli._bulk_targets("children", "SELF", "me", include_muted=False)
+    assert [l for l, _ in sel] == ["kidB"]                  # only the live one
+    assert ("kidA", "stale/non-live") in skipped
+
+
 # --- the shared per-target plan ------------------------------------------------------------------
 def test_recycle_plan_fresh_primes_from_handover(fs, monkeypatch):
     monkeypatch.setattr(cli, "_compose_recycle_cmd", lambda *a, **k: ("claude ...", ""))

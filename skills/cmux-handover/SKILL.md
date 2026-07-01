@@ -10,7 +10,7 @@ A handover is a **point-in-time brain dump of this session** for whoever picks u
 ## Where it lives
 `<your cwd>/handover/<YYYY-MM-DD>.md`. Your cwd is your home (your identity seat). A second handover the same day → add a `-HHMM` suffix. Create `handover/` if it is not there; it is yours.
 
-This is exactly the file `fleet recycle` auto-primes the next instance to read (the newest `handover/*.md` by mtime). There is **no** separate top-level `HANDOVER.md` — that was the retired relauncher's convention; `handover/<date>.md` is the single source.
+This is exactly the file `fleet recycle --fresh` auto-primes the next instance to read (the newest `handover/*.md` by mtime; a bare `fleet recycle` now RESUMES and does not prime). There is **no** separate top-level `HANDOVER.md` — that was the retired relauncher's convention; `handover/<date>.md` is the single source.
 
 ## The split (why your cwd, not the vault)
 Two kinds of output, two homes — this is the clarity the fleet is built around:
