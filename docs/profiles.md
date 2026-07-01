@@ -53,8 +53,9 @@ eval "$(~/builds/cmux-fleet-dev/bin/fleet profile dev --init)"
 # 3. give it a roster (or start from the seeded one)
 cp ~/builds/cmux-fleet-dev/profiles/test.fleet.toml "$CMUX_FLEET_TOML"
 
-# 4. start THIS build's own router against THIS profile's state
-python3 ~/builds/cmux-fleet-dev/scripts/router.py --live &
+# 4. start THIS build's own router daemon against THIS profile's state
+fleet daemon start
+fleet daemon status                             # confirm it routes this profile's state dir
 
 # 5. work in this shell: every `fleet ...` and every agent it launches is pinned to the dev build
 fleet launch --adhoc scratch
@@ -63,6 +64,52 @@ fleet ls
 
 A second shell with `eval "$(.../cmux-fleet/bin/fleet profile prod)"` runs the stable build at the same
 time. The two share no state dir, no roster, no router, and no plugin code path.
+
+## Developing cmux-fleet with cmux-fleet (the meta-dogfood loop)
+
+> Status: intended workflow, **not yet run end to end.** The pieces (profiles, `fleet daemon`, worktrees)
+> each work in prod; the combined dev-on-dev loop below has not been exercised. Treat the steps as the
+> plan, and verify each one the first time you run it.
+
+Prod runs on the stable build at the XDG homes. To change cmux-fleet itself, run a **dev profile** on a
+second checkout so a broken router, a bad hook, or a wedged agent in dev cannot touch the prod fleet. The
+dev build gets its own state, config, router daemon, and workspace group; git worktrees give each change
+its own branch. You develop cmux-fleet using cmux-fleet, off to the side, with zero prod blast radius.
+
+Stand it up (in a dedicated shell, so the `eval` does not leak into prod shells):
+
+```sh
+# 1. dev build = a second checkout (or a worktree of the repo)
+git clone <repo> ~/builds/cmux-fleet-dev
+
+# 2. activate its profile: isolated state / config / PATH / marketplace
+eval "$(~/builds/cmux-fleet-dev/bin/fleet profile dev --init)"
+cp ~/builds/cmux-fleet-dev/profiles/test.fleet.toml "$CMUX_FLEET_TOML"
+
+# 3. start the dev profile's own daemon (routes the dev state dir only)
+fleet daemon start
+fleet daemon status                    # confirm state = the dev CMUX_STATE_DIR
+ps aux | grep 'router.py --live'       # prod's router + this one; no strays
+
+# 4. launch a sandbox conductor in its own group and drive it
+fleet launch sandbox-conductor         # auto-anchors its own workspace group
+```
+
+The sandbox conductor is itself running the dev build's plugin, so it exercises your in-progress changes.
+Give it a coding role with `worktree = true` (see `docs/operations.md`) and each change lands on its own
+`fleet/<label>` branch, isolated from the dev build's own working tree.
+
+Tear it down when the change is done:
+
+```sh
+fleet rm sandbox-conductor --with-group   # dissolve the group, sweep its members
+fleet daemon stop                         # stop the dev router (from the dev shell)
+```
+
+Reclaim any worktrees the sweep left behind (`--with-group` deletes the registry rows, so `fleet worktree
+clean` can no longer find them): `git worktree list`, then `git worktree remove <path>` and, if you want
+it gone, `git branch -D fleet/<label>`. Prod is untouched throughout: it kept its own state dir, roster,
+and daemon the whole time.
 
 ## Sandbox / acceptance profile
 
@@ -98,8 +145,10 @@ So a second build's sandbox conductor lands in its own separate group, and teari
 
 ## Gotchas
 
-- Always start the router **inside** the activated shell (so it reads the profile's `CMUX_STATE_DIR`).
-  A router started without the profile serves a different build's state.
+- Always run `fleet daemon start` **inside** the activated shell (so the router reads the profile's
+  `CMUX_STATE_DIR`). `fleet daemon` is per-state: started without the profile it manages a different
+  build's router. `fleet daemon status` shows which state dir it routes; `ps aux | grep 'router.py
+  --live'` should show one router per active profile, no more.
 - `eval` runs the env block in the **current** shell. A subshell or a new terminal needs its own `eval`.
 - The build's directory basename is the plugin name the roster's `plugins = [...]` resolves to under
   `CMUX_FLEET_MARKETPLACE`. If you rename the dir, update the roster or use an absolute plugin path.

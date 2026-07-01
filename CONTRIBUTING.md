@@ -40,7 +40,7 @@ python3 -m venv .venv && .venv/bin/pip install pytest
 .venv/bin/python -m pytest tests/ -q
 ```
 
-64 tests, three layers. State the pass count in your PR.
+Three layers. State the pass count in your PR.
 
 1. **Static validators** check the manifests, skill, and `hooks.json` for
    well-formed JSON and the expected schema.

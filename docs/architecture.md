@@ -4,7 +4,8 @@ The spine as-built, by file:
 
 - `scripts/config.py` resolves every path/setting (env > `[fleet]` toml > XDG default).
 - `scripts/fleet_state.py` owns the state model: the label-keyed registry, the unified inbox, the archive shelf, the hook-store union, the idle-wake gate.
-- `scripts/router.py` is the bus daemon: child `Stop` -> deliver a completion to the parent. One process serves every conductor.
+- `scripts/router.py` is the bus router: child `Stop` -> deliver a completion to the parent. One process serves every conductor.
+- `scripts/fleet_daemon.py` is the daemon manager (`fleet daemon start|stop|status|restart`): it double-forks `router.py --live` into a detached supervisor so the router survives shell exit, Bash-tool cleanup, and a conductor recycle.
 - `scripts/hooks/awareness.py` + `scripts/hooks/drain.py` surface the inbox into a conductor's context (never its input box).
 - `scripts/fleet.py` is the CLI: launch, the lifecycle verbs, peer messaging, broadcast, worktrees, profiles, and the read-only views (`scripts/fleet_features.py`).
 - `scripts/peer-msg.py`, `scripts/child-digest.py`, `scripts/drive-child.py`, `scripts/inbox-ack.py` are the agent-facing helpers.
@@ -68,6 +69,10 @@ throwaway state dir gives you a clean run.
   `recycled`, `removed`, `broadcast`, ...). The source-of-truth timeline.
 - `notify-mode`: the dial: `passive` | `autodrain` | `auto`.
 - `router.seq`: the bus replay cursor, distinct from the inbox seq.
+- `router.pid` / `router.daemon.json` / `router.log`: the daemon manager's
+  pidfile (the supervisor pid), its metadata (state dir, start time, heartbeat
+  interval), and the router's log. Written by `fleet daemon`, one set per state
+  dir.
 
 ## Identity
 
@@ -87,9 +92,20 @@ read to answer "who am I" and "what is in my inbox".
 ## The router daemon
 
 `scripts/router.py` is one long-lived process, not a hook, and serves every
-conductor on the machine. It tails the cmux agent bus
-(`cmux events --category agent`) through a PTY (a low-volume stream is otherwise
-block-buffered), and on each child `Stop` with `phase == completed`:
+conductor on the machine. It runs under `fleet daemon` (`scripts/fleet_daemon.py`),
+which double-forks with `setsid` so the router keeps its own session and process
+group and survives the starting shell exiting, an agent's Bash-tool process-group
+cleanup, and a conductor self-recycle. The manager writes `<state>/router.pid`
+(the supervisor pid), `<state>/router.daemon.json`, and `<state>/router.log`,
+refuses to double-start, and cleans a stale pidfile. It is per-state, so under a
+profile it manages that profile's router. Running the router by hand from a
+session is unsupported: a bare `nohup &` dies with the tool's process group, or
+survives as a stray duplicate that double-processes the bus. See
+`docs/operations.md` for the verbs.
+
+The router tails the cmux agent bus (`cmux events --category agent`) through a
+PTY (a low-volume stream is otherwise block-buffered), and on each child `Stop`
+with `phase == completed`:
 
 1. maps the (bare) session id to a surface via the hook store;
 2. looks up that surface in the live registry; ignores it if it is not a

@@ -4,7 +4,38 @@ All notable changes to this project are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this project
 adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [0.1.0] - unreleased
+## [Unreleased]
+
+Post-v0.1.0 work, not yet tagged. The conductor may fold in the parallel code
+worker's fixes here before cutting v0.1.1.
+
+### Added
+
+- **Router daemon manager** (`scripts/fleet_daemon.py`). `fleet daemon
+  start|stop|status|restart` runs `router.py --live` as a properly detached
+  daemon: `start` double-forks with `setsid` (its own session, no controlling
+  terminal) and leads its own process group, so the router survives the starting
+  shell exiting, an agent Bash-tool process-group cleanup, and a conductor
+  self-recycle (a bare `nohup &` router does not; it also risks surviving as a
+  stray duplicate that double-processes the bus). Pidfile (supervisor pid), meta,
+  and log under `$CMUX_STATE_DIR` (one set per state/profile); refuses to
+  double-start, cleans a stale pidfile, and `stop` signals the whole process
+  group (router included). `--heartbeat [SECS]` adds a Tier-1 tick (default 540s)
+  that re-nudges only LIVE-IDLE conductors with a pending inbox through the
+  input-safe `wake_if_idle` gate (skips busy/human-draft/muted/non-conductor);
+  no dead-session detection or auto-recycle. `restart` preserves the running
+  heartbeat setting unless overridden.
+
+### Fixed
+
+- **Recycle/revive auto-resumes the FULL session.** `claude --resume` on an old
+  or large session shows a summary-vs-full menu that hung an automated respawn
+  and false-passed the confirm (the respawn keyed off a stale session while the
+  menu blocked). The relaunch now auto-picks the full session and dismisses the
+  menu, so recycle and revive resume complete context instead of stalling or
+  silently compacting.
+
+## [0.1.0] - 2026-06-30
 
 Initial port. The native-cmux parent/child orchestration spine, extracted and
 cleaned from an internal `cmux-conductor` plugin and decoupled from any single
@@ -98,16 +129,6 @@ vault or machine.
   the group's members out of the registry (worktree branches are kept), while plain `rm` leaves members
   ungrouped. The sandbox profile is now turnkey (no manual `workspace-group create`).
 
-- **Router daemon** (`scripts/fleet_daemon.py`). `fleet daemon start|stop|status|restart` runs the
-  router as a properly detached daemon: `start` double-forks with `setsid` (its own session, no
-  controlling terminal) and leads its own process group, so it survives the starting shell exiting, an
-  agent Bash-tool process-group cleanup, and a conductor self-recycle (a bare `nohup &` router does
-  not). Pidfile + meta + log under `$CMUX_STATE_DIR` (per state/profile); refuses to double-start,
-  cleans a stale pidfile, and `stop` signals the whole process group (router included). `--heartbeat
-  [SECS]` adds a Tier-1 tick (default 540s) that re-nudges only LIVE-IDLE conductors with a pending
-  inbox through the input-safe `wake_if_idle` gate (skips busy/human-draft/muted/non-conductor); no
-  dead-session detection or auto-recycle.
-
 ### Fixed
 
 - **Recycle relaunch is timing- and crash-safe.** A recycled agent relaunched
@@ -120,4 +141,5 @@ vault or machine.
   session" instead of false success), the launch self-heals by re-firing once if
   no fresh session binds, and the post-respawn settle is 2s -> 3s.
 
+[Unreleased]: https://github.com/seanyoungberg/cmux-fleet/compare/v0.1.0...HEAD
 [0.1.0]: https://github.com/seanyoungberg/cmux-fleet/releases/tag/v0.1.0

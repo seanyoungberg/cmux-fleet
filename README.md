@@ -50,13 +50,26 @@ ln -s "$(pwd)/bin/fleet" ~/.local/bin/fleet
    The file is optional. With no config at all you can still `fleet launch
    --adhoc <name>`; a roster only adds named roles.
 
-2. Start the router daemon (one per machine, serves every conductor):
+2. Start the router daemon (one per machine, serves every conductor). It
+   double-forks and detaches, so it outlives the shell that started it and a
+   conductor recycle:
 
    ```
-   python3 scripts/router.py --live
+   fleet daemon start
+   fleet daemon status          # running? state dir, uptime, bus seq
    ```
 
-3. From inside a cmux conductor surface, launch a child:
+   `fleet daemon` is the only supported way to run the router. Never start
+   `router.py` by hand from inside an agent session: a bare `nohup &` router
+   dies with the tool's process group, or worse, silently survives as a stray
+   duplicate that double-processes the bus. Exactly one `router.py --live`
+   should ever exist (the daemon's child):
+
+   ```
+   ps aux | grep 'router.py --live'   # expect one line
+   ```
+
+3. From inside a cmux conductor surface, launch a child and check it registered:
 
    ```
    fleet launch worker
@@ -188,9 +201,17 @@ shape from [elevens](https://github.com/hummer98/elevens). Design-mined, not cop
 
 ## Roadmap
 
-Planned, not yet implemented: `fleet daemon install-launchd` (a LaunchAgent for
-cross-reboot persistence; the daemon already survives sessions and recycles
-without it).
+Forward-looking, not yet built:
+
+- **Reboot persistence.** The daemon survives shell exit, Bash-tool cleanup, and
+  a conductor recycle, but not a machine reboot. `fleet daemon install-launchd`
+  (a `~/Library/LaunchAgents` plist) would start it at login. Until then, run
+  `fleet daemon start` after a reboot.
+- **App-vs-plugin packaging.** Today the repo is both the Claude Code plugin
+  (skills + hooks) and the app (the `fleet` CLI + router daemon), and it runs
+  from a controlled checkout with `bin/` on `PATH`. The intended split installs
+  the app like an app (uv-tool / pipx, or a `~/.local/bin/fleet` entrypoint) and
+  ships the plugin as a thin layer on top. Not done yet.
 
 ## More
 

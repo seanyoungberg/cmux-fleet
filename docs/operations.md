@@ -65,12 +65,30 @@ per-state, so under a profile it manages that profile's router (see
 LIVE-IDLE conductors that have a pending inbox, through the same input-safe
 `wake_if_idle` gate (never a busy surface, never a human draft); muted agents and
 non-conductors are skipped. There is no dead-session detection or auto-recycle.
+`restart` preserves the running `--heartbeat` setting unless you pass a new one.
 
-Under the hood the daemon runs `router.py --live`, which writes to the inbox,
-fires `cmux notify` banners, and (in `auto` mode) wakes idle conductors, tailing
-the cmux agent bus with a replay cursor (`router.seq`) so a restart resumes where
-it left off. To observe without acting, run it directly: `python3
-scripts/router.py` (no `--live`) logs what it would do and changes nothing.
+`status` prints the daemon (supervisor) pid, the state dir it routes, uptime,
+the last bus seq, and the log path (`<state>/router.log`). The pidfile holds the
+supervisor; the supervisor runs one `router.py --live` child.
+
+**Never run `router.py` by hand from a session.** `fleet daemon` is the only
+supported way to run it. A `nohup &` router started from inside an agent's Bash
+tool either dies with the tool's process group, or silently survives as a stray
+duplicate on the same bus so every event is processed twice (this was a real
+bug during the cutover). Verify exactly one router exists (the daemon's child):
+
+```
+ps aux | grep 'router.py --live'   # expect exactly one line
+```
+
+If you see more than one, stray routers are double-processing the bus: stop the
+daemon, kill the strays, then `fleet daemon start`.
+
+Under the hood the daemon's `router.py --live` writes to the inbox, fires `cmux
+notify` banners, and (in `auto` mode) wakes idle conductors, tailing the cmux
+agent bus with a replay cursor (`router.seq`) so a restart resumes where it left
+off. To observe without acting, run it directly: `python3 scripts/router.py`
+(no `--live`) logs what it would do and changes nothing.
 
 ## The mode dial
 
@@ -309,12 +327,14 @@ one in a shell, then everything that shell launches is pinned to that build:
 ```
 eval "$(/path/to/<build>/bin/fleet profile dev --init)"   # PATH + all CMUX_* knobs
 cp profiles/test.fleet.toml "$CMUX_FLEET_TOML"             # a starting roster
-python3 "$(dirname "$(command -v fleet)")/../scripts/router.py" --live   # this profile's own router
+fleet daemon start                                        # this profile's own router
 fleet launch sandbox-conductor                            # auto-anchors its own group
 ```
 
 `--init` creates the state dir and seeds the roster from `fleet.toml.example`.
-Full model and the Nth-build workflow are in `docs/profiles.md`.
+`fleet daemon` is per-state, so started inside the activated shell it manages
+that profile's router against that profile's `CMUX_STATE_DIR`, separate from
+prod's daemon. Full model and the Nth-build workflow are in `docs/profiles.md`.
 
 ### Gotcha: a recycled agent bakes `CMUX_STATE_DIR` into its env
 
@@ -322,11 +342,11 @@ Config precedence is **env > `[fleet]` toml > default**, and a recycled or reviv
 agent carries the `CMUX_STATE_DIR` (and the other `CMUX_*` paths) that were in its
 launch command's env, re-injected on every respawn. So changing `state_dir` in the
 toml alone does **not** move an already-running agent: its baked env var shadows
-the toml value silently. To relocate state (for example the `.cmux-state` to XDG
-cutover), recycle the agents with an explicit override, e.g.
-`fleet recycle <label> -- ...` from a shell whose `CMUX_STATE_DIR` points at the
-new location, or unset the baked var so the toml/default applies. A future
-`fleet migrate` should rebake the env as part of the move.
+the toml value silently. To relocate state to a new directory, recycle the agents
+with an explicit override, e.g. `fleet recycle <label> -- ...` from a shell whose
+`CMUX_STATE_DIR` points at the new location, or unset the baked var so the
+toml/default applies. A future `fleet migrate` would rebake the env as part of the
+move (not built yet).
 
 ## Stranger first run
 
