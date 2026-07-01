@@ -15,11 +15,12 @@ import sys
 import tempfile
 
 # --- repo geometry -------------------------------------------------------------------------------
+# The app is the `cmux_fleet` package (import from REPO); the plugin's hook + agent-helper scripts still
+# live under scripts/ (folded into `fleet` subcommands / hook verbs in Phases 2-3).
 TESTS_DIR = os.path.dirname(os.path.abspath(__file__))
 REPO = os.path.dirname(TESTS_DIR)
 SCRIPTS = os.path.join(REPO, "scripts")
 HOOKS_DIR = os.path.join(SCRIPTS, "hooks")
-FLEET_PY = os.path.join(SCRIPTS, "fleet.py")
 
 # --- pin STATE to a throwaway dir BEFORE config/fleet_state import ------------------------------
 # A session-lived temp dir; the clean_state fixture empties it each test. It must be set in the
@@ -32,7 +33,7 @@ os.environ.pop("CMUX_FLEET_ROOT", None)
 os.environ.pop("CMUX_FLEET_MARKETPLACE", None)
 os.environ.pop("CMUX_FLEET_FLOOR", None)
 
-sys.path.insert(0, SCRIPTS)
+sys.path.insert(0, REPO)          # so `import cmux_fleet...` resolves in-process
 
 import pytest  # noqa: E402
 
@@ -53,9 +54,9 @@ def state_dir():
 
 @pytest.fixture
 def fs():
-    """The in-process fleet_state module (STATE already points at the throwaway dir)."""
-    import fleet_state
-    return fleet_state
+    """The in-process state module (STATE already points at the throwaway dir)."""
+    from cmux_fleet import state
+    return state
 
 
 @pytest.fixture(scope="session")
@@ -72,7 +73,7 @@ def cmux_stub(tmp_path_factory):
 @pytest.fixture
 def cli_env(cmux_stub, tmp_path):
     """Base env for a `fleet` CLI subprocess: shared throwaway STATE, stub cmux, an isolated ROOT,
-    and scripts/ on PYTHONPATH so `fleet.py` can `import config`/`fleet_state`."""
+    and REPO on PYTHONPATH so `python -m cmux_fleet` (and the plugin helper scripts) import the package."""
     env = dict(os.environ)
     env["CMUX_STATE_DIR"] = _STATE_DIR
     env["CMUX_BIN"] = cmux_stub
@@ -80,5 +81,5 @@ def cli_env(cmux_stub, tmp_path):
     hookstore = tmp_path / "hookstore"
     hookstore.mkdir(exist_ok=True)
     env["CMUX_HOOKSTORE_DIR"] = str(hookstore)  # keep _pid_for_surface off the host's real ~/.cmuxterm
-    env["PYTHONPATH"] = SCRIPTS + os.pathsep + env.get("PYTHONPATH", "")
+    env["PYTHONPATH"] = REPO + os.pathsep + env.get("PYTHONPATH", "")
     return env

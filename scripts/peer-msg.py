@@ -11,8 +11,8 @@
 # its next turn; --no-wake leaves it for the next turn. (The wake gate lives in fleet_state.)
 import os, sys, secrets
 
-sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-import fleet_state as fs
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))  # repo root: locate cmux_fleet (Phase 2 folds this into a `fleet` subcommand)
+from cmux_fleet import state as fs
 
 
 def main():

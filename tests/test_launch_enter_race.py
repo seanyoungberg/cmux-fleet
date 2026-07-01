@@ -10,7 +10,7 @@ import sys
 from conftest import SCRIPTS
 
 sys.path.insert(0, SCRIPTS)
-import fleet  # noqa: E402
+from cmux_fleet import cli as fleet  # noqa: E402
 
 
 def _load_drive():

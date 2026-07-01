@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-# fleet_state.py — the ONE shared state module for the cmux fleet. Folds child-completions and
+# cmux_fleet/state.py (was fleet_state.py) — the ONE shared state module for the cmux fleet. Folds child-completions and
 # peer-messages into a single inbox. CODE lives in the plugin; STATE under $CMUX_STATE_DIR
 # (default $XDG_STATE_HOME/cmux-fleet).
 #
@@ -20,8 +20,7 @@
 # ->AGENT_LABEL, the registry key, durable across recycles) / surfaceId(current seat, a mutable field).
 import fcntl, glob, json, os, re, subprocess, sys, tempfile, time
 
-sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-from config import STATE, CMUX, HOOKSTORE  # path resolver
+from .config import STATE, CMUX, HOOKSTORE  # path resolver
 
 INBOX = os.path.join(STATE, "inbox.jsonl")
 INBOX_SEQ = os.path.join(STATE, "inbox.seq")
@@ -32,10 +31,14 @@ ARCHIVE = os.path.join(STATE, "archive.json")
 LOG = os.path.join(STATE, "log.jsonl")
 MODEFILE = os.path.join(STATE, "notify-mode")
 
-HERE = os.path.dirname(os.path.abspath(__file__))
-DIGEST = os.path.join(HERE, "child-digest.py")
-ACK = os.path.join(HERE, "inbox-ack.py")
-PEERMSG = os.path.join(HERE, "peer-msg.py")
+# Agent-helper command hints emitted into conductor context by the awareness/drain hooks. In Phase 1
+# the four helpers are still standalone plugin scripts under <repo>/scripts/; the package lives at
+# <repo>/cmux_fleet/, so they resolve one dir up. Phase 2 folds these into `fleet <verb>` subcommands
+# and these constants become the strings "fleet child-digest" / "fleet inbox-ack" / "fleet peer-msg".
+_PLUGIN_SCRIPTS = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "scripts")
+DIGEST = os.path.join(_PLUGIN_SCRIPTS, "child-digest.py")
+ACK = os.path.join(_PLUGIN_SCRIPTS, "inbox-ack.py")
+PEERMSG = os.path.join(_PLUGIN_SCRIPTS, "peer-msg.py")
 
 
 # --- primitives ----------------------------------------------------------------------------

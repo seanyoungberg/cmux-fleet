@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-# router.py - the fleet-wide completion router. One daemon serves every conductor. NOT a hook.
+# cmux_fleet/router.py - the fleet-wide completion router. One daemon serves every conductor. NOT a hook.
 #
 # Split awareness from activation (input-safe): a child Stop -> append a `completion` to the unified
 # inbox + a `cmux notify` banner (never the input box); the parent's awareness hook surfaces it next
@@ -12,10 +12,8 @@
 import fcntl, json, os, pty, subprocess, sys, time
 from datetime import datetime
 
-HERE = os.path.dirname(os.path.abspath(__file__))
-sys.path.insert(0, HERE)
-from config import CMUX  # path resolver
-import fleet_state as fs
+from .config import CMUX  # path resolver
+from . import state as fs
 
 LIVE = "--live" in sys.argv
 os.makedirs(fs.STATE, exist_ok=True)

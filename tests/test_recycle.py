@@ -9,7 +9,7 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 SCRIPTS = os.path.join(os.path.dirname(HERE), "scripts")
 sys.path.insert(0, SCRIPTS)
 
-import fleet           # noqa: E402  (never popped by other test files)
+from cmux_fleet import cli as fleet           # noqa: E402  (never popped by other test files)
 
 # NOTE: `_poll_session_back` does `import fleet_state as fs` INTERNALLY, and another test module
 # (test_features) pops `fleet_state` from sys.modules on teardown. So the resume tests below import
@@ -34,7 +34,7 @@ def test_fresh_confirms_a_genuinely_new_sid(monkeypatch):
 def test_resume_ignores_exclude_and_uses_lifecycle(monkeypatch):
     # resume keeps the SAME sid; confirmation is the surface going live again, not a new sid. So a sid
     # that is IN exclude still confirms in resume mode (exclude is a fresh-mode-only guard).
-    import fleet_state
+    from cmux_fleet import state as fleet_state
     monkeypatch.setattr(fleet.time, "sleep", lambda *_: None)
     monkeypatch.setattr(fleet, "poll_session", lambda surf, timeout=1: "old")
     monkeypatch.setattr(fleet_state, "lifecycle", lambda surf: "idle")
@@ -44,7 +44,7 @@ def test_resume_ignores_exclude_and_uses_lifecycle(monkeypatch):
 
 def test_resume_waits_while_lifecycle_dead(monkeypatch):
     # resume does NOT confirm while the surface lifecycle is still empty/ended.
-    import fleet_state
+    from cmux_fleet import state as fleet_state
     monkeypatch.setattr(fleet.time, "sleep", lambda *_: None)
     monkeypatch.setattr(fleet, "poll_session", lambda surf, timeout=1: "old")
     monkeypatch.setattr(fleet_state, "lifecycle", lambda surf: "ended")

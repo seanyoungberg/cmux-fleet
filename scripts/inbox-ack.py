@@ -6,8 +6,8 @@
 # kind is `completion`; pass --peer to ack the peer stream. Self-IDs via $CMUX_SURFACE_ID.
 import os, sys
 
-sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-import fleet_state as fs
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))  # repo root: locate cmux_fleet (Phase 2 folds this into a `fleet` subcommand)
+from cmux_fleet import state as fs
 
 args = sys.argv[1:]
 surface = os.environ.get("CMUX_SURFACE_ID", "")

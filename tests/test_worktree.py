@@ -7,10 +7,10 @@ import textwrap
 
 import pytest
 
-SCRIPTS = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "scripts")
-sys.path.insert(0, SCRIPTS)
+REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+sys.path.insert(0, REPO)
 
-import worktree as wt  # noqa: E402
+from cmux_fleet import worktree as wt  # noqa: E402
 
 
 def _run(cwd, *args):
@@ -139,8 +139,9 @@ def _toml(tmp_path, root, state):
 
 
 def _fleet(toml, state, *args):
-    env = dict(os.environ, CMUX_FLEET_TOML=toml, CMUX_STATE_DIR=state)
-    return subprocess.run([sys.executable, os.path.join(SCRIPTS, "fleet.py"), *args],
+    env = dict(os.environ, CMUX_FLEET_TOML=toml, CMUX_STATE_DIR=state,
+               PYTHONPATH=REPO + os.pathsep + os.environ.get("PYTHONPATH", ""))
+    return subprocess.run([sys.executable, "-m", "cmux_fleet", *args],
                           capture_output=True, text=True, env=env)
 
 
@@ -167,7 +168,8 @@ def test_launch_no_worktree_override(repo, tmp_path):
 
 # --- `fleet worktree clean` precondition (needs the registry row; refuses while live) -------------
 def test_worktree_clean_refuses_while_live(monkeypatch):
-    import fleet, fleet_state as fs
+    from cmux_fleet import cli as fleet
+    from cmux_fleet import state as fs
     fs.live_put("wc-live", {"role": "r", "kind": "child", "tool": "claude", "surface": "S1",
                             "status": "live",
                             "worktree": {"repo": "/r", "path": "/r/.worktrees/wc-live", "branch": "fleet/wc-live"}})
@@ -177,7 +179,8 @@ def test_worktree_clean_refuses_while_live(monkeypatch):
 
 
 def test_worktree_clean_works_on_archived(monkeypatch):
-    import fleet, fleet_state as fs
+    from cmux_fleet import cli as fleet
+    from cmux_fleet import state as fs
     fs.archive_put("wc-arch", {"role": "r", "kind": "child", "tool": "claude", "status": "archived",
                                "worktree": {"repo": "/r", "path": "/r/.worktrees/wc-arch", "branch": "fleet/wc-arch"}})
     monkeypatch.setattr(wt, "teardown",

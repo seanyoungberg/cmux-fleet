@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-# fleet_features.py — the read-only VIEW layer over the live fleet: vitals / find / graph / serve,
+# cmux_fleet/features.py (was fleet_features.py) — the read-only VIEW layer over the live fleet: vitals / find / graph / serve,
 # plus native sidebar telemetry (paint). Kept OUT of fleet.py (the lifecycle CLI) so the view code
 # is a clean, dependency-light island: it imports fleet_state + config and NOTHING from fleet.py
 # (no circular import). fleet.py just routes `vitals|find|graph|serve|paint` here.
@@ -17,12 +17,11 @@ import subprocess
 import sys
 import time
 
-sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-import fleet_state as fs
-from config import CMUX, STATE
+from . import state as fs
+from .config import CMUX, STATE
 
 try:
-    from config import CONTEXT_WINDOW as _CFG_WINDOW          # optional override (env/[fleet])
+    from .config import CONTEXT_WINDOW as _CFG_WINDOW         # optional override (env/[fleet])
 except Exception:
     _CFG_WINDOW = 0
 

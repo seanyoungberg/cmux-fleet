@@ -15,8 +15,8 @@
 # in which case it degrades to send + fixed-settle + enter, no worse than the old behavior).
 import os, subprocess, sys, time
 
-sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-from config import CMUX  # path resolver
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))  # repo root: locate cmux_fleet (Phase 2 folds this into a `fleet` subcommand)
+from cmux_fleet.config import CMUX  # path resolver
 
 SETTLE_POLLS = 12          # ~6s: wait for the paste to render in the input box before the first Enter
 SETTLE_FALLBACK = 3.0      # fixed settle when the input box can't be read back (berg's proven ~3s)

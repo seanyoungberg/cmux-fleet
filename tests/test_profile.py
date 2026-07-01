@@ -8,7 +8,7 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 SCRIPTS = os.path.join(os.path.dirname(HERE), "scripts")
 sys.path.insert(0, SCRIPTS)
 
-import fleet  # noqa: E402  (not popped by other test files)
+from cmux_fleet import cli as fleet  # noqa: E402  (not popped by other test files)
 
 
 def test_profile_emits_all_entrypoint_pins(capsys):

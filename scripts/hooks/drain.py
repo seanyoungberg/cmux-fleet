@@ -13,8 +13,8 @@ except Exception:
     pass
 
 try:
-    sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))  # scripts/
-    import fleet_state as fs
+    sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))))  # repo root: locate cmux_fleet (Phase 3 makes these thin `fleet hook-*` shims)
+    from cmux_fleet import state as fs
 
     surface = os.environ.get("CMUX_SURFACE_ID", "")
     if not surface:

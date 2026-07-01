@@ -12,8 +12,8 @@
 #
 #   python3 child-digest.py 70daaccf 3        # last 3 turns of the child whose id contains 70daaccf
 import sys, glob, json, os
-sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-import fleet_state as fs
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))  # repo root: locate cmux_fleet (Phase 2 folds this into a `fleet` subcommand)
+from cmux_fleet import state as fs
 
 frag = fs.bare_uuid(sys.argv[1] if len(sys.argv) > 1 else "")
 N = int(sys.argv[2]) if len(sys.argv) > 2 else 3

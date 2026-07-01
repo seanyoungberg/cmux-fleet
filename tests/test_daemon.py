@@ -12,7 +12,7 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 SCRIPTS = os.path.join(os.path.dirname(HERE), "scripts")
 sys.path.insert(0, SCRIPTS)
 
-import fleet_daemon as fd  # noqa: E402  (not popped by other test files)
+from cmux_fleet import daemon as fd  # noqa: E402  (not popped by other test files)
 
 
 def _dead_pid():
@@ -66,7 +66,7 @@ def test_stop_when_not_running_is_clean(capsys):
 
 
 def test_heartbeat_nudges_only_idle_conductors_with_pending(monkeypatch):
-    import fleet_state as fs
+    from cmux_fleet import state as fs
     fs.live_put("cond",  {"role": "c", "kind": "conductor", "tool": "claude", "surface": "SC", "status": "live"})
     fs.live_put("busy",  {"role": "c", "kind": "conductor", "tool": "claude", "surface": "SB", "status": "live"})
     fs.live_put("muted", {"role": "c", "kind": "conductor", "tool": "claude", "surface": "SM", "status": "live", "muted": True})
