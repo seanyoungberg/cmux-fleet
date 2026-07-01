@@ -10,14 +10,18 @@ the bar is that a change keeps it that way.
 
 ## Versioning
 
-This project follows [Semantic Versioning](https://semver.org). When a change
-touches behavior or packaging, bump the version in **both** manifests and keep
-them identical:
+This project follows [Semantic Versioning](https://semver.org). The version is
+**single-sourced** at `cmux_fleet/__init__.py` (`__version__`); `pyproject.toml`
+reads it via `[tool.hatch.version]`, so the wheel/sdist never drift. The two
+plugin manifests are independent JSON that Claude Code reads directly, so bump
+them together with `__version__` and keep all three identical:
 
+- `cmux_fleet/__init__.py` (`__version__`) — the source of truth
 - `.claude-plugin/plugin.json` (`version`)
 - `.claude-plugin/marketplace.json` (the plugin entry)
 
-Pin an explicit `vX.Y.Z`. Never rely on a commit-SHA fallback for the version.
+`tests/test_version_single_source.py` fails the build if they diverge. Pin an
+explicit `vX.Y.Z`. Never rely on a commit-SHA fallback for the version.
 
 ## Changelog
 
@@ -56,5 +60,5 @@ Three layers. State the pass count in your PR.
 
 - Standard library only. No external runtime dependencies.
 - Python 3.11+ (the config and CLI read TOML via `tomllib`).
-- Every script resolves paths through `scripts/config.py`. Do not hardcode a
+- Every module resolves paths through `cmux_fleet/config.py`. Do not hardcode a
   path, a state directory, or the cmux binary anywhere else.

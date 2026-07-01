@@ -130,3 +130,26 @@ def test_wheel_daemon_status(installed, tmp_path):
     p = _run(installed["fleet"], home, "daemon", "status", expect=None)
     combined = p.stdout + p.stderr
     assert "Traceback" not in combined, combined
+
+
+# --- Phase 3 end-to-end: the REAL plugin shim shells into the REAL installed `fleet` --------------
+def test_hook_shim_invokes_installed_app(installed, tmp_path):
+    """The unit tests drive the shim against a FAKE fleet; this proves the shim resolves and runs the
+    genuinely-installed console script end to end. Seed one completion via the installed package, then
+    run the awareness shim with CMUX_FLEET_BIN pointed at the installed fleet -> it must forward the
+    verb's additionalContext JSON."""
+    state = str(tmp_path / "state")
+    vpy = os.path.join(installed["venv_bin"], "python")
+    env = {"PATH": "/usr/bin:/bin", "HOME": str(tmp_path), "CMUX_STATE_DIR": state}
+    seed = subprocess.run(
+        [vpy, "-c", "from cmux_fleet import state as fs; "
+                    "fs.inbox_put('completion','SFC',{'label':'w1','gist':'shim e2e ok'})"],
+        env=env, capture_output=True, text=True)
+    assert seed.returncode == 0, seed.stderr
+
+    shim = os.path.join(REPO, "scripts", "hooks", "awareness.py")
+    env2 = dict(env, CMUX_FLEET_BIN=installed["fleet"], CMUX_SURFACE_ID="SFC")
+    p = subprocess.run([sys.executable, shim], input=b'{"hook_event_name":"UserPromptSubmit"}',
+                       env=env2, capture_output=True)
+    assert p.returncode == 0
+    assert b"shim e2e ok" in p.stdout and b"additionalContext" in p.stdout, p.stdout

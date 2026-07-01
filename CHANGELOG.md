@@ -37,6 +37,22 @@ Post-v0.1.0 work, not yet tagged. Candidate for v0.1.1.
 
 ### Changed
 
+- **Conductor hooks are now thin, fail-open shims over `fleet hook-*` verbs
+  (packaging P1.2/P1.3/P1.5).** The awareness/drain logic moved into the app as
+  `fleet hook-awareness` (UserPromptSubmit) and `fleet hook-drain` (Stop), in
+  `cmux_fleet/hookverbs.py`. The plugin's `scripts/hooks/{awareness,drain}.py` are
+  now stdlib-only python shims (`scripts/hooks/_shim.py`) that shell into the
+  installed `fleet` and forward its stdout ONLY on rc0 + valid expected-shape JSON;
+  every other path (app missing, timeout, nonzero exit, stdout noise, wrong shape)
+  fails open with blank stdout and exit 0. **The uvx network fallback was dropped:**
+  the plugin requires the `fleet` app on PATH; a per-turn `uvx` in the hot path risked
+  first-run/offline cost, private-repo auth latency, and the harness's 10s hook
+  timeout killing the shim before it could fail open. Without the app, fleet hooks
+  silently no-op and the rest of Claude Code is unaffected. **Version is now
+  single-sourced** at `cmux_fleet/__init__.py::__version__` (pyproject reads it via
+  `[tool.hatch.version]`); a test keeps plugin.json + marketplace.json in lockstep,
+  and there is no hook-fallback pin to sync (one fewer version surface).
+
 - **Agent helpers folded into `fleet` subcommands (packaging P2.1).** The four
   standalone plugin scripts — `scripts/{drive-child,child-digest,peer-msg,inbox-ack}.py`
   — are now `fleet drive-child` / `fleet child-digest` / `fleet peer-msg` /

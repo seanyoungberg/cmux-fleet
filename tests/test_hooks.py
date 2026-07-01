@@ -1,122 +1,125 @@
-"""Layer 2 — the hook stdin -> exit-code contract.
+"""Layer 2 — the THIN PLUGIN SHIM contract (Phase 3 / codex P1.2 + P1.3).
 
-awareness.py (UserPromptSubmit) and drain.py (Stop) are subprocess entrypoints. The contract
-(P1-plugin-standards.md §5): read JSON on stdin, self-ID via $CMUX_SURFACE_ID, read state under
-$CMUX_STATE_DIR, and ALWAYS exit 0 (fail open) — emitting structured JSON on stdout only when there
-is something to surface. awareness adds context; drain returns {decision:"block"} to auto-continue.
+The plugin's hook files (scripts/hooks/{awareness,drain}.py) are now thin fail-open shims: they shell
+into the installed app's `fleet hook-<verb>` and pass its stdout through ONLY when it is rc0 + valid
+JSON of the expected shape. Everything else fails open: BLANK stdout, exit 0. These tests drive the real
+shim scripts against a FAKE `fleet` whose behavior is env-selected, covering every failure mode.
 
-State is seeded in-process via `fs` (shared throwaway STATE), then the hook runs in a child process
-pointed at the same STATE with a test surface id.
+(The uvx fallback was dropped in Phase 3 — the plugin requires the app on PATH — so there are no
+uvx-missing/uvx-timeout/offline-cache cases: "app missing" is the single no-app path, tested below.)
 """
-import json
+import os
 import subprocess
 import sys
 
-from conftest import HOOKS_DIR, _STATE_DIR
-import os
+import pytest
+from conftest import HOOKS_DIR
 
 AWARENESS = os.path.join(HOOKS_DIR, "awareness.py")
 DRAIN = os.path.join(HOOKS_DIR, "drain.py")
-SURF = "SURF-TEST"
-STDIN = json.dumps({"hook_event_name": "x", "session_id": "s", "cwd": "/tmp"})
 
-
-def _run(hook, surface=SURF, stdin=STDIN):
-    env = dict(os.environ)
-    env["CMUX_STATE_DIR"] = _STATE_DIR
-    if surface is None:
-        env.pop("CMUX_SURFACE_ID", None)
+FAKE_FLEET = r'''#!/usr/bin/env python3
+import os, sys, time, json
+mode = os.environ.get("FAKE_FLEET_MODE", "valid")
+verb = sys.argv[1] if len(sys.argv) > 1 else ""
+data = sys.stdin.buffer.read()
+if mode == "timeout":
+    time.sleep(5)                       # the shim's inner timeout (set short in the test) fires first
+if mode == "nonzero":
+    sys.stdout.write(json.dumps({"decision": "block", "reason": "R"})); sys.exit(3)
+if mode == "noise":
+    sys.stdout.write("this is not json <<garbage>>"); sys.exit(0)
+if mode == "wrongshape":
+    sys.stdout.write(json.dumps({"foo": 1})); sys.exit(0)
+if mode == "echo-stdin":
+    open(os.environ["FAKE_FLEET_STDIN_OUT"], "wb").write(data)
+    mode = "valid"
+if mode == "valid":
+    if verb == "hook-awareness":
+        sys.stdout.write(json.dumps({"hookSpecificOutput": {
+            "hookEventName": "UserPromptSubmit", "additionalContext": "CTX-OK"}}))
     else:
-        env["CMUX_SURFACE_ID"] = surface
-    return subprocess.run([sys.executable, hook], input=stdin, env=env,
-                          capture_output=True, text=True)
+        sys.stdout.write(json.dumps({"decision": "block", "reason": "REASON-OK"}))
+    sys.exit(0)
+sys.exit(0)
+'''
 
 
-def _set_mode(fs, mode):
-    with open(fs.MODEFILE, "w") as f:
-        f.write(mode)
+@pytest.fixture
+def fake_fleet(tmp_path):
+    p = tmp_path / "fleet"
+    p.write_text(FAKE_FLEET)
+    p.chmod(0o755)
+    return str(p)
 
 
-# --- awareness -----------------------------------------------------------------------------------
-def test_awareness_empty_inbox_is_silent(fs):
-    p = _run(AWARENESS)
+def _run_shim(shim, fleet_bin, stdin=b'{"hook_event_name":"x"}', mode="valid", extra=None, timeout="4"):
+    env = dict(os.environ)
+    env["PATH"] = "/usr/bin:/bin"                 # no real `fleet` on PATH -> only CMUX_FLEET_BIN resolves
+    env.pop("CMUX_FLEET_BIN", None)
+    if fleet_bin is not None:
+        env["CMUX_FLEET_BIN"] = fleet_bin
+    env["FAKE_FLEET_MODE"] = mode
+    env["CMUX_FLEET_HOOK_TIMEOUT"] = timeout
+    if extra:
+        env.update(extra)
+    return subprocess.run([sys.executable, shim], input=stdin, env=env, capture_output=True)
+
+
+# --- valid passthrough (both verbs) --------------------------------------------------------------
+def test_awareness_passthrough_valid(fake_fleet):
+    p = _run_shim(AWARENESS, fake_fleet, mode="valid")
     assert p.returncode == 0
-    assert p.stdout.strip() == ""
+    assert b'"additionalContext": "CTX-OK"' in p.stdout
 
 
-def test_awareness_surfaces_completion(fs):
-    fs.inbox_put("completion", SURF, {"label": "w1", "gist": "finished the audit",
-                                      "child_session": "claude-abcd1234ef"})
-    p = _run(AWARENESS)
+def test_drain_passthrough_valid(fake_fleet):
+    p = _run_shim(DRAIN, fake_fleet, mode="valid")
     assert p.returncode == 0
-    out = json.loads(p.stdout)
-    ctx = out["hookSpecificOutput"]["additionalContext"]
-    assert out["hookSpecificOutput"]["hookEventName"] == "UserPromptSubmit"
-    assert "[fleet]" in ctx and "finished the audit" in ctx and "w1" in ctx
+    assert b'"reason": "REASON-OK"' in p.stdout
 
 
-def test_awareness_surfaces_peer(fs):
-    fs.inbox_put("peer", SURF, {"from_label": "cmux-advisor", "to_label": "me",
-                                "body": "status check please", "msg_id": "m1"})
-    p = _run(AWARENESS)
+# --- fail-open failure modes: all -> blank stdout, exit 0 ----------------------------------------
+def test_app_missing_fails_open(tmp_path):
+    # CMUX_FLEET_BIN points nowhere and no `fleet` on PATH -> silent no-op (the dropped-uvx design).
+    p = _run_shim(AWARENESS, str(tmp_path / "nope" / "fleet"))
+    assert p.returncode == 0 and p.stdout == b""
+
+
+def test_app_missing_no_env_fails_open():
+    p = _run_shim(AWARENESS, None)                # neither CMUX_FLEET_BIN nor PATH resolves fleet
+    assert p.returncode == 0 and p.stdout == b""
+
+
+def test_nonzero_exit_fails_open(fake_fleet):
+    # even with well-formed stdout, a nonzero rc must NOT be forwarded.
+    p = _run_shim(DRAIN, fake_fleet, mode="nonzero")
+    assert p.returncode == 0 and p.stdout == b""
+
+
+def test_stdout_noise_fails_open(fake_fleet):
+    p = _run_shim(AWARENESS, fake_fleet, mode="noise")
+    assert p.returncode == 0 and p.stdout == b""
+
+
+def test_wrong_shape_fails_open(fake_fleet):
+    # valid JSON but not the expected hook shape -> prefer blank over corrupt protocol output.
+    p = _run_shim(AWARENESS, fake_fleet, mode="wrongshape")
+    assert p.returncode == 0 and p.stdout == b""
+
+
+def test_timeout_fails_open(fake_fleet):
+    # fake fleet sleeps 5s; inner timeout is 1s -> shim must still exit 0 blank (not a timed-out hook).
+    p = _run_shim(DRAIN, fake_fleet, mode="timeout", timeout="1")
+    assert p.returncode == 0 and p.stdout == b""
+
+
+# --- stdin is consumed and passed through to the app --------------------------------------------
+def test_stdin_passed_through(fake_fleet, tmp_path):
+    sentinel = tmp_path / "stdin.bin"
+    payload = b'{"hook_event_name":"UserPromptSubmit","session_id":"abc"}'
+    p = _run_shim(AWARENESS, fake_fleet, stdin=payload, mode="echo-stdin",
+                  extra={"FAKE_FLEET_STDIN_OUT": str(sentinel)})
     assert p.returncode == 0
-    ctx = json.loads(p.stdout)["hookSpecificOutput"]["additionalContext"]
-    assert "[peer]" in ctx and "status check please" in ctx and "cmux-advisor" in ctx
-
-
-def test_awareness_no_surface_exits_clean(fs):
-    fs.inbox_put("completion", SURF, {"label": "w1", "gist": "x"})
-    p = _run(AWARENESS, surface=None)
-    assert p.returncode == 0
-    assert p.stdout.strip() == ""
-
-
-def test_awareness_fails_open_on_garbage_stdin(fs):
-    p = _run(AWARENESS, stdin="not json at all \x00\xff")
-    assert p.returncode == 0
-
-
-# --- drain ---------------------------------------------------------------------------------------
-def test_drain_peer_always_blocks(fs):
-    fs.inbox_put("peer", SURF, {"from_label": "p1", "body": "handle me", "msg_id": "m1"})
-    p = _run(DRAIN)
-    assert p.returncode == 0
-    out = json.loads(p.stdout)
-    assert out["decision"] == "block"
-    assert "handle me" in out["reason"]
-
-
-def test_drain_completion_ignored_in_passive(fs):
-    _set_mode(fs, "passive")
-    fs.inbox_put("completion", SURF, {"label": "w1", "gist": "done"})
-    p = _run(DRAIN)
-    assert p.returncode == 0
-    assert p.stdout.strip() == ""  # completions are dial-gated; passive does not chase them
-
-
-def test_drain_completion_blocks_in_auto(fs):
-    _set_mode(fs, "auto")
-    fs.inbox_put("completion", SURF, {"label": "w1", "gist": "all done",
-                                      "child_session": "claude-1111aaaa"})
-    p = _run(DRAIN)
-    assert p.returncode == 0
-    out = json.loads(p.stdout)
-    assert out["decision"] == "block" and "all done" in out["reason"]
-
-
-def test_drain_no_surface_exits_clean(fs):
-    fs.inbox_put("peer", SURF, {"from_label": "p1", "body": "x", "msg_id": "m1"})
-    p = _run(DRAIN, surface=None)
-    assert p.returncode == 0
-    assert p.stdout.strip() == ""
-
-
-def test_drain_block_guard_does_not_reblock(fs):
-    """Once drain has blocked for a seq, a second Stop must not re-block the same un-acked item
-    (else the turn loops forever); it falls back to the awareness hook instead."""
-    fs.inbox_put("peer", SURF, {"from_label": "p1", "body": "once", "msg_id": "m1"})
-    first = _run(DRAIN)
-    assert json.loads(first.stdout)["decision"] == "block"
-    second = _run(DRAIN)  # same un-acked peer, block-mark already set
-    assert second.returncode == 0
-    assert second.stdout.strip() == ""
+    assert b'"additionalContext": "CTX-OK"' in p.stdout      # still forwards valid output
+    assert sentinel.read_bytes() == payload                  # the app received the exact event payload

@@ -2121,6 +2121,11 @@ def main():
               "  inbox-ack <seq> [--peer] [--surface UUID]         mark shown completions/peer msgs handled so they stop re-surfacing")
         return 0
     sub, rest = sys.argv[1], sys.argv[2:]
+    # Hook verbs are the per-turn hot path (a plugin shim shells into them on every UserPromptSubmit/Stop).
+    # Dispatch them FIRST, before the heavier feature/daemon/helper imports, to keep that path lean.
+    if sub in ("hook-awareness", "hook-drain"):
+        from . import hookverbs as hv
+        return (hv.cmd_hook_awareness if sub == "hook-awareness" else hv.cmd_hook_drain)(rest)
     from . import features as ff
     from . import daemon as fd
     from . import helpers as fh

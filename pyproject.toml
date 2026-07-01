@@ -2,9 +2,15 @@
 requires = ["hatchling"]
 build-backend = "hatchling.build"
 
+[tool.hatch.version]
+# ONE version source of truth (codex P1.5): the package __version__ drives the wheel/sdist version.
+# A test (tests/test_version_single_source.py) asserts the plugin.json + marketplace.json versions match
+# it, so a release can never ship a plugin manifest that disagrees with the app it loads.
+path = "cmux_fleet/__init__.py"
+
 [project]
 name = "cmux-fleet"
-version = "0.1.0"
+dynamic = ["version"]                # single-sourced from cmux_fleet/__init__.py::__version__ (P1.5)
 description = "The native-cmux fleet APP: the `fleet` CLI + completion router/daemon + shared state/config library. Install the Claude plugin (hooks + skills) separately."
 readme = "README.md"
 requires-python = ">=3.11"          # config.py reads the fleet TOML via stdlib tomllib (3.11+)
