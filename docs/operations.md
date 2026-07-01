@@ -496,20 +496,43 @@ and `CMUX_STATE_DIR`. These decide whether a symlink/app swap reaches it.
 
 ### Cutover steps
 
-1. Install/upgrade the **app**: `uv tool install --force "git+…@vX.Y.Z"` (or
-   `uv tool upgrade cmux-fleet`). Confirm `command -v fleet` and `fleet --version`
-   /`fleet daemon status`-style checks point at the new build.
+1. Install/upgrade the **app**: `uv tool install --force <local-wheel>` (built from
+   the release commit — the reliable local path) or `uv tool install --force
+   "git+…@vX.Y.Z"`. Confirm `command -v fleet` resolves the new build, then
+   `fleet daemon status` reports its `version`/`python`/`package`. **There is no
+   `fleet --version` verb** — use `daemon status` for build identity. If
+   `~/.local/bin/fleet` is currently a symlink to the checkout, `--force` overwrites
+   it with the installed console script (that swap IS the cutover for anything that
+   resolves `fleet` via `~/.local/bin`).
 2. Install/upgrade the **plugin** separately (the app installer never touches it).
-   Confirm the installed hooks are the Phase 3 shims.
+   Confirm the installed hooks are the Phase 3 shims. On a machine whose plugin is a
+   marketplace symlink to the repo, this happens by merging the packaged branch to
+   the checked-out branch (the symlink then serves the thin plugin).
 3. Move the daemon onto the new build:
-   - **launchd active:** `launchctl bootout gui/$(id -u)/io.cmux.fleet` → (edit the
-     plist's `fleet` path if it changed) → `launchctl bootstrap …` →
-     `launchctl kickstart -k …`. Do **not** also `fleet daemon start` by hand —
-     that races `KeepAlive`.
+   - **launchd via a PATH-resolving boot script (this machine's model):** the
+     LaunchAgent runs `daemon-boot.sh`, which does `fleet daemon start` off `PATH`
+     (with `~/.local/bin` on it). So the app swap in step 1 is picked up
+     automatically — **no plist edit needed.** Just stop the old daemon
+     (`fleet daemon stop`) and start the installed one (`~/.local/bin/fleet daemon
+     start`, or let the launchd interval heal it).
+   - **launchd with a baked `fleet` path (foreground/KeepAlive model):** `launchctl
+     bootout gui/$(id -u)/<label>` → edit the plist's `fleet` path if it changed →
+     `launchctl bootstrap …` → `launchctl kickstart -k …`. Don't also `fleet daemon
+     start` by hand — that races `KeepAlive`.
    - **unmanaged daemon:** `fleet daemon stop`, confirm no `cmux_fleet.router
-     --live` remains except the expected one, then `fleet daemon start`.
+     --live` (or checkout `router.py --live`) remains except the expected one, then
+     `fleet daemon start`. **Watch (F4):** `daemon stop` has been observed to
+     misreport "not running" once while the daemon was alive (non-reproducible);
+     always confirm with `ps` / `fleet daemon status` after stop, before starting the
+     new build, so you don't leave a stray router double-processing the bus.
    - Record **current vs new** daemon: pid + `version`/`python`/`package` from
      `fleet daemon status` before and after — proof the new build owns the bus.
+   - **`profile --init` caveats (F2/F3):** `fleet profile <name> --init` without
+     `--base` writes to the XDG-default state `~/.local/state/cmux-fleet-<name>` (with
+     `name=staging` that IS the live checkout-staging state — use `--base <dir>` or a
+     distinct name to avoid a collision); and its emitted `marketplace` pin inherits
+     whatever `fleet.toml` `config.py` resolves (prod's, if `CMUX_FLEET_TOML` is
+     unset), so set `CMUX_FLEET_TOML` first for a true wheel-only pin.
 4. Apply the chosen agent strategy (A: flip the `CMUX_FLEET_BIN` symlink; B:
    `fleet recycle` each conductor).
 
