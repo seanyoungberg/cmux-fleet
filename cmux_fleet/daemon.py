@@ -264,7 +264,14 @@ def _run_daemon(heartbeat_secs):
     with open(PIDFILE, "w") as f:
         f.write(str(pid))
     with open(METAFILE, "w") as f:
-        json.dump({"pid": pid, "state": STATE, "started": time.time(), "heartbeat": heartbeat_secs}, f)
+        # Record WHICH BUILD owns this daemon (codex P2.5 / runbook): the python that runs it, the
+        # cmux_fleet package dir, and the app version — so `fleet daemon status` can prove the code path,
+        # not just state dir + pid, during a migration cutover/rollback.
+        import cmux_fleet
+        json.dump({"pid": pid, "state": STATE, "started": time.time(), "heartbeat": heartbeat_secs,
+                   "python": sys.executable, "router_module": ROUTER_MODULE,
+                   "package": os.path.dirname(os.path.abspath(cmux_fleet.__file__)),
+                   "version": getattr(cmux_fleet, "__version__", "?")}, f)
     print(f"[daemon] up pid={pid} state={STATE} "
           f"heartbeat={'every %ds' % heartbeat_secs if heartbeat_secs else 'off'}", flush=True)
 
@@ -323,13 +330,12 @@ def _heartbeat_tick():
 
 
 # --- verbs ----------------------------------------------------------------------------------------
-def _start(heartbeat_secs):
-    global _manager_lock_fd
+def _acquire_for_start():
+    """Shared start preamble for both the detached and foreground paths: make STATE, take the manager
+    lock BEFORE the running-check (so check->reap->run is serialized against a concurrent start), refuse
+    if a supervisor is already up, then reap any orphaned live router on this bus. Returns the held
+    manager-lock fd on success, or None if the caller should abort (message already printed)."""
     os.makedirs(STATE, exist_ok=True)
-
-    # ATOMICITY: take the manager lock BEFORE the running-check so the whole check -> reap -> fork is
-    # serialized against any concurrent `start`. Failing to acquire means another start is in flight or
-    # a supervisor already holds it — refuse without touching anyone's pid/meta.
     lock_fd = _acquire_manager_lock()
     if lock_fd is None:
         running = _running_pid()
@@ -337,15 +343,40 @@ def _start(heartbeat_secs):
             print(f"[fleet daemon] already running (pid {running}); use `fleet daemon restart` to replace")
         else:
             print("[fleet daemon] another `fleet daemon start` is in progress; try again in a moment")
-        return 1
-
+        return None
     running = _running_pid()
     if running:                                       # a validated supervisor is up (rare: it holds the lock)
         _release_manager_lock(lock_fd)
         print(f"[fleet daemon] already running (pid {running}); use `fleet daemon restart` to replace")
-        return 1
-
+        return None
     _reap_stray_router()                             # clear any orphaned live router on this bus first
+    return lock_fd
+
+
+def _start_foreground(heartbeat_secs):
+    """launchd/supervisor mode (codex P2.3): run the supervised router in THIS process — NO fork, setsid,
+    or stdio redirect — so launchd (KeepAlive) can supervise it directly and capture its stdout/stderr.
+    Same ownership protocol as the detached path (manager lock + validated pidfile/meta); it blocks until
+    the router exits or SIGTERM. This is exactly what the design plist runs: `fleet daemon start --foreground`."""
+    global _manager_lock_fd
+    lock_fd = _acquire_for_start()
+    if lock_fd is None:
+        return 1
+    _manager_lock_fd = lock_fd
+    print(f"[fleet daemon] foreground (supervised) start; state={STATE}; log={LOG}", flush=True)
+    try:
+        _run_daemon(heartbeat_secs)                  # writes pidfile/meta = THIS pid; blocks until stop
+    finally:
+        _release_manager_lock(lock_fd)
+    return 0
+
+
+def _start(heartbeat_secs):
+    global _manager_lock_fd
+
+    lock_fd = _acquire_for_start()
+    if lock_fd is None:
+        return 1
 
     pid1 = os.fork()
     if pid1 > 0:                                      # ORIGINAL caller: reap child1, await pidfile, report
@@ -443,6 +474,10 @@ def _status():
         pass
     hb = meta.get("heartbeat", 0)
     print(f"[fleet daemon] running (pid {pid})")
+    print(f"  version  : {meta.get('version', '?')}")            # WHICH build owns this daemon (P2.5/runbook)
+    print(f"  python   : {meta.get('python', '?')}")
+    print(f"  package  : {meta.get('package', '?')}")
+    print(f"  router   : python -m {meta.get('router_module', ROUTER_MODULE)} --live")
     print(f"  state    : {meta.get('state', STATE)}")
     print(f"  uptime   : {up}")
     print(f"  heartbeat: {('every %ds' % hb) if hb else 'off'}")
@@ -451,15 +486,25 @@ def _status():
     return 0
 
 
-def cmd_daemon(argv):
+def _daemon_parser():
+    """The `fleet daemon <action> [--foreground] [--heartbeat [SECS]]` parser. Extracted so a test can
+    assert the EXACT design-plist command (`fleet daemon start --foreground`) parses as intended — a
+    launchd plist is unforgiving, a silent grammar drift means reboot persistence fails."""
     ap = argparse.ArgumentParser(prog="fleet daemon")
     ap.add_argument("action", choices=["start", "stop", "status", "restart"])
+    ap.add_argument("--foreground", action="store_true",
+                    help="(start only) run the supervised router in the FOREGROUND — no fork/detach — so "
+                         "launchd/systemd can supervise it directly. This is what the design plist runs.")
     ap.add_argument("--heartbeat", nargs="?", const=DEFAULT_HEARTBEAT, type=int, default=0,
                     metavar="SECS", help="also nudge live-idle conductors with a pending inbox every "
                                          "SECS seconds (default %d); omit for router-only" % DEFAULT_HEARTBEAT)
-    a = ap.parse_args(argv)
+    return ap
+
+
+def cmd_daemon(argv):
+    a = _daemon_parser().parse_args(argv)
     if a.action == "start":
-        return _start(a.heartbeat)
+        return _start_foreground(a.heartbeat) if a.foreground else _start(a.heartbeat)
     if a.action == "stop":
         return _stop()
     if a.action == "status":
@@ -472,7 +517,7 @@ def cmd_daemon(argv):
             except Exception:
                 hb = 0
         _stop()
-        return _start(hb)
+        return _start(hb)                            # restart always re-detaches (launchd owns foreground)
 
 
 if __name__ == "__main__":

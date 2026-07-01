@@ -45,8 +45,9 @@ One router serves every conductor on the machine. Run it as a managed daemon:
 
 ```
 fleet daemon start                 # detached router; survives shell exit + conductor recycle
+fleet daemon start --foreground    # supervised router in THIS process (for launchd; see below)
 fleet daemon start --heartbeat     # also nudge live-idle conductors with pending work (every 540s)
-fleet daemon status                # running? which state dir, uptime, bus seq
+fleet daemon status                # running? which BUILD owns it (version/python/package), state, uptime, bus seq
 fleet daemon stop
 fleet daemon restart               # preserves the running --heartbeat setting unless overridden
 ```
@@ -67,18 +68,22 @@ LIVE-IDLE conductors that have a pending inbox, through the same input-safe
 non-conductors are skipped. There is no dead-session detection or auto-recycle.
 `restart` preserves the running `--heartbeat` setting unless you pass a new one.
 
-`status` prints the daemon (supervisor) pid, the state dir it routes, uptime,
-the last bus seq, and the log path (`<state>/router.log`). The pidfile holds the
-supervisor; the supervisor runs one `router.py --live` child.
+`status` prints the daemon (supervisor) pid AND **which build owns it** — the app
+`version`, the `python` that runs it, and the `cmux_fleet` package dir (recorded
+in `router.daemon.json` at start) — plus the state dir it routes, uptime, the
+last bus seq, and the log path (`<state>/router.log`). The build identity is what
+a migration cutover/rollback checks to prove the daemon is running the intended
+install (see the runbook below). The pidfile holds the supervisor; the supervisor
+runs one `python -m cmux_fleet.router --live` child.
 
-**Never run `router.py` by hand from a session.** `fleet daemon` is the only
+**Never run the router by hand from a session.** `fleet daemon` is the only
 supported way to run it. A `nohup &` router started from inside an agent's Bash
 tool either dies with the tool's process group, or silently survives as a stray
 duplicate on the same bus so every event is processed twice (this was a real
 bug during the cutover). Verify exactly one router exists (the daemon's child):
 
 ```
-ps aux | grep 'router.py --live'   # expect exactly one line
+ps aux | grep 'cmux_fleet.router --live'   # expect exactly one line
 ```
 
 If you see more than one, stray routers are double-processing the bus: stop the
@@ -366,3 +371,166 @@ CMUX_STATE_DIR=$(mktemp -d) python -m cmux_fleet.router
 
 Layer your own setup back in by setting the env vars or filling in the `[fleet]`
 block and roster in your `fleet.toml`.
+
+## Reboot persistence (launchd)
+
+The `fleet daemon start` detached daemon survives a shell exit, a Bash-tool
+process-group cleanup, and a conductor recycle — but **not a machine reboot**. To
+start the router at login, run it under launchd in **foreground** mode
+(`fleet daemon start --foreground`): no fork/detach, so launchd's `KeepAlive`
+supervises the process directly and captures its stdout/stderr.
+
+Write `~/Library/LaunchAgents/io.cmux.fleet.plist` (adjust the absolute
+`fleet` path — `command -v fleet` — and any `CMUX_*` env for the profile this
+daemon serves):
+
+```xml
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key>            <string>io.cmux.fleet</string>
+  <key>ProgramArguments</key>
+  <array>
+    <string>/Users/you/.local/bin/fleet</string>
+    <string>daemon</string>
+    <string>start</string>
+    <string>--foreground</string>
+  </array>
+  <key>EnvironmentVariables</key>
+  <dict>
+    <!-- pin the SAME state/config this daemon should route (a profile's paths, or omit for defaults) -->
+    <key>CMUX_STATE_DIR</key>  <string>/Users/you/.local/state/cmux-fleet</string>
+    <key>PATH</key>           <string>/Users/you/.local/bin:/usr/bin:/bin</string>
+  </dict>
+  <key>KeepAlive</key>        <true/>
+  <key>RunAtLoad</key>        <true/>
+  <key>StandardOutPath</key>  <string>/Users/you/.local/state/cmux-fleet/launchd.out.log</string>
+  <key>StandardErrorPath</key><string>/Users/you/.local/state/cmux-fleet/launchd.err.log</string>
+</dict>
+</plist>
+```
+
+Load / reload / verify (modern `launchctl`; `gui/$(id -u)` is your login domain):
+
+```
+launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/io.cmux.fleet.plist   # load
+launchctl kickstart -k gui/$(id -u)/io.cmux.fleet                             # (re)start now
+fleet daemon status                                                          # confirm it owns the bus
+launchctl bootout gui/$(id -u)/io.cmux.fleet                                  # unload
+```
+
+`fleet daemon stop` will stop the router, but under `KeepAlive` launchd restarts
+it — so `bootout` (or set the job disabled) is the way to actually take it down.
+One launchd job per state dir: a second profile's daemon is a second plist with
+its own `Label` and `CMUX_STATE_DIR`.
+
+## Migration runbook: app/plugin cutover
+
+**Document, verify, decide — do not fire blind.** Moving a live fleet onto a new
+build is not "repoint a symlink and restart the daemon." Running agents keep the
+PATH, `--plugin-dir`, and `CMUX_*` env they were launched with; repointing a
+symlink does **not** mutate an already-running process. So a cutover has to reason
+about what each *live* agent actually resolves, not just what the shell resolves.
+
+### Why "no conductor recycle" is not free
+
+- `fleet profile` deliberately prepends a build-specific `bin/` to `PATH`, and a
+  launch injects `CMUX_*` but **not** `PATH` — so a launched agent keeps its
+  start-time `PATH`. The `fleet` a live conductor's hook shim finds is whatever
+  was first on that baked `PATH`, not necessarily the one you just installed.
+- `--plugin-dir` is baked per launch; a marketplace/symlink repoint does not
+  change a running agent's loaded plugin.
+- Therefore a live conductor can keep calling an *old* `fleet` for its hook verbs
+  even after you upgrade the app and the plugin. The daemon can be new while hook
+  behavior is old.
+
+Phase 3 makes this tractable: the plugin hooks are now **thin shims that resolve
+`fleet` at call time** (`$CMUX_FLEET_BIN` → `which fleet`), so a repointable app
+path CAN update a running agent — but only if that agent's shim actually resolves
+the path you're swapping. That is what you verify before trusting it.
+
+### Preconditions (gate the cutover)
+
+1. **Phase 3 thin shims are in the installed plugin.** `scripts/hooks/{awareness,
+   drain}.py` must be the shims (they shell into `fleet hook-awareness` /
+   `fleet hook-drain`), not the old inline-logic files. If a live agent still
+   loads inline-logic hooks, it imports checkout code regardless of the app swap —
+   recycle is mandatory for those.
+2. **A staging run has proven an already-running conductor uses the installed app
+   for hook verbs** (see the verification step). Until it has, **do not advertise
+   "no conductor recycle."**
+
+### Inventory the live fleet (before touching anything)
+
+For every live agent, record what it actually resolves — from its launch command
+and cmux's per-agent hook store:
+
+```
+fleet ls                                   # the live roster + sessions
+fleet daemon status                        # CURRENT daemon: pid + version/python/package (the old build)
+# for each conductor surface, capture the PATH / CMUX_FLEET_BIN / plugin-dir it was launched with:
+#   - its launch command env (CMUX_* + PATH assumptions) from the hook store / registry entry
+#   - the `fleet` a live shim resolves:  the app path the conductor's hook shim would pick
+```
+
+Write down, per agent: baked `PATH`, `CMUX_FLEET_BIN` (if set), `--plugin-dir`,
+and `CMUX_STATE_DIR`. These decide whether a symlink/app swap reaches it.
+
+### Choose ONE cutover strategy (explicit decision)
+
+- **A — repointable app path (no recycle, IF verified).** Make every hook shim
+  resolve an absolute, atomically-swappable app path: set `CMUX_FLEET_BIN` (or put
+  a stable shim path first on the agents' `PATH`) to a symlink you flip
+  atomically (`ln -sfn <new> <link>`). Requires that the *live* agents already
+  carry that `CMUX_FLEET_BIN` / stable-path assumption — verify per agent.
+- **B — recycle after cutover (always correct).** Upgrade the app + plugin, then
+  `fleet recycle <label>` each conductor so it relaunches with the new PATH /
+  plugin-dir / env. The safe default when the inventory shows agents with baked
+  build-specific paths that a swap won't reach.
+
+### Cutover steps
+
+1. Install/upgrade the **app**: `uv tool install --force "git+…@vX.Y.Z"` (or
+   `uv tool upgrade cmux-fleet`). Confirm `command -v fleet` and `fleet --version`
+   /`fleet daemon status`-style checks point at the new build.
+2. Install/upgrade the **plugin** separately (the app installer never touches it).
+   Confirm the installed hooks are the Phase 3 shims.
+3. Move the daemon onto the new build:
+   - **launchd active:** `launchctl bootout gui/$(id -u)/io.cmux.fleet` → (edit the
+     plist's `fleet` path if it changed) → `launchctl bootstrap …` →
+     `launchctl kickstart -k …`. Do **not** also `fleet daemon start` by hand —
+     that races `KeepAlive`.
+   - **unmanaged daemon:** `fleet daemon stop`, confirm no `cmux_fleet.router
+     --live` remains except the expected one, then `fleet daemon start`.
+   - Record **current vs new** daemon: pid + `version`/`python`/`package` from
+     `fleet daemon status` before and after — proof the new build owns the bus.
+4. Apply the chosen agent strategy (A: flip the `CMUX_FLEET_BIN` symlink; B:
+   `fleet recycle` each conductor).
+
+### Verify (this is the gate for "no recycle")
+
+On an **already-running** conductor (not a fresh one), confirm its hook path now
+reaches the new app: check that the `fleet` its shim resolves is the new build
+(inspect its `CMUX_FLEET_BIN` / `PATH`), and that a hook-driven action (a peer
+message or completion surfaced into its context) is served by the new
+`fleet hook-*`. Only after a staging conductor passes this may strategy A be
+called "no recycle." If it fails, that agent needs strategy B (recycle).
+
+### Rollback
+
+- **App:** repoint to the previous build — `uv tool install --force …@<old-tag>`
+  or flip the `CMUX_FLEET_BIN` symlink back. **Shell hash caveat:** an interactive
+  shell caches command paths; after moving `fleet` on `PATH`, run `hash -r` (bash)
+  / `rehash` (zsh) or the shell keeps calling the old path. A *running* agent
+  process does not re-hash — that's exactly why the inventory + recycle decision
+  matters.
+- **Daemon:** launchd — `bootout` the new, restore the old plist, `bootstrap` +
+  `kickstart`. Unmanaged — `fleet daemon stop`, start the old build's `fleet
+  daemon`. Confirm the router cursor (`router.seq`) is still compatible before
+  downgrading; verify pid + build via `fleet daemon status`.
+- **Plugin:** reinstall the prior plugin version; recycle any conductor that must
+  load it now (a running agent keeps its baked `--plugin-dir`).
+
+Until a staging run proves strategy A end-to-end, treat conductor **recycle**
+(strategy B) as the default for a production cutover.

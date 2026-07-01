@@ -10,6 +10,27 @@ Post-v0.1.0 work, not yet tagged. Candidate for v0.1.1.
 
 ### Added
 
+- **`fleet daemon start --foreground` for launchd/systemd (packaging P2.3).** Runs
+  the supervised router in the current process — no fork/detach/stdio-redirect — so
+  a supervisor's KeepAlive owns it directly and captures its output. Preserves the
+  `daemon <start|stop|status|restart>` grammar (a parser test pins the exact plist
+  command; a bare `fleet daemon --foreground` is rejected). `restart` still
+  re-detaches. `fleet daemon status` now also reports **which build owns the
+  daemon** — app `version`, the `python` running it, and the `cmux_fleet` package
+  dir (recorded in `router.daemon.json` at start) — so a migration can prove the
+  code path, not just state dir + pid (P2.5).
+- **Two-step install + migration runbook (packaging P1.4/P2.5).** README quickstart
+  is now two independent installs — `uv tool install` the app, then install the
+  plugin your way (the app installer never touches the plugin). `docs/operations.md`
+  gains a launchd reboot-persistence section (plist + bootstrap/kickstart/bootout)
+  and an app/plugin **cutover runbook** written around real running-process
+  behavior: it gates prod cutover on the Phase 3 thin shims, inventories each live
+  agent's baked PATH/`--plugin-dir`/`CMUX_*`, forces an explicit
+  repointable-path-vs-recycle decision, records current-vs-new daemon build
+  identity + the `hash -r`/`rehash` rollback caveat + launchd ordering, and does
+  NOT advertise "no conductor recycle" until a staging run proves a live conductor
+  resolves the installed app for hook verbs.
+
 - **Router daemon manager** (`scripts/fleet_daemon.py`). `fleet daemon
   start|stop|status|restart` runs `router.py --live` as a properly detached
   daemon: `start` double-forks with `setsid` (its own session, no controlling

@@ -17,56 +17,72 @@ and the hooks and daemon that move completions to the right parent.
 - **cmux**, on `$PATH` as `cmux` (or point `CMUX_BIN` at it).
 - **Claude Code** and/or **codex** as the agent tool.
 - **python3.11+** (the CLI and config read TOML via `tomllib`).
-- No other runtime dependencies. The plugin is standard-library Python.
+- **[uv](https://docs.astral.sh/uv/)** to install the app (`uv tool install`).
+- No other runtime dependencies. The app is standard-library Python.
 
 ## Install
 
-cmux-fleet is its own Claude Code marketplace. `marketplace.json` lists one
-plugin sourced from the repo root (`./`), so adding the repo as a marketplace
-makes the plugin installable from it.
+Two independent installs. **The app installer never touches the plugin** — you
+install each the way that fits it, and the plugin reaches the app through the
+`fleet` on `PATH`.
+
+### 1. The app — the `fleet` CLI + router daemon
+
+Install it as a uv tool, so a `fleet` console script lands on your `PATH` and the
+package is vendored in its own environment (no repo checkout needed at runtime):
+
+```
+uv tool install .                                             # from a checkout, or:
+uv tool install "git+https://github.com/seanyoungberg/cmux-fleet@v0.1.0"   # pinned tag (private repo → git auth)
+```
+
+Upgrade with `uv tool upgrade cmux-fleet`, or install a new tag to move between
+releases. The app is standard-library only.
+
+### 2. The plugin — the conductor hooks + skill
+
+Installed separately, your way; the app install deliberately does **not** do
+this. cmux-fleet is its own Claude Code marketplace (`marketplace.json` sources
+one plugin from the repo root, `./`):
 
 ```
 /plugin marketplace add seanyoungberg/cmux-fleet
 /plugin install cmux-fleet@cmux-fleet
 ```
 
-To put the `fleet` CLI on your `PATH`, symlink or add `bin/` to your shell:
-
-```
-ln -s "$(pwd)/bin/fleet" ~/.local/bin/fleet
-```
-
-`bin/fleet` is a thin shim to `scripts/fleet.py`.
+The plugin's hooks are thin shims that call the installed `fleet` app on `PATH`.
+**If the app is not installed the hooks silently no-op** — fleet features simply
+don't activate and the rest of Claude Code is unaffected — so install the app
+first. There is no network fallback; the plugin requires the app.
 
 ## Quickstart
 
-1. Copy the example config and edit your roster:
-
-   ```
-   mkdir -p ~/.config/cmux-fleet
-   cp fleet.toml.example ~/.config/cmux-fleet/fleet.toml
-   ```
-
-   The file is optional. With no config at all you can still `fleet launch
+1. Seed a roster (optional). With no config at all you can still `fleet launch
    --adhoc <name>`; a roster only adds named roles.
 
-2. Start the router daemon (one per machine, serves every conductor). It
-   double-forks and detaches, so it outlives the shell that started it and a
-   conductor recycle:
+   ```
+   fleet profile default --init   # pins this build + seeds the bundled example roster, or plainly:
+   mkdir -p ~/.config/cmux-fleet && cp fleet.toml.example ~/.config/cmux-fleet/fleet.toml
+   ```
+
+2. Start the router daemon (one per machine/profile, serves every conductor). It
+   double-forks and detaches, so it outlives the starting shell and a conductor
+   recycle:
 
    ```
    fleet daemon start
-   fleet daemon status          # running? state dir, uptime, bus seq
+   fleet daemon status          # running? version/python/package that owns it, state dir, uptime, bus seq
    ```
 
-   `fleet daemon` is the only supported way to run the router. Never start
-   `router.py` by hand from inside an agent session: a bare `nohup &` router
-   dies with the tool's process group, or worse, silently survives as a stray
-   duplicate that double-processes the bus. Exactly one `router.py --live`
-   should ever exist (the daemon's child):
+   For reboot persistence, run it under launchd with `fleet daemon start
+   --foreground` (the plist + a cutover runbook are in `docs/operations.md`).
+   `fleet daemon` is the only supported way to run the router — never start it by
+   hand from an agent session: a bare `nohup &` router dies with the tool's
+   process group, or worse survives as a stray duplicate that double-processes
+   the bus. Exactly one `cmux_fleet.router --live` should ever exist:
 
    ```
-   ps aux | grep 'router.py --live'   # expect one line
+   ps aux | grep 'cmux_fleet.router --live'   # expect one line
    ```
 
 3. From inside a cmux conductor surface, launch a child and check it registered:
@@ -95,7 +111,7 @@ mode dial below).
 | `fleet worktree ls` / `clean` | manage fleet-owned git worktrees (config-gated) |
 | `fleet broadcast "<msg>"` | input-safe heads-up to a target set of live agents |
 | `fleet profile <name>` | pin all entrypoints at this build (multi-build isolation) |
-| `fleet daemon start\|stop\|status\|restart` | run the router as a detached daemon (survives shell exit + recycle); `--heartbeat` to nudge idle conductors |
+| `fleet daemon start\|stop\|status\|restart` | run the router as a detached daemon (survives shell exit + recycle); `start --foreground` for launchd; `--heartbeat` to nudge idle conductors |
 | `fleet peer-msg` / `fleet child-digest` / `fleet drive-child` / `fleet inbox-ack` | agent-facing helpers |
 
 Full runbook in `docs/operations.md`.
@@ -116,7 +132,7 @@ See `docs/profiles.md` for the model and the workflow to stand up an Nth build.
 ## Configuration
 
 Every setting resolves with the precedence **environment variable > `[fleet]`
-block in the toml > built-in default**, in `scripts/config.py`. With none of
+block in the toml > built-in default**, in `cmux_fleet/config.py`. With none of
 them set and cmux on `$PATH`, the defaults are stranger-safe: state under XDG,
 no vault assumption, marketplace and floor disabled.
 
@@ -203,15 +219,12 @@ shape from [elevens](https://github.com/hummer98/elevens). Design-mined, not cop
 
 Forward-looking, not yet built:
 
-- **Reboot persistence.** The daemon survives shell exit, Bash-tool cleanup, and
-  a conductor recycle, but not a machine reboot. `fleet daemon install-launchd`
-  (a `~/Library/LaunchAgents` plist) would start it at login. Until then, run
-  `fleet daemon start` after a reboot.
-- **App-vs-plugin packaging.** Today the repo is both the Claude Code plugin
-  (skills + hooks) and the app (the `fleet` CLI + router daemon), and it runs
-  from a controlled checkout with `bin/` on `PATH`. The intended split installs
-  the app like an app (uv-tool / pipx, or a `~/.local/bin/fleet` entrypoint) and
-  ships the plugin as a thin layer on top. Not done yet.
+- **A `fleet daemon install-launchd` helper.** Reboot persistence works today by
+  running the router under launchd with `fleet daemon start --foreground`; the
+  plist and the cutover steps are documented in `docs/operations.md`. A helper
+  verb that writes the `~/Library/LaunchAgents` plist and `bootstrap`s it (so you
+  don't hand-author it) is still to come. Until then, or on a non-launchd box,
+  run `fleet daemon start` after a reboot.
 
 ## More
 

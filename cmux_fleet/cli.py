@@ -2113,7 +2113,7 @@ def main():
               "  paint                                             sync fleet state onto the cmux sidebar (status pills + ctx bars)\n"
               "  worktree <ls | clean <label> [--wip-commit]>      manage fleet-owned git worktrees (config-gated, default-off)\n"
               "  profile <name> [--base DIR] [--root DIR] [--init]  emit env that pins ALL entrypoints at THIS build (eval it for multi-build isolation)\n"
-              "  daemon <start|stop|status|restart> [--heartbeat [SECS]]  run the router as a detached daemon (survives shell exit + recycle)\n"
+              "  daemon <start|stop|status|restart> [--foreground] [--heartbeat [SECS]]  run the router as a detached daemon (survives shell exit + recycle); start --foreground for launchd\n"
               "  drive-child <surface-uuid> <prompt...>            submit a prompt to a child's TUI (beats the paste-settle enter-race)\n"
               "  peer-msg <to-label> \"<body>\" [--no-reply] [--reply-to <id>] [--expect-reply] [--no-wake]\n"
               "                                                    input-safe A2A: message a live PEER conductor (into its context, never its input box)\n"
