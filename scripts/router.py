@@ -9,7 +9,7 @@
 #
 #   python3 router.py            # OBSERVE: log decisions, write/send nothing
 #   python3 router.py --live     # ACTIVE: write inbox + notify; idle-wake iff notify-mode==auto
-import json, os, pty, subprocess, sys, time
+import fcntl, json, os, pty, subprocess, sys, time
 from datetime import datetime
 
 HERE = os.path.dirname(os.path.abspath(__file__))
@@ -20,7 +20,10 @@ import fleet_state as fs
 LIVE = "--live" in sys.argv
 os.makedirs(fs.STATE, exist_ok=True)
 CURSOR_FILE = os.path.join(fs.STATE, "router.seq")     # bus replay cursor (distinct from inbox.seq)
+LOCKFILE = os.path.join(fs.STATE, "router.live.lock")  # bus-level singleton lock (one --live router)
 DEBOUNCE_S = 3.0
+
+_lock_fd = None   # module-global so the flock survives for the whole process (closing the fd drops it)
 
 # registry cache + a materialized surface->entry index (the live store is label-keyed; the router
 # needs surface->entry on each Stop, so build the inverse once per reload — critic issue #6).
@@ -165,7 +168,40 @@ def handle(ev):
         maybe_idle_wake(surface, label)
 
 
+def acquire_singleton_lock():
+    """Bus-level singleton: only ONE `--live` router may PROCESS a given state dir's bus. A second
+    live router (a leftover nohup, a crashed-but-alive process) sitting on the SAME bus double-processes
+    every event -> duplicate child completions reach conductors (this happened during cutover: 3 strays
+    triple-processed the bus). Acquire an exclusive, non-blocking flock tied to STATE BEFORE consuming;
+    a router that can't get it exits instead of processing in parallel. OBSERVE routers do NOT lock —
+    they write nothing, so running one alongside the live one for debugging stays safe.
+
+    The lockfile is per-STATE (under fs.STATE), so the invariant is scoped to this build/profile's bus.
+    We open with 'a+' (create, no truncate) so a REFUSED second router can't wipe the holder's pid line
+    before it fails the flock; only the winner (after acquiring) rewrites the file with its own pid."""
+    global _lock_fd
+    fd = open(LOCKFILE, "a+")
+    try:
+        fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except OSError:
+        fd.seek(0)
+        holder = fd.read().strip()
+        fd.close()
+        log(f"[router] REFUSING to start: another --live router already holds the bus lock for "
+            f"state={fs.STATE}" + (f" (pid {holder})" if holder else "")
+            + f" [{LOCKFILE}]. Only one live router may process this bus; exiting to avoid "
+            f"double-processing. Stop the other router (or `fleet daemon restart`) first.")
+        sys.exit(3)
+    fd.seek(0)
+    fd.truncate()
+    fd.write(str(os.getpid()))
+    fd.flush()
+    _lock_fd = fd   # keep the fd (and thus the lock) alive for the process lifetime
+
+
 def main():
+    if LIVE:
+        acquire_singleton_lock()                       # hard invariant: one live bus processor
     log(f"[router] mode={'LIVE' if LIVE else 'OBSERVE'} notify-mode={fs.mode()} state={fs.STATE}")
     registry()
     master, slave = pty.openpty()      # PTY or cmux block-buffers a low-volume stream (proven gotcha)

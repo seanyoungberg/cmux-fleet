@@ -12,6 +12,7 @@
 # per-build/profile (see config.py / docs/profiles.md). The router path is resolved relative to THIS
 # module so `start` always runs this build's router.
 import argparse
+import fcntl
 import json
 import os
 import signal
@@ -28,6 +29,7 @@ PIDFILE = os.path.join(STATE, "router.pid")
 METAFILE = os.path.join(STATE, "router.daemon.json")
 LOG = os.path.join(STATE, "router.log")
 ROUTER_SEQ = os.path.join(STATE, "router.seq")
+ROUTER_LOCK = os.path.join(STATE, "router.live.lock")   # the router's bus-level singleton flock
 DEFAULT_HEARTBEAT = 540                              # 9 min, within the spec's 8-10 min window
 
 
@@ -67,6 +69,77 @@ def _running_pid():
     if pid:
         _clear_files()
     return 0
+
+
+# --- stray-router reaping (bus singleton, daemon side) --------------------------------------------
+def _lock_holder_pid():
+    """If a `--live` router currently holds THIS state dir's bus lock, return its pid; else 0. Probe by
+    trying to flock the per-STATE lockfile non-blocking: success => nobody holds it (release at once and
+    return 0); failure => held, so return the holder pid the router wrote into the file."""
+    if not os.path.exists(ROUTER_LOCK):
+        return 0
+    try:
+        fd = open(ROUTER_LOCK, "a+")
+    except OSError:
+        return 0
+    try:
+        fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        fcntl.flock(fd, fcntl.LOCK_UN)               # free -> nobody to reap
+        return 0
+    except OSError:
+        fd.seek(0)
+        try:
+            return int(fd.read().strip())
+        except ValueError:
+            return 0
+    finally:
+        fd.close()
+
+
+def _is_live_router(pid):
+    """True iff `pid` is actually a `router.py --live` process — a ps cmdline check so we never signal an
+    unrelated process that inherited a reused pid. Matches the router script + `--live` (the lockfile is
+    already per-STATE, so state-dir scoping comes for free)."""
+    if not _alive(pid):
+        return False
+    try:
+        out = subprocess.run(["ps", "-o", "command=", "-p", str(pid)],
+                             capture_output=True, text=True, timeout=5).stdout
+    except Exception:
+        return False
+    return "router.py" in out and "--live" in out
+
+
+def _reap_stray_router():
+    """Before spawning our router, reap a STRAY `router.py --live` that holds this bus's singleton lock
+    but is NOT our daemon's child (a leftover nohup / crashed-but-alive process). Called only once we've
+    confirmed no daemon of ours is running, so the lock holder — if any — is genuinely orphaned. Matched
+    via the per-STATE lockfile pid + a ps cmdline check, so an unrelated (pid-reused) process is left
+    alone with a warning. Returns the reaped pid, or 0."""
+    pid = _lock_holder_pid()
+    if not pid:
+        return 0
+    if not _is_live_router(pid):
+        print(f"[fleet daemon] warn: bus lock held by pid {pid}, which is not a live router "
+              f"(pid reuse?); leaving it alone. Remove {ROUTER_LOCK} by hand if this is wrong.")
+        return 0
+    print(f"[fleet daemon] reaping stray live router (pid {pid}) holding the bus for state={STATE} "
+          f"before starting — prevents double-processing.")
+    try:
+        os.kill(pid, signal.SIGTERM)
+    except ProcessLookupError:
+        return pid
+    for _ in range(30):                              # up to ~3s for a graceful exit
+        if not _alive(pid):
+            break
+        time.sleep(0.1)
+    if _alive(pid):
+        try:
+            os.kill(pid, signal.SIGKILL)
+        except ProcessLookupError:
+            pass
+        time.sleep(0.2)
+    return pid
 
 
 # --- the daemon body (runs in the fully-detached grandchild) --------------------------------------
@@ -150,6 +223,8 @@ def _start(heartbeat_secs):
     if running:
         print(f"[fleet daemon] already running (pid {running}); use `fleet daemon restart` to replace")
         return 1
+
+    _reap_stray_router()                             # clear any orphaned live router on this bus first
 
     pid1 = os.fork()
     if pid1 > 0:                                      # ORIGINAL caller: reap child1, await pidfile, report

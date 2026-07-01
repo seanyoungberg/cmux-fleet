@@ -1,6 +1,8 @@
-# tests/test_daemon.py — `fleet daemon` lifecycle bookkeeping + the Tier-1 heartbeat filter. The actual
-# double-fork daemonize is smoke-tested (hard to unit-test); here we cover the pidfile/liveness logic
-# and the heartbeat's skip rules without spawning a daemon.
+# tests/test_daemon.py — `fleet daemon` lifecycle bookkeeping + the Tier-1 heartbeat filter + the
+# stray-router reap (bus singleton, daemon side). The actual double-fork daemonize is smoke-tested
+# (hard to unit-test); here we cover the pidfile/liveness logic, the heartbeat's skip rules, and the
+# reap's match-before-kill safety without spawning a daemon.
+import fcntl
 import os
 import sys
 
@@ -75,3 +77,54 @@ def test_heartbeat_nudges_only_idle_conductors_with_pending(monkeypatch):
     assert "SB" in attempted                       # a busy conductor is still attempted; wake_if_idle declines it
     assert "SM" not in attempted                   # muted -> filtered before the gate
     assert "SW" not in attempted                   # a child -> never nudged (conductors only)
+
+
+# --- stray-router reap (bus singleton, daemon side) ----------------------------------------------
+def test_lock_holder_pid_detects_held_and_free():
+    os.makedirs(os.path.dirname(fd.ROUTER_LOCK), exist_ok=True)
+    holder = open(fd.ROUTER_LOCK, "a+")
+    holder.seek(0)
+    holder.truncate()
+    holder.write("9999")                           # the "stray router"'s pid it stamped
+    holder.flush()
+    fcntl.flock(holder, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    try:
+        assert fd._lock_holder_pid() == 9999        # lock held -> report the holder pid
+    finally:
+        fcntl.flock(holder, fcntl.LOCK_UN)
+        holder.close()
+    assert fd._lock_holder_pid() == 0               # released -> nobody to reap
+
+
+def test_reap_skips_non_router_pid(monkeypatch, capsys):
+    # a pid holds the lock but ps says it is NOT a router (pid reuse) -> never signal it.
+    monkeypatch.setattr(fd, "_lock_holder_pid", lambda: 4242)
+    monkeypatch.setattr(fd, "_is_live_router", lambda pid: False)
+    killed = []
+    monkeypatch.setattr(fd.os, "kill", lambda *a: killed.append(a))
+    assert fd._reap_stray_router() == 0
+    assert killed == []                             # safety: unrelated process left alone
+    assert "not a live router" in capsys.readouterr().out
+
+
+def test_reap_kills_stray_live_router(monkeypatch):
+    monkeypatch.setattr(fd, "_lock_holder_pid", lambda: 4242)
+    monkeypatch.setattr(fd, "_is_live_router", lambda pid: True)
+    state = {"alive": True}
+    sent = []
+    def fake_kill(pid, sig):
+        sent.append((pid, sig))
+        state["alive"] = False                      # SIGTERM takes it down
+    monkeypatch.setattr(fd.os, "kill", fake_kill)
+    monkeypatch.setattr(fd, "_alive", lambda pid: state["alive"])
+    monkeypatch.setattr(fd.time, "sleep", lambda *_: None)
+    assert fd._reap_stray_router() == 4242          # reaped
+    assert sent and sent[0][0] == 4242              # signalled the stray pid
+
+
+def test_reap_noop_when_lock_free(monkeypatch):
+    monkeypatch.setattr(fd, "_lock_holder_pid", lambda: 0)
+    killed = []
+    monkeypatch.setattr(fd.os, "kill", lambda *a: killed.append(a))
+    assert fd._reap_stray_router() == 0
+    assert killed == []

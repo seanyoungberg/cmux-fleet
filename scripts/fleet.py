@@ -1080,8 +1080,13 @@ def cmd_revive(argv):
     if not ws or not surf:
         sys.exit(1)
     cmuxq("send", "--workspace", ws, "--surface", surf, send_cmd + "\n")
-    if sess and tool == "claude":                                 # full-resume: dismiss the summary menu
-        _dismiss_resume_summary_prompt(surf, lambda m: print(f"[fleet] {m}"))
+    # full-resume: dismiss the summary menu, and GATE the bind on it clearing. The menu blocks the
+    # session bind, so binding behind an undismissed menu would register nothing and leave the agent
+    # live-but-UNREGISTERED (invisible to `fleet ls`, still shown archived). On timeout we abort BEFORE
+    # archive_del so the label stays parked and re-runnable rather than half-revived.
+    if not _resume_and_gate(surf, send_cmd, tool, sess, lambda m: print(f"[fleet] {m}")):
+        sys.exit(f"[fleet] ABORT: resume-summary menu never resolved for {a.label} (surface still "
+                 f"booting or wedged at the menu); NOT registering. Re-run `fleet revive {a.label}`.")
     sid = poll_session(surf)
     if not sid:
         sys.exit("[fleet] timed out waiting for session binding")
@@ -1089,6 +1094,142 @@ def cmd_revive(argv):
     fs.archive_del(a.label)
     fs.log_event("revived", label=a.label, role=spec["role"], surface=surf, session=sid)
     print(f"[fleet] DONE: revived {a.label} = surface {surf} (session {sid})")
+    return 0
+
+
+# ---------------------------------------------------------------- register (manual escape hatch)
+def _discover_surface_for(label, abs_cwd):
+    """Find a LIVE agent's surface UUID in the cmux hook store WITHOUT the registry (that's the whole
+    point — it's unregistered). Prefer an exact AGENT_LABEL match in the recorded launchCommand (fleet
+    injects AGENT_LABEL=<label> into every launch); fall back to a cwd match. Returns '' if ambiguous/none."""
+    import re
+    d = _store()
+    needle = re.compile(rf"AGENT_LABEL=['\"]?{re.escape(label)}['\"]?(\s|$)")
+    by_cwd = ""
+    for s in (d.get("sessions") or {}).values():
+        surf = s.get("surfaceId") or ""
+        if not surf:
+            continue
+        if needle.search(s.get("launchCommand") or ""):
+            return surf                                        # exact label match wins outright
+        if abs_cwd and s.get("cwd") and os.path.realpath(s["cwd"]) == os.path.realpath(abs_cwd):
+            by_cwd = by_cwd or surf
+    return by_cwd
+
+
+def _tool_for_surface(surf):
+    """Which agent tool (claude/codex/...) owns this surface, DERIVED from cmux's PER-tool hook stores
+    (~/.cmuxterm/<tool>-hook-sessions.json) — a live-binding fact, not a guess. '' if not found."""
+    import glob
+    from config import HOOKSTORE
+    su = (surf or "").upper()
+    suffix = "-hook-sessions.json"
+    for path in sorted(glob.glob(os.path.join(HOOKSTORE, "*" + suffix))):
+        try:
+            d = json.load(open(path))
+        except Exception:
+            continue
+        hit = any((k or "").upper() == su for k in (d.get("activeSessionsBySurface") or {})) or \
+              any((s.get("surfaceId") or "").upper() == su for s in (d.get("sessions") or {}).values())
+        if hit:
+            base = os.path.basename(path)
+            return base[:-len(suffix)] if base.endswith(suffix) else ""
+    return ""
+
+
+def _role_from_binding(surf):
+    """AGENT_ROLE the surface was launched with (parsed from its recorded launchCommand), or ''. Lets an
+    OFF-ROSTER agent's spec be rebuilt from the live surface itself when no archive/registry entry exists."""
+    import re
+    d = _store()
+    for s in (d.get("sessions") or {}).values():
+        if (s.get("surfaceId") or "").upper() == (surf or "").upper():
+            m = re.search(r"AGENT_ROLE=['\"]?([\w.\-]+)", s.get("launchCommand") or "")
+            if m:
+                return m.group(1)
+    return ""
+
+
+def cmd_register(argv):
+    """Manually pull a LIVE-but-UNREGISTERED agent into the registry — belt-and-suspenders recovery for
+    the SAME failure Fix 2's gate prevents (a resume that bound a session but skipped register, or an
+    agent launched outside fleet). PRINCIPLE: derive, don't ask. Given a label + its live surface, we
+    DERIVE tool/session/workspace/cwd from the live surface (cmux hook store) and rebuild the launch spec
+    from the roster role (toml-authoritative), falling back to the archive/live entry or the surface's own
+    AGENT_ROLE/binding for off-roster agents. --session/--parent are optional OVERRIDES, never required.
+    Promotes a parked (archived) label to live; idempotent on the SAME surface; refuses to move a label
+    that is already live under a DIFFERENT surface."""
+    import fleet_state as fs
+    ap = argparse.ArgumentParser(prog="fleet register")
+    ap.add_argument("label")
+    ap.add_argument("--surface", default="", help="the agent's live surface UUID (primary input); if "
+                    "omitted, discovered from the cmux hook store by AGENT_LABEL/cwd")
+    ap.add_argument("--parent", default=os.environ.get("CMUX_SURFACE_ID", ""),
+                    help="parent LABEL or surface (default $CMUX_SURFACE_ID)")
+    ap.add_argument("--session", default="", help="bound session id override (default: derived from cmux)")
+    a = ap.parse_args(argv)
+    label = a.label
+    arch = fs.archive_get(label)
+    live = fs.live_get(label)
+    src = arch or live or {}
+
+    # surface: explicit --surface is the primary/robust path; else best-effort discovery. Discovery wants
+    # a cwd hint, so compute a preliminary cwd (entry > roster resolve) up front.
+    prelim_role = src.get("role") or label
+    prelim_cwd = src.get("cwd", "")
+    if not prelim_cwd and _is_roster(prelim_role):
+        try:
+            prelim_cwd = resolve(load_config(), prelim_role, src.get("tool", "claude"), None).get("cwd", "")
+        except SystemExit:
+            pass
+    prelim_abs = (prelim_cwd if os.path.isabs(prelim_cwd)
+                  else os.path.join(ROOT, prelim_cwd)) if prelim_cwd else ""
+    surf = a.surface or _discover_surface_for(label, prelim_abs)
+    if not surf:
+        sys.exit(f"[fleet] register: no --surface and could not discover one for '{label}' (no "
+                 f"AGENT_LABEL/cwd match in the hook store). Pass --surface <uuid> (copy it from cmux).")
+
+    # validate: don't hijack a label already live on a DIFFERENT surface; require a bound session.
+    if live and live.get("surface") and live["surface"].upper() != surf.upper():
+        sys.exit(f"[fleet] register: '{label}' is already live under a DIFFERENT surface "
+                 f"({live['surface']}); refusing to move it to {surf}. `fleet rm {label}` first if that "
+                 f"entry is stale, or re-run with the correct --surface.")
+    session = a.session or fs.bare_uuid(poll_session(surf, timeout=5))
+    if not session:
+        sys.exit(f"[fleet] register: surface {surf} is not bound to a session (agent not up yet?). "
+                 f"Wait for its first turn to bind, or pass --session <id>.")
+
+    # derive tool + workspace + cwd from the LIVE surface (bindings, not flags).
+    tool = _tool_for_surface(surf) or src.get("tool", "claude")
+    ws = ws_uuid_for_surface(surf) or (surface_loc(surf)[0] or "")
+    surf_cwd = _surface_cwd(surf) or ""
+
+    # rebuild the spec: roster role (toml-authoritative, berg's proven recipe) > archive/live entry >
+    # the surface's own binding for a truly off-roster agent.
+    role = src.get("role") or _role_from_binding(surf) or label
+    if _is_roster(role):
+        spec = resolve(load_config(), role, tool, None)
+        spec["label"] = label
+        source = "roster"
+    else:
+        spec = {"tool": tool, "role": role, "label": label, "kind": src.get("kind", "child"),
+                "place": src.get("place", "tab"), "group": src.get("group", ""),
+                "cwd": src.get("cwd", "") or surf_cwd, "plugins": list(src.get("plugins", [])),
+                "flags": list(src.get("flags", [])), "settings": src.get("settings", "")}
+        source = "archive" if arch else ("live" if live else "surface")
+    spec["tool"] = tool
+    if not spec.get("cwd"):
+        spec["cwd"] = surf_cwd                              # last resort: the live surface's own cwd
+    spec["abs_cwd"] = spec["cwd"] if os.path.isabs(spec["cwd"]) else os.path.join(ROOT, spec["cwd"])
+    spec.setdefault("worktree_meta", src.get("worktree"))
+
+    register(surf, spec, a.parent, session, ws)
+    promoted = bool(arch) and bool(fs.archive_del(label))   # archive->live promotion (else it double-lists)
+    fs.log_event("registered", label=label, role=role, surface=surf, session=session, source=source)
+    print(f"[fleet] registered {label} = surface {surf} (session {session[:12]}, tool={tool}, "
+          f"ws={ws or '-'}, parent={fs.label_for_surface(a.parent) or a.parent or '-'}, source={source})"
+          + ("; promoted from archive" if promoted else "")
+          + ("; updated in place" if live and not arch else ""))
     return 0
 
 
@@ -1372,15 +1513,46 @@ def cmd_recycle(argv):
     return 0
 
 
-def _dismiss_resume_summary_prompt(surf, log, timeout=30):
+def _count_plugin_dirs(send_cmd):
+    """Loadout weight proxy: how many `--plugin-dir` plugins the launch carries. Heavier loadouts boot
+    slower (RAM pressure + more plugins to load), so the resume-menu watch window scales by this."""
+    return (send_cmd or "").count("--plugin-dir")
+
+
+def _resume_menu_timeout(plugin_count, base=60, per_plugin=8, ceiling=120):
+    """Ceiling for the resume-menu watch. The PRIMARY fix is event-driven polling (below), not a bigger
+    number; this is only the generous upper bound. Base is already generous (heavy loadouts take 30-40s
+    to boot, not 2s); plugin count is a SECONDARY heuristic that stretches the ceiling for the heaviest
+    loadouts (e.g. homelab's 6 plugins) without over-waiting light ones."""
+    return min(ceiling, base + per_plugin * max(0, plugin_count))
+
+
+# tri-state outcomes of the resume-menu watch (see _dismiss_resume_summary_prompt)
+RESUME_DISMISSED = "dismissed"   # the summary menu rendered and we picked 'full session as-is'
+RESUME_READY = "ready"           # resumed straight to a running prompt (no menu; nothing to do)
+RESUME_TIMEOUT = "timeout"       # neither appeared within the ceiling -> the caller MUST NOT bind
+
+
+def _dismiss_resume_summary_prompt(surf, log, timeout=None, plugin_count=0):
     """`claude --resume` on an OLD/LARGE session shows an interactive menu before resuming:
          1. Resume from summary (recommended)   2. Resume full session as-is   3. Don't ask me again
     A respawn/recycle has NO human to choose, so the agent HANGS at the menu (and the resume-confirm
     false-passes on the bound-but-stuck session). Policy: ALWAYS resume FULL, never summarize/compact.
     No claude flag/setting/env var exists to suppress this or force full (GitHub #46751, verified), so a
     keystroke is the only lever: the cursor defaults to option 1, so DOWN -> option 2 ('full as-is'),
-    then ENTER. Poll the pane until the menu renders; bail early (no keystrokes) if the agent already
-    resumed straight to a running prompt. Returns True iff it dismissed a menu."""
+    then ENTER.
+
+    This is a PURE TIMING gate, not a detection problem: the menu renders fine, but a heavy loadout can
+    take 30-40s to boot, so a fixed window closed before it appeared (WARN + revive left at the shell —
+    homelab's symptom). We poll the pane for ONE of three states until a GENEROUS, loadout-scaled ceiling
+    (never a single fixed sleep):
+      - RESUME_DISMISSED: the menu is up -> pick 'full session as-is'
+      - RESUME_READY:     already at a running prompt -> nothing to dismiss
+      - RESUME_TIMEOUT:   still booting past the ceiling -> the CALLER MUST treat this as a failed resume
+                          and NOT proceed to bind/register (the menu is a GATE that blocks the session
+                          bind; binding behind an undismissed menu leaves the agent running UNREGISTERED)."""
+    if timeout is None:
+        timeout = _resume_menu_timeout(plugin_count)
     end = time.time() + timeout
     while time.time() < end:
         pane = cmuxq("capture-pane", "--surface", surf) or ""
@@ -1389,13 +1561,27 @@ def _dismiss_resume_summary_prompt(surf, log, timeout=30):
             cmuxq("send-key", "--surface", surf, "down")
             time.sleep(0.5)
             cmuxq("send-key", "--surface", surf, "enter")
-            return True
+            return RESUME_DISMISSED
         # small session resumed straight to a running prompt -> no menu, nothing to dismiss
         if "Context Remaining" in pane or "bypass permissions" in pane:
-            return False
+            return RESUME_READY
         time.sleep(1)
-    log("WARN: resume launched but no summary-menu and no running prompt seen within timeout")
-    return False
+    log(f"WARN: resume launched but neither the summary-menu nor a running prompt appeared within "
+        f"{timeout:.0f}s (plugin_count={plugin_count}); NOT binding -- surface is still booting or "
+        f"wedged behind the menu. Re-run once it settles.")
+    return RESUME_TIMEOUT
+
+
+def _resume_and_gate(surf, send_cmd, tool, sess, log):
+    """Dismiss the resume-summary menu AND report whether the surface is safe to bind. The menu blocks
+    the session bind, so poll_session/register can't succeed until it clears; a timed-out dismiss that
+    the caller ignored is exactly what left agents running UNREGISTERED (live pane, still shown archived).
+    Returns True iff the resume resolved (menu dismissed OR already at a running prompt); False iff it
+    timed out -- the caller MUST NOT bind/register. A no-op True for fresh / non-claude launches (no menu)."""
+    if not (sess and tool == "claude"):
+        return True
+    status = _dismiss_resume_summary_prompt(surf, log, plugin_count=_count_plugin_dirs(send_cmd))
+    return status != RESUME_TIMEOUT
 
 
 def cmd_recycle_exec(argv):
@@ -1462,8 +1648,14 @@ def cmd_recycle_exec(argv):
             time.sleep(8)                                # codex boots slower than claude; let the TUI come up
     else:
         if mode == "resume":
-            # full-resume the session (dismiss claude's summary-vs-full menu before it hangs the confirm)
-            _dismiss_resume_summary_prompt(surf, log)
+            # full-resume the session (dismiss claude's summary-vs-full menu before it hangs the confirm),
+            # and GATE the bind on it clearing: the menu blocks the session bind, so a timed-out dismiss
+            # would otherwise fall through to a failed poll and skip the registry re-bind -> a live pane
+            # that fleet no longer tracks. Abort instead so the caller re-runs when the surface settles.
+            if not _resume_and_gate(surf, send_cmd, p.get("tool"), old_sid, log):
+                log("ABORT: resume-summary menu never resolved within ceiling; NOT binding/registering "
+                    "(surface still booting or wedged at the menu). Re-run `fleet recycle --resume` later.")
+                return 1
         # exclude pre_sid (the stale store entry snapshotted post-respawn) so a crashed launch can't
         # false-confirm on it; fresh requires a sid that is neither old_sid nor pre_sid.
         exclude = {old_sid, pre_sid} if mode == "fresh" else {old_sid}
@@ -1679,13 +1871,15 @@ def cmd_profile(argv):
 
 def main():
     if len(sys.argv) < 2 or sys.argv[1] in ("-h", "--help"):
-        print("usage: fleet <launch|config|ls|archive|revive|recycle|rm|vitals|find|graph|serve|paint|worktree|profile|daemon> ...\n"
+        print("usage: fleet <launch|config|ls|archive|revive|register|recycle|rm|vitals|find|graph|serve|paint|worktree|profile|daemon> ...\n"
               "  launch <role|--adhoc NAME> [--tool t] [--place p] [--parent s] [--dry-run] [-- <tool flags>]\n"
               "  config <role|--adhoc NAME|--cwd DIR> [--tool t]   effective config (base settings + fleet adds)\n"
               "  ls                                                live fleet x hook store; flags STALE + archived\n"
               "  archive <label>                                   park a live agent (revivable)\n"
               "  revive <label> [--place p] [--parent s] [--add-plugin N] [-- <flags>]\n"
               "                                                    bring a parked agent back (replays the captured binding, claude --resume)\n"
+              "  register <label> [--surface UUID] [--parent s] [--session id]\n"
+              "                                                    pull a LIVE-but-unregistered agent into the registry (recovery for a skipped auto-register)\n"
               "  recycle [label] [--resume] [--force] [--add-plugin N] [--prime T|--no-prime] [-- <flags>]\n"
               "                                                    restart in place, same surface/identity (default self+fresh)\n"
               "  broadcast \"<msg>\" [--target all|all-conductors|all-children|my-children] [--no-wake] [--expect-reply] [--dry-run]\n"
@@ -1705,7 +1899,7 @@ def main():
     import fleet_features as ff
     import fleet_daemon as fd
     fns = {"launch": cmd_launch, "config": cmd_config, "ls": cmd_ls,
-           "archive": cmd_archive, "revive": cmd_revive, "recycle": cmd_recycle,
+           "archive": cmd_archive, "revive": cmd_revive, "register": cmd_register, "recycle": cmd_recycle,
            "_recycle-exec": cmd_recycle_exec, "broadcast": cmd_broadcast,
            "mute": lambda a: cmd_mute(a, mute=True), "unmute": lambda a: cmd_mute(a, mute=False),
            "rm": cmd_rm, "worktree": cmd_worktree, "profile": cmd_profile, "daemon": fd.cmd_daemon,
