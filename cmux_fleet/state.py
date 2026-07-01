@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # cmux_fleet/state.py (was fleet_state.py) — the ONE shared state module for the cmux fleet. Folds child-completions and
-# peer-messages into a single inbox. CODE lives in the plugin; STATE under $CMUX_STATE_DIR
-# (default $XDG_STATE_HOME/cmux-fleet).
+# peer-messages into a single inbox. CODE lives in the `fleet` APP (the plugin ships only thin hook
+# wiring that shells into it); STATE under $CMUX_STATE_DIR (default $XDG_STATE_HOME/cmux-fleet).
 #
 # Stores (9 files, down from 12; one inbox mechanism instead of two):
 #   inbox.jsonl        unified append-only message stream. One line: {seq, ts, kind, to, **payload}.

@@ -16,16 +16,27 @@
 import json, os, shutil, subprocess, sys
 
 # Inner timeout, safely under the harness's 10s hook timeout (headroom to still exit 0). Overridable via
-# env for tests / an operator on a slow box; a bad value falls back to the 8s default.
+# env for tests / an operator on a slow box, but HARD-CLAMPED to TIMEOUT_MAX: a value at/above the
+# harness timeout would recreate the P1.2 failure (harness kills the shim mid-run before it can exit 0),
+# so anything >= TIMEOUT_MAX (or unparseable) is capped, never honored. Keep the 8s default.
+TIMEOUT_MAX = 9.0                     # must stay < the 10s harness hook timeout
 try:
     TIMEOUT = float(os.environ.get("CMUX_FLEET_HOOK_TIMEOUT", "") or "8")
 except ValueError:
     TIMEOUT = 8.0
+if TIMEOUT != TIMEOUT or TIMEOUT <= 0:  # NaN or non-positive -> the safe default
+    TIMEOUT = 8.0
+TIMEOUT = min(TIMEOUT, TIMEOUT_MAX)     # a bigger override is capped, never honored past the ceiling
 
 
 def _find_fleet():
     """The installed `fleet` app: $CMUX_FLEET_BIN (an executable OR a bin dir) else `which fleet`. None
-    if the app is not installed -> caller fails open."""
+    if the app is not installed -> caller fails open.
+
+    $CMUX_FLEET_BIN is AUTHORITATIVE: if it is set but does not resolve to an executable `fleet`, return
+    None (fail open blank) — do NOT fall through to `which`. During a strategy-A cutover the operator
+    pins CMUX_FLEET_BIN as the atomically-repointable app path; silently running whatever stale `fleet`
+    happens to be first on a live agent's baked PATH would defeat that (codex should-fix #1)."""
     env = os.environ.get("CMUX_FLEET_BIN", "").strip()
     if env:
         env = os.path.expanduser(env)
@@ -34,11 +45,14 @@ def _find_fleet():
         cand = os.path.join(env, "fleet")
         if os.path.isfile(cand) and os.access(cand, os.X_OK):
             return cand
+        return None                     # explicit-but-invalid -> fail open; never ambient which()
     return shutil.which("fleet")
 
 
 def _valid(verb, text):
-    """The exact output contract per verb — the shim never forwards anything else to the harness."""
+    """The exact output contract per verb — the shim never forwards anything else to the harness. Strict:
+    the payload fields must be the right TYPES (a non-string additionalContext/reason, or an awareness
+    object missing hookEventName, is corrupt protocol output -> blank fail-open, codex should-fix #4)."""
     try:
         obj = json.loads(text)
     except Exception:
@@ -47,9 +61,11 @@ def _valid(verb, text):
         return False
     if verb == "hook-awareness":
         hso = obj.get("hookSpecificOutput")
-        return isinstance(hso, dict) and "additionalContext" in hso
+        return (isinstance(hso, dict)
+                and hso.get("hookEventName") == "UserPromptSubmit"
+                and isinstance(hso.get("additionalContext"), str))
     if verb == "hook-drain":
-        return obj.get("decision") == "block" and "reason" in obj
+        return obj.get("decision") == "block" and isinstance(obj.get("reason"), str)
     return False
 
 

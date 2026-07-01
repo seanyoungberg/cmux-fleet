@@ -1,8 +1,8 @@
 # Operations
 
 Day-to-day running of a cmux fleet. All commands assume `fleet` is on your
-`PATH` (via `bin/fleet`) and you are issuing them from inside a conductor's cmux
-surface, so `$CMUX_SURFACE_ID` is set.
+`PATH` (the installed app, or a checkout's `bin/fleet` shim) and you are issuing
+them from inside a conductor's cmux surface, so `$CMUX_SURFACE_ID` is set.
 
 ## Cheat sheet
 
@@ -325,21 +325,26 @@ and survives the ack.
 
 ## Profiles and multi-build
 
-A build is a checkout directory; a profile pins every entrypoint at one build so
-two builds run side by side with separate config, state, and daemons. Activate
-one in a shell, then everything that shell launches is pinned to that build:
+A build is a `fleet` app + plugin — usually a checkout directory (the side-by-side
+dev model), or the single installed uv-tool app. A profile pins every entrypoint at
+one build so two builds run side by side with separate config, state, and daemons.
+Activate one in a shell, then everything that shell launches is pinned to that build:
 
 ```
-eval "$(/path/to/<build>/bin/fleet profile dev --init)"   # PATH + all CMUX_* knobs
+eval "$(/path/to/<build>/bin/fleet profile dev --init)"   # a checkout build (or bare `fleet profile ...` for the installed app)
 cp profiles/test.fleet.toml "$CMUX_FLEET_TOML"             # a starting roster
 fleet daemon start                                        # this profile's own router
 fleet launch sandbox-conductor                            # auto-anchors its own group
 ```
 
-`--init` creates the state dir and seeds the roster from `fleet.toml.example`.
-`fleet daemon` is per-state, so started inside the activated shell it manages
-that profile's router against that profile's `CMUX_STATE_DIR`, separate from
-prod's daemon. Full model and the Nth-build workflow are in `docs/profiles.md`.
+`--init` creates the state dir and seeds the roster from the bundled
+`fleet.toml.example`. The `PATH` pin is THIS build's `fleet` dir (a checkout's
+`bin/` or the installed console-script dir); `CMUX_FLEET_MARKETPLACE` is emitted
+only for a real **checkout** — a bare installed app **omits** it, so set it (or
+`[fleet].marketplace`) explicitly if a roster uses `plugins = [...]`. `fleet
+daemon` is per-state, so started inside the activated shell it manages that
+profile's router against that profile's `CMUX_STATE_DIR`, separate from prod's
+daemon. Full model and the Nth-build workflow are in `docs/profiles.md`.
 
 ### Gotcha: a recycled agent bakes `CMUX_STATE_DIR` into its env
 

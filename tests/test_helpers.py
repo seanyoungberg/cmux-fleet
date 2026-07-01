@@ -6,6 +6,7 @@ plus the CLI dispatch that routes the hyphenated subcommands to them. Pure/in-pr
 throwaway STATE (no cmux): peer-msg runs with --no-wake so it never shells out.
 """
 import os
+import sys
 
 import pytest
 
@@ -22,14 +23,23 @@ def two_peers(fs, monkeypatch):
     return fs
 
 
-# --- dispatch: the hyphenated verbs route to helpers ---------------------------------------------
-def test_cli_dispatch_maps_the_four_verbs():
-    from cmux_fleet import helpers
-    # main() builds the fns table lazily; assert the helper callables are the ones wired for each verb.
-    assert helpers.cmd_drive_child.__name__ == "cmd_drive_child"
-    assert helpers.cmd_peer_msg.__name__ == "cmd_peer_msg"
-    assert helpers.cmd_child_digest.__name__ == "cmd_child_digest"
-    assert helpers.cmd_inbox_ack.__name__ == "cmd_inbox_ack"
+# --- dispatch: the hyphenated verbs actually route to helpers through cli.main -------------------
+def test_cli_dispatch_routes_hyphenated_verb(fs, monkeypatch, capsys):
+    # Prove the cli.main dispatch table routes a hyphenated verb to its helper (not just that the callable
+    # exists): child-digest is side-effect-free with a fragment that matches nothing — it returns 1 and
+    # prints its own message, which only cmd_child_digest emits.
+    monkeypatch.setattr(sys, "argv", ["fleet", "child-digest", "nomatchfrag"])
+    rc = fleet.main()
+    assert rc == 1
+    assert "child-digest: no transcript" in capsys.readouterr().out
+
+
+def test_cli_dispatch_routes_inbox_ack(fs, monkeypatch):
+    # inbox-ack with no surface exits via its own usage guard -> proves `inbox-ack` reaches cmd_inbox_ack.
+    monkeypatch.delenv("CMUX_SURFACE_ID", raising=False)
+    monkeypatch.setattr(sys, "argv", ["fleet", "inbox-ack", "7"])
+    with pytest.raises(SystemExit):
+        fleet.main()
 
 
 # --- peer-msg -> inbox-ack roundtrip -------------------------------------------------------------

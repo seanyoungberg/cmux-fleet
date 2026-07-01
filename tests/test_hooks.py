@@ -31,6 +31,15 @@ if mode == "noise":
     sys.stdout.write("this is not json <<garbage>>"); sys.exit(0)
 if mode == "wrongshape":
     sys.stdout.write(json.dumps({"foo": 1})); sys.exit(0)
+if mode == "badtype":                   # right keys, WRONG value types (corrupt protocol)
+    if verb == "hook-awareness":
+        sys.stdout.write(json.dumps({"hookSpecificOutput": {
+            "hookEventName": "UserPromptSubmit", "additionalContext": 123}}))
+    else:
+        sys.stdout.write(json.dumps({"decision": "block", "reason": 123}))
+    sys.exit(0)
+if mode == "nohookevent":               # awareness object missing hookEventName
+    sys.stdout.write(json.dumps({"hookSpecificOutput": {"additionalContext": "CTX"}})); sys.exit(0)
 if mode == "echo-stdin":
     open(os.environ["FAKE_FLEET_STDIN_OUT"], "wb").write(data)
     mode = "valid"
@@ -112,6 +121,58 @@ def test_timeout_fails_open(fake_fleet):
     # fake fleet sleeps 5s; inner timeout is 1s -> shim must still exit 0 blank (not a timed-out hook).
     p = _run_shim(DRAIN, fake_fleet, mode="timeout", timeout="1")
     assert p.returncode == 0 and p.stdout == b""
+
+
+def test_badtype_payload_fails_open(fake_fleet):
+    # right keys, wrong value types (additionalContext/reason not a string) -> blank, not forwarded.
+    assert _run_shim(AWARENESS, fake_fleet, mode="badtype").stdout == b""
+    assert _run_shim(DRAIN, fake_fleet, mode="badtype").stdout == b""
+
+
+def test_awareness_missing_hookeventname_fails_open(fake_fleet):
+    p = _run_shim(AWARENESS, fake_fleet, mode="nohookevent")
+    assert p.returncode == 0 and p.stdout == b""
+
+
+# --- CMUX_FLEET_BIN is AUTHORITATIVE: invalid explicit path never falls through to ambient PATH ---
+def test_invalid_explicit_bin_does_not_fall_through_to_path(tmp_path):
+    """Strategy-A cutover safety (should-fix #1): with CMUX_FLEET_BIN set to a missing path AND a valid
+    'old' fleet first on PATH, the shim must fail open blank and NEVER invoke the ambient binary."""
+    ambient = tmp_path / "oldbin"; ambient.mkdir()
+    sentinel = tmp_path / "ambient_called"
+    old = ambient / "fleet"
+    old.write_text("#!/usr/bin/env python3\n"
+                   "import sys, json, os\n"
+                   "open(os.environ['SENT'], 'w').write('called')\n"
+                   "sys.stdout.write(json.dumps({'hookSpecificOutput': "
+                   "{'hookEventName': 'UserPromptSubmit', 'additionalContext': 'OLD-STALE'}}))\n")
+    old.chmod(0o755)
+    env = dict(os.environ)
+    env["PATH"] = str(ambient) + ":/usr/bin:/bin"
+    env["CMUX_FLEET_BIN"] = str(tmp_path / "missing" / "fleet")   # explicit but invalid
+    env["SENT"] = str(sentinel)
+    env["CMUX_FLEET_HOOK_TIMEOUT"] = "4"
+    p = subprocess.run([sys.executable, AWARENESS], input=b'{}', env=env, capture_output=True)
+    assert p.returncode == 0 and p.stdout == b"", p.stdout
+    assert not sentinel.exists(), "shim ran the ambient PATH fleet despite an explicit CMUX_FLEET_BIN"
+
+
+# --- the timeout override is clamped below the harness ceiling (should-fix #2) --------------------
+def test_hook_timeout_override_is_clamped(monkeypatch):
+    import importlib
+    sys.path.insert(0, HOOKS_DIR)
+    import _shim
+    monkeypatch.setenv("CMUX_FLEET_HOOK_TIMEOUT", "100")        # would exceed the 10s harness timeout
+    importlib.reload(_shim)
+    assert _shim.TIMEOUT <= _shim.TIMEOUT_MAX < 10
+    monkeypatch.setenv("CMUX_FLEET_HOOK_TIMEOUT", "2")          # a sane override is honored
+    importlib.reload(_shim)
+    assert _shim.TIMEOUT == 2.0
+    monkeypatch.setenv("CMUX_FLEET_HOOK_TIMEOUT", "garbage")    # unparseable -> the 8s default
+    importlib.reload(_shim)
+    assert _shim.TIMEOUT == 8.0
+    monkeypatch.delenv("CMUX_FLEET_HOOK_TIMEOUT", raising=False)
+    importlib.reload(_shim)                                     # restore module default for tidiness
 
 
 # --- stdin is consumed and passed through to the app --------------------------------------------

@@ -89,6 +89,18 @@ Post-v0.1.0 work, not yet tagged. Candidate for v0.1.1.
 
 ### Fixed
 
+- **Hook-shim hardening (codex P2-P4 re-review should-fixes).** `scripts/hooks/_shim.py`:
+  (1) `$CMUX_FLEET_BIN` is now authoritative — set-but-invalid fails open blank
+  instead of falling through to an ambient `which fleet`, so a strategy-A cutover
+  can't silently run a stale binary off a live agent's baked `PATH`;
+  (2) `CMUX_FLEET_HOOK_TIMEOUT` is clamped below the 10s harness timeout (max 9s;
+  bad/oversized values ignored) so an override can't recreate the timed-out-hook
+  failure; (3) stricter output validation — a non-string `additionalContext`/`reason`,
+  or an awareness payload missing `hookEventName`, is treated as corrupt and blanked.
+  Docs (`docs/profiles.md`, `docs/operations.md`) refreshed for the installed-app
+  model (profile omits the marketplace pin unless explicit; `fleet` resolves from
+  the installed app or a checkout shim).
+
 - **`fleet profile` works from an installed wheel (packaging P1.1).** Phase 1's
   package move broke `fleet profile` for a `uv tool install`/venv install: it
   derived a checkout-style `PLUGIN_ROOT` by walking up from `cli.py`, so a wheel
