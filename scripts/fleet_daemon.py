@@ -11,6 +11,15 @@
 # reader) with one `killpg`. Pidfile + meta + log live under $CMUX_STATE_DIR, so the daemon is
 # per-build/profile (see config.py / docs/profiles.md). The router path is resolved relative to THIS
 # module so `start` always runs this build's router.
+#
+# OWNERSHIP PROTOCOL (codex-review hardening): `start` is made atomic by a per-STATE MANAGER lock
+# (`router.daemon.lock`), SEPARATE from the router's bus lock. It is flock(LOCK_EX|LOCK_NB)'d before
+# the running-check and, via the shared open-file-description that fork() dups, held by the supervisor
+# grandchild for its whole life — so two near-simultaneous starts can never both proceed and orphan
+# the daemon from its pidfile. A pidfile is trusted only after IDENTITY validation (live + group
+# leader + a `fleet daemon` ps cmdline), so `stop`'s killpg can never hit an unrelated (pid-reused)
+# process group. And `_clear_files()` only unlinks pid/meta that STILL name the pid being cleared,
+# so no start/stop ever deletes another live supervisor's files.
 import argparse
 import fcntl
 import json
@@ -30,7 +39,10 @@ METAFILE = os.path.join(STATE, "router.daemon.json")
 LOG = os.path.join(STATE, "router.log")
 ROUTER_SEQ = os.path.join(STATE, "router.seq")
 ROUTER_LOCK = os.path.join(STATE, "router.live.lock")   # the router's bus-level singleton flock
+MANAGER_LOCK = os.path.join(STATE, "router.daemon.lock")  # the daemon MANAGER lock (start/ownership)
 DEFAULT_HEARTBEAT = 540                              # 9 min, within the spec's 8-10 min window
+
+_manager_lock_fd = None   # supervisor keeps its manager-lock fd here so the flock survives for its life
 
 
 # --- pidfile / liveness ---------------------------------------------------------------------------
@@ -53,7 +65,13 @@ def _read_pid():
         return 0
 
 
-def _clear_files():
+def _clear_files(pid):
+    """Unlink pid/meta, but ONLY if router.pid still names `pid`. A start/stop must never delete files
+    that now belong to a DIFFERENT live supervisor (the concurrent-start orphan the manager lock also
+    guards). If the pidfile is already gone/other, we leave meta alone too."""
+    cur = _read_pid()
+    if cur and cur != pid:
+        return
     for f in (PIDFILE, METAFILE):
         try:
             os.remove(f)
@@ -61,13 +79,91 @@ def _clear_files():
             pass
 
 
+# --- daemon-manager lock (atomic start + ownership; SEPARATE from the router bus lock) -------------
+def _acquire_manager_lock():
+    """Take the per-STATE daemon MANAGER lock. Returns the held fd on success (the caller/supervisor
+    MUST keep it open — closing the last fd on this open-file-description drops the lock), or None if
+    another `start` is in flight or a supervisor is already up. flock is tied to the open-file-
+    description, which fork() shares, so the supervisor grandchild inherits the hold with no gap."""
+    try:
+        fd = open(MANAGER_LOCK, "a+")
+    except OSError:
+        return None
+    try:
+        fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except OSError:
+        fd.close()
+        return None
+    return fd
+
+
+def _release_manager_lock(fd):
+    """Drop THIS process's fd for the manager lock. We CLOSE (never LOCK_UN): the supervisor may share
+    the same open-file-description via fork(), and LOCK_UN would release the lock out from under it —
+    closing only this fd leaves the supervisor's fd (and thus the lock) intact."""
+    try:
+        fd.close()
+    except Exception:
+        pass
+
+
+def _manager_lock_holder_pid():
+    """Pid the supervisor stamped into the manager lock while holding it, or 0 if the lock is free.
+    Probe with a non-blocking flock (like the router bus probe): acquiring means nobody holds it."""
+    if not os.path.exists(MANAGER_LOCK):
+        return 0
+    try:
+        fd = open(MANAGER_LOCK, "a+")
+    except OSError:
+        return 0
+    try:
+        fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        fcntl.flock(fd, fcntl.LOCK_UN)
+        return 0
+    except OSError:
+        fd.seek(0)
+        try:
+            return int(fd.read().strip())
+        except ValueError:
+            return 0
+    finally:
+        fd.close()
+
+
+def _is_daemon_supervisor(pid):
+    """True iff `pid` is THIS build's live `fleet daemon` SUPERVISOR — not merely a live pid. Guards a
+    stale pidfile whose pid was reused by an unrelated process, so `stop`'s killpg can never signal a
+    foreign process group. Checks: alive, is its own process-group leader (the supervisor calls
+    setpgrp, so pgid==pid — and its router child is NOT, since it inherits the supervisor's group),
+    and its ps cmdline is the fleet daemon entrypoint (`fleet.py daemon` or `fleet_daemon.py`)."""
+    if not _alive(pid):
+        return False
+    try:
+        if os.getpgid(pid) != pid:
+            return False
+    except OSError:
+        return False
+    try:
+        out = subprocess.run(["ps", "-o", "command=", "-p", str(pid)],
+                             capture_output=True, text=True, timeout=5).stdout
+    except Exception:
+        return False
+    return ("fleet.py" in out or "fleet_daemon.py" in out) and "daemon" in out
+
+
 def _running_pid():
-    """Live daemon pid, or 0. Cleans a STALE pidfile (pid dead) as a side effect."""
+    """Live, VALIDATED daemon supervisor pid, or 0. A pidfile pointing at a dead pid — or a live pid
+    that is NOT actually our supervisor (pid reuse) — is treated as stale and cleaned as a side effect.
+    Also distrusts a pidfile that disagrees with the live manager-lock owner (the orphan invariant)."""
     pid = _read_pid()
-    if pid and _alive(pid):
+    if pid and _is_daemon_supervisor(pid):
+        holder = _manager_lock_holder_pid()
+        if holder and holder != pid:                 # pidfile disagrees with the live lock owner -> stale
+            _clear_files(pid)
+            return 0
         return pid
     if pid:
-        _clear_files()
+        _clear_files(pid)
     return 0
 
 
@@ -124,7 +220,7 @@ def _reap_stray_router():
               f"(pid reuse?); leaving it alone. Remove {ROUTER_LOCK} by hand if this is wrong.")
         return 0
     print(f"[fleet daemon] reaping stray live router (pid {pid}) holding the bus for state={STATE} "
-          f"before starting — prevents double-processing.")
+          f"— an orphaned bus processor with no supervisor of ours.")
     try:
         os.kill(pid, signal.SIGTERM)
     except ProcessLookupError:
@@ -155,6 +251,14 @@ def _run_daemon(heartbeat_secs):
     """Supervise router.py --live (+ optional heartbeat). pidfile = THIS (supervisor) pid; the router is
     a child in our process group. On SIGTERM we tear the router down and clear the pidfile."""
     pid = os.getpid()
+    if _manager_lock_fd is not None:                 # stamp our pid into the manager lock we hold, so
+        try:                                         # status/stop can confirm the lock owner == pidfile
+            _manager_lock_fd.seek(0)
+            _manager_lock_fd.truncate()
+            _manager_lock_fd.write(str(pid))
+            _manager_lock_fd.flush()
+        except Exception:
+            pass
     with open(PIDFILE, "w") as f:
         f.write(str(pid))
     with open(METAFILE, "w") as f:
@@ -195,7 +299,7 @@ def _run_daemon(heartbeat_secs):
         if proc.poll() is None:
             proc.kill()
     print(f"[daemon] exiting (stopping={stopping['v']}, router rc={proc.poll()})", flush=True)
-    _clear_files()
+    _clear_files(pid)                                # only OUR pid/meta — never a successor daemon's
 
 
 def _heartbeat_tick():
@@ -218,9 +322,24 @@ def _heartbeat_tick():
 
 # --- verbs ----------------------------------------------------------------------------------------
 def _start(heartbeat_secs):
+    global _manager_lock_fd
     os.makedirs(STATE, exist_ok=True)
+
+    # ATOMICITY: take the manager lock BEFORE the running-check so the whole check -> reap -> fork is
+    # serialized against any concurrent `start`. Failing to acquire means another start is in flight or
+    # a supervisor already holds it — refuse without touching anyone's pid/meta.
+    lock_fd = _acquire_manager_lock()
+    if lock_fd is None:
+        running = _running_pid()
+        if running:
+            print(f"[fleet daemon] already running (pid {running}); use `fleet daemon restart` to replace")
+        else:
+            print("[fleet daemon] another `fleet daemon start` is in progress; try again in a moment")
+        return 1
+
     running = _running_pid()
-    if running:
+    if running:                                       # a validated supervisor is up (rare: it holds the lock)
+        _release_manager_lock(lock_fd)
         print(f"[fleet daemon] already running (pid {running}); use `fleet daemon restart` to replace")
         return 1
 
@@ -229,6 +348,7 @@ def _start(heartbeat_secs):
     pid1 = os.fork()
     if pid1 > 0:                                      # ORIGINAL caller: reap child1, await pidfile, report
         os.waitpid(pid1, 0)
+        _release_manager_lock(lock_fd)               # supervisor inherited the hold via the shared OFD
         for _ in range(50):
             time.sleep(0.1)
             p = _read_pid()
@@ -243,7 +363,8 @@ def _start(heartbeat_secs):
     os.setsid()
     if os.fork() > 0:
         os._exit(0)
-    # grandchild = the daemon
+    # grandchild = the daemon. It holds the manager lock (inherited via the shared OFD) for its life.
+    _manager_lock_fd = lock_fd
     os.setpgrp()                                     # lead our own group so `stop` can killpg the tree
     os.chdir("/")
     os.umask(0o022)
@@ -255,17 +376,28 @@ def _start(heartbeat_secs):
 
 
 def _stop():
-    pid = _read_pid()
-    if not pid or not _alive(pid):
-        if pid:
-            _clear_files()
-        print("[fleet daemon] not running" + (" (cleaned stale pidfile)" if pid else ""))
+    pid = _running_pid()                             # VALIDATED live supervisor, or 0 (+ stale cleanup)
+    if not pid:
+        # No supervisor of ours — but a `router.py --live` child may still hold the bus (supervisor
+        # crash, or the pre-fix concurrent-start race). Reap that orphaned router with the same
+        # match-before-kill validation as start; never touch pid/meta that may be another instance's.
+        reaped = _reap_stray_router()
+        if reaped:
+            print(f"[fleet daemon] no live supervisor; reaped stray live router (pid {reaped})")
+        else:
+            print("[fleet daemon] not running")
+        return 0
+    # Re-validate identity IMMEDIATELY before signalling (narrow the validate->killpg TOCTOU window),
+    # so killpg can never hit a foreign process group if the pid died and got reused between checks.
+    if not _is_daemon_supervisor(pid):
+        _clear_files(pid)
+        print("[fleet daemon] not running (stale pidfile did not identify a live daemon)")
         return 0
     # signal the whole process group (supervisor + router + the router's bus reader)
     try:
         os.killpg(pid, signal.SIGTERM)
     except ProcessLookupError:
-        _clear_files()
+        _clear_files(pid)
         print("[fleet daemon] not running (cleaned stale pidfile)")
         return 0
     for _ in range(50):                              # up to ~5s for a graceful exit
@@ -278,17 +410,20 @@ def _stop():
         except ProcessLookupError:
             pass
         time.sleep(0.3)
-    _clear_files()
+    _clear_files(pid)
     print(f"[fleet daemon] stopped (pid {pid})")
     return 0
 
 
 def _status():
-    pid = _read_pid()
-    if not pid or not _alive(pid):
-        if pid:
-            _clear_files()
-        print(f"[fleet daemon] not running (state={STATE})")
+    pid = _running_pid()                             # VALIDATED (identity + lock-owner), or 0
+    if not pid:
+        stray = _lock_holder_pid()                   # surface an orphaned live router so ops can act
+        if stray and _is_live_router(stray):
+            print(f"[fleet daemon] not running, BUT a live router (pid {stray}) still holds the bus "
+                  f"(state={STATE}); run `fleet daemon start` (it reaps it) or `stop`.")
+        else:
+            print(f"[fleet daemon] not running (state={STATE})")
         return 3
     meta = {}
     try:
