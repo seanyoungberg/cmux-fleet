@@ -4,6 +4,8 @@
 # reap's match-before-kill safety without spawning a daemon.
 import fcntl
 import os
+import signal
+import subprocess
 import sys
 
 HERE = os.path.dirname(os.path.abspath(__file__))
@@ -20,6 +22,10 @@ def _dead_pid():
         os._exit(0)
     os.waitpid(pid, 0)
     return pid
+
+
+def _no_fork(*_a, **_k):
+    raise AssertionError("_start must not fork when a daemon is already running / a start is in flight")
 
 
 def test_status_reports_not_running(capsys):
@@ -39,11 +45,13 @@ def test_stale_pidfile_is_cleaned(capsys):
     assert not os.path.exists(fd.PIDFILE)          # ...and the stale pidfile is removed
 
 
-def test_start_refuses_if_running(capsys):
+def test_start_refuses_if_running(monkeypatch, capsys):
     os.makedirs(os.path.dirname(fd.PIDFILE), exist_ok=True)
     with open(fd.PIDFILE, "w") as f:
         f.write(str(os.getpid()))                  # our own (alive) pid stands in for a running daemon
-    rc = fd._start(0)                              # must refuse BEFORE forking
+    monkeypatch.setattr(fd, "_is_daemon_supervisor", lambda pid: True)  # validated as our supervisor
+    monkeypatch.setattr(fd.os, "fork", _no_fork)   # must refuse BEFORE forking
+    rc = fd._start(0)
     assert rc == 1 and "already running" in capsys.readouterr().out
     os.remove(fd.PIDFILE)
 
@@ -128,3 +136,153 @@ def test_reap_noop_when_lock_free(monkeypatch):
     monkeypatch.setattr(fd.os, "kill", lambda *a: killed.append(a))
     assert fd._reap_stray_router() == 0
     assert killed == []
+
+
+# --- FIX 1: atomic start (manager lock) + conditional _clear_files -------------------------------
+def test_clear_files_only_removes_matching_pid():
+    os.makedirs(os.path.dirname(fd.PIDFILE), exist_ok=True)
+    with open(fd.PIDFILE, "w") as f:
+        f.write("1111")
+    with open(fd.METAFILE, "w") as f:
+        f.write('{"pid": 1111}')
+    fd._clear_files(2222)                            # pidfile names a DIFFERENT supervisor -> leave it
+    assert os.path.exists(fd.PIDFILE) and os.path.exists(fd.METAFILE)
+    assert fd._read_pid() == 1111
+    fd._clear_files(1111)                            # names our pid -> remove
+    assert not os.path.exists(fd.PIDFILE) and not os.path.exists(fd.METAFILE)
+
+
+def test_manager_lock_holder_pid_detects_held_and_free():
+    os.makedirs(os.path.dirname(fd.MANAGER_LOCK), exist_ok=True)
+    holder = open(fd.MANAGER_LOCK, "a+")
+    holder.seek(0)
+    holder.truncate()
+    holder.write("31337")                            # the "running supervisor" stamps its pid
+    holder.flush()
+    fcntl.flock(holder, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    try:
+        assert fd._manager_lock_holder_pid() == 31337   # held -> report the stamped pid
+    finally:
+        fcntl.flock(holder, fcntl.LOCK_UN)
+        holder.close()
+    assert fd._manager_lock_holder_pid() == 0        # released -> free
+
+
+def test_concurrent_start_refuses_and_preserves_owner_files(monkeypatch, capsys):
+    """A second `fleet daemon start` while the first holds the manager lock must refuse WITHOUT forking
+    and WITHOUT deleting the running daemon's pid/meta (the non-orphaning invariant of FIX 1)."""
+    os.makedirs(os.path.dirname(fd.PIDFILE), exist_ok=True)
+    owner_pid = 314159
+    with open(fd.PIDFILE, "w") as f:
+        f.write(str(owner_pid))
+    with open(fd.METAFILE, "w") as f:
+        f.write('{"pid": 314159}')
+    held = open(fd.MANAGER_LOCK, "a+")               # the first supervisor holds the manager lock...
+    held.seek(0)
+    held.truncate()
+    held.write(str(owner_pid))                       # ...and has stamped its pid
+    held.flush()
+    fcntl.flock(held, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    monkeypatch.setattr(fd, "_is_daemon_supervisor", lambda pid: pid == owner_pid)
+    monkeypatch.setattr(fd.os, "fork", _no_fork)
+    try:
+        rc = fd._start(0)
+    finally:
+        fcntl.flock(held, fcntl.LOCK_UN)
+        held.close()
+    assert rc == 1
+    assert "already running" in capsys.readouterr().out
+    assert os.path.exists(fd.PIDFILE) and os.path.exists(fd.METAFILE)   # owner files untouched
+    assert fd._read_pid() == owner_pid
+
+
+# --- FIX 2: identity validation before trusting a pidfile / before killpg ------------------------
+def test_is_daemon_supervisor_rejects_non_group_leader():
+    """A live process that is NOT its own group leader (a child inheriting our pgrp) is never mistaken
+    for the supervisor — so a reused pid can't be signalled by `stop`."""
+    child = subprocess.Popen(["sleep", "30"])        # inherits our process group -> not a leader
+    try:
+        assert os.getpgid(child.pid) != child.pid    # precondition: not a group leader
+        assert fd._is_daemon_supervisor(child.pid) is False
+    finally:
+        child.kill()
+        child.wait()
+
+
+def test_running_pid_rejects_live_non_supervisor_pid(monkeypatch):
+    """A pidfile pointing at a LIVE but non-supervisor pid (pid reuse) is treated as stale and cleaned,
+    so `_running_pid()` reports not-running rather than trusting an unrelated process."""
+    os.makedirs(os.path.dirname(fd.PIDFILE), exist_ok=True)
+    with open(fd.PIDFILE, "w") as f:
+        f.write(str(os.getpid()))                    # alive, but not our daemon
+    monkeypatch.setattr(fd, "_is_daemon_supervisor", lambda pid: False)
+    assert fd._running_pid() == 0
+    assert not os.path.exists(fd.PIDFILE)            # stale record cleaned
+
+
+def test_running_pid_distrusts_pidfile_disagreeing_with_lock_owner(monkeypatch):
+    """Even if the pidfile pid passes the process checks, a live manager-lock owner that disagrees means
+    the pidfile is an orphan -> distrust it."""
+    os.makedirs(os.path.dirname(fd.PIDFILE), exist_ok=True)
+    with open(fd.PIDFILE, "w") as f:
+        f.write("4001")
+    monkeypatch.setattr(fd, "_is_daemon_supervisor", lambda pid: True)
+    monkeypatch.setattr(fd, "_manager_lock_holder_pid", lambda: 4002)   # a DIFFERENT live supervisor
+    assert fd._running_pid() == 0
+
+
+def test_stop_refuses_to_signal_unrelated_live_pid(monkeypatch, capsys):
+    """`stop` must NOT killpg a live pid that fails identity validation (the P1 unrelated-process-group
+    kill). With no stray router either, it simply reports not running."""
+    os.makedirs(os.path.dirname(fd.PIDFILE), exist_ok=True)
+    with open(fd.PIDFILE, "w") as f:
+        f.write(str(os.getpid()))                    # alive, unrelated
+    monkeypatch.setattr(fd, "_is_daemon_supervisor", lambda pid: False)
+    monkeypatch.setattr(fd, "_lock_holder_pid", lambda: 0)   # no stray router on the bus
+    killpg_calls = []
+    monkeypatch.setattr(fd.os, "killpg", lambda *a: killpg_calls.append(a))
+    rc = fd._stop()
+    assert rc == 0
+    assert killpg_calls == []                         # never signalled the unrelated pid group
+    assert "not running" in capsys.readouterr().out
+    assert not os.path.exists(fd.PIDFILE)             # its stale record was cleaned
+
+
+# --- FIX 3: stop reaps an orphaned live router (no validated supervisor) -------------------------
+def test_stop_reaps_orphaned_router(monkeypatch, capsys):
+    """Supervisor pidfile gone/dead, but a `router.py --live` child still holds the bus -> `stop`
+    validates and reaps it instead of reporting not-running and leaving it live."""
+    try:
+        os.remove(fd.PIDFILE)                         # no supervisor
+    except OSError:
+        pass
+    stray = 55501
+    monkeypatch.setattr(fd, "_lock_holder_pid", lambda: stray)   # a live router holds the bus lock
+    monkeypatch.setattr(fd, "_is_live_router", lambda pid: True)  # ...and ps confirms it is a router
+    state = {"alive": True}
+    sent = []
+    def fake_kill(pid, sig):
+        sent.append((pid, sig))
+        state["alive"] = False                        # SIGTERM takes it down
+    monkeypatch.setattr(fd.os, "kill", fake_kill)
+    monkeypatch.setattr(fd, "_alive", lambda pid: state["alive"])
+    monkeypatch.setattr(fd.time, "sleep", lambda *_: None)
+    rc = fd._stop()
+    assert rc == 0
+    assert sent and sent[0] == (stray, signal.SIGTERM)   # reaped the orphaned router
+    assert "reaped stray live router" in capsys.readouterr().out
+
+
+def test_stop_not_running_when_no_supervisor_and_no_router(monkeypatch, capsys):
+    """No supervisor AND no stray router -> a clean not-running, no signals sent."""
+    try:
+        os.remove(fd.PIDFILE)
+    except OSError:
+        pass
+    monkeypatch.setattr(fd, "_lock_holder_pid", lambda: 0)
+    killed = []
+    monkeypatch.setattr(fd.os, "kill", lambda *a: killed.append(a))
+    monkeypatch.setattr(fd.os, "killpg", lambda *a: killed.append(a))
+    rc = fd._stop()
+    assert rc == 0 and killed == []
+    assert "not running" in capsys.readouterr().out
