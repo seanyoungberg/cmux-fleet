@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
-# fleet_state.py — the ONE shared state module for the cmux fleet. Folds child-completions and
-# peer-messages into a single inbox. CODE lives in the plugin; STATE under $CMUX_STATE_DIR
-# (default $XDG_STATE_HOME/cmux-fleet).
+# cmux_fleet/state.py (was fleet_state.py) — the ONE shared state module for the cmux fleet. Folds child-completions and
+# peer-messages into a single inbox. CODE lives in the `fleet` APP (the plugin ships only thin hook
+# wiring that shells into it); STATE under $CMUX_STATE_DIR (default $XDG_STATE_HOME/cmux-fleet).
 #
 # Stores (9 files, down from 12; one inbox mechanism instead of two):
 #   inbox.jsonl        unified append-only message stream. One line: {seq, ts, kind, to, **payload}.
@@ -20,8 +20,7 @@
 # ->AGENT_LABEL, the registry key, durable across recycles) / surfaceId(current seat, a mutable field).
 import fcntl, glob, json, os, re, subprocess, sys, tempfile, time
 
-sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-from config import STATE, CMUX, HOOKSTORE  # path resolver
+from .config import STATE, CMUX, HOOKSTORE  # path resolver
 
 INBOX = os.path.join(STATE, "inbox.jsonl")
 INBOX_SEQ = os.path.join(STATE, "inbox.seq")
@@ -32,10 +31,13 @@ ARCHIVE = os.path.join(STATE, "archive.json")
 LOG = os.path.join(STATE, "log.jsonl")
 MODEFILE = os.path.join(STATE, "notify-mode")
 
-HERE = os.path.dirname(os.path.abspath(__file__))
-DIGEST = os.path.join(HERE, "child-digest.py")
-ACK = os.path.join(HERE, "inbox-ack.py")
-PEERMSG = os.path.join(HERE, "peer-msg.py")
+# Agent-helper command hints emitted into conductor context by the awareness/drain hooks. Phase 2
+# folded the four standalone plugin scripts into `fleet <verb>` subcommands, so these are now the app
+# command strings a conductor runs directly (`fleet` on PATH -> THIS build, via the profile pin). The
+# hooks interpolate them as-is: `f"{DIGEST} {frag} 5"` -> `fleet child-digest <frag> 5`.
+DIGEST = "fleet child-digest"
+ACK = "fleet inbox-ack"
+PEERMSG = "fleet peer-msg"
 
 
 # --- primitives ----------------------------------------------------------------------------

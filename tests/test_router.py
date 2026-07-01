@@ -9,11 +9,8 @@ import sys
 
 import pytest
 
-HERE = os.path.dirname(os.path.abspath(__file__))
-SCRIPTS = os.path.join(os.path.dirname(HERE), "scripts")
-sys.path.insert(0, SCRIPTS)
 
-import router  # noqa: E402
+from cmux_fleet import router  # noqa: E402
 
 
 def _release_router_lock():

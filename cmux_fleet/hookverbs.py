@@ -1,0 +1,127 @@
+#!/usr/bin/env python3
+# cmux_fleet/hookverbs.py — the conductor hook LOGIC, folded out of the old standalone
+# scripts/hooks/{awareness,drain}.py into `fleet hook-awareness` / `fleet hook-drain` (Phase 3 / codex
+# P1.2/P1.3). The plugin now ships THIN python shims that just shell into these verbs (see
+# scripts/hooks/_shim.py); all the real inbox logic lives here, in the app, versioned with it.
+#
+# OUTPUT CONTRACTS (the shim validates these exact shapes before passing stdout to the harness):
+#   hook-awareness  (UserPromptSubmit) -> {"hookSpecificOutput":{"hookEventName":"UserPromptSubmit",
+#                                          "additionalContext": <str>}}   (blank stdout when nothing pending)
+#   hook-drain      (Stop)             -> {"decision":"block","reason": <str>}   (blank stdout = don't block)
+#
+# Both READ + DISCARD stdin (the harness pipes the event JSON) so a future verb can inspect the payload,
+# self-ID via $CMUX_SURFACE_ID, read state under $CMUX_STATE_DIR, and FAIL OPEN: any error -> blank
+# stdout, exit 0. Kept out of the 2k-line cli.py per P3.1; cli.main dispatches the two verbs early,
+# before the heavier feature/daemon imports, to keep the per-turn hot path lean.
+import json, os, sys
+
+from . import state as fs
+
+
+def _read_stdin():
+    """Consume the event payload (bytes) so the pipe drains and future verbs can inspect it. Best-effort."""
+    try:
+        return sys.stdin.buffer.read()
+    except Exception:
+        return b""
+
+
+def cmd_hook_awareness(argv):
+    """UserPromptSubmit: inject the conductor's pending inbox (child completions + peer messages) into
+    CONTEXT via hookSpecificOutput.additionalContext — never the input box. Blank when empty. Fails open."""
+    _read_stdin()
+    try:
+        surface = os.environ.get("CMUX_SURFACE_ID", "")
+        comp = fs.inbox_pending(surface, kind="completion") if surface else []
+        peers = fs.inbox_pending(surface, kind="peer") if surface else []
+        if not comp and not peers:
+            return 0
+
+        lines = []
+        if comp:
+            lines.append(f"[fleet] {len(comp)} child completion(s) pending your attention "
+                         f"(input-safe context note, not from the human):")
+            for r in comp:
+                frag = (r.get("child_session", "")).replace("claude-", "")[:8]
+                gist = (r.get("gist") or "").strip().replace("\n", " ")[:100]
+                lines.append(f"  - seq {r.get('seq')}  {r.get('label','?')}: \"{gist}\"   "
+                             f"full: {fs.DIGEST} {frag} 5")
+            lines.append(f"  ack when handled: {fs.ACK} {fs.max_seq(comp)}")
+        if peers:
+            lines.append(f"[peer] {len(peers)} peer message(s) for you (a DELIBERATE send from a peer "
+                         f"conductor, NOT a child you dispatched; input-safe context note, not from the human):")
+            for r in peers:
+                mid, ptype = r.get("msg_id", "?"), r.get("ptype", "peer-msg")
+                rexp = "REPLY EXPECTED" if r.get("reply_expected") else "no reply needed"
+                rt = f" re:{r.get('reply_to')}" if r.get("reply_to") else ""
+                lines.append(f"  @{r.get('to_label','you')}: [{r.get('from_label','?')}] ({ptype} {mid}{rt} · {rexp})")
+                for bl in ((r.get("body") or "").strip().splitlines() or [""]):
+                    lines.append(f"      {bl}")
+                if r.get("reply_expected"):
+                    lines.append(f"      reply: {fs.PEERMSG} {r.get('from_label')} \"<reply>\" --reply-to {mid}")
+            lines.append(f"  ack when handled: {fs.ACK} {fs.max_seq(peers)} --peer")
+
+        print(json.dumps({"hookSpecificOutput": {
+            "hookEventName": "UserPromptSubmit", "additionalContext": "\n".join(lines)}}))
+        return 0
+    except Exception:
+        return 0
+
+
+def cmd_hook_drain(argv):
+    """Stop: return {decision:block, reason:...} so the turn auto-continues to process pending work.
+      - child completions: drained ONLY in autodrain/auto mode (the dial governs chasing children).
+      - peer messages: drained ALWAYS (a deliberate peer send wants attention now).
+    Per-kind block-mark guard prevents re-blocking an un-acked set forever. Blank = don't block. Fails open."""
+    _read_stdin()
+    try:
+        surface = os.environ.get("CMUX_SURFACE_ID", "")
+        if not surface:
+            return 0
+
+        comp, comp_hi = [], 0
+        if fs.autodrain_on():
+            cp = fs.inbox_pending(surface, kind="completion")
+            chi = fs.max_seq(cp)
+            if cp and chi > fs.block_get(surface, "completion"):
+                comp, comp_hi = cp, chi
+
+        peers, peer_hi = [], 0
+        pp = fs.inbox_pending(surface, kind="peer")
+        phi = fs.max_seq(pp)
+        if pp and phi > fs.block_get(surface, "peer"):
+            peers, peer_hi = pp, phi
+
+        if not comp and not peers:
+            return 0
+
+        lines = []
+        if comp:
+            fs.block_set(surface, "completion", comp_hi)
+            lines.append(f"You have {len(comp)} pending child completion(s) (notify-mode={fs.mode()}, "
+                         f"auto-continuing). Process them now, then ack:")
+            for r in comp:
+                frag = (r.get("child_session", "")).replace("claude-", "")[:8]
+                gist = (r.get("gist") or "").strip().replace("\n", " ")[:100]
+                lines.append(f"  - seq {r.get('seq')}  {r.get('label','?')}: \"{gist}\"   "
+                             f"full: {fs.DIGEST} {frag} 5")
+            lines.append(f"  ack: {fs.ACK} {comp_hi}")
+        if peers:
+            fs.block_set(surface, "peer", peer_hi)
+            lines.append(f"You have {len(peers)} peer message(s) (a DELIBERATE send from a peer conductor). "
+                         f"Handle them now, then ack:")
+            for r in peers:
+                mid, ptype = r.get("msg_id", "?"), r.get("ptype", "peer-msg")
+                rexp = "REPLY EXPECTED" if r.get("reply_expected") else "no reply needed"
+                rt = f" re:{r.get('reply_to')}" if r.get("reply_to") else ""
+                lines.append(f"  @{r.get('to_label','you')}: [{r.get('from_label','?')}] ({ptype} {mid}{rt} · {rexp})")
+                for bl in ((r.get("body") or "").strip().splitlines() or [""]):
+                    lines.append(f"      {bl}")
+                if r.get("reply_expected"):
+                    lines.append(f"      reply: {fs.PEERMSG} {r.get('from_label')} \"<reply>\" --reply-to {mid}")
+            lines.append(f"  ack peer msgs: {fs.ACK} {peer_hi} --peer")
+
+        print(json.dumps({"decision": "block", "reason": "\n".join(lines)}))
+        return 0
+    except Exception:
+        return 0

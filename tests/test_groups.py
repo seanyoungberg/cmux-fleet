@@ -6,10 +6,10 @@ import subprocess
 import sys
 
 HERE = os.path.dirname(os.path.abspath(__file__))
-SCRIPTS = os.path.join(os.path.dirname(HERE), "scripts")
-sys.path.insert(0, SCRIPTS)
+REPO = os.path.dirname(HERE)
+sys.path.insert(0, REPO)
 
-import fleet  # noqa: E402  (not popped by other test files)
+from cmux_fleet import cli as fleet  # noqa: E402  (not popped by other test files)
 
 
 def test_group_ref_resolves_name_passthrough_and_missing(monkeypatch):
@@ -64,15 +64,16 @@ def test_conductor_group_defaults_to_label(tmp_path):
     toml = tmp_path / "f.toml"
     toml.write_text('[tool.claude]\nflags=""\n[role.solo]\nkind="conductor"\nplace="workspace"\ncwd="x"\n')
     env = dict(os.environ, CMUX_FLEET_TOML=str(toml), CMUX_STATE_DIR=str(tmp_path / "st"),
-               CMUX_FLEET_ROOT=str(tmp_path), CMUX_FLEET_MARKETPLACE="")
-    p = subprocess.run([sys.executable, os.path.join(SCRIPTS, "fleet.py"),
+               CMUX_FLEET_ROOT=str(tmp_path), CMUX_FLEET_MARKETPLACE="",
+               PYTHONPATH=REPO + os.pathsep + os.environ.get("PYTHONPATH", ""))
+    p = subprocess.run([sys.executable, "-m", "cmux_fleet",
                         "launch", "solo", "--parent", "FAKE", "--dry-run"],
                        capture_output=True, text=True, env=env)
     assert "group=solo" in p.stdout, p.stdout + p.stderr        # defaulted to the conductor's label
 
 
 def test_rm_with_group_dissolves_by_ref(monkeypatch):
-    import fleet_state as fs
+    from cmux_fleet import state as fs
     fs.live_put("cond", {"role": "r", "kind": "conductor", "tool": "claude", "group": "gg",
                          "surface": "", "status": "live"})
     calls = []
@@ -86,7 +87,7 @@ def test_rm_with_group_dissolves_by_ref(monkeypatch):
 def test_rm_with_group_sweeps_all_members(monkeypatch):
     # the orphan bug: dissolving the group closed every member surface, but only the SELECTED label was
     # cleared from the registry, leaving siblings as stale rows. rm --with-group must sweep them all.
-    import fleet_state as fs
+    from cmux_fleet import state as fs
     fs.live_put("cond", {"role": "c", "kind": "conductor", "tool": "claude", "group": "g",
                          "surface": "SC", "status": "live"})
     fs.live_put("child", {"role": "w", "kind": "child", "tool": "claude", "group": "g",
@@ -103,7 +104,7 @@ def test_rm_with_group_sweeps_all_members(monkeypatch):
 
 
 def test_rm_without_group_leaves_group_intact(monkeypatch):
-    import fleet_state as fs
+    from cmux_fleet import state as fs
     fs.live_put("cond2", {"role": "r", "kind": "conductor", "tool": "claude", "group": "gg",
                           "surface": "", "status": "live"})
     calls = []

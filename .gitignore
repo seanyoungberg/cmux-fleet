@@ -3,6 +3,12 @@ __pycache__/
 .DS_Store
 # test runner virtualenv (pytest is the one dev dep; see tests/README.md)
 .venv/
+.testvenv/
 .pytest_cache/
+uv.lock
 # local mining clones / scratch (never committed)
 _mining/
+# uv/hatchling build artifacts
+dist/
+build/
+*.egg-info/

@@ -3,16 +3,15 @@
 # (hard to unit-test); here we cover the pidfile/liveness logic, the heartbeat's skip rules, and the
 # reap's match-before-kill safety without spawning a daemon.
 import fcntl
+import json
 import os
 import signal
 import subprocess
 import sys
+import time
 
-HERE = os.path.dirname(os.path.abspath(__file__))
-SCRIPTS = os.path.join(os.path.dirname(HERE), "scripts")
-sys.path.insert(0, SCRIPTS)
 
-import fleet_daemon as fd  # noqa: E402  (not popped by other test files)
+from cmux_fleet import daemon as fd  # noqa: E402  (not popped by other test files)
 
 
 def _dead_pid():
@@ -66,7 +65,7 @@ def test_stop_when_not_running_is_clean(capsys):
 
 
 def test_heartbeat_nudges_only_idle_conductors_with_pending(monkeypatch):
-    import fleet_state as fs
+    from cmux_fleet import state as fs
     fs.live_put("cond",  {"role": "c", "kind": "conductor", "tool": "claude", "surface": "SC", "status": "live"})
     fs.live_put("busy",  {"role": "c", "kind": "conductor", "tool": "claude", "surface": "SB", "status": "live"})
     fs.live_put("muted", {"role": "c", "kind": "conductor", "tool": "claude", "surface": "SM", "status": "live", "muted": True})
@@ -286,3 +285,59 @@ def test_stop_not_running_when_no_supervisor_and_no_router(monkeypatch, capsys):
     rc = fd._stop()
     assert rc == 0 and killed == []
     assert "not running" in capsys.readouterr().out
+
+
+# --- FIX (Phase 4): launchd foreground grammar + status build identity ---------------------------
+def test_daemon_parses_the_exact_plist_command():
+    """The design plist runs `fleet daemon start --foreground`. A launchd plist is unforgiving, so pin
+    that EXACT grammar (codex P2.3): action=start + foreground=True — NOT a bare `fleet daemon --foreground`."""
+    ns = fd._daemon_parser().parse_args(["start", "--foreground"])
+    assert ns.action == "start" and ns.foreground is True
+
+
+def test_daemon_bare_start_is_not_foreground():
+    ns = fd._daemon_parser().parse_args(["start"])
+    assert ns.foreground is False
+
+
+def test_bare_daemon_foreground_without_action_is_rejected():
+    # `fleet daemon --foreground` (no action) must NOT parse -> the grammar stays `daemon <action> ...`.
+    import pytest
+    with pytest.raises(SystemExit):
+        fd._daemon_parser().parse_args(["--foreground"])
+
+
+def test_start_foreground_runs_in_process_without_forking(monkeypatch):
+    """Foreground start must run the supervised router in THIS process (for launchd) — never fork/detach —
+    and hold the manager lock while the supervisor runs."""
+    try:
+        os.remove(fd.PIDFILE)
+    except OSError:
+        pass
+    monkeypatch.setattr(fd.os, "fork", _no_fork)          # foreground path must never fork
+    seen = {"ran": False, "lock_held": False}
+
+    def fake_run(hb):
+        seen["ran"] = True
+        seen["lock_held"] = fd._manager_lock_fd is not None
+    monkeypatch.setattr(fd, "_run_daemon", fake_run)
+    try:
+        rc = fd._start_foreground(0)
+        assert rc == 0
+        assert seen["ran"] and seen["lock_held"]
+    finally:
+        fd._manager_lock_fd = None                        # don't leak the module global across tests
+
+
+def test_status_reports_owning_build(monkeypatch, capsys):
+    """`fleet daemon status` must identify WHICH build owns the daemon (version + python + package),
+    not just state dir + pid — the runbook needs this to prove the cutover (codex P2.5)."""
+    monkeypatch.setattr(fd, "_running_pid", lambda: 4321)
+    with open(fd.METAFILE, "w") as f:
+        json.dump({"pid": 4321, "state": fd.STATE, "started": time.time() - 65, "heartbeat": 0,
+                   "python": "/opt/py/bin/python", "package": "/opt/app/cmux_fleet",
+                   "version": "9.9.9", "router_module": "cmux_fleet.router"}, f)
+    rc = fd._status()
+    out = capsys.readouterr().out
+    assert rc == 0
+    assert "9.9.9" in out and "/opt/py/bin/python" in out and "/opt/app/cmux_fleet" in out

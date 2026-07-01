@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-# fleet.py - the native-cmux fleet CLI. ONE tool, tool-agnostic. The `fleet` namespace is the
+# cmux_fleet/cli.py (was scripts/fleet.py) - the native-cmux fleet CLI. ONE tool, tool-agnostic. The `fleet` namespace is the
 # umbrella for the rest of the scripts (state/drive/digest/ack).
 #
 #   fleet launch <role> [launcher flags] [-- <verbatim tool flags>]
@@ -27,11 +27,79 @@
 # [defaults] (orchestration) -> [role] scalars -> tool config [tool.<t>] -> [role.<t>] -> caller `--`.
 import argparse, json, os, shlex, subprocess, sys, time
 
-sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-from config import ROOT, STATE, CMUX, MARKETPLACE, FLOOR, FLEET_TOML, ADHOC_SUBDIR  # path resolver
+from .config import ROOT, STATE, CMUX, MARKETPLACE, FLOOR, FLEET_TOML, ADHOC_SUBDIR  # path resolver
 
-PLUGIN_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))  # the build dir (this plugin)
+# The checkout/build root: the dir that holds bin/, .claude-plugin/, fleet.toml.example next to the
+# cmux_fleet package. In a repo/editable install this is the repo root (unchanged from the flat layout,
+# where it was dirname(dirname(scripts/fleet.py))). In a WHEEL/venv install it is site-packages — which
+# holds NONE of bin/, .claude-plugin/, or a repo-root fleet.toml.example — so `fleet profile` must NOT
+# derive its pins from it there (see _fleet_bin_dir / _marketplace_pin / _seed_example_text below, and
+# the codex P1.1 fix). PLUGIN_ROOT stays only as the checkout-detection anchor + editable-install seed
+# path; it is never emitted as a marketplace or bin dir unless it is provably a real plugin checkout.
+PLUGIN_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 REGISTRY = os.path.join(STATE, "fleet-registry.json")
+
+
+def _is_plugin_checkout(root=PLUGIN_ROOT):
+    """True only when `root` is a real cmux-fleet plugin CHECKOUT (has .claude-plugin/marketplace.json
+    next to the package). False for a wheel/venv install, where PLUGIN_ROOT is site-packages."""
+    return os.path.exists(os.path.join(root, ".claude-plugin", "marketplace.json"))
+
+
+def _fleet_bin_dir():
+    """The dir to prepend to PATH so `fleet` (and its `python -m cmux_fleet`) resolve to THIS build.
+    Three concepts kept separate from the plugin root (codex P1.1):
+      - explicit override: $CMUX_FLEET_BIN (a fleet executable path OR its containing dir);
+      - checkout: the repo's bin/ dev shim (bin/fleet), the historical multi-build-isolation pin;
+      - wheel/venv: the dir of the INSTALLED `fleet` console script (never site-packages/bin, which
+        does not exist). Falls back to which()/argv[0].
+    Returns "" if no real app bin dir can be resolved (caller then omits the PATH pin rather than
+    emitting a bogus site-packages path)."""
+    env = os.environ.get("CMUX_FLEET_BIN", "").strip()
+    if env:
+        env = os.path.abspath(os.path.expanduser(env))
+        return env if os.path.isdir(env) else os.path.dirname(env)
+    checkout_bin = os.path.join(PLUGIN_ROOT, "bin")
+    if _is_plugin_checkout() and os.path.exists(os.path.join(checkout_bin, "fleet")):
+        return checkout_bin                            # dev shim, real checkout (not a build-cache copy)
+    # Installed console script: sys.argv[0] IS the exact invoked `fleet` path -> the most reliable pin
+    # (an absolute `.../bin/fleet`). Falls back to which() for a bare-name invocation.
+    argv0 = sys.argv[0] if sys.argv and sys.argv[0] else ""
+    if argv0 and os.path.sep in argv0 and os.path.basename(argv0).startswith("fleet"):
+        return os.path.dirname(os.path.abspath(argv0))
+    import shutil as _sh
+    exe = _sh.which("fleet")
+    return os.path.dirname(exe) if exe else ""
+
+
+def _marketplace_pin():
+    """The dir to emit as $CMUX_FLEET_MARKETPLACE (so a roster's plugins=["<build-name>"] resolves to
+    THIS build's plugin). EXPLICIT config wins; else inferred ONLY from a real checkout — NEVER from a
+    wheel's site-packages (codex P1.1). Returns "" -> caller omits the pin (internal --plugin-dir
+    resolution stays disabled, which is correct for a wheel install with no bundled plugin)."""
+    if MARKETPLACE:                                   # env CMUX_FLEET_MARKETPLACE / [fleet].marketplace
+        return MARKETPLACE
+    if _is_plugin_checkout():
+        return os.path.dirname(PLUGIN_ROOT)           # parent holds the build dir; plugins=["<name>"] -> it
+    return ""
+
+
+def _seed_example_text():
+    """The bundled fleet.toml.example seed roster text, or None. Read via importlib.resources for a
+    WHEEL install (force-included at cmux_fleet/fleet.toml.example), falling back to the repo-root
+    fleet.toml.example for a CHECKOUT/editable install (where it lives outside the package)."""
+    try:
+        from importlib.resources import files
+        r = files("cmux_fleet").joinpath("fleet.toml.example")
+        if r.is_file():
+            return r.read_text()
+    except (ModuleNotFoundError, FileNotFoundError, OSError):
+        pass
+    p = os.path.join(PLUGIN_ROOT, "fleet.toml.example")
+    if os.path.exists(p):
+        with open(p) as f:
+            return f.read()
+    return None
 
 
 def _profile_env():
@@ -244,7 +312,7 @@ def adapter_compile(tool, spec, caller_tokens):
 
 # ---------------------------------------------------------------- cmux placement (ported, proven)
 def _store():
-    import fleet_state as fs                                  # union of all per-agent hook stores
+    from . import state as fs                                  # union of all per-agent hook stores
     return fs.read_hook_store()                               # (claude/codex/... -> tool-agnostic poll/ls)
 
 
@@ -416,7 +484,7 @@ def _poll_surface_cwd(surf, want, timeout=10):
 
 
 def register(surf, spec, parent_surface, session, ws):
-    import fleet_state as fs
+    from . import state as fs
     parent_label = fs.label_for_surface(parent_surface) or parent_surface   # store parent LABEL (durable)
     fs.live_put(spec["label"], {
         "role": spec["role"], "kind": spec["kind"], "tool": spec["tool"],
@@ -549,7 +617,7 @@ def cmd_launch(argv):
         if spec["kind"] == "conductor":
             spec["group"] = spec["label"]
         elif a.parent:
-            import fleet_state as fs
+            from . import state as fs
             pe = fs.entry_for_surface(a.parent)
             if pe and pe.get("group"):
                 spec["group"] = pe["group"]
@@ -571,7 +639,7 @@ def cmd_launch(argv):
         spec["worktree_base"] = a.worktree_base
     spec["worktree_active"] = wt_on
     if wt_on:
-        import worktree as wt
+        from . import worktree as wt
         repo = wt.repo_root(spec["abs_cwd"])
         if not repo:
             sys.exit(f"[fleet] ABORT: --worktree set but cwd is not a git repo: {spec['abs_cwd']}")
@@ -692,7 +760,7 @@ def log_launch(spec, parent, surf, session, send_cmd):
     """Append a `launched` event to the ledger (log.jsonl). Captures the EFFECTIVE settings the session
     launched with (resolved end-state, since settings drift) + a base snapshot for provenance + what
     fleet composed."""
-    import fleet_state as fs
+    from . import state as fs
     effective, base = compute_effective(spec, spec["abs_cwd"])
     fs.log_event("launched", label=spec["label"], role=spec["role"], tool=spec["tool"],
                  kind=spec["kind"], place=spec["place"], cwd=spec["abs_cwd"], parent=parent,
@@ -814,7 +882,7 @@ def cmd_config(argv):
 
 # ---------------------------------------------------------------- lifecycle verbs (the conductor's job)
 def _store():
-    import fleet_state as fs                                  # union of all per-agent hook stores
+    from . import state as fs                                  # union of all per-agent hook stores
     return fs.read_hook_store()
 
 
@@ -828,7 +896,7 @@ def _pid_for_surface(surface):
 def cmd_ls(argv):
     """Reconcile the live registry against cmux's hook store. Flags STALE = registry says live but the
     surface has no live session (a closed tab / crash never fires an archive transition)."""
-    import fleet_state as fs
+    from . import state as fs
     live, arch = fs.live_all(), fs.archive_all()
     print(f"LIVE FLEET ({len(live)}):  {'label':<24}{'role':<16}{'kind':<11}{'status':<8}{'lifecycle':<11}surface")
     for label, v in sorted(live.items()):
@@ -861,7 +929,7 @@ def cmd_rm(argv):
     `git worktree remove <path>` (and `git branch -D fleet/<label>` if you want the branch gone).
     WITHOUT --with-group, only this agent's own workspace goes and remaining members are left
     ungrouped."""
-    import fleet_state as fs, signal
+    from . import state as fs; import signal
     kill = "--kill" in argv
     wipc = "--wip-commit" in argv
     with_group = "--with-group" in argv
@@ -910,7 +978,7 @@ def cmd_rm(argv):
         cmuxq("close-surface", "--surface", e["surface"])
     wt_note = ""
     if kill and e.get("worktree"):
-        import worktree as wt
+        from . import worktree as wt
         m = e["worktree"]
         removed, msg = wt.teardown(m["repo"], m["path"], label, wip_commit_flag=wipc)
         wt_note = f"\n[fleet] worktree: {msg}"
@@ -927,7 +995,7 @@ def cmd_rm(argv):
 
 def _worktree_entries():
     """(label -> {meta, where}) for every registry entry carrying worktree bookkeeping (live + archive)."""
-    import fleet_state as fs
+    from . import state as fs
     out = {}
     for where, table in (("live", fs.live_all()), ("archive", fs.archive_all())):
         for label, v in table.items():
@@ -940,7 +1008,7 @@ def _worktree_entries():
 def cmd_worktree(argv):
     """Manage fleet-owned git worktrees. v0.1 verbs: `ls` (list + dirty/exists state) and
     `clean <label>` (teardown, refuse-if-dirty, keep branch)."""
-    import worktree as wt
+    from . import worktree as wt
     if not argv or argv[0] in ("-h", "--help"):
         print("usage: fleet worktree <ls | clean <label> [--wip-commit] [--force]>")
         return 0
@@ -979,7 +1047,7 @@ def cmd_worktree(argv):
         info = ents.get(a.label)
         if not info:
             sys.exit(f"fleet worktree clean: no registered worktree for '{a.label}' (see `fleet worktree ls`)")
-        import fleet_state as fs
+        from . import state as fs
         live = fs.live_get(a.label)
         if info["where"] == "live" and live and fs.lifecycle(live.get("surface", "")) not in ("", "-", "ended", None):
             sys.exit(f"fleet worktree clean: '{a.label}' is still LIVE. Either `fleet archive {a.label}` "
@@ -1002,7 +1070,7 @@ def cmd_worktree(argv):
 def cmd_archive(argv):
     """Park a live agent: stop its process (SIGINT x2 = clean TUI exit), close the tab, move it to the
     archive shelf with enough to `claude --resume` it later."""
-    import fleet_state as fs, signal
+    from . import state as fs; import signal
     if not argv:
         sys.exit("usage: fleet archive <label>")
     label = argv[0]
@@ -1058,7 +1126,7 @@ def cmd_revive(argv):
     like recycle: if archive captured cmux's launch binding, REPLAY it (--resume swapped to the parked
     session, caller `-- <flags>` / --add-plugin re-layered on top). Falls back to the registry-spec
     compose for entries archived before binding-capture existed (or with no binding)."""
-    import fleet_state as fs
+    from . import state as fs
     caller = []
     if "--" in argv:
         i = argv.index("--"); argv, caller = argv[:i], argv[i + 1:]
@@ -1231,7 +1299,7 @@ def _tool_for_surface(surf):
     whose store lists the surface as ACTIVE, else the tool with the freshest non-ended record. '' if no
     store (live-)knows the surface."""
     import glob
-    from config import HOOKSTORE
+    from .config import HOOKSTORE
     su = (surf or "").upper()
     suffix = "-hook-sessions.json"
     best_tool, best_rank = "", None                            # rank = (is_active, freshest_updatedAt)
@@ -1273,7 +1341,7 @@ def cmd_register(argv):
     AGENT_ROLE/binding for off-roster agents. --session/--parent are optional OVERRIDES, never required.
     Promotes a parked (archived) label to live; idempotent on the SAME surface; refuses to move a label
     that is already live under a DIFFERENT surface."""
-    import fleet_state as fs
+    from . import state as fs
     ap = argparse.ArgumentParser(prog="fleet register")
     ap.add_argument("label")
     ap.add_argument("--surface", default="", help="the agent's live surface UUID (primary input); if "
@@ -1391,7 +1459,7 @@ def _quiet_gate(surf, timeout, force):
     Stop hook yet -> never reaches 'idle') sits at 'unknown' awaiting input. Excluding it made a
     just-resumed agent un-recyclable (the quiet-gate would block until 180s ABORT, and --force only
     skips the DRAFT check, not the lifecycle check) -- so back-to-back resume recycles deadlocked."""
-    import fleet_state as fs
+    from . import state as fs
     def quiet():
         lc = fs.lifecycle(surf)
         return lc in ("idle", "needsInput", "unknown") and (force or not _input_draft_nonempty(surf))
@@ -1428,7 +1496,7 @@ def _poll_session_back(surf, old_sid, mode, timeout=90, exclude=None):
     `exclude` is a set of sids that do NOT count as a fresh bind (old_sid plus any stale store entry
     lingering on the surface post-respawn) -- prevents a crashed launch from false-confirming.
     Returns the bound sid, or '' on timeout."""
-    import fleet_state as fs
+    from . import state as fs
     exclude = exclude or {old_sid}
     end = time.time() + timeout
     while time.time() < end:
@@ -1572,7 +1640,7 @@ def _compose_recycle_cmd(label, entry, caller_tokens, add_plugins, mode):
 
 def cmd_recycle(argv):
     """Restart THIS (or a named) agent in place on the same surface, same identity. See block comment."""
-    import fleet_state as fs
+    from . import state as fs
     caller = []
     if "--" in argv:
         i = argv.index("--"); argv, caller = argv[:i], argv[i + 1:]
@@ -1632,7 +1700,7 @@ def cmd_recycle(argv):
     with open(pf, "w") as fh:
         json.dump(payload, fh)
     log = os.path.join(STATE, "recycle.log")
-    subprocess.Popen([sys.executable, os.path.abspath(__file__), "_recycle-exec", pf],
+    subprocess.Popen([sys.executable, "-m", "cmux_fleet", "_recycle-exec", pf],
                      stdout=open(log, "a"), stderr=subprocess.STDOUT, stdin=subprocess.DEVNULL,
                      start_new_session=True)
     gate = "idle" if a.force else "idle + empty draft"
@@ -1728,7 +1796,7 @@ def _resume_and_gate(surf, send_cmd, tool, sess, log):
 def cmd_recycle_exec(argv):
     """DETACHED worker (internal verb): quiet-gate -> respawn-pane -> confirm new session -> update
     registry -> auto-prime. Never half-kills: aborts before respawn if the surface won't go quiet."""
-    import fleet_state as fs
+    from . import state as fs
     p = json.load(open(argv[0]))
     surf, send_cmd, label = p["surface"], p["send_cmd"], p["label"]
     mode, force, prime, old_sid = p["mode"], p["force"], p.get("prime"), p.get("old_session") or ""
@@ -1835,13 +1903,13 @@ def cmd_recycle_exec(argv):
 def cmd_mute(argv, mute=True):
     """Mute/unmute a child's completion delivery. When muted, the router does NOT push the child's
     turn-completions to the parent's inbox (no inbox row, no `cmux notify`, no idle-wake); the parent
-    reads that child ON DEMAND (`fleet ls` shows it MUTED with its session → `child-digest`). Use when
+    reads that child ON DEMAND (`fleet ls` shows it MUTED with its session → `fleet child-digest`). Use when
     Berg drives a child directly (he is in the loop, so the conductor should not be spammed). The
     inverse of the notify-on-completion default. Mute is per-child runtime state on `fleet.json`.
 
       fleet mute <label>     fleet unmute <label>
     """
-    import fleet_state as fs
+    from . import state as fs
     verb = "mute" if mute else "unmute"
     if not argv:
         sys.exit(f"usage: fleet {verb} <label>")
@@ -1860,7 +1928,7 @@ def cmd_mute(argv, mute=True):
     fs.log_event(verb + "d", label=label)
     if mute:
         print(f"[fleet] {label} MUTED — completions suppressed; read on demand "
-              f"(fleet ls → child-digest {(e.get('session') or '').replace('claude-','')[:12]})")
+              f"(fleet ls → fleet child-digest {(e.get('session') or '').replace('claude-','')[:12]})")
     else:
         print(f"[fleet] {label} unmuted — completions deliver to its parent again")
     return 0
@@ -1879,7 +1947,7 @@ def cmd_broadcast(argv):
     Default target: all-conductors (config-change broadcasts are a conductor concern — they refresh
     their own fleets). `my-children` = live children whose parent label == mine.
     """
-    import fleet_state as fs, secrets
+    from . import state as fs; import secrets
     target = "all-conductors"
     no_wake = expect_reply = dry = False
     pos, i = [], 0
@@ -1986,27 +2054,38 @@ def cmd_profile(argv):
         state = os.path.join(xdg_state, f"cmux-fleet-{a.name}")
         toml = os.path.join(xdg_cfg, f"cmux-fleet-{a.name}", "fleet.toml")
     root = os.path.abspath(os.path.expanduser(a.root)) if a.root else os.path.expanduser("~")
-    mkt = os.path.dirname(PLUGIN_ROOT)            # plugins=["<build-name>"] -> PLUGIN_ROOT
-    binp = os.path.join(PLUGIN_ROOT, "bin")
+    mkt = _marketplace_pin()                      # explicit config, or a real checkout's parent; "" -> omit
+    binp = _fleet_bin_dir()                        # THIS build's fleet dir (checkout bin/ or installed script)
 
     if a.init:
         os.makedirs(state, exist_ok=True)
         os.makedirs(os.path.dirname(toml), exist_ok=True)
         if not os.path.exists(toml):
-            example = os.path.join(PLUGIN_ROOT, "fleet.toml.example")
-            if os.path.exists(example):
-                import shutil
-                shutil.copyfile(example, toml)
+            seed = _seed_example_text()
+            if seed is not None:
+                with open(toml, "w") as f:
+                    f.write(seed)
                 sys.stderr.write(f"[fleet profile] seeded {toml} from fleet.toml.example\n")
+            else:
+                sys.stderr.write("[fleet profile] warning: no bundled fleet.toml.example found; roster not seeded\n")
         sys.stderr.write(f"[fleet profile] init: state dir {state}\n")
 
-    print(f'# cmux-fleet profile "{a.name}" -> build {PLUGIN_ROOT}  (eval this to activate)')
+    build_label = PLUGIN_ROOT if _is_plugin_checkout() else (binp or "installed app")
+    print(f'# cmux-fleet profile "{a.name}" -> build {build_label}  (eval this to activate)')
     print(f'export CMUX_FLEET_ROOT={shlex.quote(root)}')
     print(f'export CMUX_STATE_DIR={shlex.quote(state)}')
     print(f'export CMUX_FLEET_TOML={shlex.quote(toml)}')
-    print(f'export CMUX_FLEET_MARKETPLACE={shlex.quote(mkt)}')
+    if mkt:
+        print(f'export CMUX_FLEET_MARKETPLACE={shlex.quote(mkt)}')
+    else:
+        sys.stderr.write("[fleet profile] note: no plugin marketplace pinned (wheel install / no explicit "
+                         "$CMUX_FLEET_MARKETPLACE); install the plugin separately and set it if you use plugins=[...]\n")
     print(f'export CMUX_BIN={shlex.quote(CMUX)}')
-    print(f'export PATH={shlex.quote(binp)}:"$PATH"')
+    if binp:
+        print(f'export PATH={shlex.quote(binp)}:"$PATH"')
+    else:
+        sys.stderr.write("[fleet profile] warning: could not resolve THIS build's fleet bin dir; PATH not pinned "
+                         "(set $CMUX_FLEET_BIN to the installed fleet path)\n")
     return 0
 
 
@@ -2034,23 +2113,35 @@ def main():
               "  paint                                             sync fleet state onto the cmux sidebar (status pills + ctx bars)\n"
               "  worktree <ls | clean <label> [--wip-commit]>      manage fleet-owned git worktrees (config-gated, default-off)\n"
               "  profile <name> [--base DIR] [--root DIR] [--init]  emit env that pins ALL entrypoints at THIS build (eval it for multi-build isolation)\n"
-              "  daemon <start|stop|status|restart> [--heartbeat [SECS]]  run the router as a detached daemon (survives shell exit + recycle)")
+              "  daemon <start|stop|status|restart> [--foreground] [--heartbeat [SECS]]  run the router as a detached daemon (survives shell exit + recycle); start --foreground for launchd\n"
+              "  drive-child <surface-uuid> <prompt...>            submit a prompt to a child's TUI (beats the paste-settle enter-race)\n"
+              "  peer-msg <to-label> \"<body>\" [--no-reply] [--reply-to <id>] [--expect-reply] [--no-wake]\n"
+              "                                                    input-safe A2A: message a live PEER conductor (into its context, never its input box)\n"
+              "  child-digest <session-frag> [N]                   print a child's last N transcript turns (the reliable content source)\n"
+              "  inbox-ack <seq> [--peer] [--surface UUID]         mark shown completions/peer msgs handled so they stop re-surfacing")
         return 0
     sub, rest = sys.argv[1], sys.argv[2:]
-    import fleet_features as ff
-    import fleet_daemon as fd
+    # Hook verbs are the per-turn hot path (a plugin shim shells into them on every UserPromptSubmit/Stop).
+    # Dispatch them FIRST, before the heavier feature/daemon/helper imports, to keep that path lean.
+    if sub in ("hook-awareness", "hook-drain"):
+        from . import hookverbs as hv
+        return (hv.cmd_hook_awareness if sub == "hook-awareness" else hv.cmd_hook_drain)(rest)
+    from . import features as ff
+    from . import daemon as fd
+    from . import helpers as fh
     fns = {"launch": cmd_launch, "config": cmd_config, "ls": cmd_ls,
            "archive": cmd_archive, "revive": cmd_revive, "register": cmd_register, "recycle": cmd_recycle,
            "_recycle-exec": cmd_recycle_exec, "broadcast": cmd_broadcast,
            "mute": lambda a: cmd_mute(a, mute=True), "unmute": lambda a: cmd_mute(a, mute=False),
            "rm": cmd_rm, "worktree": cmd_worktree, "profile": cmd_profile, "daemon": fd.cmd_daemon,
            "vitals": ff.cmd_vitals, "find": ff.cmd_find, "graph": ff.cmd_graph,
-           "serve": ff.cmd_serve, "paint": ff.cmd_paint}
+           "serve": ff.cmd_serve, "paint": ff.cmd_paint,
+           "drive-child": fh.cmd_drive_child, "peer-msg": fh.cmd_peer_msg,
+           "child-digest": fh.cmd_child_digest, "inbox-ack": fh.cmd_inbox_ack}
     if sub in fns:
         return fns[sub](rest)
     sys.exit(f"fleet: unknown subcommand '{sub}'")
 
 
 if __name__ == "__main__":
-    sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
     raise SystemExit(main())

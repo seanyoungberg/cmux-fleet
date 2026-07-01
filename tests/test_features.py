@@ -7,9 +7,6 @@ import sys
 
 import pytest
 
-HERE = os.path.dirname(os.path.abspath(__file__))
-SCRIPTS = os.path.join(os.path.dirname(HERE), "scripts")
-sys.path.insert(0, SCRIPTS)
 
 
 @pytest.fixture(autouse=True)
@@ -18,18 +15,26 @@ def _throwaway_state(tmp_path, monkeypatch):
     # their paths from the env AT IMPORT, so they're popped before this test re-imports them under the
     # throwaway env — AND popped again on teardown, so the next test file re-imports cleanly under the
     # restored (session) env instead of inheriting this test's now-deleted tmp_path state dir.
-    mods = ("config", "fleet_state", "fleet_features")
     monkeypatch.setenv("CMUX_STATE_DIR", str(tmp_path / "state"))
     monkeypatch.setenv("CMUX_FLEET_TOML", str(tmp_path / "none.toml"))
-    for m in mods:
-        sys.modules.pop(m, None)
+    _reset_pkg_modules()
     yield
-    for m in mods:
-        sys.modules.pop(m, None)
+    _reset_pkg_modules()
+
+
+def _reset_pkg_modules():
+    """Force a fresh re-import of the config-reading modules under the current env. Popping from
+    sys.modules is NOT enough for a package: `from cmux_fleet import X` reuses the stale attribute
+    still bound on the parent package object, so we clear those attributes too."""
+    import cmux_fleet
+    for sub in ("config", "state", "features"):
+        sys.modules.pop(f"cmux_fleet.{sub}", None)
+        if hasattr(cmux_fleet, sub):
+            delattr(cmux_fleet, sub)
 
 
 def _ff():
-    import fleet_features as ff
+    from cmux_fleet import features as ff
     return ff
 
 
@@ -178,7 +183,7 @@ def test_scan_transcript_respects_turn_window(tmp_path):
 # ── find arg parsing: the --turns value must not leak into the query ───────────────────────────
 def test_find_turns_value_not_folded_into_query(capsys):
     ff = _ff()
-    import fleet_state as fs
+    from cmux_fleet import state as fs
     fs.live_put("alpha", {"role": "r", "kind": "child", "tool": "claude", "cwd": "",
                           "surface": "", "parent": "", "status": "live"})
     # the OLD bug collected every non-dash token, so the query became "alpha 3" and matched nothing.
@@ -189,7 +194,7 @@ def test_find_turns_value_not_folded_into_query(capsys):
 
 def test_find_turns_value_reaches_scanner(monkeypatch):
     ff = _ff()
-    import fleet_state as fs
+    from cmux_fleet import state as fs
     fs.live_put("w1", {"role": "r", "kind": "child", "tool": "claude", "cwd": "",
                        "surface": "S1", "parent": "", "status": "live"})
     seen = {}

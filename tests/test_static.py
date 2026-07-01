@@ -4,6 +4,7 @@ The plugin's JSON surface (plugin.json, marketplace.json, hooks.json) and skill 
 well-formed and schema-correct, since Claude Code refuses to load a malformed plugin. These tests
 need no state; they read the repo as shipped. The rules mirror P1-plugin-standards.md §2/§5.
 """
+import glob
 import json
 import os
 import re
@@ -119,3 +120,39 @@ def test_each_skill_has_valid_frontmatter(skill_dir):
     fm = text.split("---", 2)[1]
     assert re.search(r"^name:\s*\S+", fm, re.M), "frontmatter needs a name"
     assert re.search(r"^description:\s*\S+", fm, re.M), "frontmatter needs a description"
+
+
+# --- no stale helper-script / router-script recipes (Phase 2 / codex P2.1) -----------------------
+# The four agent helpers folded from standalone plugin scripts into `fleet <verb>` subcommands, and the
+# router moved to the package (`python -m cmux_fleet.router`). No operator-followed surface — docs,
+# skills, profiles, README, tests docs, or the plugin hooks — may still tell an agent or human to run a
+# now-deleted `scripts/<helper>.py` (bare, `python3 scripts/...`, or `${CLAUDE_PLUGIN_ROOT}/scripts/...`)
+# or `scripts/router.py`. A line explicitly marked historical/deprecated is exempt (e.g. a CHANGELOG-style
+# ledger line documenting a past release). This is the release gate that keeps the package correct-in-code
+# while conductors keep emitting broken commands.
+_HELPER_PY_RE = re.compile(r"(child-digest|drive-child|inbox-ack|peer-msg)\.py")
+_ROUTER_SCRIPT_RE = re.compile(r"scripts/router\.py")
+_REF_EXEMPT = ("historical", "deprecated", "fleet-refs-ok")
+
+
+def _operator_surfaces():
+    pats = ["docs/**/*.md", "skills/**/*.md", "profiles/*.toml", "profiles/*.example",
+            "README.md", "tests/README.md", "scripts/hooks/*.py", "hooks/*.json"]
+    files = []
+    for p in pats:
+        files += glob.glob(os.path.join(REPO, p), recursive=True)
+    return sorted(set(files))
+
+
+def test_no_stale_helper_or_router_script_refs():
+    offenders = []
+    for f in _operator_surfaces():
+        with open(f, encoding="utf-8") as fh:
+            for i, line in enumerate(fh, 1):
+                if any(m in line.lower() for m in _REF_EXEMPT):
+                    continue
+                if _HELPER_PY_RE.search(line) or _ROUTER_SCRIPT_RE.search(line):
+                    offenders.append(f"{os.path.relpath(f, REPO)}:{i}: {line.strip()}")
+    assert not offenders, (
+        "stale helper/router SCRIPT refs — fold into `fleet <verb>` / `python -m cmux_fleet.router` "
+        "(or mark the line historical/deprecated):\n  " + "\n  ".join(offenders))

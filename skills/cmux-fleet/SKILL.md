@@ -9,11 +9,11 @@ You are a **conductor**: a long-lived agent that spawns and coordinates child ag
 
 ## At a glance — the everyday flow
 The common loop is **launch → drive → (completions arrive on their own) → digest**, then **recycle or retire**. `fleet` is on PATH; the helper scripts live in `${CLAUDE_PLUGIN_ROOT}/scripts/`. Exact invocations are in the sections below.
-- **Spawn + task a worker:** `fleet launch <role> --parent $CMUX_SURFACE_ID` → `drive-child.py <child-surface> "<task>"`
-- **Read what it did:** `child-digest.py <session-frag> 5` — a child's *completion* also reaches you automatically via the notify flow; you don't poll for it.
+- **Spawn + task a worker:** `fleet launch <role> --parent $CMUX_SURFACE_ID` → `fleet drive-child <child-surface> "<task>"`
+- **Read what it did:** `fleet child-digest <session-frag> 5` — a child's *completion* also reaches you automatically via the notify flow; you don't poll for it.
 - **Restart yourself clean:** write a handover (`/cmux-handover`) → `fleet recycle` → end your turn.
 - **Park vs throw away:** `fleet archive <label>` (durable, revivable) · `fleet rm <label> --kill` (throwaway).
-- **Message a peer conductor:** `peer-msg.py <peer-label> "<body>"`.
+- **Message a peer conductor:** `fleet peer-msg <peer-label> "<body>"`.
 - **Know your fleet:** `fleet ls`. **Know yourself:** `$CMUX_SURFACE_ID` (invariant across recycle).
 
 ## Who am I
@@ -74,14 +74,14 @@ Dispatch a child to a **dedicated workspace in the conductor's group** (same top
 Otherwise (the common case) children are tabs in the conductor's bottom pane. For the dedicated case just use `--place workspace`: a workspace child with **no** `--group` automatically **joins its parent conductor's group** (one conductor = one group), so you do not name the group. Pass `--group <name>` only to override that default and put the child in a different group. (`--place pane` + fold for the tab case.)
 
 ## Drive a child
-`python3 ${CLAUDE_PLUGIN_ROOT}/scripts/drive-child.py <child-surface-uuid> "<prompt>"` — sends the text then a SEPARATE `send-key enter`. A trailing `\n` in `cmux send` only inserts a newline; it does NOT submit. It fails loud (non-zero) if a cmux call errors. Always target by surface UUID, never a bare `surface:N` ref.
+`fleet drive-child <child-surface-uuid> "<prompt>"` — sends the text then a SEPARATE `send-key enter`. A trailing `\n` in `cmux send` only inserts a newline; it does NOT submit. It fails loud (non-zero) if a cmux call errors. Always target by surface UUID, never a bare `surface:N` ref.
 
 ## Retrieve a child's output
-`python3 ${CLAUDE_PLUGIN_ROOT}/scripts/child-digest.py <session-frag> <N>` → last N transcript turns (the reliable source). Do NOT trust the hook store's `lastBody` for content — the cmux Notification hook clobbers it right after Stop.
+`fleet child-digest <session-frag> <N>` → last N transcript turns (the reliable source). Do NOT trust the hook store's `lastBody` for content — the cmux Notification hook clobbers it right after Stop.
 
 ## The notify flow (how children's completions reach you)
 A fleet-wide daemon (`router.py --live`, run separately) watches the bus. When a child finishes, it appends the completion to the queue + fires a `cmux notify` banner. It NEVER types into your input. You become aware of it through your hooks:
-- **awareness** (every turn): pending completions are injected into your context as a `[fleet] N pending` note, each with a `child-digest` command and an ack command. Handle them, then ack: `python3 ${CLAUDE_PLUGIN_ROOT}/scripts/inbox-ack.py <seq>` so they stop re-surfacing.
+- **awareness** (every turn): pending completions are injected into your context as a `[fleet] N pending` note, each with a `fleet child-digest` command and an ack command. Handle them, then ack: `fleet inbox-ack <seq>` so they stop re-surfacing.
 - **The mode dial** `$CMUX_STATE_DIR/notify-mode` (read live, no restart):
   - `passive` — awareness only; you pick up pending work on your next turn. Calm, human-driven.
   - `autodrain` — your Stop hook auto-continues you to process pending at the end of any turn.
@@ -91,12 +91,12 @@ Key fact: nothing wakes a flat-idle conductor except `auto` mode (a Stop hook on
 
 ## Talk to a peer conductor (A2A)
 Child→parent comms are automatic; talking to a **peer** conductor is a **deliberate choice**, and the peer is NOT expecting it. Same input-safe delivery as the notify flow, on a separate `peer-inbox` channel, never the input box. Because a peer send is deliberate, it reaches the recipient **promptly in both states** (see Delivery).
-- **Send:** `python3 ${CLAUDE_PLUGIN_ROOT}/scripts/peer-msg.py <peer-label> "<body>"` (peers resolve by label from the fleet registry). The message reaches the peer carrying the `@<peer>: [<you>]` identity markers.
+- **Send:** `fleet peer-msg <peer-label> "<body>"` (peers resolve by label from the fleet registry). The message reaches the peer carrying the `@<peer>: [<you>]` identity markers.
 - **Reply protocol (explicit):** a fresh message **expects a reply** by default; add `--no-reply` to make it informational; the recipient replies with `--reply-to <msg_id>` (a reply expects none further unless `--expect-reply`).
 - **Delivery (both states, prompt by default):**
   - **IDLE recipient** (at the prompt, no draft) is **woken now** to handle the message, so it doesn't sit until the human's next prompt and bundle in with it. `--no-wake` opts out and leaves it for the peer's next turn. A human's draft is never clobbered.
   - **BUSY recipient** is never interrupted mid-turn, but its **drain (Stop) hook surfaces pending peer messages at the end of its current turn, ALWAYS** — not gated on `notify-mode` (unlike child completions), because a peer send is deliberate and shouldn't wait on the dial.
-- **Receiving:** peer messages arrive as a `[peer] N message(s)` context note (distinct from `[fleet]` child completions), each with its reply command. Ack when handled: `python3 ${CLAUDE_PLUGIN_ROOT}/scripts/inbox-ack.py <seq> --peer`.
+- **Receiving:** peer messages arrive as a `[peer] N message(s)` context note (distinct from `[fleet]` child completions), each with its reply command. Ack when handled: `fleet inbox-ack <seq> --peer`.
 
 ## Answer a child's gate (permission / question / plan)
 A child's AskUserQuestion/permission/ExitPlanMode parks in the Feed (≤120s), keyed by `request_id`.

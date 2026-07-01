@@ -10,11 +10,9 @@ import json
 import subprocess
 import sys
 
-from conftest import FLEET_PY
-
-
 def run_fleet(env, *args, expect=0):
-    p = subprocess.run([sys.executable, FLEET_PY, *args], env=env, capture_output=True, text=True)
+    # `python -m cmux_fleet` == the `fleet` console script; cli_env puts REPO on PYTHONPATH.
+    p = subprocess.run([sys.executable, "-m", "cmux_fleet", *args], env=env, capture_output=True, text=True)
     if expect is not None:
         assert p.returncode == expect, f"`fleet {' '.join(args)}` rc={p.returncode}\n{p.stdout}\n{p.stderr}"
     return p

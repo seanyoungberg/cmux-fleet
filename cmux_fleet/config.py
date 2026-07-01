@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-# config.py — the ONE path/setting resolver for cmux-fleet. Every other script imports its constants
+# cmux_fleet/config.py — the ONE path/setting resolver for cmux-fleet. Every other script imports its constants
 # from here; nothing else hardcodes a path. Resolution precedence, per key:
 #
 #     env var  >  [fleet] block in the fleet toml  >  built-in default (XDG / which / skip)

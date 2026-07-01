@@ -11,10 +11,11 @@ import subprocess
 import sys
 import textwrap
 
-from conftest import SCRIPTS
+from conftest import REPO
 
 _DUMP = textwrap.dedent("""
-    import json, config
+    import json
+    from cmux_fleet import config
     keys = ["ROOT","STATE","CMUX","MARKETPLACE","FLOOR","HOOKSTORE","ADHOC_SUBDIR","FLEET_TOML","TOML_DIR"]
     print(json.dumps({k: getattr(config, k) for k in keys}))
 """)
@@ -24,7 +25,7 @@ def _resolve(env=None, toml_text=None, toml_dir=None, cwd=None):
     """Import config in a clean subprocess. Returns (constants_dict, stderr_text)."""
     e = {k: v for k, v in os.environ.items() if not k.startswith("CMUX_") and k != "XDG_CONFIG_HOME"
          and k != "XDG_STATE_HOME"}
-    e["PYTHONPATH"] = SCRIPTS
+    e["PYTHONPATH"] = REPO
     if toml_text is not None:
         td = toml_dir or cwd or os.getcwd()
         path = os.path.join(td, "fleet.toml")

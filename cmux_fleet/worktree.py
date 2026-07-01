@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-# worktree.py — git-worktree lifecycle for cmux-fleet. Config-gated, DEFAULT-OFF.
+# cmux_fleet/worktree.py — git-worktree lifecycle for cmux-fleet. Config-gated, DEFAULT-OFF.
 #
 # ONE owner per worktree = the fleet. We run `git worktree add` ourselves, point the agent's cwd at
 # the result, and own teardown. We do NOT hook Claude's WorktreeCreate/WorktreeRemove and we do NOT

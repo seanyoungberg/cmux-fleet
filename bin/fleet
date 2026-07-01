@@ -1,3 +1,7 @@
 #!/usr/bin/env bash
-# fleet — the native-cmux fleet CLI shim. Forwards to scripts/fleet.py (on PATH via the plugin bin).
-exec python3 "$(dirname "$(readlink -f "$0" 2>/dev/null || echo "$0")")/../scripts/fleet.py" "$@"
+# fleet — checkout/dev shim. Runs THIS build's cmux_fleet package via `-m` (the uv tool install ships
+# its own `fleet` console script; this shim is for running straight from a checkout, and is what
+# `fleet profile` pins onto PATH for multi-build isolation). Adds the repo root to PYTHONPATH so the
+# package imports even when it isn't pip/uv-installed.
+here="$(cd "$(dirname "$(readlink -f "$0" 2>/dev/null || echo "$0")")/.." && pwd)"
+exec env PYTHONPATH="$here${PYTHONPATH:+:$PYTHONPATH}" python3 -m cmux_fleet "$@"
