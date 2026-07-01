@@ -7,9 +7,6 @@ import sys
 
 import pytest
 
-HERE = os.path.dirname(os.path.abspath(__file__))
-SCRIPTS = os.path.join(os.path.dirname(HERE), "scripts")
-sys.path.insert(0, SCRIPTS)
 
 
 @pytest.fixture(autouse=True)

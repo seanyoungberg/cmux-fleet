@@ -10,9 +10,6 @@ import subprocess
 import sys
 import time
 
-HERE = os.path.dirname(os.path.abspath(__file__))
-SCRIPTS = os.path.join(os.path.dirname(HERE), "scripts")
-sys.path.insert(0, SCRIPTS)
 
 from cmux_fleet import daemon as fd  # noqa: E402  (not popped by other test files)
 
