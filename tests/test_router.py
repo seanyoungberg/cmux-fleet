@@ -191,3 +191,63 @@ def test_stamp_health_writes_fresh_pid_and_ts():
     h = json.load(open(router.HEALTH_FILE))
     assert h["pid"] == os.getpid()
     assert abs(h["ts"] - time.time()) < 5
+
+
+# --- root cause #3: moved/desynced child completion recovered via registry truth -----------------
+# A running child whose surface was MOVED across workspaces loses its live hook-store `sessions{}`
+# record, leaving only a frozen `activeSessionsBySurface` pointer. The pre-fix handle() resolved the
+# surface from that missing session record and RETURNED before queueing anything — a silent completion
+# loss that stalled the parent (never woken). handle() must now fall back to fleet-REGISTRY truth.
+def test_handle_recovers_moved_child_via_registry_when_hookstore_session_absent(fs, monkeypatch):
+    """A Stop whose bus session_id matches a LIVE registry row while the hook-store `sessions{}` entry
+    is ABSENT must still queue a completion for the parent AND attempt a wake — with a thin/empty gist
+    (the transcript is gone) rather than dropping. This is the codex-named root-cause-#3 regression."""
+    uuid = "11111111-1111-1111-1111-111111111111"
+    fs.live_put("parent", {"surface": "PARENT", "kind": "conductor", "role": "c",
+                           "session": "claude-parent"})
+    fs.live_put("child", {"surface": "CHILD", "kind": "child", "role": "w", "parent": "parent",
+                          "session": f"claude-{uuid}"})
+
+    monkeypatch.setattr(router, "LIVE", True)
+    monkeypatch.setattr(router, "_reg", {"mtime": 0, "by_label": {}, "by_surface": {}})  # force a reload
+    # THE DESYNC: hook store has NO sessions{} record for the child (its live record vanished on the
+    # move) — only the frozen activeSessionsBySurface pointer, so _rec_by_session finds no surface.
+    monkeypatch.setattr(router, "store",
+                        lambda: {"sessions": {}, "activeSessionsBySurface": {"CHILD": {"sessionId": uuid}}})
+    monkeypatch.setattr(router, "cmux", lambda *a, **k: "")            # no real `cmux notify` shell-out
+    monkeypatch.setattr(router.time, "sleep", lambda s: None)          # skip deliver()'s flush sleep
+    # Record the wake attempt at the router's wake entrypoint. Patching `router.maybe_idle_wake` (a
+    # module global that deliver() resolves at call time) is stable across the suite — unlike patching
+    # `fs.wake_if_idle`, which desyncs when another test reloads the state module.
+    waked = []
+    monkeypatch.setattr(router, "maybe_idle_wake", lambda parent_surface, label: waked.append(parent_surface))
+
+    router.handle({"name": "agent.hook.Stop", "occurred_at": "2026-07-01T12:00:00Z",
+                   "payload": {"phase": "completed", "session_id": f"claude-{uuid}"}})
+
+    pending = fs.inbox_pending("PARENT", kind="completion")           # file-backed: robust to module reloads
+    assert len(pending) == 1                                          # completion QUEUED, not silently dropped
+    row = pending[0]
+    assert row["label"] == "child"
+    assert row["child_surface"] == "CHILD"
+    assert row["gist"] == ""                                          # thin gist (transcript gone) beats loss
+    assert waked == ["PARENT"]                                        # ...and the parent's wake was attempted
+
+
+def test_member_by_session_matches_bare_uuid_tool_aware(monkeypatch):
+    """The registry-truth fallback matches a bus session id to a live member by bare uuid, is TOOL-AWARE
+    (never binds a codex id onto a claude agent), and FAILS OPEN to a uuid-only match when the bus id
+    carries no tool prefix."""
+    uuid = "22222222-2222-2222-2222-222222222222"
+    reg = {"by_label": {
+        "cl": {"surface": "CL", "kind": "child", "session": f"claude-{uuid}", "tool": "claude"},
+        "other": {"surface": "OT", "kind": "child", "session": "claude-deadbeef", "tool": "claude"},
+    }, "by_surface": {}, "mtime": 1}
+    monkeypatch.setattr(router, "registry", lambda: reg)
+
+    m = router._member_by_session(uuid, "claude")                    # exact match, tool agrees
+    assert m.get("label") == "cl" and m.get("surface") == "CL"       # entry returned with label merged
+    assert router._member_by_session(uuid, "").get("label") == "cl"  # bare bus id -> fail-open uuid match
+    assert router._member_by_session(uuid, "codex") == {}            # tool disagrees -> no cross-tool bind
+    assert router._member_by_session("99999999-9999-9999-9999-999999999999", "claude") == {}  # no match
+    assert router._member_by_session("", "claude") == {}             # empty id -> nothing
