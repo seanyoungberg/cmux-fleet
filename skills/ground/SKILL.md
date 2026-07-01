@@ -15,7 +15,7 @@ Before researching context, check what is already filed: past handovers (`./hand
 To spawn, drive, or observe child agents, use the **`/cmux-fleet:cmux-fleet`** skill: launch, drive, completions arrive on their own, digest (`fleet launch` / `recycle` / `archive`). Do not re-derive dispatch.
 
 ## Conductors: handover
-At session end, when context runs low, or before a relaunch, write a point-in-time handover with **`/cmux-fleet:cmux-handover`**. It is the file `fleet recycle` auto-primes the next instance to read.
+At session end, when context runs low, or before a relaunch, write a point-in-time handover with **`/cmux-fleet:cmux-handover`**. It is the file `fleet recycle --fresh` auto-primes the next instance to read (a bare `fleet recycle` now RESUMES — it does not prime).
 
 ## Surfacing to the user (conductors)
 When the user needs to SEE something (a file, a diff, a decision), surface it into a view pane rather than pasting walls of text. The recipe lives in the `/cmux-fleet:cmux-fleet` skill's Layout section.

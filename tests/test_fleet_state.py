@@ -83,6 +83,58 @@ def test_surface_label_lookups(fs):
     assert fs.label_for_surface("nope") == ""
 
 
+# --- registry<->real-session reconciliation (kills the "No conversation found" divergence) --------
+def test_reconcile_backfills_empty_session(fs):
+    fs.live_put("w1", {"tool": "claude", "surface": "S", "session": ""})
+    action = fs.reconcile_session("w1", "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee")
+    assert action == "backfill"
+    assert fs.live_get("w1")["session"] == "claude-aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee"
+
+
+def test_reconcile_fixes_diverged_bridge_id(fs):
+    # the live-proven case: registry holds a stale bridge id, cmux's real live id has moved on
+    fs.live_put("w1", {"tool": "claude", "surface": "S", "session": "claude-019f144d-c5f0-7a52-b586-f9e267c469fa"})
+    action = fs.reconcile_session("w1", "93666b60-ae1e-4746-bc00-d2c498fac2ff")
+    assert action == "reconcile"
+    assert fs.live_get("w1")["session"] == "claude-93666b60-ae1e-4746-bc00-d2c498fac2ff"
+
+
+def test_reconcile_noop_when_already_in_sync(fs):
+    fs.live_put("w1", {"tool": "claude", "surface": "S", "session": "claude-abc12345-0000-0000-0000-000000000000"})
+    # bare uuid of the stored session == the live id -> no write, no churn
+    assert fs.reconcile_session("w1", "abc12345-0000-0000-0000-000000000000") == ""
+
+
+def test_reconcile_noop_on_empty_sid_or_missing_label(fs):
+    fs.live_put("w1", {"tool": "claude", "surface": "S", "session": "claude-x"})
+    assert fs.reconcile_session("w1", "") == ""            # empty live id -> never clobber
+    assert fs.reconcile_session("ghost", "some-sid") == ""  # unknown label -> no-op
+
+
+def test_reconcile_codex_stores_bare_uuid(fs):
+    fs.live_put("c1", {"tool": "codex", "surface": "S", "session": ""})
+    fs.reconcile_session("c1", "77777777-8888-9999-aaaa-bbbbbbbbbbbb")
+    assert fs.live_get("c1")["session"] == "77777777-8888-9999-aaaa-bbbbbbbbbbbb"  # no claude- prefix
+
+
+def test_bus_tool_extracts_prefix(fs):
+    assert fs.bus_tool("claude-aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee") == "claude"
+    assert fs.bus_tool("codex-aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee") == "codex"
+    assert fs.bus_tool("aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee") == ""      # already bare -> no tool
+    assert fs.bus_tool("") == ""
+
+
+def test_reconcile_refuses_cross_tool_write(fs):
+    # the berg-sandbox trap: a codex-store id must NOT overwrite a claude agent's session
+    fs.live_put("w1", {"tool": "claude", "surface": "S", "session": "claude-93666b60-ae1e-4746-bc00-d2c498fac2ff"})
+    action = fs.reconcile_session("w1", "019f144d-c5f0-7a52-b586-f9e267c469fa", "claude", event_tool="codex")
+    assert action == "skip-tool"
+    assert fs.live_get("w1")["session"] == "claude-93666b60-ae1e-4746-bc00-d2c498fac2ff"  # unchanged
+    # a matching-tool event still reconciles
+    action = fs.reconcile_session("w1", "ffffffff-0000-0000-0000-000000000000", "claude", event_tool="claude")
+    assert action == "reconcile"
+
+
 # --- the archive shelf + the live->archive->live transition -------------------------------------
 def test_archive_put_get_del(fs):
     fs.archive_put("w1", {"role": "worker", "last_session": "abc"})

@@ -10,7 +10,7 @@ A handover is a **point-in-time brain dump of this session** for whoever picks u
 ## Where it lives
 `<your cwd>/handover/<YYYY-MM-DD>.md`. Your cwd is your home (your identity seat). A second handover the same day → add a `-HHMM` suffix. Create `handover/` if it is not there; it is yours.
 
-This is exactly the file `fleet recycle` auto-primes the next instance to read (the newest `handover/*.md` by mtime). There is **no** separate top-level `HANDOVER.md` — that was the retired relauncher's convention; `handover/<date>.md` is the single source.
+This is exactly the file `fleet recycle --fresh` auto-primes the next instance to read (the newest `handover/*.md` by mtime; a bare `fleet recycle` now RESUMES and does not prime). There is **no** separate top-level `HANDOVER.md` — that was the retired relauncher's convention; `handover/<date>.md` is the single source.
 
 ## The split (why your cwd, not the vault)
 Two kinds of output, two homes — this is the clarity the fleet is built around:
@@ -32,17 +32,19 @@ Hit what's relevant, skip what's empty, add what's yours. Write for a reader wit
 - **Read on resume** — the 2-3 pointers (docs, memory, this file) to load first.
 
 ## Optional final step: recycle yourself
-The natural tail of a handover is a **recycle** — restart yourself fresh in the same seat, shedding bloated context, and let the next instance boot and read the handover you just wrote. **Only do this when you are actually ready to relaunch** (most handovers don't recycle — you write one and keep going, or hand back to a human). Never recycle with a draft you haven't finished.
+The natural tail of a handover is a **`fleet recycle --fresh`** — restart yourself into a fresh session in the same seat, shedding bloated context, and let the next instance boot and read the handover you just wrote. At handover time you want **`--fresh`** (shedding is the whole point). **Only do this when you are actually ready to relaunch** (most handovers don't recycle — you write one and keep going, or hand back to a human). Never recycle with a draft you haven't finished.
+
+> NOTE (2026-07-01): `fleet recycle` now DEFAULTS to **RESUME** (preserve context — the least-disruptive default). A handover recycle must pass **`--fresh`** to get a clean session; a bare `fleet recycle` would just continue the same session (no shed, no handover prime).
 
 ```
-fleet recycle                 # self, FRESH session, same surface/identity — the handover-time default
-fleet recycle --dry-run       # see the composed launch + prime first
-fleet recycle -- --effort xhigh --add-plugin <name>   # recycle WITH changed launch params
+fleet recycle --fresh              # self, FRESH session, same surface/identity — the handover pattern
+fleet recycle --fresh --dry-run    # see the composed launch + prime first
+fleet recycle --fresh -- --effort xhigh --add-plugin <name>   # fresh recycle WITH changed launch params
 ```
 
-What it does (see the `cmux-fleet` SKILL → recycle, and `docs/operations.md`): a **detached** worker waits until you go quiet (idle + empty input draft; `--force` to override), then uses cmux's native `respawn-pane` to tear you down and relaunch a fresh session **in the same surface** — so your label and all parent/child routing stay valid (only the session id changes). The launch is recomposed from cmux's own resume binding (accurate even if the registry is sparse), then it auto-primes the fresh instance to read this handover. `--resume` instead continues the session (rarely what you want at handover time). You can recycle a **child** the same way: have it write its handover first, then `fleet recycle <label>`.
+What it does (see the `cmux-fleet` SKILL → recycle, and `docs/operations.md`): a **detached** worker waits until you go quiet (idle + empty input draft; `--force` to override), then uses cmux's native `respawn-pane` to tear you down and relaunch a fresh session **in the same surface** — so your label and all parent/child routing stay valid (only the session id changes). The launch is recomposed from cmux's own resume binding (accurate even if the registry is sparse), then it auto-primes the fresh instance to read this handover. A bare `fleet recycle` (no `--fresh`) instead RESUMES the same session — not what you want at handover time. You can recycle a **child** the same way: have it write its handover first, then `fleet recycle <label> --fresh`.
 
-Because the worker is detached and waits for idle, the clean pattern is: write the handover → call `fleet recycle` → **end your turn**. It fires once you're quiet.
+Because the worker is detached and waits for idle, the clean pattern is: write the handover → call `fleet recycle --fresh` → **end your turn**. It fires once you're quiet.
 
 ## Principles
 - **Cold-read first.** Assume the reader knows nothing of this session.

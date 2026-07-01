@@ -103,8 +103,9 @@ mode dial below).
 | --- | --- |
 | `fleet launch <role\|--adhoc N>` | spawn an agent (`--place tab\|pane\|workspace`, `--dry-run`, `-- <tool flags>`) |
 | `fleet ls` | live fleet reconciled against cmux's hook store (flags STALE / pending / MUTED) |
-| `fleet recycle [label]` | restart in place, same surface and identity (`--resume`, `--force`) |
-| `fleet archive` / `revive` | park a live agent / bring a parked one back |
+| `fleet recycle [label]` | restart in place, same surface and identity (default RESUME; `--fresh` sheds, `--session <id>`, `--force`; bulk `--all\|--conductors\|--children\|--my-children`) |
+| `fleet sessions <label>` | list resumable prior sessions for the agent's surface (id, age, size, snippet) |
+| `fleet archive` / `revive` | park a live agent / bring a parked one back (`revive --fresh\|--session`) |
 | `fleet rm <label>` | drop a label (`--kill` closes it, `--with-group` dissolves its group) |
 | `fleet mute` / `unmute` | stop / resume pushing a child's completions to its parent |
 | `fleet vitals` / `find` / `graph` / `serve` / `paint` | read-only views (triage, lookup, tree, localhost, sidebar) |

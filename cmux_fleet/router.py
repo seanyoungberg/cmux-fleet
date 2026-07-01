@@ -125,19 +125,36 @@ def handle(ev):
     if p.get("phase") != "completed":
         return
     st = store()
-    sid_bare = fs.bare_uuid(p.get("session_id") or "")
+    raw_sid = p.get("session_id") or ""
+    sid_bare = fs.bare_uuid(raw_sid)
     surface = _rec_by_session(st, sid_bare).get("surfaceId", "")
     if not surface:
         return
     entry = registry()["by_surface"].get(surface)
     if not entry:
         return                                          # not a registered live member -> ignore
-    if not entry.get("session"):                        # lazily-registered at launch (codex binds on
-        e = fs.live_get(entry["label"]) or {}           # its 1st turn) -> backfill the bound session now
-        if e:
-            e["session"] = f"claude-{sid_bare}" if e.get("tool", "claude") == "claude" else sid_bare
-            fs.live_put(entry["label"], e)
+    # Keep the registry `session` honest against cmux's live id on EVERY Stop: empty -> backfill (codex
+    # binds on its 1st turn); DIVERGED -> reconcile (a fresh respawn re-issues the conversation id, or a
+    # bridge id was stored at bind -> the "No conversation found" class on a later archive/revive).
+    # TOOL-AWARE (reconcile_session enforces it): only reconcile from the entry's OWN tool id — a
+    # codex-store id must never overwrite a claude agent's session (berg-sandbox's stale 019f144d was a
+    # codex id on a now-claude agent).
+    entry_tool = entry.get("tool", "claude")
+    ev_tool = fs.bus_tool(raw_sid)
+    if LIVE:                                             # OBSERVE mode holds no singleton lock -> writes NOTHING
+        action = fs.reconcile_session(entry["label"], sid_bare, entry_tool, event_tool=ev_tool)
+        if action == "backfill":
             log(f"[backfill] {entry['label']}: session {sid_bare[:12]} bound on first turn")
+        elif action == "reconcile":
+            log(f"[reconcile] {entry['label']}: registry session -> {sid_bare[:12]} (was stale/bridge id)")
+        elif action == "skip-tool":
+            log(f"[reconcile] skip {entry['label']}: {ev_tool} Stop on a {entry_tool} agent (no cross-tool id write)")
+    else:
+        # observe: report what a LIVE router would reconcile, mutate nothing (respects the observe contract
+        # + the singleton-lock invariant — an unlocked observer racing the daemon on fleet.json is the bug).
+        stored = fs.bare_uuid(entry.get("session") or "")
+        if sid_bare and stored != sid_bare and not (ev_tool and ev_tool != entry_tool):
+            log(f"[reconcile] (observe) would set {entry['label']} session -> {sid_bare[:12]} (was {stored[:12] or 'unbound'})")
 
     try:
         ts = datetime.fromisoformat(ev.get("occurred_at", "").replace("Z", "+00:00"))

@@ -226,6 +226,33 @@ def entry_for_surface(surface):
     return None
 
 
+def reconcile_session(label, sid_bare, tool=None, event_tool=None):
+    """Refresh a live member's stored `session` to the GROUND-TRUTH bound id `sid_bare` when it's either
+    empty (lazy first-turn backfill: codex binds on its 1st turn) OR DIVERGED from what the surface
+    actually carries. Divergence is the "No conversation found" class: a fresh respawn re-issues the
+    conversation id on its first turn, and a bridge id can get stored at bind — so the registry `session`
+    drifts from cmux's real live id. The router sees the real id on every Stop, so calling this there keeps
+    the registry honest continuously. No-op (returns '') when already in sync or `sid_bare` is empty, so
+    it's safe to call unconditionally.
+    TOOL-AWARE: `event_tool` (the tool that produced `sid_bare`, via bus_tool) guards cross-tool writes —
+    when set and it disagrees with the entry's tool, this REFUSES to write (returns 'skip-tool'), so a
+    codex-store id never overwrites a claude agent's session (the berg-sandbox 019f144d trap). `tool`
+    defaults to the entry's own tool (claude sessions store the `claude-` prefixed form).
+    Returns the action: 'backfill' | 'reconcile' | 'skip-tool' | ''."""
+    e = live_get(label)
+    if not e or not sid_bare:
+        return ""
+    t = tool or e.get("tool", "claude")
+    if event_tool and event_tool != t:
+        return "skip-tool"                              # cross-tool id -> never write it (no contamination)
+    stored = bare_uuid(e.get("session") or "")
+    if stored == sid_bare:
+        return ""
+    e["session"] = f"claude-{sid_bare}" if t == "claude" else sid_bare
+    live_put(label, e)
+    return "backfill" if not stored else "reconcile"
+
+
 # --- identity: the ARCHIVE shelf (parked, revivable) ---------------------------------------
 def archive_all():
     return _read_json(ARCHIVE, {})
@@ -282,12 +309,26 @@ def read_hook_store():
     return {"sessions": sessions, "activeSessionsBySurface": active}
 
 
+_UUID_RE = r"[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}"
+
+
 def bare_uuid(sid):
     """The canonical 36-char session uuid, stripping any '<tool>-' prefix cmux's BUS adds
     (claude-<uuid>, codex-<uuid>, ...). The per-agent STORE keys on the bare uuid; the BUS event's
     session_id is tool-prefixed. Returns sid unchanged if it carries no uuid."""
-    m = re.search(r"[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}", sid or "")
+    m = re.search(_UUID_RE, sid or "")
     return m.group(0) if m else (sid or "")
+
+
+def bus_tool(sid_raw):
+    """The tool prefix cmux's BUS puts on a session_id: 'claude-<uuid>' -> 'claude', 'codex-<uuid>' ->
+    'codex'. '' when the id is already bare (no prefix) OR carries no uuid. Keeps session reconciliation
+    TOOL-AWARE: a codex-store bridge id must never overwrite a CLAUDE agent's registry session (the live
+    berg-sandbox trap — stale 019f144d was a codex id on a now-claude agent)."""
+    m = re.search(_UUID_RE, sid_raw or "")
+    if not m or m.start() == 0:
+        return ""
+    return sid_raw[:m.start()].rstrip("-")
 
 
 def last_agent_text(path, cap=160):
