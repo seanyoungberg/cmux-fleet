@@ -78,13 +78,48 @@ def test_revive_roster_compose_resumes(monkeypatch):
     assert "--resume SESSID" in send
 
 
-# --- today's DEFAULTS (make the ratify-gated flip a single visible point) -------------------------
-def test_recycle_default_is_fresh_today():
-    # design §1 proposes flipping this to resume; until ratified, no --resume/--session => fresh.
-    import argparse
-    # mirror cmd_recycle's decision without spawning: mode = resume iff (--resume or --session)
-    def mode_for(resume, session):
-        return "resume" if (resume or session) else "fresh"
-    assert mode_for(False, "") == "fresh"          # <-- the cell §1 will flip
-    assert mode_for(True, "") == "resume"
-    assert mode_for(False, "SID") == "resume"      # --session implies resume
+# --- GATE 2: effort/model provenance + no-pin warning --------------------------------------------
+def test_provenance_override(monkeypatch):
+    monkeypatch.setattr(cli, "_is_roster", lambda role: True)
+    line, warn = cli._session_pref_provenance("w", "claude", "claude --effort max", "max", "")
+    assert "effort=max (override)" in line and warn == ""
+
+
+def test_provenance_role_pin(monkeypatch):
+    monkeypatch.setattr(cli, "_is_roster", lambda role: True)
+    monkeypatch.setattr(cli, "load_config", lambda: {
+        "tool": {"claude": {"flags": "--effort high"}},
+        "role": {"w": {"claude": {"flags": "--effort xhigh"}}}})
+    line, warn = cli._session_pref_provenance("w", "claude", "claude --effort xhigh", "", "")
+    assert "effort=xhigh (role-pin)" in line and warn == ""      # role pin wins, no warning
+
+
+def test_provenance_floor_warns_no_pin(monkeypatch):
+    monkeypatch.setattr(cli, "_is_roster", lambda role: True)
+    monkeypatch.setattr(cli, "load_config", lambda: {
+        "tool": {"claude": {"flags": "--effort high"}},
+        "role": {"w": {"claude": {"flags": "--add-dir /x"}}}})    # role has NO --effort pin
+    line, warn = cli._session_pref_provenance("w", "claude", "claude --effort high", "", "")
+    assert "effort=high (floor)" in line
+    assert "no --effort pin" in warn and "won't survive" in warn  # the cmux-advisor-came-back-on-high catch
+
+
+def test_provenance_adhoc_is_binding(monkeypatch):
+    monkeypatch.setattr(cli, "_is_roster", lambda role: False)
+    line, warn = cli._session_pref_provenance("adhoc-x", "claude", "claude --effort low --model opus", "", "")
+    assert "effort=low (binding)" in line and "model=opus (binding)" in line and warn == ""
+
+
+def test_provenance_empty_when_none(monkeypatch):
+    monkeypatch.setattr(cli, "_is_roster", lambda role: False)
+    assert cli._session_pref_provenance("x", "claude", "claude --dangerously-skip-permissions", "", "") == ("", "")
+
+
+# --- the RATIFIED default (flipped 2026-07-01): recycle now RESUMES; --fresh is the shed opt-in --------
+def test_recycle_default_is_resume():
+    # mirror cmd_recycle's decision without spawning: mode = fresh IFF --fresh; else resume (preserve).
+    def mode_for(fresh, session):
+        return "fresh" if fresh else "resume"
+    assert mode_for(False, "") == "resume"         # <-- the flip: plain recycle preserves context
+    assert mode_for(True, "") == "fresh"           # --fresh is the explicit shed
+    assert mode_for(False, "SID") == "resume"      # --session naturally resumes (the default)

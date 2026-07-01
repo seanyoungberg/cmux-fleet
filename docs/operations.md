@@ -20,8 +20,10 @@ fleet child-digest <session-frag> 5
 
 # inventory + lifecycle
 fleet ls                                    # live x hook store; flags STALE / pending / MUTED
-fleet recycle [label] [--resume] [--force] [-- <flags>]   # restart in place, same identity
-fleet archive <label>          / fleet revive <label>     # park / bring back
+fleet recycle [label] [--fresh] [--session id] [--force] [-- <flags>]   # restart in place (default RESUME; --fresh sheds)
+fleet recycle --all|--conductors|--children|--my-children [--include-muted]  # bulk restart, sequential + gated
+fleet sessions <label>                      # list resumable prior sessions (id, age, size, snippet)
+fleet archive <label>   / fleet revive <label> [--fresh] [--session id]     # park / bring back
 fleet rm <label> [--kill] [--with-group] [--wip-commit]   # drop; optionally close + dissolve group
 fleet mute <label> / unmute <label>
 
@@ -223,16 +225,23 @@ writes.
 ## Recycling, archiving, reviving
 
 - **recycle** restarts an agent in place on its own surface, same identity, via
-  cmux's native `respawn-pane`. Default is a fresh session (it sheds context and
-  auto-primes from the latest `handover/*.md`); `--resume` continues the
-  session. It runs detached (so it can recycle the caller itself) behind a
-  quiet-gate that waits for an idle prompt with an empty draft before respawning,
-  never half-killing a mid-turn agent. `--force` skips the draft guard.
+  cmux's native `respawn-pane`. Default is **RESUME** (it preserves context — the
+  least-disruptive default, ratified 2026-07-01); **`--fresh`** sheds context into
+  a new session and auto-primes from the latest `handover/*.md`. `--session <id>`
+  resumes an arbitrary prior session (`fleet sessions <label>` lists them);
+  `--resume` is a no-op alias. It runs detached (so it can recycle the caller
+  itself) behind a quiet-gate that waits for an idle prompt with an empty draft
+  before respawning, never half-killing a mid-turn agent. `--force` skips the
+  draft guard. Bulk selectors restart many sequentially + gated, skipping self and
+  muted agents: `--all` / `--conductors` / `--children` / `--my-children`
+  (`--include-muted` to force).
 
   ```
-  fleet recycle                 # recycle self, fresh session
-  fleet recycle worker --resume
-  fleet recycle worker --add-plugin some-plugin -- --model opus
+  fleet recycle                 # recycle self, RESUME (preserve context) — the default
+  fleet recycle --fresh         # shed context + prime from the handover (the handover pattern)
+  fleet recycle worker --session <id>          # resume an arbitrary prior session
+  fleet recycle worker --fresh --add-plugin some-plugin -- --model opus
+  fleet recycle --children      # restart my live children, sequential + gated (RESUME each)
   ```
 
 - **archive** parks a live agent: it stops the process (SIGINT twice for a clean
@@ -245,12 +254,23 @@ writes.
   ```
 
 - **revive** brings a parked agent back into a fresh surface, resuming its last
-  session. It replays the captured launch binding (with `--resume` swapped in),
-  falling back to the registry spec for older entries.
+  session by default. It replays the captured launch binding (with `--resume`
+  swapped in), falling back to the registry spec for older entries. `--fresh`
+  sheds into a new session (auto-primed from the handover); `--session <id>`
+  resumes an arbitrary prior session.
 
   ```
   fleet revive worker
   fleet revive worker --place pane -- --effort high
+  fleet revive worker --session <id>     # resume a specific prior session
+  ```
+
+- **sessions** lists the resumable prior sessions for an agent's surface (id, age,
+  size, first-user-message snippet, freshest first; `*` marks the currently-bound
+  one) — pick an id for `recycle --session` / `revive --session`.
+
+  ```
+  fleet sessions worker
   ```
 
 For a roster role, both recycle and revive are toml-authoritative: they

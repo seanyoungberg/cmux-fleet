@@ -669,6 +669,14 @@ def cmd_launch(argv):
           + (f" group={spec['group']}" if spec['place'] == 'workspace' else ""))
     print(f"[fleet] cwd={spec['abs_cwd']}")
     print(f"[fleet] launch: {send_cmd}")
+    _eff = _flag_val(caller, "--effort"); _mdl = _flag_val(caller, "--model")
+    provline, provwarn = _session_pref_provenance(
+        spec.get("role"), spec["tool"], send_cmd,
+        _eff if isinstance(_eff, str) else "", _mdl if isinstance(_mdl, str) else "")
+    if provline:
+        print(provline)                                          # effort/model + provenance (source)
+    if provwarn:
+        print(provwarn)                                          # no-pin warning (floor-inherited effort)
     if a.dry_run:
         print("[fleet] dry-run (omit --dry-run to spawn)")
         return 0
@@ -1127,9 +1135,10 @@ def cmd_archive(argv):
 
 
 def cmd_revive(argv):
-    """Bring a parked agent back into a fresh surface, resuming its last session. Binding-first, just
-    like recycle: if archive captured cmux's launch binding, REPLAY it (--resume swapped to the parked
-    session, caller `-- <flags>` / --add-plugin re-layered on top). Falls back to the registry-spec
+    """Bring a parked agent back into a fresh surface. Default RESUMES its last session (--fresh sheds it
+    into a new session, auto-primed from the handover; --session targets an arbitrary prior one). Binding-
+    first, like recycle: if archive captured cmux's launch binding, REPLAY it (--resume swapped to the
+    parked session, caller `-- <flags>` / --add-plugin re-layered on top). Falls back to the registry-spec
     compose for entries archived before binding-capture existed (or with no binding)."""
     from . import state as fs
     caller = []
@@ -1139,6 +1148,9 @@ def cmd_revive(argv):
     ap.add_argument("label")
     ap.add_argument("--parent", default=os.environ.get("CMUX_SURFACE_ID", ""))
     ap.add_argument("--place")
+    ap.add_argument("--fresh", action="store_true",
+                    help="revive into a brand-new session (DROP the parked session), auto-primed from the "
+                         "latest handover — the shed opt-in; default is RESUME the last session")
     ap.add_argument("--session", default="", metavar="ID",
                     help="resume an ARBITRARY prior session id (default: the archived last_session); "
                          "list with `fleet sessions <label>`")
@@ -1150,11 +1162,13 @@ def cmd_revive(argv):
     if not e:
         sys.exit(f"fleet revive: no archived label '{a.label}'")
     tool = e.get("tool", "claude")
-    # an explicit --session targets an arbitrary prior session directly; else the archived last_session.
+    if a.fresh and a.session:
+        sys.exit("[fleet] revive: --fresh and --session are contradictory (fresh drops the session; --session resumes one)")
+    # --fresh drops the session; an explicit --session targets an arbitrary prior one; else last_session.
     if a.session and not _known_session(e, "", a.session):   # archived -> no live surface, encode the cwd
         sys.exit(f"[fleet] revive: session '{a.session}' not found under {a.label}'s projects dir; "
                  f"`fleet sessions {a.label}` to list resumable ids.")
-    sess = (a.session or e.get("last_session") or "").replace("claude-", "")   # --resume wants the bare uuid
+    sess = "" if a.fresh else (a.session or e.get("last_session") or "").replace("claude-", "")   # bare uuid
     # Authoritative cwd/place/group: roster toml > archived entry > captured binding. NEVER let cwd fall
     # to "" -> os.path.join(ROOT,"") = ROOT root, which lands the agent off its session (claude --resume
     # then exits "No conversation found"). Self-heals a sparse shelf archived before the backfill existed.
@@ -1193,7 +1207,8 @@ def cmd_revive(argv):
             print(f"[fleet] note: tool '{tool}' has no resume in this flow; fresh launch")
         send_cmd = render_send_cmd(bin_name, args, env, spec["abs_cwd"])
         source = "registry-spec"
-    print(f"[fleet] revive {a.label} (tool={tool}, resume {sess[:12] or '-'}, source={source})\n[fleet] launch: {send_cmd}")
+    disp = "FRESH (no resume)" if a.fresh else f"resume {sess[:12] or '-'}"
+    print(f"[fleet] revive {a.label} (tool={tool}, {disp}, source={source})\n[fleet] launch: {send_cmd}")
     if a.dry_run:
         print("[fleet] dry-run"); return 0
     if not a.parent:
@@ -1215,8 +1230,17 @@ def cmd_revive(argv):
     sid = _resume_binding(surf).get("checkpoint_id", "") or sid   # ground-truth session over a bridge poll id
     register(surf, spec, a.parent, sid, ws)
     fs.archive_del(a.label)
-    fs.log_event("revived", label=a.label, role=spec["role"], surface=surf, session=sid)
-    print(f"[fleet] DONE: revived {a.label} = surface {surf} (session {sid})")
+    fs.log_event("revived", label=a.label, role=spec["role"], surface=surf, session=sid, fresh=a.fresh)
+    if a.fresh:                                                   # shed -> prime from the handover (like a fresh recycle)
+        ho = _latest_handover(spec["abs_cwd"])
+        prime = (f"You were just REVIVED into a FRESH session (same identity: label '{a.label}', "
+                 f"role '{spec.get('role')}'). Re-orient from your latest handover"
+                 + (f" at {ho}" if ho else " under ./handover/") + ", then continue where it left off.")
+        time.sleep(3)                                            # let the fresh TUI settle before input
+        cmuxq("send", "--surface", surf, prime)
+        cmuxq("send-key", "--surface", surf, "enter")
+        print("[fleet]   primed (fresh revive)")
+    print(f"[fleet] DONE: revived {a.label} = surface {surf} (session {sid}{', FRESH' if a.fresh else ''})")
     return 0
 
 
@@ -1579,9 +1603,10 @@ def cmd_sessions(argv):
 # ---------------------------------------------------------------- recycle (live->live, same surface)
 # Restart an agent IN PLACE on its OWN surface via cmux's native `respawn-pane` (the tmux-compat
 # kill+restart: cmux tears down the surface's current process and runs a fresh command in the SAME
-# seat). Default = FRESH session (sheds context, auto-primes from the latest handover); --resume
-# continues the session. Same surfaceId -> the registry entry (label, parent/child pointers) stays
-# valid with ZERO churn; only `session` changes. Runs DETACHED so it can recycle the CALLER itself.
+# seat). Default = RESUME (preserves context — the least-disruptive action, ratified 2026-07-01); --fresh
+# sheds context into a brand-new session and auto-primes from the latest handover. Same surfaceId -> the
+# registry entry (label, parent/child pointers) stays valid with ZERO churn; only `session` changes. Runs
+# DETACHED so it can recycle the CALLER itself. (--resume kept as a no-op alias for back-compat.)
 #
 # Why this is NOT the old kill-pid-then-type-the-launch-into-a-prompt dance: respawn-pane does the
 # teardown+restart atomically and natively, so 3 of berg-sandbox's 6 lab guards are obsolete (the
@@ -1787,6 +1812,43 @@ def _compose_recycle_cmd(label, entry, caller_tokens, add_plugins, mode, explici
     return send_cmd, checkpoint
 
 
+def _session_pref_provenance(role, tool, send_cmd, effort_override, model_override):
+    """(provenance_line, warning) for the SESSION-PREFERENCE flags (effort/model) on a recycle/launch —
+    makes 'why did it come back on X' obvious (the cmux-advisor-came-back-on-high surprise). The effective
+    value is read from the composed command; its SOURCE is resolved override > role-pin > floor >
+    binding(ad-hoc). WARNS when a ROSTER role inherits the [tool.<t>] floor effort with NO role pin: a
+    mid-session /effort writes to GLOBAL settings and is overridden by the launch flag, so it won't survive
+    the respawn — pin the role (the durable authority) or pass --effort."""
+    toks = shlex.split(send_cmd or "")
+    roster = _is_roster(role)
+    cfg = load_config() if roster else {}
+    tdef = (cfg.get("tool", {}) or {}).get(tool, {}) or {}
+    rblock = (cfg.get("role", {}) or {}).get(role, {}) or {}
+    rtool = (rblock.get(tool) if isinstance(rblock.get(tool), dict) else {}) or {}
+    parts, warn = [], ""
+    for name, override in (("--effort", effort_override), ("--model", model_override)):
+        val = _flag_val(toks, name)
+        if not val or val is True:
+            continue
+        key = name[2:]
+        if override:
+            src = "override"
+        elif not roster:
+            src = "binding"
+        elif _flag_val(shlex.split(rtool.get("flags", "")), name) not in (None, True):
+            src = "role-pin"
+        elif _flag_val(shlex.split(tdef.get("flags", "")), name) not in (None, True):
+            src = "floor"
+            if key == "effort":
+                warn = (f"[fleet] note: effort '{val}' comes from the [tool.{tool}] floor — role '{role}' "
+                        f"has no --effort pin, so a mid-session /effort won't survive this respawn. Pin it "
+                        f"in [role.{role}.{tool}].flags (the durable authority), or pass --effort.")
+        else:
+            src = "settings/env"
+        parts.append(f"{key}={val} ({src})")
+    return ("[fleet] session-prefs: " + ", ".join(parts)) if parts else "", warn
+
+
 def _recycle_plan(label, entry, caller, add_plugin, mode, session, force, prime_override, no_prime):
     """Compose ONE recycle payload (the dict the detached exec consumes). Shared by single + bulk recycle
     so the mode/session/prime logic lives in exactly one place. FRESH boots clean -> auto-prime from the
@@ -1844,10 +1906,19 @@ def cmd_recycle(argv):
         i = argv.index("--"); argv, caller = argv[:i], argv[i + 1:]
     ap = argparse.ArgumentParser(prog="fleet recycle", add_help=True)
     ap.add_argument("label", nargs="?", help="registry label (default: self, via $CMUX_SURFACE_ID)")
-    ap.add_argument("--resume", action="store_true", help="continue the session (default: fresh)")
+    ap.add_argument("--fresh", action="store_true",
+                    help="SHED context: recycle into a brand-new session, auto-primed from the latest "
+                         "handover. Default is RESUME (preserve context) — --fresh is the explicit opt-in.")
+    ap.add_argument("--resume", action="store_true",
+                    help="(now the DEFAULT; kept as a no-op alias for back-compat) continue the session")
     ap.add_argument("--session", default="", metavar="ID",
-                    help="resume an ARBITRARY prior session id directly (implies --resume; list with "
-                         "`fleet sessions <label>`) — no cmux-checkpoint surgery; single-target only")
+                    help="resume an ARBITRARY prior session id directly (list with `fleet sessions "
+                         "<label>`) — no cmux-checkpoint surgery; single-target only")
+    ap.add_argument("--effort", default="", metavar="LEVEL",
+                    help="session-preference override for THIS restart (low|medium|high|xhigh|max); layers "
+                         "over the composed loadout. Durable per-agent effort belongs in the role's toml.")
+    ap.add_argument("--model", default="", metavar="MODEL",
+                    help="session-preference override for THIS restart; layers over the composed loadout")
     ap.add_argument("--force", action="store_true", help="skip the empty-draft guard (intentional go-live)")
     ap.add_argument("--add-plugin", action="append", default=[], metavar="NAME",
                     help="union a marketplace plugin into this identity (repeatable; persisted)")
@@ -1863,7 +1934,18 @@ def cmd_recycle(argv):
                     help="bulk: also recycle muted/human-driven agents (skipped by default)")
     a = ap.parse_args(argv)
 
-    mode = "resume" if (a.resume or a.session) else "fresh"      # a --session target implies resume
+    # DEFAULT FLIPPED (ratified 2026-07-01): recycle now RESUMES (preserves context) by default; --fresh is
+    # the explicit context-shedding opt-in (was the silent default that dropped berg-sandbox's session). The
+    # old --resume is kept as an accepted no-op alias so muscle-memory/scripts don't break.
+    if a.fresh and a.session:
+        sys.exit("[fleet] recycle: --fresh and --session are contradictory (fresh sheds context; --session resumes one)")
+    mode = "fresh" if a.fresh else "resume"
+    # session-preference overrides funnel into the caller-token layer (highest precedence over the composed
+    # floor/role loadout) — applies to the single AND bulk paths.
+    if a.effort:
+        caller += ["--effort", a.effort]
+    if a.model:
+        caller += ["--model", a.model]
     selectors = {"all": a.all, "conductors": a.conductors, "children": a.children, "my-children": a.my_children}
     chosen = [k for k, on in selectors.items() if on]
     if chosen:
@@ -1886,9 +1968,15 @@ def cmd_recycle(argv):
         sys.exit(f"[fleet] recycle: session '{a.session}' not found under {label}'s projects dir; "
                  f"`fleet sessions {label}` to list resumable ids.")
     payload = _recycle_plan(label, entry, caller, a.add_plugin, mode, a.session, a.force, a.prime, a.no_prime)
+    provline, provwarn = _session_pref_provenance(entry.get("role"), entry.get("tool", "claude"),
+                                                   payload["send_cmd"], a.effort, a.model)
 
     print(f"[fleet] recycle {label} (mode={mode}, tool={entry.get('tool','claude')}, surface={surf})")
     print(f"[fleet] launch: {payload['send_cmd']}")
+    if provline:
+        print(provline)                                          # effort/model + provenance (source)
+    if provwarn:
+        print(provwarn)                                          # no-pin warning (floor-inherited effort)
     if a.add_plugin or caller:
         print("[fleet] overrides applied (persist for free: cmux re-captures this as the new binding)")
     print(f"[fleet] prime: {payload['prime'] if payload['prime'] else '(none)'}")
@@ -1925,7 +2013,8 @@ def _recycle_bulk(target, mode, caller, a):
         print(f"[fleet] recycle --{target}: no live targets"
               + (f" ({len(skipped)} skipped: {', '.join(l for l, _ in skipped)})" if skipped else ""))
         return 0
-    print(f"[fleet] recycle --{target} (mode={mode}) from {from_label}: {len(sel)} target(s), sequential + gated")
+    ov = (f", effort={a.effort}" if a.effort else "") + (f", model={a.model}" if a.model else "")
+    print(f"[fleet] recycle --{target} (mode={mode}{ov}) from {from_label}: {len(sel)} target(s), sequential + gated")
     payloads = []
     for label, entry in sel:
         payload = _recycle_plan(label, entry, caller, a.add_plugin, mode, "", a.force, a.prime, a.no_prime)
@@ -2371,12 +2460,12 @@ def main():
               "  config <role|--adhoc NAME|--cwd DIR> [--tool t]   effective config (base settings + fleet adds)\n"
               "  ls                                                live fleet x hook store; flags STALE + archived\n"
               "  archive <label>                                   park a live agent (revivable)\n"
-              "  revive <label> [--session id] [--place p] [--parent s] [--add-plugin N] [-- <flags>]\n"
-              "                                                    bring a parked agent back (replays the captured binding, claude --resume; --session targets an arbitrary prior session)\n"
+              "  revive <label> [--fresh] [--session id] [--place p] [--parent s] [--add-plugin N] [-- <flags>]\n"
+              "                                                    bring a parked agent back (default RESUME last session; --fresh sheds; --session targets an arbitrary prior one)\n"
               "  register <label> [--surface UUID] [--parent s] [--session id]\n"
               "                                                    pull a LIVE-but-unregistered agent into the registry (recovery for a skipped auto-register)\n"
-              "  recycle [label] [--resume] [--session id] [--force] [--add-plugin N] [--prime T|--no-prime] [-- <flags>]\n"
-              "                                                    restart in place, same surface/identity (default self+fresh)\n"
+              "  recycle [label] [--fresh] [--session id] [--effort L] [--model M] [--force] [--add-plugin N] [--prime T|--no-prime] [-- <flags>]\n"
+              "                                                    restart in place, same surface/identity (default self+RESUME; --fresh sheds; --effort/--model = session-pref override)\n"
               "  recycle --all|--conductors|--children|--my-children [--include-muted] [--resume] [--dry-run]\n"
               "                                                    BULK restart (sequential + gated, skips self + muted); cross-conductor = the safe topology\n"
               "  sessions <label> [--all] [--json]                 list resumable prior sessions for the agent's surface (id, age, size, snippet)\n"

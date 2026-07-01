@@ -172,20 +172,33 @@ same mechanism fanned out to a target set (`all`, `all-conductors`,
 ## Lifecycle: recycle, revive, archive
 
 - **recycle** restarts a live agent in place on its own surface, same identity,
-  via cmux's `respawn-pane`. It runs detached behind a quiet-gate (idle prompt,
-  empty draft) so it can recycle the caller itself. The confirm is crash-safe:
-  the relaunch is PATH-guarded (the fresh login shell may not have finished
-  building `$PATH`, which otherwise makes the cmux wrapper exit 127), and the
-  pre-relaunch session id is snapshotted and **excluded** from the fresh-mode
-  confirm so a crashed launch resolves to "no session" instead of false-confirming
-  on a stale store entry. If no fresh session binds, it re-fires once.
+  via cmux's `respawn-pane`. Default is **RESUME** (preserve context — the
+  least-disruptive default); **`--fresh`** sheds into a new session + primes from
+  the handover; `--session <id>` resumes an arbitrary prior session. It runs
+  detached behind a quiet-gate (idle prompt, empty draft) so it can recycle the
+  caller itself. The confirm is crash-safe: the relaunch is PATH-guarded (the
+  fresh login shell may not have finished building `$PATH`, which otherwise makes
+  the cmux wrapper exit 127), and the pre-relaunch session id is snapshotted and
+  **excluded** from the fresh-mode confirm so a crashed launch resolves to "no
+  session" instead of false-confirming on a stale store entry. If no fresh session
+  binds, it re-fires once. Bulk selectors (`--all`/`--conductors`/`--children`/
+  `--my-children`) restart many sequentially + gated, skipping self and muted.
 - **archive** parks a live agent: SIGINT for a clean TUI exit, close the tab,
-  move the entry to `archive.json` with the captured launch binding.
+  move the entry to `archive.json` with the captured launch binding. `last_session`
+  is captured from cmux's checkpoint (ground truth) so revive resumes the real id.
 - **revive** brings a parked agent back on a fresh surface, resuming its last
-  session by replaying that binding (with `--resume` swapped in).
+  session by replaying that binding (with `--resume` swapped in); `--fresh` sheds,
+  `--session <id>` targets an arbitrary prior session.
+
+Session ids are kept honest against cmux's live id: the router reconciles the
+registry `session` on every `Stop` (tool-aware, so a codex id never overwrites a
+claude agent's session), killing the "No conversation found" class on later
+archive/revive.
 
 For a roster role, recycle and revive are toml-authoritative: they re-resolve the
 current roster, so a restart picks up role or floor changes made since launch.
+Effort/model are session preferences (see operations.md): the recycle prints the
+effective value + source, and `--effort`/`--model` override for that restart.
 
 ## Worktrees
 

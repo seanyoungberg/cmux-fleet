@@ -117,6 +117,24 @@ def test_reconcile_codex_stores_bare_uuid(fs):
     assert fs.live_get("c1")["session"] == "77777777-8888-9999-aaaa-bbbbbbbbbbbb"  # no claude- prefix
 
 
+def test_bus_tool_extracts_prefix(fs):
+    assert fs.bus_tool("claude-aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee") == "claude"
+    assert fs.bus_tool("codex-aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee") == "codex"
+    assert fs.bus_tool("aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee") == ""      # already bare -> no tool
+    assert fs.bus_tool("") == ""
+
+
+def test_reconcile_refuses_cross_tool_write(fs):
+    # the berg-sandbox trap: a codex-store id must NOT overwrite a claude agent's session
+    fs.live_put("w1", {"tool": "claude", "surface": "S", "session": "claude-93666b60-ae1e-4746-bc00-d2c498fac2ff"})
+    action = fs.reconcile_session("w1", "019f144d-c5f0-7a52-b586-f9e267c469fa", "claude", event_tool="codex")
+    assert action == "skip-tool"
+    assert fs.live_get("w1")["session"] == "claude-93666b60-ae1e-4746-bc00-d2c498fac2ff"  # unchanged
+    # a matching-tool event still reconciles
+    action = fs.reconcile_session("w1", "ffffffff-0000-0000-0000-000000000000", "claude", event_tool="claude")
+    assert action == "reconcile"
+
+
 # --- the archive shelf + the live->archive->live transition -------------------------------------
 def test_archive_put_get_del(fs):
     fs.archive_put("w1", {"role": "worker", "last_session": "abc"})

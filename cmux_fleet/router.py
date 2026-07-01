@@ -125,7 +125,8 @@ def handle(ev):
     if p.get("phase") != "completed":
         return
     st = store()
-    sid_bare = fs.bare_uuid(p.get("session_id") or "")
+    raw_sid = p.get("session_id") or ""
+    sid_bare = fs.bare_uuid(raw_sid)
     surface = _rec_by_session(st, sid_bare).get("surfaceId", "")
     if not surface:
         return
@@ -135,11 +136,17 @@ def handle(ev):
     # Keep the registry `session` honest against cmux's live id on EVERY Stop: empty -> backfill (codex
     # binds on its 1st turn); DIVERGED -> reconcile (a fresh respawn re-issues the conversation id, or a
     # bridge id was stored at bind -> the "No conversation found" class on a later archive/revive).
-    action = fs.reconcile_session(entry["label"], sid_bare, entry.get("tool", "claude"))
+    # TOOL-AWARE (reconcile_session enforces it): only reconcile from the entry's OWN tool id — a
+    # codex-store id must never overwrite a claude agent's session (berg-sandbox's stale 019f144d was a
+    # codex id on a now-claude agent).
+    entry_tool = entry.get("tool", "claude")
+    action = fs.reconcile_session(entry["label"], sid_bare, entry_tool, event_tool=fs.bus_tool(raw_sid))
     if action == "backfill":
         log(f"[backfill] {entry['label']}: session {sid_bare[:12]} bound on first turn")
     elif action == "reconcile":
         log(f"[reconcile] {entry['label']}: registry session -> {sid_bare[:12]} (was stale/bridge id)")
+    elif action == "skip-tool":
+        log(f"[reconcile] skip {entry['label']}: {fs.bus_tool(raw_sid)} Stop on a {entry_tool} agent (no cross-tool id write)")
 
     try:
         ts = datetime.fromisoformat(ev.get("occurred_at", "").replace("Z", "+00:00"))
