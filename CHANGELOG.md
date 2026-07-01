@@ -6,6 +6,42 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [0.3.0] - 2026-07-01
+
+Lifecycle + notifications hardening. Two reviewed features (each went through a
+cross-model adversarial review before merge).
+
+### Added
+
+- **Recycle/revive lifecycle hardening.** `fleet recycle` default flips
+  **FRESH → RESUME** (the least-disruptive action; `--fresh` is the explicit
+  context-shed, `--resume` kept as a no-op alias). `--session <id>` resumes an
+  arbitrary prior session, and `fleet sessions <label>` lists resumable sessions
+  so an operator can pick one. Registry↔session **reconciliation** (tool-aware:
+  router Stop-time + bind-time + archive-time) keeps the recorded session honest
+  against cmux's ground truth, killing the "No conversation found" class on
+  archive/revive. **Bulk restart** selectors (`--all`/`--conductors`/`--children`/
+  `--my-children`, sequential + gated, skips self + muted + non-live). Effort/model
+  **provenance** on recycle/launch + first-class `--effort`/`--model` overrides.
+- **Notifications: wake-now by default.** The idle-wake gate no longer trusts a
+  stale/foreign `running` record — a bound-session + freshness cross-check plus the
+  on-screen prompt as arbiter fixes the idle-conductor-never-woken stall. The
+  `notify-mode` dial is demoted to a single **`passive` mute** (honored across
+  completions, peer-msg, broadcast, and heartbeat); wake-now is the default. Adds a
+  bounded event-driven wake **retry** (only when genuinely mid-turn at event time),
+  **router self-health** (bus-consumption stamp + alive-but-wedged detection), and a
+  **stale-draft-gate** (an abandoned draft is clobbered-with-log after it ages past a
+  threshold, so a walked-away draft can't silence a conductor forever; active typing
+  is preserved).
+
+### Known issues
+
+- **Moved-child completion routing (root cause #3):** moving an already-running
+  child's surface across workspaces can desync its hook-store binding so its
+  completion is dropped before it's queued. Operational guard: don't `move-surface`
+  a running child (recycle to rebind). A router registry-fallback fix is landing as
+  a fast-follow (v0.3.1).
+
 ## [0.2.0] - 2026-07-01
 
 Packaging release. cmux-fleet is now an installable **uv tool** (`fleet` CLI + a
