@@ -128,3 +128,34 @@ def test_gate_allows_bind_when_resolved(monkeypatch):
     # non-claude tool / no session -> gate never runs the dismiss, always safe to proceed
     assert fleet._resume_and_gate("S", "cmd", "codex", "sess", lambda m: None) is True
     assert fleet._resume_and_gate("S", "cmd", "claude", "", lambda m: None) is True
+
+
+# --- fresh-after-cwd-move: a FRESH recycle must PERSIST the new cwd so the next default RESUME finds
+#     the new session (codex residual-blocker: compose-time pin was right, persistence was missing) -----
+def test_fresh_recycle_persists_new_cwd_then_resume_composes_from_new(fs, monkeypatch):
+    from cmux_fleet import state as fleet_state
+    # role w moved to /NEW; registry still records /OLD + the old session.
+    fleet_state.live_put("w", {"role": "w", "tool": "claude", "surface": "S",
+                               "cwd": "/OLD", "session": "claude-OLD", "kind": "child"})
+    # stub the respawn/bind machinery so _recycle_exec_one runs with no live surface
+    monkeypatch.setattr(fleet.time, "sleep", lambda *_: None)
+    monkeypatch.setattr(fleet, "cmuxq", lambda *a, **k: "")
+    monkeypatch.setattr(fleet, "_quiet_gate", lambda *a, **k: True)
+    monkeypatch.setattr(fleet, "poll_session", lambda surf, timeout=1: "")          # no stale pre_sid
+    monkeypatch.setattr(fleet, "_poll_session_back", lambda *a, **k: "NEWSID")       # fresh bind
+    payload = {"label": "w", "surface": "S", "send_cmd": "cd /NEW && claude x", "mode": "fresh",
+               "tool": "claude", "force": True, "prime": None, "old_session": "OLD", "cwd": "/NEW"}
+    assert fleet._recycle_exec_one(payload) == 0
+    # PERSISTED: registry cwd is now /NEW (was /OLD) and the fresh session is bound
+    assert fleet_state.live_get("w")["cwd"] == "/NEW"
+    assert fleet_state.live_get("w")["session"] == "claude-NEWSID"
+    # a subsequent DEFAULT (resume) recycle now composes from /NEW (where the new session lives)
+    monkeypatch.setattr(fleet, "_is_roster", lambda role: True)
+    monkeypatch.setattr(fleet, "_resume_binding", lambda surf: {})
+    monkeypatch.setattr(fleet, "load_config", lambda: {"role": {"w": {}}})
+    monkeypatch.setattr(fleet, "resolve", lambda *a: {
+        "tool": "claude", "role": "w", "label": "w", "kind": "child", "place": "tab", "group": "",
+        "cwd": "/NEW", "plugins": [], "flags": [], "env": {}, "settings": "",
+        "enable_plugins": [], "setting_sources": ""})
+    resume, _ = fleet._compose_recycle_cmd("w", fleet_state.live_get("w"), [], [], "resume", "")
+    assert "cd /NEW" in resume and "--resume NEWSID" in resume

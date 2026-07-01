@@ -1223,6 +1223,14 @@ def cmd_revive(argv):
             print(f"[fleet] note: tool '{tool}' has no resume in this flow; fresh launch")
         send_cmd = render_send_cmd(bin_name, args, env, spec["abs_cwd"])
         source = "registry-spec"
+    if a.fresh:
+        # PERSIST: a fresh revive creates a NEW session under the cwd the send cmd uses (the re-resolved
+        # toml cwd for a roster role). register() records spec["abs_cwd"], so pin it to that same cwd —
+        # else the registry keeps the OLD cwd and the next default RESUME can't find the new session.
+        fresh_cwd = _cwd_of_sendcmd(send_cmd)
+        if fresh_cwd:
+            spec["cwd"] = fresh_cwd
+            spec["abs_cwd"] = fresh_cwd if os.path.isabs(fresh_cwd) else os.path.join(ROOT, fresh_cwd)
     disp = "FRESH (no resume)" if a.fresh else f"resume {sess[:12] or '-'}"
     print(f"[fleet] revive {a.label} (tool={tool}, {disp}, source={source})\n[fleet] launch: {send_cmd}")
     if a.dry_run:
@@ -1886,6 +1894,18 @@ def _session_pref_provenance(role, tool, send_cmd, effort_override, model_overri
     return ("[fleet] session-prefs: " + ", ".join(parts)) if parts else "", warn
 
 
+def _cwd_of_sendcmd(send_cmd):
+    """The abs cwd a composed launch cd's into (`cd <cwd> && ...`), or ''. Used to PERSIST the effective
+    cwd after a FRESH recycle/revive: the new session is created under this cwd's project dir, so the
+    registry must record it — else the next default RESUME composes `cd <stale cwd> && --resume <new sid>`
+    and hits 'No conversation found' (the exact class #4 kills, re-opened by a stale registry cwd)."""
+    try:
+        toks = shlex.split(send_cmd or "")
+    except ValueError:
+        return ""
+    return toks[1] if len(toks) >= 2 and toks[0] == "cd" else ""
+
+
 def _recycle_plan(label, entry, caller, add_plugin, mode, session, force, prime_override, no_prime):
     """Compose ONE recycle payload (the dict the detached exec consumes). Shared by single + bulk recycle
     so the mode/session/prime logic lives in exactly one place. FRESH boots clean -> auto-prime from the
@@ -1906,7 +1926,8 @@ def _recycle_plan(label, entry, caller, add_plugin, mode, session, force, prime_
                      + (f" at {ho}" if ho else " under ./handover/")
                      + ", then continue where it left off.")
     return {"label": label, "surface": surf, "send_cmd": send_cmd, "mode": mode,
-            "tool": entry.get("tool", "claude"), "force": force, "prime": prime, "old_session": old_sid}
+            "tool": entry.get("tool", "claude"), "force": force, "prime": prime, "old_session": old_sid,
+            "cwd": _cwd_of_sendcmd(send_cmd)}          # effective launch cwd, persisted after a FRESH bind
 
 
 def _bulk_targets(target, from_surface, from_label, include_muted):
@@ -2232,6 +2253,8 @@ def _recycle_exec_one(p):
         e["surface"] = surf
         if mode == "fresh":
             e["session"] = ""                            # a NEW session binds on 1st turn -> router backfills
+            if p.get("cwd"):
+                e["cwd"] = p["cwd"]                      # PERSIST the fresh cwd so the next RESUME finds the new session
         fs.live_put(label, e)
         fs.log_event("recycled", label=label, role=e.get("role"), surface=surf,
                      session=e.get("session") or "", mode=mode)
@@ -2272,6 +2295,8 @@ def _recycle_exec_one(p):
             e = fs.live_get(label) or {}
             e["surface"] = surf
             e["session"] = f"claude-{sid}" if e.get("tool", "claude") == "claude" else sid
+            if mode == "fresh" and p.get("cwd"):
+                e["cwd"] = p["cwd"]                      # PERSIST the fresh cwd (a role move -> new session lives here)
             fs.live_put(label, e)
             fs.log_event("recycled", label=label, role=e.get("role"), surface=surf, session=sid, mode=mode)
         if prime and sid:
