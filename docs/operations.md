@@ -15,8 +15,8 @@ echo auto > "$CMUX_STATE_DIR/notify-mode"   # passive | autodrain | auto
 # spawn + drive
 fleet launch <role> [--place tab|pane|workspace] [--dry-run] [-- <tool flags>]
 fleet launch --adhoc <name> --tool claude -- --model opus
-python3 scripts/drive-child.py <surface> "<prompt>"
-python3 scripts/child-digest.py <session-frag> 5
+fleet drive-child <surface> "<prompt>"
+fleet child-digest <session-frag> 5
 
 # inventory + lifecycle
 fleet ls                                    # live x hook store; flags STALE / pending / MUTED
@@ -34,9 +34,9 @@ fleet worktree ls / clean <label> [--wip-commit]
 eval "$(/path/to/<build>/bin/fleet profile <name> --init)"   # pin a build (see docs/profiles.md)
 
 # comms
-python3 scripts/peer-msg.py <to-label> "<msg>" [--reply-to <id>] [--no-reply]
+fleet peer-msg <to-label> "<msg>" [--reply-to <id>] [--no-reply]
 fleet broadcast "<msg>" [--target all|all-conductors|all-children|my-children]
-python3 scripts/inbox-ack.py <seq> [--peer]
+fleet inbox-ack <seq> [--peer]
 ```
 
 ## The router daemon
@@ -87,7 +87,7 @@ daemon, kill the strays, then `fleet daemon start`.
 Under the hood the daemon's `router.py --live` writes to the inbox, fires `cmux
 notify` banners, and (in `auto` mode) wakes idle conductors, tailing the cmux
 agent bus with a replay cursor (`router.seq`) so a restart resumes where it left
-off. To observe without acting, run it directly: `python3 scripts/router.py`
+off. To observe without acting, run it directly: `python -m cmux_fleet.router`
 (no `--live`) logs what it would do and changes nothing.
 
 ## The mode dial
@@ -272,7 +272,7 @@ the agent launched.
 
 When you are driving a child directly (you are in the loop), mute it so the
 router stops pushing its completions to its parent. The parent then reads it on
-demand (`fleet ls` shows it `MUTED`; use `child-digest.py` for the content).
+demand (`fleet ls` shows it `MUTED`; use `fleet child-digest` for the content).
 
 ```
 fleet mute worker
@@ -286,9 +286,9 @@ path as completions): the peer sees it in context, and an idle peer is woken to
 handle it now unless you pass `--no-wake`.
 
 ```
-python3 scripts/peer-msg.py <to-label> "your message"
-python3 scripts/peer-msg.py <to-label> "ack, on it" --reply-to <msg_id>
-python3 scripts/peer-msg.py <to-label> "fyi only" --no-reply
+fleet peer-msg <to-label> "your message"
+fleet peer-msg <to-label> "ack, on it" --reply-to <msg_id>
+fleet peer-msg <to-label> "fyi only" --no-reply
 ```
 
 A fresh message expects a reply by default; `--no-reply` marks it
@@ -311,8 +311,8 @@ After handling what the awareness or drain hook surfaced, ack it so it stops
 re-surfacing. The hooks print the exact command, including the seq:
 
 ```
-python3 scripts/inbox-ack.py <seq>           # ack completions
-python3 scripts/inbox-ack.py <seq> --peer    # ack peer messages
+fleet inbox-ack <seq>           # ack completions
+fleet inbox-ack <seq> --peer    # ack peer messages
 ```
 
 Acking an exact seq is race-safe: a message that arrived later has a higher seq
@@ -361,7 +361,7 @@ on `$PATH`:
 To exercise an isolated run, point `CMUX_STATE_DIR` at a throwaway directory:
 
 ```
-CMUX_STATE_DIR=$(mktemp -d) python3 scripts/router.py
+CMUX_STATE_DIR=$(mktemp -d) python -m cmux_fleet.router
 ```
 
 Layer your own setup back in by setting the env vars or filling in the `[fleet]`

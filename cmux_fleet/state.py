@@ -31,14 +31,13 @@ ARCHIVE = os.path.join(STATE, "archive.json")
 LOG = os.path.join(STATE, "log.jsonl")
 MODEFILE = os.path.join(STATE, "notify-mode")
 
-# Agent-helper command hints emitted into conductor context by the awareness/drain hooks. In Phase 1
-# the four helpers are still standalone plugin scripts under <repo>/scripts/; the package lives at
-# <repo>/cmux_fleet/, so they resolve one dir up. Phase 2 folds these into `fleet <verb>` subcommands
-# and these constants become the strings "fleet child-digest" / "fleet inbox-ack" / "fleet peer-msg".
-_PLUGIN_SCRIPTS = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "scripts")
-DIGEST = os.path.join(_PLUGIN_SCRIPTS, "child-digest.py")
-ACK = os.path.join(_PLUGIN_SCRIPTS, "inbox-ack.py")
-PEERMSG = os.path.join(_PLUGIN_SCRIPTS, "peer-msg.py")
+# Agent-helper command hints emitted into conductor context by the awareness/drain hooks. Phase 2
+# folded the four standalone plugin scripts into `fleet <verb>` subcommands, so these are now the app
+# command strings a conductor runs directly (`fleet` on PATH -> THIS build, via the profile pin). The
+# hooks interpolate them as-is: `f"{DIGEST} {frag} 5"` -> `fleet child-digest <frag> 5`.
+DIGEST = "fleet child-digest"
+ACK = "fleet inbox-ack"
+PEERMSG = "fleet peer-msg"
 
 
 # --- primitives ----------------------------------------------------------------------------

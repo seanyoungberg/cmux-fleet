@@ -45,8 +45,8 @@ try:
             frag = (r.get("child_session", "")).replace("claude-", "")[:8]
             gist = (r.get("gist") or "").strip().replace("\n", " ")[:100]
             lines.append(f"  - seq {r.get('seq')}  {r.get('label','?')}: \"{gist}\"   "
-                         f"full: python3 {fs.DIGEST} {frag} 5")
-        lines.append(f"  ack: python3 {fs.ACK} {comp_hi}")
+                         f"full: {fs.DIGEST} {frag} 5")
+        lines.append(f"  ack: {fs.ACK} {comp_hi}")
     if peers:
         fs.block_set(surface, "peer", peer_hi)
         lines.append(f"You have {len(peers)} peer message(s) (a DELIBERATE send from a peer conductor). "
@@ -59,8 +59,8 @@ try:
             for bl in ((r.get("body") or "").strip().splitlines() or [""]):
                 lines.append(f"      {bl}")
             if r.get("reply_expected"):
-                lines.append(f"      reply: python3 {fs.PEERMSG} {r.get('from_label')} \"<reply>\" --reply-to {mid}")
-        lines.append(f"  ack peer msgs: python3 {fs.ACK} {peer_hi} --peer")
+                lines.append(f"      reply: {fs.PEERMSG} {r.get('from_label')} \"<reply>\" --reply-to {mid}")
+        lines.append(f"  ack peer msgs: {fs.ACK} {peer_hi} --peer")
 
     print(json.dumps({"decision": "block", "reason": "\n".join(lines)}))
     sys.exit(0)

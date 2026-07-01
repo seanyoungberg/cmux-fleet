@@ -3,23 +3,14 @@
 # processed BEFORE the terminal finishes rendering the paste, so it never submits — the command/prompt
 # sits unexecuted. Both paths now VERIFY-then-RETRY the Enter. These are pure units: the cmux reads
 # (cmuxq / capture-pane / poll_session) are stubbed, so nothing touches a real surface.
-import importlib.util
-import os
-import sys
-
-from conftest import SCRIPTS
-
-sys.path.insert(0, SCRIPTS)
-from cmux_fleet import cli as fleet  # noqa: E402
+from cmux_fleet import cli as fleet
 
 
 def _load_drive():
-    """Import the hyphenated drive-child.py as a module (not importable by name)."""
-    path = os.path.join(SCRIPTS, "drive-child.py")
-    spec = importlib.util.spec_from_file_location("drive_child", path)
-    mod = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(mod)
-    return mod
+    """The drive-child logic now lives in the `fleet drive-child` verb (cmux_fleet.helpers), folded out
+    of the old standalone scripts/drive-child.py in Phase 2."""
+    from cmux_fleet import helpers
+    return helpers
 
 
 # --- launch: _send_launch_and_confirm re-kicks the Enter until the session binds ------------------

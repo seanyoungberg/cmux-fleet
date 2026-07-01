@@ -96,7 +96,7 @@ mode dial below).
 | `fleet broadcast "<msg>"` | input-safe heads-up to a target set of live agents |
 | `fleet profile <name>` | pin all entrypoints at this build (multi-build isolation) |
 | `fleet daemon start\|stop\|status\|restart` | run the router as a detached daemon (survives shell exit + recycle); `--heartbeat` to nudge idle conductors |
-| `peer-msg.py` / `child-digest.py` / `drive-child.py` / `inbox-ack.py` | agent-facing helpers |
+| `fleet peer-msg` / `fleet child-digest` / `fleet drive-child` / `fleet inbox-ack` | agent-facing helpers |
 
 Full runbook in `docs/operations.md`.
 

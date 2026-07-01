@@ -1903,7 +1903,7 @@ def cmd_recycle_exec(argv):
 def cmd_mute(argv, mute=True):
     """Mute/unmute a child's completion delivery. When muted, the router does NOT push the child's
     turn-completions to the parent's inbox (no inbox row, no `cmux notify`, no idle-wake); the parent
-    reads that child ON DEMAND (`fleet ls` shows it MUTED with its session → `child-digest`). Use when
+    reads that child ON DEMAND (`fleet ls` shows it MUTED with its session → `fleet child-digest`). Use when
     Berg drives a child directly (he is in the loop, so the conductor should not be spammed). The
     inverse of the notify-on-completion default. Mute is per-child runtime state on `fleet.json`.
 
@@ -1928,7 +1928,7 @@ def cmd_mute(argv, mute=True):
     fs.log_event(verb + "d", label=label)
     if mute:
         print(f"[fleet] {label} MUTED — completions suppressed; read on demand "
-              f"(fleet ls → child-digest {(e.get('session') or '').replace('claude-','')[:12]})")
+              f"(fleet ls → fleet child-digest {(e.get('session') or '').replace('claude-','')[:12]})")
     else:
         print(f"[fleet] {label} unmuted — completions deliver to its parent again")
     return 0
@@ -2113,18 +2113,26 @@ def main():
               "  paint                                             sync fleet state onto the cmux sidebar (status pills + ctx bars)\n"
               "  worktree <ls | clean <label> [--wip-commit]>      manage fleet-owned git worktrees (config-gated, default-off)\n"
               "  profile <name> [--base DIR] [--root DIR] [--init]  emit env that pins ALL entrypoints at THIS build (eval it for multi-build isolation)\n"
-              "  daemon <start|stop|status|restart> [--heartbeat [SECS]]  run the router as a detached daemon (survives shell exit + recycle)")
+              "  daemon <start|stop|status|restart> [--heartbeat [SECS]]  run the router as a detached daemon (survives shell exit + recycle)\n"
+              "  drive-child <surface-uuid> <prompt...>            submit a prompt to a child's TUI (beats the paste-settle enter-race)\n"
+              "  peer-msg <to-label> \"<body>\" [--no-reply] [--reply-to <id>] [--expect-reply] [--no-wake]\n"
+              "                                                    input-safe A2A: message a live PEER conductor (into its context, never its input box)\n"
+              "  child-digest <session-frag> [N]                   print a child's last N transcript turns (the reliable content source)\n"
+              "  inbox-ack <seq> [--peer] [--surface UUID]         mark shown completions/peer msgs handled so they stop re-surfacing")
         return 0
     sub, rest = sys.argv[1], sys.argv[2:]
     from . import features as ff
     from . import daemon as fd
+    from . import helpers as fh
     fns = {"launch": cmd_launch, "config": cmd_config, "ls": cmd_ls,
            "archive": cmd_archive, "revive": cmd_revive, "register": cmd_register, "recycle": cmd_recycle,
            "_recycle-exec": cmd_recycle_exec, "broadcast": cmd_broadcast,
            "mute": lambda a: cmd_mute(a, mute=True), "unmute": lambda a: cmd_mute(a, mute=False),
            "rm": cmd_rm, "worktree": cmd_worktree, "profile": cmd_profile, "daemon": fd.cmd_daemon,
            "vitals": ff.cmd_vitals, "find": ff.cmd_find, "graph": ff.cmd_graph,
-           "serve": ff.cmd_serve, "paint": ff.cmd_paint}
+           "serve": ff.cmd_serve, "paint": ff.cmd_paint,
+           "drive-child": fh.cmd_drive_child, "peer-msg": fh.cmd_peer_msg,
+           "child-digest": fh.cmd_child_digest, "inbox-ack": fh.cmd_inbox_ack}
     if sub in fns:
         return fns[sub](rest)
     sys.exit(f"fleet: unknown subcommand '{sub}'")

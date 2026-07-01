@@ -35,6 +35,21 @@ Post-v0.1.0 work, not yet tagged. Candidate for v0.1.1.
   agents; promotes a parked label to live, idempotent on the same surface, and
   refuses to move a label already live under a different surface.
 
+### Changed
+
+- **Agent helpers folded into `fleet` subcommands (packaging P2.1).** The four
+  standalone plugin scripts — `scripts/{drive-child,child-digest,peer-msg,inbox-ack}.py`
+  — are now `fleet drive-child` / `fleet child-digest` / `fleet peer-msg` /
+  `fleet inbox-ack` (bodies in `cmux_fleet/helpers.py`, kept out of the 2k-line
+  `cli.py` per P3.1). One app, one entrypoint: a conductor runs the verb via the
+  `fleet` on PATH instead of shelling into a per-plugin script path. The
+  awareness/drain hook context notes now emit the `fleet <verb>` forms. **Breaking:**
+  the old `scripts/<helper>.py` paths are removed; any external caller that copied
+  a script path must switch to the subcommand. A new static test
+  (`tests/test_static.py::test_no_stale_helper_or_router_script_refs`) fails the
+  release if any doc/skill/profile/README/hook still names a deleted
+  `scripts/<helper>.py` or `scripts/router.py`.
+
 ### Fixed
 
 - **`fleet profile` works from an installed wheel (packaging P1.1).** Phase 1's

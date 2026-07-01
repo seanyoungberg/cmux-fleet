@@ -4,11 +4,11 @@ The spine as-built, by file:
 
 - `scripts/config.py` resolves every path/setting (env > `[fleet]` toml > XDG default).
 - `scripts/fleet_state.py` owns the state model: the label-keyed registry, the unified inbox, the archive shelf, the hook-store union, the idle-wake gate.
-- `scripts/router.py` is the bus router: child `Stop` -> deliver a completion to the parent. One process serves every conductor.
+- `cmux_fleet/router.py` is the bus router: child `Stop` -> deliver a completion to the parent. One process serves every conductor.
 - `scripts/fleet_daemon.py` is the daemon manager (`fleet daemon start|stop|status|restart`): it double-forks `router.py --live` into a detached supervisor so the router survives shell exit, Bash-tool cleanup, and a conductor recycle.
 - `scripts/hooks/awareness.py` + `scripts/hooks/drain.py` surface the inbox into a conductor's context (never its input box).
 - `scripts/fleet.py` is the CLI: launch, the lifecycle verbs, peer messaging, broadcast, worktrees, profiles, and the read-only views (`scripts/fleet_features.py`).
-- `scripts/peer-msg.py`, `scripts/child-digest.py`, `scripts/drive-child.py`, `scripts/inbox-ack.py` are the agent-facing helpers.
+- `fleet peer-msg`, `fleet child-digest`, `fleet drive-child`, `fleet inbox-ack` are the agent-facing helpers.
 
 ## The division of labor
 
@@ -91,7 +91,7 @@ read to answer "who am I" and "what is in my inbox".
 
 ## The router daemon
 
-`scripts/router.py` is one long-lived process, not a hook, and serves every
+`cmux_fleet/router.py` is one long-lived process, not a hook, and serves every
 conductor on the machine. It runs under `fleet daemon` (`scripts/fleet_daemon.py`),
 which double-forks with `setsid` so the router keeps its own session and process
 group and survives the starting shell exiting, an agent's Bash-tool process-group
@@ -117,7 +117,7 @@ with `phase == completed`:
    A **muted** child is suppressed (no row, no notify, no wake; the parent reads
    it on demand). A **conductor**'s own Stop only triggers an idle-wake check.
 
-Run it `python3 scripts/router.py` to observe (log decisions, write nothing) or
+Run it `python -m cmux_fleet.router` to observe (log decisions, write nothing) or
 `--live` to act.
 
 ## The two hooks
@@ -159,7 +159,7 @@ configuration table in the README for every key.
 ## Peer messaging (A2A)
 
 Child-to-parent delivery is automatic (the router). Talking to a **peer**
-conductor is deliberate: `peer-msg.py` appends a `peer` row to the same unified
+conductor is deliberate: `fleet peer-msg` appends a `peer` row to the same unified
 inbox, addressed to the peer's surface, so the peer's awareness hook surfaces it
 in context. A reply protocol rides the row: a fresh message expects a reply by
 default, `--no-reply` marks it informational, `--reply-to <id>` makes a message a

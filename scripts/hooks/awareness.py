@@ -29,8 +29,8 @@ try:
             frag = (r.get("child_session", "")).replace("claude-", "")[:8]
             gist = (r.get("gist") or "").strip().replace("\n", " ")[:100]
             lines.append(f"  - seq {r.get('seq')}  {r.get('label','?')}: \"{gist}\"   "
-                         f"full: python3 {fs.DIGEST} {frag} 5")
-        lines.append(f"  ack when handled: python3 {fs.ACK} {fs.max_seq(comp)}")
+                         f"full: {fs.DIGEST} {frag} 5")
+        lines.append(f"  ack when handled: {fs.ACK} {fs.max_seq(comp)}")
     if peers:
         lines.append(f"[peer] {len(peers)} peer message(s) for you (a DELIBERATE send from a peer "
                      f"conductor, NOT a child you dispatched; input-safe context note, not from the human):")
@@ -42,8 +42,8 @@ try:
             for bl in ((r.get("body") or "").strip().splitlines() or [""]):
                 lines.append(f"      {bl}")
             if r.get("reply_expected"):
-                lines.append(f"      reply: python3 {fs.PEERMSG} {r.get('from_label')} \"<reply>\" --reply-to {mid}")
-        lines.append(f"  ack when handled: python3 {fs.ACK} {fs.max_seq(peers)} --peer")
+                lines.append(f"      reply: {fs.PEERMSG} {r.get('from_label')} \"<reply>\" --reply-to {mid}")
+        lines.append(f"  ack when handled: {fs.ACK} {fs.max_seq(peers)} --peer")
 
     print(json.dumps({"hookSpecificOutput": {
         "hookEventName": "UserPromptSubmit", "additionalContext": "\n".join(lines)}}))
