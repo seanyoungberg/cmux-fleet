@@ -6,8 +6,7 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
-Post-v0.1.0 work, not yet tagged. The conductor may fold in the parallel code
-worker's fixes here before cutting v0.1.1.
+Post-v0.1.0 work, not yet tagged. Candidate for v0.1.1.
 
 ### Added
 
@@ -26,7 +25,26 @@ worker's fixes here before cutting v0.1.1.
   no dead-session detection or auto-recycle. `restart` preserves the running
   heartbeat setting unless overridden.
 
+- **`fleet register <label> [--surface UUID] [--parent] [--session]`.** Manual
+  escape hatch to pull a LIVE-but-unregistered agent into the registry — recovery
+  for a skipped auto-register (see the resume gate below) or an agent launched
+  outside fleet, for which no command previously existed. Derives
+  tool/session/workspace/cwd from the live surface (cmux hook store) and rebuilds
+  the spec from the roster role (toml-authoritative), falling back to the
+  archive/live entry or the surface's own `AGENT_ROLE`/binding for off-roster
+  agents; promotes a parked label to live, idempotent on the same surface, and
+  refuses to move a label already live under a different surface.
+
 ### Fixed
+
+- **Router bus singleton guard (no more double-processing).** A stray
+  `router.py --live` on the same bus double-processed every event (during the
+  cutover, 3 strays triple-processed the bus and duplicate child completions
+  reached conductors). The live router now acquires an exclusive, non-blocking
+  `flock` on a per-state lockfile before consuming; a second live router that
+  can't get it exits instead of processing in parallel. `fleet daemon start`
+  reaps a stray live router holding the lock first (matched by lockfile pid + a
+  `ps` cmdline check, so a pid-reused unrelated process is left alone).
 
 - **Recycle/revive auto-resumes the FULL session.** `claude --resume` on an old
   or large session shows a summary-vs-full menu that hung an automated respawn
@@ -34,6 +52,16 @@ worker's fixes here before cutting v0.1.1.
   menu blocked). The relaunch now auto-picks the full session and dismisses the
   menu, so recycle and revive resume complete context instead of stalling or
   silently compacting.
+
+- **Resume-menu watch is event-driven and gates registration.** The dismiss used
+  a fixed window that closed before a heavy loadout (e.g. 6 plugins, 30-40s boot)
+  rendered the menu, so revive was left at the shell. It now polls for one of
+  three states (menu / already-running / still-booting) under a generous,
+  plugin-count-scaled ceiling. Crucially, the menu *gates* the session bind, so a
+  timed-out dismiss used to fall through and skip `register()` — leaving the agent
+  running but UNREGISTERED (a live pane still shown as archived). Revive and
+  recycle now abort loudly on timeout instead of half-binding (revive before
+  `archive_del`, so the label stays parked and re-runnable).
 
 ## [0.1.0] - 2026-06-30
 
