@@ -476,6 +476,30 @@ it — so `bootout` (or set the job disabled) is the way to actually take it dow
 One launchd job per state dir: a second profile's daemon is a second plist with
 its own `Label` and `CMUX_STATE_DIR`.
 
+## Upstream risk register (design around these)
+
+cmux's session persistence and agent-status signals are not fully trustworthy at
+the versions the fleet runs on, and the resume / parked-context strategy leans on
+exactly those. Treat them as not-yet-reliable and design around them —
+**handover-to-disk is the backstop, not an optional nicety.** The risks that
+touch the design directly:
+
+- **Hibernation can overwrite a live transcript with a stub.** Background
+  hibernation has been observed replacing a running session's JSONL with a stub,
+  after which `claude --resume` returns "No conversation found" — permanent
+  context loss. Because resume depends on transcript integrity, a written
+  handover is the mandatory fallback here.
+- **Running / needs-input indicators are flaky.** The status signal the fleet
+  routes on is unreliable upstream (a long-standing, widely-hit bug). cmux-fleet
+  mitigates by reading the hook store's `agentLifecycle` plus the debounced
+  `Stop` trigger rather than the sidebar pill — but the underlying machinery is
+  the same, so a completion is confirmed from the transcript, never from a pill.
+- **Sessions can be lost on restart, relaunch, auto-update, or the restore
+  shortcut.** Any of these can drop a workspace or session with no recovery. Do
+  not assume cmux's own restore brings the fleet back up; the launcher plus
+  handover-to-disk is the reliable path until declarative session-restore is
+  wired.
+
 ## Migration runbook: app/plugin cutover
 
 **Document, verify, decide — do not fire blind.** Moving a live fleet onto a new
