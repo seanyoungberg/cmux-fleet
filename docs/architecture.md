@@ -45,6 +45,110 @@ The router and hooks treat cmux's facilities as three distinct sources:
   reliable source). The parser handles both the claude and codex transcript
   dialects.
 
+## The claude wrapper and the `CMUX_*` footgun
+
+A fleet agent is `claude` (or `codex`) running in a cmux **terminal surface**.
+When it starts there, cmux sets `$CMUX_SURFACE_ID` and a `cmux-claude-wrapper`
+shim on `PATH` injects a `--settings` that wires the full Claude Code lifecycle
+(SessionStart, UserPromptSubmit, Stop, SessionEnd, Notification,
+PermissionRequest, ...) to `cmux hooks`. That is what makes a session send-able,
+readable, restorable, and a clean emitter of lifecycle events with correct
+attribution — with none of the plugin's own hook plumbing. The wrapper
+**deep-merges** any `--settings` you pass (hook-event arrays concatenate, your
+scalars win), so a conductor's own `--plugin-dir` hooks ride *on top of* cmux's
+lifecycle instead of clobbering it.
+
+Three wrapper behaviors shape the orchestration built on it:
+
+- **It is gated on `$CMUX_SURFACE_ID`.** Set → it injects the hooks and a session
+  id. Unset, or `CMUX_CLAUDE_HOOKS_DISABLED=1` → it passes straight through to the
+  real `claude` with no hooks and no session id. Those are the two levers for
+  running a `claude` inside a cmux terminal *without* it touching cmux state.
+- **It assigns a fresh `--session-id`** unless you already pass
+  `--resume`/`--session-id`/`--continue`. So a relaunch with `--resume <id>` keeps
+  the seat's session; a bare launch gets a new one. The surface id is the stable
+  identity, not the session.
+- **It injects for `claude -p` too.** This is the footgun: a nested `claude -p`
+  (or a Claude Code Task-tool subagent, which runs in-process on the parent's
+  surface) inherits the parent's `$CMUX_SURFACE_ID`, so *its* lifecycle hooks fire
+  against the **parent** surface and corrupt the parent's status a few seconds
+  later. The fix is to **scrub every `CMUX_*` variable (and set
+  `CMUX_CLAUDE_HOOKS_DISABLED=1`) before spawning any nested agent** — the same
+  discipline cmux's own background summarizer follows. For any non-trivial helper,
+  **prefer a real cmux child (its own surface and session) over an in-process
+  subagent**, so lifecycle stays attributable.
+
+## Reading `agentLifecycle`
+
+cmux runs the session state machine and stores the result, so the plugin never
+recomputes busy/idle from raw events. The field has four values —
+`unknown | running | idle | needsInput` — and there is **no `ended`**
+(session-end clears the record). Two traps matter when routing on it:
+
+- **A finished turn sits at `idle`,** with its real last message; it does *not*
+  auto-flip to `needsInput`. `needsInput` fires only on a genuine signal: a
+  permission / `AskUserQuestion` / `ExitPlanMode` gate, or a long idle-at-prompt.
+  So a child that just completed is `idle`, not `needsInput`. **Not-busy = `idle`
+  or `needsInput`**; its output is ready to read either way.
+- **Busy = a *fresh*, live `running` record.** A `running` record that has not
+  ticked within a staleness window (~90s) is treated as **not** mid-turn, so an
+  orphaned or stale `running` can never wedge the wake gate into thinking a
+  finished conductor is still working. The input-safe wake gate (see **The two
+  hooks**, below) then confirms an actual clean idle prompt *on screen* before
+  injecting — the screen is ground truth, not the store. These status signals are
+  upstream-flaky (see the risk register in `docs/operations.md`), which is why the
+  router trusts the debounced `Stop` and a transcript read, never the live sidebar
+  pill.
+
+## The Feed: programmatic gate supervision
+
+When a child hits an interactive gate — an `AskUserQuestion`, a permission
+request, or an `ExitPlanMode` — cmux parks it in the **Feed**, a short-lived
+(~120s) semaphore keyed by the request id. `feed.list` reports each item's `kind`
+(permission / question / exit_plan / stop / sessionStart), `status` (`pending`
+for a live gate, `resolved` once answered, `telemetry` for non-gates), and its
+source. A pending gate is answerable over the cmux socket **without touching the
+child's input box**:
+
+- `feed.permission.reply {request_id, mode}` — `once` | `always` |
+  `bypassPermissions` | `deny`
+- `feed.question.reply {request_id, selections}` — selections are option *labels*
+- `feed.exit_plan.reply {request_id, mode}`
+
+This is the channel that lets a conductor (or an operator) answer a child's gates
+programmatically, and it is agent-agnostic — the same Feed serves claude and
+codex. cmux-fleet does not yet drive the Feed from the router (auto-answering a
+gate by policy is unbuilt); today it is a deliberate, in-the-loop move.
+
+## Two agent tools: claude and codex
+
+cmux-fleet runs `claude` and `codex` as first-class agent tools over one roster,
+one hook-store union, one router, and one inbox. `cmux_fleet/cli.py` is a dumb
+builder over each tool's native flags and env; the only tool-specific code is a
+small adapter branch plus the resume form. Two substrate differences shape the
+orchestration:
+
+- **codex registers lazily and never ends.** claude binds a session at boot;
+  codex binds on its **first turn**. So a freshly launched codex worker has no
+  session yet — `fleet ls` shows it `pending`, and the router backfills the
+  session on its first `Stop`. codex also fires **no `SessionEnd`**, so its
+  hook-store entry lingers after the process exits and re-binds on the next turn.
+  The practical rule: **drive a `pending` codex worker to bind it.**
+- **The resume form differs.** claude resumes with a `--resume <id>` flag; codex
+  resumes with a `resume <id>` subcommand. Both continue the *same* session id;
+  recycle and revive carry both shapes.
+
+Plugins are cross-tool the same way. A plugin's hooks fire **per agent tool**, so
+a plugin that must run under both ships **one source tree with a per-tool
+hook-declaration file**: claude reads `.claude-plugin/plugin.json` +
+`hooks/hooks.json`; codex reads `.codex-plugin/plugin.json`, whose `hooks` field
+names a *separate* codex hooks file; and an adapter absorbs the I/O deltas (codex
+has no `SessionEnd`, carries an `apply_patch` tool, and hands hooks a different
+stdin shape). cmux-fleet's own conductor hooks are claude-side today: codex runs
+as a first-class **worker**, but the adapter does not yet map claude's
+`plugins`/`settings` vocabulary onto codex (it warns and ignores those keys), so
+a codex agent does not load the plugin's conductor hooks.
+
 ## State files
 
 All mutable state lives under `$CMUX_STATE_DIR` (default
