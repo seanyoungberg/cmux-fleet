@@ -230,7 +230,10 @@ def handle(ev):
         elif action == "reconcile":
             log(f"[reconcile] {entry['label']}: registry session -> {sid_bare[:12]} (was stale/bridge id)")
         elif action == "skip-tool":
+            # a tool mismatch on a RESOLVED surface means the resolution itself was bad (a stale/bad
+            # hook-store session record pointed a foreign-tool Stop at this entry) -- not ours to route.
             log(f"[reconcile] skip {entry['label']}: {ev_tool} Stop on a {entry_tool} agent (no cross-tool id write)")
+            return
     else:
         # observe: report what a LIVE router would reconcile, mutate nothing (respects the observe contract
         # + the singleton-lock invariant — an unlocked observer racing the daemon on fleet.json is the bug).

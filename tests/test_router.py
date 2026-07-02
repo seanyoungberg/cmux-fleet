@@ -234,6 +234,41 @@ def test_handle_recovers_moved_child_via_registry_when_hookstore_session_absent(
     assert waked == ["PARENT"]                                        # ...and the parent's wake was attempted
 
 
+# --- tool-mismatch on a RESOLVED surface must not fall through to delivery -------------------------
+# A codex Stop can resolve, via a stale/bad hook-store `sessions{}` record, to a CLAUDE-typed member's
+# surface in the PRIMARY (_rec_by_session/by_surface) lookup -- reconcile_session() correctly refuses to
+# write the cross-tool id (returns 'skip-tool'), but that skip IS the signal the resolution was wrong: the
+# pre-fix handle() fell through unconditionally to debounce/log/deliver, re-queueing the member's STALE
+# last-known completion to its parent on every such Stop (the berg-sandbox ack-loop).
+def test_handle_skips_delivery_on_tool_mismatch(fs, monkeypatch):
+    uuid = "33333333-3333-3333-3333-333333333333"
+    fs.live_put("parent", {"surface": "PARENT", "kind": "conductor", "role": "c",
+                           "session": "claude-parent"})
+    fs.live_put("memsearch-expert", {"surface": "CHILD", "kind": "child", "role": "w",
+                                     "parent": "parent", "tool": "claude",
+                                     "session": "claude-stale-uuid-on-record"})
+
+    monkeypatch.setattr(router, "LIVE", True)
+    monkeypatch.setattr(router, "_reg", {"mtime": 0, "by_label": {}, "by_surface": {}})  # force a reload
+    # THE STALE RECORD: the hook store's sessions{} entry for this bare uuid resolves (via the PRIMARY
+    # _rec_by_session/by_surface lookup) to CHILD, a claude-typed entry -- but the bus event that produced
+    # this uuid is a CODEX Stop, so entry_tool != ev_tool -> reconcile_session() returns 'skip-tool'.
+    monkeypatch.setattr(router, "store",
+                        lambda: {"sessions": {uuid: {"sessionId": uuid, "surfaceId": "CHILD"}},
+                                 "activeSessionsBySurface": {"CHILD": {"sessionId": uuid}}})
+    monkeypatch.setattr(router, "cmux", lambda *a, **k: "")            # no real `cmux notify` shell-out
+    monkeypatch.setattr(router.time, "sleep", lambda s: None)          # skip deliver()'s flush sleep
+    waked = []
+    monkeypatch.setattr(router, "maybe_idle_wake", lambda parent_surface, label: waked.append(parent_surface))
+
+    router.handle({"name": "agent.hook.Stop", "occurred_at": "2026-07-01T12:00:00Z",
+                   "payload": {"phase": "completed", "session_id": f"codex-{uuid}"}})
+
+    pending = fs.inbox_pending("PARENT", kind="completion")
+    assert pending == []                                              # no stale completion re-queued
+    assert waked == []                                                # ...and no wake attempted
+
+
 def test_member_by_session_matches_bare_uuid_tool_aware(monkeypatch):
     """The registry-truth fallback matches a bus session id to a live member by bare uuid, is TOOL-AWARE
     (never binds a codex id onto a claude agent), and FAILS OPEN to a uuid-only match when the bus id
