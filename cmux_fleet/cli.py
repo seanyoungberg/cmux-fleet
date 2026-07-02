@@ -385,6 +385,24 @@ def _group_ref(name_or_ref):
         return ""
 
 
+def _group_member_workspaces(gref):
+    """The REAL (cmux ground-truth) workspace-uuid membership of a group ref, for cross-checking the
+    registry's belief before a destructive `--with-group` dissolve (root-cause #3 of the 2026-07-02
+    incident: a registry `group` field can diverge from cmux's actual visual group). `workspace-group
+    list --json` reports members as short refs (`member_workspace_refs`: ["workspace:11", ...]), not
+    UUIDs -- resolve each through the same _ref_to_uuid `cmux tree` lookup used everywhere else in this
+    file. Returns None (not an empty set) if the group data can't be read or the ref isn't listed at all
+    -- the caller must treat that as fail-closed, not as 'zero real members'."""
+    try:
+        gd = json.loads(cmuxq("workspace-group", "list", "--json"))
+    except Exception:
+        return None
+    g = next((x for x in (gd.get("groups") or []) if x.get("ref") == gref), None)
+    if g is None:
+        return None
+    return {_ref_to_uuid("workspace", r) for r in (g.get("member_workspace_refs") or [])}
+
+
 def create_surface(spec, parent_surf, direction):
     """Create the target surface per spec['place']; return (ws_uuid, surf_uuid). Aborts (None) on any
     unresolved UUID -- never send blind."""
@@ -493,7 +511,14 @@ def register(surf, spec, parent_surface, session, ws):
         "session": f"claude-{session}" if spec["tool"] == "claude" else session,
         # carried so archive->revive can rebuild the launch without re-resolving the roster
         "plugins": spec["plugins"], "flags": spec["flags"], "settings": spec["settings"],
-        "group": spec["group"],
+        # group is only ever REAL cmux-side membership when place=="workspace" -- that's the one branch
+        # of create_surface() that touches workspace-group at all (join/bootstrap). A role's toml (or a
+        # caller --group) can carry a `group` value alongside place="tab"/"pane" (e.g. a --place override
+        # on a workspace-default role); persisting it there anyway is exactly the 2026-07-02 root cause
+        # (Item 2 point 3): a registry row claims group membership its surface never actually joined, and
+        # `fleet rm --with-group` trusted that claim without checking placement. Scrub it here so the
+        # registry can never assert membership create_surface didn't enact.
+        "group": spec["group"] if spec["place"] == "workspace" else "",
         # worktree bookkeeping (present only for worktree-isolated agents): repo/path/branch so
         # `fleet worktree ls|clean` and `rm --kill` can find + tear down the tree by label.
         "worktree": spec.get("worktree_meta")})
@@ -543,13 +568,26 @@ def _agent_surfaced(surf):
     return any(m in pane for m in _TUI_MARKERS)
 
 
+def _resume_menu_visible(surf):
+    """True if claude's resume-summary menu (`1. Resume from summary` / `2. Resume full session as-is`,
+    see _dismiss_resume_summary_prompt) is on-screen. Distinct from _agent_surfaced: none of _TUI_MARKERS
+    match this screen, so the old blind-kick loop mistook it for 'still at the shell' and spammed a bare
+    Enter into it -- which lands on the menu's cursor-default, LOSSY 'Resume from summary' option. The
+    menu blocks the session bind, so the caller must gate/dismiss it (_resume_and_gate), never re-kick
+    Enter into it."""
+    pane = cmuxq("capture-pane", "--surface", surf) or ""
+    return "Resume from summary" in pane
+
+
 def _send_launch_and_confirm(ws, surf, send_cmd, lazy, timeout):
     """Inject the launch command + Enter, then VERIFY it actually started and RE-KICK Enter if the
     terminating newline lost the paste-settle race (the injected command sits unexecuted at the shell —
     the intermittent 'dead launch': surface exists, no agent). The success signal is the strongest
     readback available — a bound session for claude; for a lazy tool (binds on its first turn) an agent
     TUI appearing. Re-kicks are bounded and suppressed once a TUI is on-screen, so a slow boot is never
-    spammed. Returns the bound sid, or '' (normal for a lazy tool). Retries the ENTER, never the paste."""
+    spammed. Returns the bound sid, or '' (normal for a lazy tool, OR for a claude `--resume` launch that
+    surfaced its resume-summary menu — the caller must gate/dismiss that separately, see cmd_launch).
+    Retries the ENTER, never the paste."""
     cmuxq("send", "--workspace", ws, "--surface", surf, send_cmd + "\n")
     end = time.time() + timeout
     kicks, max_kicks = 0, 5
@@ -557,6 +595,8 @@ def _send_launch_and_confirm(ws, surf, send_cmd, lazy, timeout):
         sid = poll_session(surf, timeout=1)
         if sid:
             return sid                                       # claude bound -> definitively started
+        if _resume_menu_visible(surf):
+            return ""                # resume-summary menu is up -- caller must gate/dismiss it, not us
         surfaced = _agent_surfaced(surf)
         if lazy and surfaced:
             return ""                                        # lazy tool is up; it binds on its 1st turn
@@ -568,6 +608,39 @@ def _send_launch_and_confirm(ws, surf, send_cmd, lazy, timeout):
         else:
             time.sleep(1)
     return ""
+
+
+def _bind_launched_session(ws, surf, send_cmd, tool, label, abs_cwd, caller, lazy, timeout):
+    """The resume-aware bind step for `cmd_launch`. Confirms/re-kicks the enter-race as before
+    (_send_launch_and_confirm), then, when the caller passthrough carries a claude `--resume <id>`, gates
+    the bind on the SAME dismiss sequence `cmd_revive` uses (_resume_and_gate -> picks 'full session
+    as-is', never the lossy cursor-default 'resume from summary') instead of trusting a blind re-kick to
+    land correctly on the menu. Aborts via sys.exit on a resume-gate timeout, same as cmd_revive: NOT
+    binding/registering behind an undismissed menu, surface left alone (nothing torn down -- it may still
+    be salvageable). Finally, if the direct poll still came up empty, reconciles against the hook store by
+    AGENT_LABEL/cwd (_discover_surface_for) instead of trusting the pre-bind surface uuid unconditionally
+    -- claude occasionally binds its session to a DIFFERENT surface than the one launched into (its
+    workspace is re-resolved too, so a swapped surface never leaves a mismatched (surface, workspace)
+    pair in the registry). Returns (ws, surf, sid); sid is '' if unresolved (the caller decides whether
+    that's fatal, e.g. lazy tools expect it)."""
+    sid = _send_launch_and_confirm(ws, surf, send_cmd, lazy, timeout)
+    resume_flag = _flag_val(caller, "--resume") if tool == "claude" else None
+    if not sid and resume_flag not in (None, False):
+        resume_sid = resume_flag if isinstance(resume_flag, str) else ""
+        if not _resume_and_gate(surf, send_cmd, tool, resume_sid, lambda m: print(f"[fleet] {m}")):
+            sys.exit(f"[fleet] ABORT: resume-summary menu never resolved for {label} (surface still "
+                     f"booting or wedged at the menu); NOT registering. Re-run the launch once it "
+                     f"settles. Inspect: cmux capture-pane --surface {surf}")
+        sid = poll_session(surf)
+    if not sid and not lazy:
+        real_surf, _ = _discover_surface_for(label, abs_cwd)
+        if real_surf and real_surf.upper() != surf.upper():
+            real_sid = poll_session(real_surf, timeout=5)
+            if real_sid:
+                print(f"[fleet] note: session bound to surface {real_surf}, not the launched {surf} "
+                      f"-- reconciled via AGENT_LABEL/cwd match in the hook store")
+                ws, surf, sid = (ws_uuid_for_surface(real_surf) or ws), real_surf, real_sid
+    return ws, surf, sid
 
 
 def cmd_launch(argv):
@@ -702,11 +775,13 @@ def cmd_launch(argv):
     # claude binds a session at BOOT; codex (and the other cmux agents) register LAZILY on their first
     # turn. So poll briefly but DON'T fail if there's no session yet -> register the surface now and let
     # the session BACKFILL on the child's first turn (the router does this when it sees the first Stop).
-    # _send_launch_and_confirm injects the command and RE-KICKS the terminating Enter if it lost the
-    # paste-settle race (the injected cmd otherwise sits unexecuted at the shell -> no agent ever starts).
+    # _bind_launched_session injects the command, RE-KICKS the terminating Enter if it lost the
+    # paste-settle race (the injected cmd otherwise sits unexecuted at the shell -> no agent ever starts),
+    # and gates a `--resume <id>` passthrough on the real resume-menu dismiss instead of a blind re-kick.
     lazy = spec["tool"] != "claude"
     print(f"[fleet] waiting for cmux to bind a session to {surf} ...")
-    sid = _send_launch_and_confirm(ws, surf, send_cmd, lazy, timeout=8 if lazy else 60)
+    ws, surf, sid = _bind_launched_session(ws, surf, send_cmd, spec["tool"], spec["label"], spec["abs_cwd"],
+                                           caller, lazy, timeout=8 if lazy else 60)
     if not sid and not lazy:
         sys.exit(f"[fleet] timed out waiting for session binding; the injected command may not have "
                  f"started. Inspect the surface: cmux capture-pane --surface {surf}")
@@ -938,14 +1013,19 @@ def cmd_ls(argv):
 def cmd_rm(argv):
     """Drop a label from live/archive. --kill also stops the process + closes its tab (throwaway), and
     for a worktree-isolated agent tears the worktree down (refuse-if-dirty; --wip-commit to override;
-    branch always kept). --with-group also dissolves the agent's workspace-group: deleting the group by
-    ref closes EVERY member surface, so we then SWEEP all live+archive entries in that group out of the
-    registry (otherwise they linger as orphaned rows for dead surfaces). A swept member's worktree dir
-    and branch are left UNMANAGED: their registry rows are gone, so `fleet worktree clean` (which
-    discovers from the registry) cannot find them. Reclaim manually with `git worktree list` +
-    `git worktree remove <path>` (and `git branch -D fleet/<label>` if you want the branch gone).
-    WITHOUT --with-group, only this agent's own workspace goes and remaining members are left
-    ungrouped."""
+    branch always kept); it ALSO force-archives first (see below) so a killed agent is never left with no
+    recovery trace. --with-group also dissolves the agent's workspace-group: deleting the group by ref
+    closes EVERY member surface, so we then SWEEP all live+archive entries in that group out of the
+    registry (otherwise they linger as orphaned rows for dead surfaces). Before touching anything,
+    --with-group cross-checks the registry's belief about that group's membership against cmux's REAL
+    membership (`workspace-group list --json`) and REFUSES (no dissolve, no sweep) on any disagreement --
+    a registry `group` field can desync from cmux's actual visual group (root cause of the 2026-07-02
+    incident: dissolving a group the target only THOUGHT it belonged to swept 3 unrelated live agents). A
+    swept member's worktree dir and branch are left UNMANAGED: their registry rows are gone, so `fleet
+    worktree clean` (which discovers from the registry) cannot find them. Reclaim manually with `git
+    worktree list` + `git worktree remove <path>` (and `git branch -D fleet/<label>` if you want the
+    branch gone). WITHOUT --with-group, only this agent's own workspace goes and remaining members are
+    left ungrouped."""
     from . import state as fs; import signal
     kill = "--kill" in argv
     wipc = "--wip-commit" in argv
@@ -962,18 +1042,33 @@ def cmd_rm(argv):
         gname = e["group"]
         gref = _group_ref(gname)
         if gref:
-            cmuxq("workspace-group", "delete", gref)         # delete takes a REF -> closes ALL members
-            # SWEEP the registry: every other live/archive entry in the dissolved group is now a stale
-            # row for a closed surface. Collect them BEFORE deleting (so we can report kept worktrees),
-            # then clear each. The selected `label` itself is cleared below by the normal path.
+            # registry-believed membership: this label + every other live/archive row claiming the same
+            # group NAME. Compare its workspace-uuid set against cmux's REAL membership for the ref
+            # BEFORE doing anything destructive -- a mismatch means the registry can't be trusted here.
             members = {}
             for tbl in (fs.live_all(), fs.archive_all()):
                 for lbl, v in tbl.items():
                     if lbl != label and v.get("group") == gname:
                         members.setdefault(lbl, v)
-            for lbl, v in members.items():
-                fs.live_del(lbl); fs.archive_del(lbl)
-                fs.log_event("removed", label=lbl, role=v.get("role"), via="group-dissolve")
+            registry_all = {label: e, **members}
+            registry_ws = {lbl: v.get("workspace") for lbl, v in registry_all.items()}
+            unverifiable = sorted(lbl for lbl, ws in registry_ws.items() if not ws)
+            real_ws = _group_member_workspaces(gref)
+            if real_ws is None or unverifiable or set(registry_ws.values()) != real_ws:
+                real_display = sorted(real_ws) if real_ws is not None else "UNREADABLE (cmux group data unavailable)"
+                sys.exit(
+                    f"[fleet] ABORT --with-group: refusing to dissolve '{gname}' ({gref}) -- registry and "
+                    f"cmux disagree about membership (this is a registry-integrity bug, not a --force case; "
+                    f"see Item 2, 2026-07-02 incident).\n"
+                    f"[fleet]   registry believes group '{gname}' = {sorted(registry_ws)}"
+                    + (f"  (workspace id unknown for: {', '.join(unverifiable)} -- can't verify, treated as a "
+                       f"mismatch)" if unverifiable else "") + "\n"
+                    f"[fleet]   cmux reports group '{gref}' member workspaces = {real_display}\n"
+                    f"[fleet] no dissolve, no sweep happened. Investigate before retrying "
+                    f"(`fleet ls`, `cmux workspace-group list --json`).")
+            # AGREEMENT confirmed -> observability BEFORE the irreversible act (not just an after-the-fact
+            # report): print what's about to die, THEN dissolve. wt_kept only needs `members` (already
+            # known), so it's computable up front too.
             wt_kept = sorted([lbl for lbl, v in members.items() if v.get("worktree")]
                              + ([label] if e.get("worktree") and not kill else []))
             group_note = f"\n[fleet] group '{gname}' dissolved ({gref}); closed + cleared {1 + len(members)} member(s)"
@@ -983,16 +1078,35 @@ def cmd_rm(argv):
                 group_note += (f"\n[fleet]   worktree dirs/branches left UNMANAGED for {', '.join(wt_kept)} "
                                f"(registry rows gone; reclaim manually: git worktree list; "
                                f"git worktree remove <path>; git branch -D fleet/<label>)")
+            print(f"[fleet] about to dissolve group '{gname}' ({gref}); closing {1 + len(members)} "
+                  f"member(s): {', '.join(sorted(registry_all))}")
+            cmuxq("workspace-group", "delete", gref)         # delete takes a REF -> closes ALL members
+            for lbl, v in members.items():
+                fs.live_del(lbl); fs.archive_del(lbl)
+                fs.log_event("removed", label=lbl, role=v.get("role"), via="group-dissolve")
         else:
             group_note = f"\n[fleet] group '{gname}' not found live; nothing to dissolve"
+    killed_and_archived = False
     if kill and e.get("surface"):
-        pid = _pid_for_surface(e["surface"])
+        surf = e["surface"]
+        # force-archive-on-kill: --kill was the ONLY removal path that left NO recovery trace (plain rm
+        # and `fleet archive` both shelve an entry) -- quietly breaking the "prune freely, agents are
+        # recoverable" doctrine. Capture the binding + write the archive row BEFORE tearing the surface
+        # down, so a killed agent degrades to "recorded but maybe-unresumable" rather than vanishing.
+        # An empty/pending last_session (never bound / wedged agent) is still a valid marker -- `fleet
+        # revive` just relaunches fresh in that case; refusing to archive would block killing a wedged
+        # agent that needs to stay killable.
+        b = _resume_binding(surf)
+        fs.archive_put(label, _build_archive_entry(e, b))
+        fs.log_event("archived", label=label, role=e.get("role"), session=e.get("session"), via="kill")
+        killed_and_archived = True
+        pid = _pid_for_surface(surf)
         if pid:
             try:
                 os.kill(pid, signal.SIGINT); time.sleep(0.4); os.kill(pid, signal.SIGINT)
             except (ProcessLookupError, PermissionError):
                 pass
-        cmuxq("close-surface", "--surface", e["surface"])
+        cmuxq("close-surface", "--surface", surf)
     wt_note = ""
     if kill and e.get("worktree"):
         from . import worktree as wt
@@ -1000,13 +1114,17 @@ def cmd_rm(argv):
         removed, msg = wt.teardown(m["repo"], m["path"], label, wip_commit_flag=wipc)
         wt_note = f"\n[fleet] worktree: {msg}"
         if not removed:
-            # the registry row is deleted just below, so `fleet worktree clean` can no longer find it;
-            # the tree is dirty -> reclaim manually after committing/stashing.
-            wt_note += (f"\n[fleet]   ({label}'s tree is dirty and its registry row is now gone; "
-                        f"reclaim manually: git -C {m['repo']} worktree remove {m['path']} after committing/stashing)")
-    fs.live_del(label); fs.archive_del(label)
+            # the registry row is deleted (or, since --kill, re-parked in archive) just below, so `fleet
+            # worktree clean` can no longer find it; the tree is dirty -> reclaim manually.
+            wt_note += (f"\n[fleet]   ({label}'s tree is dirty; reclaim manually: "
+                        f"git -C {m['repo']} worktree remove {m['path']} after committing/stashing)")
+    fs.live_del(label)
+    if not killed_and_archived:
+        fs.archive_del(label)
     fs.log_event("removed", label=label, role=e.get("role"), killed=kill, with_group=with_group)
-    print(f"[fleet] removed {label}{' (killed + closed)' if kill else ''}{group_note}{wt_note}")
+    tail = f" (killed + closed; archived for recovery: fleet revive {label})" if killed_and_archived \
+        else (" (killed + closed)" if kill else "")
+    print(f"[fleet] removed {label}{tail}{group_note}{wt_note}")
     return 0
 
 
@@ -1084,6 +1202,43 @@ def cmd_worktree(argv):
     sys.exit(f"fleet worktree: unknown verb '{verb}' (use ls | clean)")
 
 
+def _build_archive_entry(e, b):
+    """Compose an archive.json row from a LIVE registry entry `e` + its captured cmux binding `b` (see
+    _resume_binding) -- the resumable snapshot `fleet revive` reads. Shared by `fleet archive` and
+    `fleet rm --kill` (force-archive-on-kill: --kill was the one removal path that left no recovery
+    trace)."""
+    arch = {k: e[k] for k in ("role", "kind", "tool", "cwd", "parent", "place",
+                              "plugins", "flags", "settings", "group", "worktree") if k in e}
+    # last_session = the id `fleet revive` will `--resume`. Prefer cmux's CHECKPOINT (ground truth, read
+    # off the binding above) over the registry `session`, which can be a stale bridge id from bind time
+    # (the registry-vs-real divergence -> "No conversation found" on revive). Falls back to the registry
+    # session when cmux exposes no checkpoint; '' (empty/pending marker) if neither is known -- a killed
+    # agent that never bound a session, still archived so it isn't vanished, just maybe-unresumable.
+    arch["last_session"] = (b.get("checkpoint_id") or "").strip() or e.get("session") or ""
+    arch["archived_at"] = time.time()
+    if b.get("command"):                       # revive replays this like recycle (binding-first)
+        arch["binding_cmd"] = b["command"]
+        if b.get("cwd"):
+            arch["binding_cwd"] = b["cwd"]
+    # A sparse live entry (hand-bootstrapped conductors carry NO cwd/place) would archive without a cwd,
+    # so revive composes abs_cwd = ROOT root and `claude --resume` can't find the session (it lives
+    # under the role project dir). Backfill cwd/place/group from the authoritative source: the toml for a
+    # roster role, else the captured binding cwd. Sanitize a bad place ("native" etc.) to a real one.
+    if _is_roster(e.get("role")):
+        try:
+            r = resolve(load_config(), e.get("role"), e.get("tool", "claude"), None)
+            if not arch.get("cwd"):   arch["cwd"]   = r.get("cwd", "")
+            if not arch.get("place"): arch["place"] = r.get("place", "tab")
+            if not arch.get("group"): arch["group"] = r.get("group", "")
+        except SystemExit:
+            pass
+    if not arch.get("cwd") and b.get("cwd"):
+        arch["cwd"] = b["cwd"]
+    if arch.get("place") not in ("tab", "pane", "workspace"):
+        arch["place"] = "tab"
+    return arch
+
+
 def cmd_archive(argv):
     """Park a live agent: stop its process (SIGINT x2 = clean TUI exit), close the tab, move it to the
     archive shelf with enough to `claude --resume` it later."""
@@ -1107,36 +1262,7 @@ def cmd_archive(argv):
         except (ProcessLookupError, PermissionError):
             pass
     cmuxq("close-surface", "--surface", surf)
-    arch = {k: e[k] for k in ("role", "kind", "tool", "cwd", "parent", "place",
-                              "plugins", "flags", "settings", "group", "worktree") if k in e}
-    # last_session = the id `fleet revive` will `--resume`. Prefer cmux's CHECKPOINT (ground truth, read
-    # off the binding above) over the registry `session`, which can be a stale bridge id from bind time
-    # (the registry-vs-real divergence -> "No conversation found" on revive). Falls back to the registry
-    # session when cmux exposes no checkpoint. The router keeps `session` fresh in the live case, but a
-    # never-took-a-turn-since-divergence agent (e.g. berg-sandbox this morning) still needs this.
-    arch["last_session"] = (b.get("checkpoint_id") or "").strip() or e.get("session")
-    arch["archived_at"] = time.time()
-    if b.get("command"):                       # revive replays this like recycle (binding-first)
-        arch["binding_cmd"] = b["command"]
-        if b.get("cwd"):
-            arch["binding_cwd"] = b["cwd"]
-    # A sparse live entry (hand-bootstrapped conductors carry NO cwd/place) would archive without a cwd,
-    # so revive composes abs_cwd = ROOT root and `claude --resume` can't find the session (it lives
-    # under the role project dir). Backfill cwd/place/group from the authoritative source: the toml for a
-    # roster role, else the captured binding cwd. Sanitize a bad place ("native" etc.) to a real one.
-    if _is_roster(e.get("role")):
-        try:
-            r = resolve(load_config(), e.get("role"), e.get("tool", "claude"), None)
-            if not arch.get("cwd"):   arch["cwd"]   = r.get("cwd", "")
-            if not arch.get("place"): arch["place"] = r.get("place", "tab")
-            if not arch.get("group"): arch["group"] = r.get("group", "")
-        except SystemExit:
-            pass
-    if not arch.get("cwd") and b.get("cwd"):
-        arch["cwd"] = b["cwd"]
-    if arch.get("place") not in ("tab", "pane", "workspace"):
-        arch["place"] = "tab"
-    fs.archive_put(label, arch)
+    fs.archive_put(label, _build_archive_entry(e, b))
     fs.live_del(label)
     fs.log_event("archived", label=label, role=e.get("role"), session=e.get("session"))
     print(f"[fleet] archived {label} (session {e.get('session')}); revive with: fleet revive {label}")

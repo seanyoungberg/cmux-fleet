@@ -201,6 +201,25 @@ def test_log_event_appends(fs):
     assert lines[0]["label"] == "w1" and "ts" in lines[0]
 
 
+def test_log_event_stamps_agent_invoker(fs, monkeypatch):
+    # a fleet AGENT's own identity wins outright (AGENT_LABEL is the routing/recycle key) -- this is
+    # the attribution the 2026-07-02 incident forensics needed and didn't have (Item 3): reconstructing
+    # WHO ran a destructive command required correlating external logs by hand.
+    monkeypatch.setenv("AGENT_LABEL", "berg-sandbox")
+    monkeypatch.setenv("AGENT_ROLE", "berg-sandbox")
+    fs.log_event("removed", label="staging-conductor")
+    rec = json.loads(open(fs.LOG).readlines()[-1])
+    assert rec["invoker"] == "agent:berg-sandbox"
+
+
+def test_log_event_stamps_shell_invoker_without_agent_env(fs, monkeypatch):
+    monkeypatch.delenv("AGENT_LABEL", raising=False)
+    monkeypatch.delenv("AGENT_ROLE", raising=False)
+    fs.log_event("removed", label="staging-conductor")
+    rec = json.loads(open(fs.LOG).readlines()[-1])
+    assert rec["invoker"].startswith("shell:")   # a bare human shell, not an agent -- diagnostic breadcrumb
+
+
 def test_atomic_write_creates_dirs(fs, state_dir):
     target = os.path.join(state_dir, "nested", "deep", "f.json")
     fs._atomic_write(target, json.dumps({"ok": True}))

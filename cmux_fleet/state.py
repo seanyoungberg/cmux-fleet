@@ -289,8 +289,32 @@ def archive_del(label):
 
 
 # --- the event ledger ----------------------------------------------------------------------
+def _invoker():
+    """Best-effort attribution for WHO ran the `fleet` command behind this event: a fleet AGENT's own
+    identity (AGENT_LABEL/AGENT_ROLE env, set on every agent-issued fleet call) if one is driving, else a
+    breadcrumb for a bare human shell (whoami@tty). Diagnostic only, not an audit system -- the
+    2026-07-02 incident forensics dead-ended trying to figure out WHO ran a destructive command by
+    correlating external logs by hand because no event recorded an invoker at all."""
+    label = os.environ.get("AGENT_LABEL")
+    if label:
+        return f"agent:{label}"
+    role = os.environ.get("AGENT_ROLE")
+    if role:
+        return f"agent-role:{role}"
+    try:
+        import pwd
+        who = pwd.getpwuid(os.getuid()).pw_name
+    except Exception:
+        who = os.environ.get("USER") or os.environ.get("LOGNAME") or "?"
+    try:
+        tty = os.ttyname(0)
+    except OSError:
+        tty = "no-tty"
+    return f"shell:{who}@{tty} ppid={os.getppid()}"
+
+
 def log_event(event, **fields):
-    rec = {"ts": time.time(), "event": event}
+    rec = {"ts": time.time(), "event": event, "invoker": _invoker()}
     rec.update(fields)
     _append(LOG, rec)
 
