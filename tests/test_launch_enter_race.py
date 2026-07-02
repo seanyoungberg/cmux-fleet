@@ -3,6 +3,13 @@
 # processed BEFORE the terminal finishes rendering the paste, so it never submits — the command/prompt
 # sits unexecuted. Both paths now VERIFY-then-RETRY the Enter. These are pure units: the cmux reads
 # (cmuxq / capture-pane / poll_session) are stubbed, so nothing touches a real surface.
+#
+# Also covers the resume-menu variant of the SAME code path (2026-07-02 incident, Item 1): a
+# `--resume <id>` passthrough can surface claude's interactive resume-summary menu, which shows NONE of
+# _TUI_MARKERS. The old blind re-kick mistook it for "still at the shell" and spammed Enter into it,
+# landing on the menu's cursor-default, LOSSY "Resume from summary" option instead of "full as-is".
+import pytest
+
 from cmux_fleet import cli as fleet
 
 
@@ -53,6 +60,65 @@ def test_launch_never_kicks_enter_into_a_booted_tui(monkeypatch):
     sid = fleet._send_launch_and_confirm("WS", "SURF", "cmd", lazy=True, timeout=5)
     assert sid == ""                                        # lazy tool up; it binds on its first turn
     assert not any(c == ("send-key", "--surface", "SURF", "enter") for c in calls)
+
+
+# --- launch: resume-menu awareness (Item 1 fix) ----------------------------------------------------
+def test_send_launch_and_confirm_stops_kicking_into_resume_menu(monkeypatch):
+    monkeypatch.setattr(fleet.time, "sleep", lambda *_: None)
+    monkeypatch.setattr(fleet, "poll_session", lambda surf, timeout=60: "")
+    calls = []
+
+    def fake_cmuxq(*args):
+        calls.append(args)
+        if args[:1] == ("capture-pane",):
+            return "1. Resume from summary (recommended)   2. Resume full session as-is"
+        return ""
+
+    monkeypatch.setattr(fleet, "cmuxq", fake_cmuxq)
+    sid = fleet._send_launch_and_confirm("WS", "SURF", "claude --resume abc", lazy=False, timeout=5)
+    assert sid == ""                                    # unresolved -- caller must gate/dismiss the menu
+    assert not any(c == ("send-key", "--surface", "SURF", "enter") for c in calls)   # no blind kick
+
+
+def test_bind_launched_session_resume_gate_picks_full_not_summary(monkeypatch):
+    # end-to-end through the REAL _dismiss_resume_summary_prompt / _resume_and_gate (only
+    # _send_launch_and_confirm is stubbed, standing in for "the menu stopped the confirm loop early"):
+    # a --resume <id> passthrough must dismiss via DOWN then ENTER (picks option 2, 'full as-is'), never
+    # a bare/blind ENTER (which lands on the menu's cursor-default 'Resume from summary').
+    monkeypatch.setattr(fleet.time, "sleep", lambda *_: None)
+    monkeypatch.setattr(fleet, "_send_launch_and_confirm", lambda *a, **k: "")
+    calls = []
+
+    def fake_cmuxq(*args):
+        calls.append(args)
+        if args[:1] == ("capture-pane",):
+            return "1. Resume from summary (recommended)   2. Resume full session as-is"
+        return ""
+
+    monkeypatch.setattr(fleet, "cmuxq", fake_cmuxq)
+    monkeypatch.setattr(fleet, "poll_session", lambda surf, timeout=60: "SID-FULL")
+    ws, surf, sid = fleet._bind_launched_session(
+        "WS", "SURF", "claude --resume abc123", "claude", "lbl", "/x",
+        ["--resume", "abc123"], lazy=False, timeout=5)
+    assert sid == "SID-FULL"
+    keys = [c for c in calls if c[:1] == ("send-key",)]
+    assert keys == [("send-key", "--surface", "SURF", "down"),      # picks option 2 ('full as-is')...
+                    ("send-key", "--surface", "SURF", "enter")]    # ...never a blind bare Enter
+
+
+def test_bind_launched_session_resume_timeout_aborts_without_register(monkeypatch):
+    # a wedged/never-resolving menu must abort (sys.exit) rather than bind/register behind it -- matches
+    # cmd_revive's no-teardown-on-timeout contract. _resume_and_gate returning False IS the RESUME_TIMEOUT
+    # outcome (see test_recycle.py for its own unit coverage); this test proves cmd_launch's integration
+    # point respects that and never reaches register().
+    monkeypatch.setattr(fleet, "_send_launch_and_confirm", lambda *a, **k: "")
+    monkeypatch.setattr(fleet, "_resume_and_gate", lambda *a, **k: False)
+    registered = []
+    monkeypatch.setattr(fleet, "register", lambda *a, **k: registered.append(a))
+    with pytest.raises(SystemExit):
+        fleet._bind_launched_session("WS", "SURF", "claude --resume abc123", "claude", "lbl", "/x",
+                                     ["--resume", "abc123"], lazy=False, timeout=1)
+    assert not registered            # NOT registering behind an undismissed/wedged menu
 
 
 # --- drive: _submit settles then verifies + retries the Enter ------------------------------------

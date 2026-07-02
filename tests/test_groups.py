@@ -5,6 +5,8 @@ import os
 import subprocess
 import sys
 
+import pytest
+
 HERE = os.path.dirname(os.path.abspath(__file__))
 REPO = os.path.dirname(HERE)
 sys.path.insert(0, REPO)
@@ -73,12 +75,21 @@ def test_conductor_group_defaults_to_label(tmp_path):
 
 
 def test_rm_with_group_dissolves_by_ref(monkeypatch):
+    # registry and cmux AGREE on membership (workspace ids match member_workspace_refs) -> dissolve proceeds.
     from cmux_fleet import state as fs
     fs.live_put("cond", {"role": "r", "kind": "conductor", "tool": "claude", "group": "gg",
-                         "surface": "", "status": "live"})
+                         "surface": "", "workspace": "WS-COND", "status": "live"})
     calls = []
-    monkeypatch.setattr(fleet, "cmuxq", lambda *a: (calls.append(a) or ""))
+
+    def fake_cmuxq(*a):
+        calls.append(a)
+        if a[:2] == ("workspace-group", "list"):
+            return '{"groups":[{"ref":"workspace_group:4","member_workspace_refs":["workspace:1"]}]}'
+        return ""
+
+    monkeypatch.setattr(fleet, "cmuxq", fake_cmuxq)
     monkeypatch.setattr(fleet, "_group_ref", lambda g: "workspace_group:4")
+    monkeypatch.setattr(fleet, "_ref_to_uuid", lambda kind, ref: "WS-COND")
     fleet.cmd_rm(["cond", "--with-group"])
     assert ("workspace-group", "delete", "workspace_group:4") in calls   # delete by REF
     assert fs.live_get("cond") is None
@@ -87,20 +98,79 @@ def test_rm_with_group_dissolves_by_ref(monkeypatch):
 def test_rm_with_group_sweeps_all_members(monkeypatch):
     # the orphan bug: dissolving the group closed every member surface, but only the SELECTED label was
     # cleared from the registry, leaving siblings as stale rows. rm --with-group must sweep them all.
+    # (registry and cmux agree here too -- the mismatch-refusal case is covered separately below.)
     from cmux_fleet import state as fs
     fs.live_put("cond", {"role": "c", "kind": "conductor", "tool": "claude", "group": "g",
-                         "surface": "SC", "status": "live"})
+                         "surface": "SC", "workspace": "WS-C", "status": "live"})
     fs.live_put("child", {"role": "w", "kind": "child", "tool": "claude", "group": "g",
-                          "parent": "cond", "surface": "SW", "status": "live"})
+                          "parent": "cond", "surface": "SW", "workspace": "WS-W", "status": "live"})
     fs.live_put("other", {"role": "w", "kind": "child", "tool": "claude", "group": "other-g",
-                          "surface": "SX", "status": "live"})
-    monkeypatch.setattr(fleet, "cmuxq", lambda *a: "")
+                          "surface": "SX", "workspace": "WS-X", "status": "live"})
+
+    def fake_cmuxq(*a):
+        if a[:2] == ("workspace-group", "list"):
+            return ('{"groups":[{"ref":"workspace_group:1",'
+                    '"member_workspace_refs":["workspace:c","workspace:w"]}]}')
+        return ""
+
+    monkeypatch.setattr(fleet, "cmuxq", fake_cmuxq)
     monkeypatch.setattr(fleet, "_group_ref", lambda g: "workspace_group:1")
     monkeypatch.setattr(fleet, "_pid_for_surface", lambda s: None)
+    monkeypatch.setattr(fleet, "_ref_to_uuid",
+                        lambda kind, ref: {"workspace:c": "WS-C", "workspace:w": "WS-W"}[ref])
     fleet.cmd_rm(["cond", "--with-group"])
     assert fs.live_get("cond") is None         # the selected conductor is gone
     assert fs.live_get("child") is None         # ...and so is its group sibling (the swept orphan)
     assert fs.live_get("other") is not None     # a DIFFERENT group is untouched
+
+
+def test_rm_with_group_refuses_on_membership_mismatch(monkeypatch):
+    # 2026-07-02 incident shape: the registry believes a small/wrong membership for the group NAME on
+    # this row, but cmux's REAL group (resolved by ref) reports totally different members -- refuse
+    # instead of dissolving strangers. No dissolve, no sweep; the label stays untouched.
+    from cmux_fleet import state as fs
+    fs.live_put("staging-conductor", {"role": "c", "kind": "conductor", "tool": "claude",
+                                       "group": "AD - Berg Sandbox", "surface": "S1",
+                                       "workspace": "WS-1", "status": "live"})
+    calls = []
+
+    def fake_cmuxq(*a):
+        calls.append(a)
+        if a[:2] == ("workspace-group", "list"):
+            return ('{"groups":[{"ref":"workspace_group:3",'
+                    '"member_workspace_refs":["workspace:10","workspace:11","workspace:12"]}]}')
+        return ""
+
+    monkeypatch.setattr(fleet, "cmuxq", fake_cmuxq)
+    monkeypatch.setattr(fleet, "_group_ref", lambda g: "workspace_group:3")
+    monkeypatch.setattr(fleet, "_ref_to_uuid", lambda kind, ref: "WS-" + ref.split(":")[1])
+    with pytest.raises(SystemExit):
+        fleet.cmd_rm(["staging-conductor", "--with-group"])
+    assert not [c for c in calls if c[:2] == ("workspace-group", "delete")]   # refused BEFORE dissolving
+    assert fs.live_get("staging-conductor") is not None   # nothing swept -- refusal touches no registry row
+
+
+def test_register_scrubs_group_for_non_workspace_placement(fs):
+    # Item 2 point 3 (launcher-misplacement discovery): a role's toml (or a caller --group) can carry a
+    # `group` value alongside place="tab"/"pane" (e.g. a --place override away from a workspace-default
+    # role) -- but create_surface() only ever performs REAL cmux workspace-group membership when
+    # place=="workspace". Persisting the group value anyway let a registry row claim membership its
+    # surface never actually joined (the 2026-07-02 root cause: staging-conductor's row said
+    # group="AD - Berg Sandbox" though it was never placed in that visual group, and `rm --with-group`
+    # trusted the claim). register() must scrub it for any non-workspace placement.
+    spec = {"role": "berg-sandbox", "kind": "conductor", "tool": "claude", "abs_cwd": "/x",
+            "place": "tab", "group": "AD - Berg Sandbox", "label": "staging-conductor",
+            "plugins": [], "flags": [], "settings": ""}
+    fleet.register("SURF-1", spec, "", "SESSID", "WS-1")
+    assert fs.live_get("staging-conductor")["group"] == ""
+
+
+def test_register_keeps_group_for_workspace_placement(fs):
+    spec = {"role": "berg-sandbox", "kind": "conductor", "tool": "claude", "abs_cwd": "/x",
+            "place": "workspace", "group": "AD - Berg Sandbox", "label": "berg-sandbox",
+            "plugins": [], "flags": [], "settings": ""}
+    fleet.register("SURF-2", spec, "", "SESSID", "WS-2")
+    assert fs.live_get("berg-sandbox")["group"] == "AD - Berg Sandbox"
 
 
 def test_rm_without_group_leaves_group_intact(monkeypatch):
