@@ -449,3 +449,39 @@ def test_wake_preserve_opt_in_never_clobbers(fs, monkeypatch):
     monkeypatch.setattr(fs, "_cmux", _fake_cmux(f"❯ {draft}", sink))
     assert fs.wake_if_idle("S", "wake") is False
     assert [a for a in sink if a[0] in ("send", "send-key")] == []
+
+
+# --- expected-close tombstones (CLI <-> router registry-hygiene handshake, fleet-doctor #5) ------------
+def test_expected_close_fresh_is_recent(fs):
+    fs.expected_close_put("S1", now=1000.0)
+    assert fs.expected_close_recent("S1", now=1000.0) is True
+    assert fs.expected_close_recent("S1", now=1000.0 + fs.EXPECTED_CLOSE_S - 1) is True
+
+
+def test_expected_close_expires(fs):
+    fs.expected_close_put("S1", now=1000.0)
+    assert fs.expected_close_recent("S1", now=1000.0 + fs.EXPECTED_CLOSE_S + 1) is False   # window passed
+
+
+def test_expected_close_missing_file_is_not_recent(fs):
+    # no tombstone file at all -> a GENUINE external close is never suppressed (fail-open).
+    assert fs.expected_close_recent("NEVER-CLOSED") is False
+
+
+def test_expected_close_only_matches_its_own_surface(fs):
+    fs.expected_close_put("S1", now=1000.0)
+    assert fs.expected_close_recent("S2", now=1000.0) is False
+
+
+def test_expected_close_prunes_expired_on_write(fs):
+    fs.expected_close_put("OLD", now=1000.0)
+    fs.expected_close_put("NEW", now=1000.0 + fs.EXPECTED_CLOSE_S + 5)   # write prunes the expired OLD row
+    import json
+    rows = json.load(open(fs.EXPECTED_CLOSE))
+    ids = [r["surface_id"] for r in rows]
+    assert ids == ["NEW"]                                          # OLD pruned, file can't grow unboundedly
+
+
+def test_expected_close_empty_surface_is_noop(fs):
+    fs.expected_close_put("", now=1000.0)                          # empty id -> no row written, no crash
+    assert fs.expected_close_recent("", now=1000.0) is False

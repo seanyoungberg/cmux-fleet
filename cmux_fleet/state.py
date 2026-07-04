@@ -32,6 +32,8 @@ LOG = os.path.join(STATE, "log.jsonl")
 MODEFILE = os.path.join(STATE, "notify-mode")
 DRAFTMODE = os.path.join(STATE, "draft-through")        # policy override: 'clobber' | 'preserve' (default 'stale')
 DRAFTMARKS = os.path.join(STATE, "draft-marks.json")    # {surface: {text, since}} — stale-draft-gate age tracking
+EXPECTED_CLOSE = os.path.join(STATE, "expected-close.json")  # short-lived CLI-close tombstones (list of {surface_id, ts})
+EXPECTED_CLOSE_S = 10   # a CLI-written close tombstone shields _archive_closed_surface from this surface this long
 
 # Agent-helper command hints emitted into conductor context by the awareness/drain hooks. Phase 2
 # folded the four standalone plugin scripts into `fleet <verb>` subcommands, so these are now the app
@@ -264,6 +266,43 @@ def reconcile_session(label, sid_bare, tool=None, event_tool=None):
     e["session"] = f"claude-{sid_bare}" if t == "claude" else sid_bare
     live_put(label, e)
     return "backfill" if not stored else "reconcile"
+
+
+# --- expected-close tombstones (CLI <-> router registry-hygiene handshake) ------------------------
+# A DELIBERATE close (fleet rm / archive / --with-group dissolve) races the router's surface.closed
+# handler across processes: the CLI's live_del is meant to land before the router resolves the closed
+# surface, but registry() is mtime-cached at 1s granularity so the close can beat live_del's visibility
+# and _archive_closed_surface then mis-reads the intentional retirement as an accidental external close
+# (spurious `kind='stale'` "revive?" alert to the parent). The CLI stamps a short-lived tombstone BEFORE
+# it closes, and the router checks it — a deterministic signal that doesn't depend on lookup timing.
+def expected_close_put(surface_id, now=None):
+    """Tombstone `surface_id` as a DELIBERATE CLI close. Appends {surface_id, ts} and prunes expired rows
+    on write, so the file can't grow. No-op on an empty surface id. Best-effort (never raises into a
+    close path)."""
+    if not surface_id:
+        return
+    now = time.time() if now is None else now
+    try:
+        rows = [r for r in _read_json(EXPECTED_CLOSE, [])
+                if isinstance(r, dict) and (now - float(r.get("ts") or 0)) < EXPECTED_CLOSE_S]
+        rows.append({"surface_id": surface_id, "ts": now})
+        _atomic_write(EXPECTED_CLOSE, json.dumps(rows))
+    except Exception:
+        pass
+
+
+def expected_close_recent(surface_id, now=None):
+    """True iff `surface_id` was CLI-close-tombstoned within EXPECTED_CLOSE_S. Read-only + fail-open: a
+    missing/garbage file returns False, so a GENUINE external close (the path we must never suppress)
+    still archives + alerts."""
+    if not surface_id:
+        return False
+    now = time.time() if now is None else now
+    for r in _read_json(EXPECTED_CLOSE, []):
+        if isinstance(r, dict) and r.get("surface_id") == surface_id \
+                and (now - float(r.get("ts") or 0)) < EXPECTED_CLOSE_S:
+            return True
+    return False
 
 
 # --- identity: the ARCHIVE shelf (parked, revivable) ---------------------------------------

@@ -231,6 +231,12 @@ def _archive_closed_surface(ev):
     if not entry:
         return                                          # not a tracked live member's surface
     label = entry["label"]
+    if fs.expected_close_recent(surface):
+        # a DELIBERATE CLI close (rm/archive/--with-group) that beat its own live_del to this process —
+        # NOT an accidental external close. The CLI already archived + reconciled the registry; skip the
+        # duplicate archive AND the spurious `kind='stale'` "revive?" alert to the parent (fleet-doctor #5).
+        log(f"[stale] skip {label}: expected CLI close (surface {surface[:8]})")
+        return
     if not LIVE:
         log(f"[stale] (observe) would archive {label}: surface {surface[:8]} closed outside fleet CLI")
         return
