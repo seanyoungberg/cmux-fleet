@@ -27,7 +27,7 @@
 # [defaults] (orchestration) -> [role] scalars -> tool config [tool.<t>] -> [role.<t>] -> caller `--`.
 import argparse, json, os, shlex, subprocess, sys, tempfile, time
 
-from .config import ROOT, STATE, CMUX, MARKETPLACE, FLOOR, FLEET_TOML, ADHOC_SUBDIR, load_plugin_index  # path resolver
+from .config import ROOT, STATE, CMUX, MARKETPLACE, FLOOR, FLEET_TOML, ADHOC_SUBDIR, PLUGIN_INDEX, load_plugin_index  # path resolver
 
 # The checkout/build root: the dir that holds bin/, .claude-plugin/, fleet.toml.example next to the
 # cmux_fleet package. In a repo/editable install this is the repo root (unchanged from the flat layout,
@@ -1068,6 +1068,235 @@ def cmd_config(argv):
     if our_effort and user.get("effortLevel") and our_effort != user["effortLevel"]:
         print(f"\n  NOTE: settings effortLevel={user['effortLevel']} is OVERRIDDEN by fleet --effort {our_effort}.")
     return 0
+
+
+# ---------------------------------------------------------------- plugins verb (index reconcile + discovery)
+def _claude_settings_paths():
+    """The claude settings JSONs whose `enabledPlugins` feed reconcile's enabled channel. Overridable
+    via $CMUX_FLEET_CLAUDE_SETTINGS (os.pathsep-joined) so tests point at fixtures instead of the host's
+    real ~/.claude — the default is the real user-scope settings + the legacy ~/.claude.json."""
+    override = os.environ.get("CMUX_FLEET_CLAUDE_SETTINGS", "").strip()
+    if override:
+        return [p for p in override.split(os.pathsep) if p]
+    return [os.path.expanduser("~/.claude/settings.json"), os.path.expanduser("~/.claude.json")]
+
+
+def _roles_using(name):
+    """Scan the roster for every place `name` is referenced, so `plugins show` can answer "which roles
+    load this". Returns [(scope, key)] e.g. ("tool.claude","use"), ("role.researcher.claude","plugins").
+    Matches the index-native `use` key AND the legacy `plugins`/`enable_plugins` keys (an enable_plugins
+    ref is `name@mkt`, so match on the pre-@ name)."""
+    cfg = load_config()
+    hits = []
+
+    def _check(block, scope):
+        if not isinstance(block, dict):
+            return
+        for key in ("use", "plugins", "enable_plugins"):
+            for ref in (block.get(key) or []):
+                refname = str(ref).split("@")[0] if key == "enable_plugins" else str(ref)
+                if refname == name:
+                    hits.append((scope, key))
+
+    for tname, tblock in (cfg.get("tool") or {}).items():
+        _check(tblock, f"tool.{tname}")
+    for rname, rblock in (cfg.get("role") or {}).items():
+        if not isinstance(rblock, dict):
+            continue
+        _check(rblock, f"role.{rname}")                       # rare, but a role may carry keys directly
+        for tname, tblock in rblock.items():
+            if isinstance(tblock, dict):
+                _check(tblock, f"role.{rname}.{tname}")
+    return hits
+
+
+def _plugin_skills(plugin_dir):
+    """Skill names a plugin exposes = the subdirs of <dir>/skills that hold a SKILL.md. os.path.* follow
+    symlinks, so the cmux plugin's SYMLINKED skills resolve correctly (design §4 / brief B)."""
+    skills_dir = os.path.join(plugin_dir, "skills")
+    if not os.path.isdir(skills_dir):
+        return []
+    out = []
+    for s in sorted(os.listdir(skills_dir)):
+        if os.path.exists(os.path.join(skills_dir, s, "SKILL.md")):
+            out.append(s)
+    return out
+
+
+def _plugin_resolved_dir(name, entry, index):
+    """The --plugin-dir path a `type=linked` entry resolves to (or None), via Phase-1 resolution. An
+    `enabled` entry has no local dir (it's a global install), so None."""
+    if entry.get("type") == "enabled":
+        return None
+    return _linked_dir(name, entry.get("source", ""), index)
+
+
+def _cmd_plugins_reconcile(rest):
+    from . import plugins as fp
+    ap = argparse.ArgumentParser(prog="fleet plugins reconcile",
+                                 description="scan marketplaces + claude settings, refresh the index")
+    ap.add_argument("--dry-run", action="store_true", help="print the diff and write NOTHING")
+    ap.add_argument("--prune", action="store_true", help="also drop index entries no longer backed by a source")
+    ap.add_argument("--json", action="store_true", help="emit the diff as JSON")
+    a = ap.parse_args(rest)
+
+    index = load_plugin_index()
+    new_text, diff, existing_text = fp.run_reconcile(
+        PLUGIN_INDEX, index["marketplaces"], _claude_settings_paths(), prune=a.prune)
+    wrote = False
+    if not a.dry_run and new_text != existing_text:
+        os.makedirs(os.path.dirname(os.path.abspath(PLUGIN_INDEX)), exist_ok=True)
+        with open(PLUGIN_INDEX, "w", encoding="utf-8") as f:
+            f.write(new_text)
+        wrote = True
+
+    counts = diff.counts()
+    if a.json:
+        print(json.dumps({
+            "index": PLUGIN_INDEX,
+            "changes": [{"action": act, "name": n, "detail": d} for act, n, d in diff.changes],
+            "notes": [{"kind": k, "name": n, "detail": d} for k, n, d in diff.notes],
+            "counts": counts, "dry_run": a.dry_run, "wrote": wrote,
+        }, indent=2))
+        return 0
+
+    sym = {"add": "+", "update": "~", "prune": "-"}
+    note_sym = {"preserve": "=", "drift": "!"}
+    print(f"fleet plugins reconcile — index {PLUGIN_INDEX}")
+    for action, n, d in diff.changes:
+        print(f"  {sym[action]} {action:8} {n:24} {d}")
+    for kind, n, d in diff.notes:
+        print(f"  {note_sym[kind]} {kind:8} {n:24} {d}")
+    if not diff.changes and not diff.notes:
+        print("  (index already in sync with sources)")
+    print(f"  {counts['add']} added, {counts['update']} updated, {counts['prune']} pruned, "
+          f"{counts['preserve']} preserved, {counts['drift']} drift")
+    if a.dry_run:
+        print("  [dry-run] nothing written")
+    elif wrote:
+        print(f"  wrote {PLUGIN_INDEX}")
+    else:
+        print("  no changes; file untouched")
+    return 0
+
+
+def _cmd_plugins_ls(rest):
+    ap = argparse.ArgumentParser(prog="fleet plugins ls", description="list the plugin index")
+    ap.add_argument("--json", action="store_true")
+    a = ap.parse_args(rest)
+    plugins = load_plugin_index()["plugins"]
+    if a.json:
+        print(json.dumps([{
+            "name": n, "type": e["type"], "tools": e["tools"], "source": e["source"],
+            "origin": e["origin"], "description": e["description"],
+        } for n, e in sorted(plugins.items())], indent=2))
+        return 0
+    if not plugins:
+        print(f"(empty index — no plugins.toml at {PLUGIN_INDEX}, or it has no [plugin.*] entries)")
+        return 0
+    rows = [("NAME", "TYPE", "TOOLS", "SOURCE", "DESCRIPTION")]
+    for n, e in sorted(plugins.items()):
+        rows.append((n, e["type"], ",".join(e["tools"]) or "-", e["source"] or "-",
+                     (e["description"] or "").split("\n")[0]))
+    w = [max(len(r[i]) for r in rows) for i in range(4)]                 # size the first 4 cols; desc runs free
+    for i, r in enumerate(rows):
+        print(f"  {r[0]:<{w[0]}}  {r[1]:<{w[1]}}  {r[2]:<{w[2]}}  {r[3]:<{w[3]}}  {r[4]}")
+        if i == 0:
+            print(f"  {'-' * w[0]}  {'-' * w[1]}  {'-' * w[2]}  {'-' * w[3]}  {'-' * 11}")
+    return 0
+
+
+def _cmd_plugins_show(rest):
+    ap = argparse.ArgumentParser(prog="fleet plugins show", description="full index entry + resolved path + roles")
+    ap.add_argument("name")
+    ap.add_argument("--json", action="store_true")
+    a = ap.parse_args(rest)
+    index = load_plugin_index()
+    entry = index["plugins"].get(a.name)
+    if entry is None:
+        if a.json:
+            print(json.dumps({"name": a.name, "found": False}))
+        else:
+            print(f"plugin '{a.name}' is not in the index ({PLUGIN_INDEX})")
+        return 1
+    resolved = _plugin_resolved_dir(a.name, entry, index)
+    roles = _roles_using(a.name)
+    if a.json:
+        print(json.dumps({
+            "name": a.name, "found": True, "type": entry["type"], "source": entry["source"],
+            "tools": entry["tools"], "origin": entry["origin"], "install": entry["install"],
+            "description": entry["description"], "resolved_dir": resolved,
+            "tool_overrides": entry["tool_overrides"],
+            "used_by": [{"scope": s, "key": k} for s, k in roles],
+        }, indent=2))
+        return 0
+    print(f"=== plugin: {a.name} ===")
+    print(f"  type:        {entry['type']}")
+    print(f"  source:      {entry['source'] or '-'}")
+    print(f"  tools:       {', '.join(entry['tools']) or '-'}")
+    print(f"  origin:      {entry['origin'] or '-'}")
+    if entry["install"]:
+        print(f"  install:     {entry['install']}")
+    print(f"  description: {entry['description'] or '-'}")
+    print(f"  resolved:    {resolved or ('(enabled: global install, no local dir)' if entry['type'] == 'enabled' else '(unresolved — marketplace unset or dir missing)')}")
+    for tool, block in sorted(entry["tool_overrides"].items()):
+        print(f"  [{a.name}.{tool}]: {', '.join(f'{k}={v}' for k, v in sorted(block.items()))}")
+    if roles:
+        print("  used by:")
+        for scope, key in roles:
+            legacy = "" if key == "use" else f"  (legacy `{key}`)"
+            print(f"      {scope}  via {key}{legacy}")
+    else:
+        print("  used by:     (no role references it)")
+    return 0
+
+
+def _cmd_plugins_describe(rest):
+    ap = argparse.ArgumentParser(prog="fleet plugins describe", description="description + skills a plugin exposes")
+    ap.add_argument("name")
+    ap.add_argument("--json", action="store_true")
+    a = ap.parse_args(rest)
+    index = load_plugin_index()
+    entry = index["plugins"].get(a.name)
+    if entry is None:
+        if a.json:
+            print(json.dumps({"name": a.name, "found": False}))
+        else:
+            print(f"plugin '{a.name}' is not in the index ({PLUGIN_INDEX})")
+        return 1
+    resolved = _plugin_resolved_dir(a.name, entry, index)
+    skills = _plugin_skills(resolved) if resolved else []
+    if a.json:
+        print(json.dumps({
+            "name": a.name, "found": True, "description": entry["description"],
+            "resolved_dir": resolved, "skills": skills,
+        }, indent=2))
+        return 0
+    print(f"=== {a.name} ===")
+    print(f"  {entry['description'] or '(no description)'}")
+    if resolved:
+        print(f"\n  skills ({len(skills)}): {', '.join(skills) if skills else '(none found under skills/)'}")
+    elif entry["type"] == "enabled":
+        print("\n  (enabled plugin: global install, skills not locally introspectable)")
+    else:
+        print("\n  (unresolved: marketplace unset or dir missing — skills not introspectable)")
+    return 0
+
+
+def cmd_plugins(argv):
+    """`fleet plugins <reconcile|ls|show|describe>` — the plugin index's reconcile helper + on-demand
+    discovery (design §4/§6). Discovery is NEVER auto-loaded; a conductor consults it when deciding what
+    to dispatch a child with. None of these verbs touch launch composition."""
+    verbs = {"reconcile": _cmd_plugins_reconcile, "ls": _cmd_plugins_ls,
+             "show": _cmd_plugins_show, "describe": _cmd_plugins_describe}
+    if not argv or argv[0] in ("-h", "--help") or argv[0] not in verbs:
+        print("usage: fleet plugins <reconcile|ls|show|describe> ...\n"
+              "  reconcile [--dry-run] [--prune] [--json]   scan marketplaces + ~/.claude settings; refresh the index\n"
+              "  ls [--json]                                table: name · type · tools · source · description\n"
+              "  show <name> [--json]                       full entry + resolved --plugin-dir path + roles that use it\n"
+              "  describe <name> [--json]                   description + the skills the plugin exposes")
+        return 0 if (argv and argv[0] in ("-h", "--help")) else (0 if not argv else 2)
+    return verbs[argv[0]](argv[1:])
 
 
 # ---------------------------------------------------------------- lifecycle verbs (the conductor's job)
@@ -2966,10 +3195,11 @@ def cmd_profile(argv):
 
 def main():
     if len(sys.argv) < 2 or sys.argv[1] in ("-h", "--help"):
-        print("usage: fleet <launch|config|ls|archive|revive|register|recycle|rm|vitals|find|graph|serve|paint|worktree|profile|daemon> ...\n"
+        print("usage: fleet <launch|config|ls|plugins|archive|revive|register|recycle|rm|vitals|find|graph|serve|paint|worktree|profile|daemon> ...\n"
               "  launch <role|--adhoc NAME> [--tool t] [--place p] [--parent s] [--effort L] [--model M] [--dry-run] [-- <tool flags>]\n"
               "  config <role|--adhoc NAME|--cwd DIR> [--tool t]   effective config (base settings + fleet adds)\n"
               "  ls                                                live fleet x hook store; flags STALE + archived\n"
+              "  plugins <reconcile|ls|show|describe> ...          the plugin INDEX: reconcile from sources + on-demand discovery\n"
               "  archive <label>                                   park a live agent (revivable)\n"
               "  revive <label> [--fresh] [--session id] [--place p] [--parent s] [--add-plugin N] [-- <flags>]\n"
               "                                                    bring a parked agent back (default RESUME last session; --fresh sheds; --session targets an arbitrary prior one)\n"
@@ -3008,7 +3238,7 @@ def main():
     from . import features as ff
     from . import daemon as fd
     from . import helpers as fh
-    fns = {"launch": cmd_launch, "config": cmd_config, "ls": cmd_ls,
+    fns = {"launch": cmd_launch, "config": cmd_config, "ls": cmd_ls, "plugins": cmd_plugins,
            "archive": cmd_archive, "revive": cmd_revive, "register": cmd_register, "recycle": cmd_recycle,
            "sessions": cmd_sessions,
            "_recycle-exec": cmd_recycle_exec, "_recycle-bulk-exec": cmd_recycle_bulk_exec,
