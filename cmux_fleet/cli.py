@@ -2447,11 +2447,21 @@ def _resume_and_gate(surf, send_cmd, tool, sess, log):
     return status != RESUME_TIMEOUT
 
 
+# Ceiling for _respawn_and_verify's post-respawn poll. respawn-pane's kill is ASYNC and normally lands
+# in well under a second, but a transient cmux hang can stretch it (the confirmed field failure: a 15s
+# "Command timed out"). 30s leaves a wide margin over that without letting one attempt hang forever.
+_RESPAWN_VERIFY_TIMEOUT = 30
+
+
 def _recycle_exec_one(p):
-    """Run ONE recycle: quiet-gate -> respawn-pane -> confirm new session -> reconcile the registry ->
-    auto-prime. Never half-kills: aborts before respawn if the surface won't go quiet. Shared by the
-    single `_recycle-exec` verb and the sequential `_recycle-bulk-exec` orchestrator. Returns 0 when the
-    respawn proceeded (bound or lazy), 1 on a pre-respawn / resume-gate abort."""
+    """Run ONE recycle: quiet-gate -> respawn-pane (verified) -> confirm new session -> reconcile the
+    registry -> auto-prime. Never half-kills: aborts before respawn if the surface won't go quiet, and
+    never sends the launch unless the old session is confirmed dead (see _respawn_and_verify) -- a
+    respawn-pane timeout that goes unverified leaves the old claude ALIVE, and blindly firing the launch
+    types it as an unsubmitted draft into that live TUI (the 9h berg-sandbox silent-recycle failure).
+    Shared by the single `_recycle-exec` verb and the sequential `_recycle-bulk-exec` orchestrator.
+    Returns 0 when the respawn proceeded (bound or lazy), 1 on a pre-respawn / verify-respawn /
+    resume-gate abort."""
     from . import state as fs
     surf, send_cmd, label = p["surface"], p["send_cmd"], p["label"]
     mode, force, prime, old_sid = p["mode"], p["force"], p.get("prime"), p.get("old_session") or ""
@@ -2473,16 +2483,6 @@ def _recycle_exec_one(p):
     # -- a bare `/bin/sh -c claude` fails with 'claude not found'. Then we `send` the launch into it.
     # NOTE: the login shell's PATH is built incrementally during init; the send below PATH-guards the
     # command so a too-early send can't crash on an unready PATH (see `guarded`).
-    log("quiet; respawn-pane -> fresh interactive shell (cmux kills the old agent in place)")
-    out = cmuxq("respawn-pane", "--surface", surf, "--command", "exec /bin/zsh -il")
-    log(f"respawn-pane -> {out.strip()}")
-    # SNAPSHOT the surface's store sid right after respawn but BEFORE relaunch. cmux's session-end on
-    # respawn does NOT reliably drop the old entry from sessions[] (poll_session's fallback still sees
-    # it), so a fresh-mode confirm could match this STALE sid and falsely report success even when the
-    # launch crashed -- then prime/wakes get typed into a dead shell (the 'claude not found' incident).
-    # Excluding pre_sid makes a crash correctly resolve to '' (no new session) -> WARN + no prime.
-    pre_sid = poll_session(surf, timeout=1)
-    time.sleep(3)                                        # let the login shell source its integration
     # PATH-GUARD the launch: the cmux claude-wrapper's find_real_claude walks $PATH for the real binary
     # (~/.local/bin/claude, added by ~/.zshenv). If the send lands before the shell finished building
     # PATH, the wrapper exits 127 'claude not found in PATH'. Prepending the standard dirs makes the
@@ -2494,6 +2494,73 @@ def _recycle_exec_one(p):
         cmuxq("send", "--surface", surf, guarded)
         cmuxq("send-key", "--surface", surf, "enter")
 
+    def _direct_kill():
+        """cmux-INDEPENDENT teardown of the old claude process: SIGINT x2 (clean TUI exit) straight to
+        its pid, the exact mechanism cmd_archive/cmd_rm already use for a reliable kill (Berg's manual
+        Ctrl-C-twice). respawn-pane's OWN kill goes through cmux itself, so a wedged/unresponsive cmux
+        (the confirmed 05:44 failure: a 15s 'Command timed out') can hang or silently no-op it; a raw
+        os.kill on the pid doesn't care whether cmux is responsive. No-ops quietly if the pid is already
+        gone or unreadable (best-effort fallback, not the primary path)."""
+        import signal
+        pid = _pid_for_surface(surf)
+        if not pid:
+            log("direct-kill fallback: no pid on record for this surface; skipping straight to respawn")
+            return
+        log(f"direct-kill fallback: SIGINT x2 -> pid {pid} (cmux-independent)")
+        try:
+            os.kill(pid, signal.SIGINT); time.sleep(0.5); os.kill(pid, signal.SIGINT)
+        except (ProcessLookupError, PermissionError):
+            pass
+
+    def _respawn_and_verify(kill_first=False):
+        """One respawn-pane attempt, verified by polling for the OLD claude session's death instead of
+        a blind sleep. respawn-pane is ASYNC and normally near-instant, but `out=='OK'` means 'command
+        accepted', NOT 'old process killed' -- the old claude actually dies a few seconds later (see the
+        module docstring above). We poll cmux's hook store for this surface's agentLifecycle to read a
+        TERMINAL state ('', '-', 'ended' -- the exact 'stale/non-live' vocabulary _bulk_targets/
+        _live_session_for already use elsewhere in this file for 'this surface's claude is dead'),
+        rather than testing raw sessions[] entry absence: cmux does not reliably DROP the old entry (see
+        the pre_sid comment below), but it does reliably flip agentLifecycle to a terminal value once the
+        SessionEnd hook fires, and that's the most-validated 'is the old TUI actually gone' signal this
+        codebase has. `kill_first` runs the cmux-independent SIGINTx2 fallback before respawning --
+        for when cmux itself was too wedged for respawn-pane's own kill to land. Returns True once
+        confirmed dead; False if `out` reports an error or the poll exhausts `_RESPAWN_VERIFY_TIMEOUT`
+        without ever seeing a terminal state."""
+        if kill_first:
+            _direct_kill()
+        out = cmuxq("respawn-pane", "--surface", surf, "--command", "exec /bin/zsh -il")
+        log(f"respawn-pane -> {out.strip()}")
+        if "error" in out.lower():
+            return False
+        end = time.time() + _RESPAWN_VERIFY_TIMEOUT
+        while time.time() < end:
+            if fs.lifecycle(surf) in ("", "-", "ended"):
+                return True
+            time.sleep(1)
+        return fs.lifecycle(surf) in ("", "-", "ended")
+
+    log("quiet; respawn-pane -> fresh interactive shell (cmux kills the old agent in place)")
+    if not _respawn_and_verify():
+        log(f"respawn not confirmed within {_RESPAWN_VERIFY_TIMEOUT}s; falling back to a direct "
+            "SIGINTx2 kill (cmux-independent) then re-respawning")
+        if not _respawn_and_verify(kill_first=True):
+            log(f"ABORT: respawn still not confirmed after the direct-kill fallback; old session is "
+                f"(almost certainly) still ALIVE on {surf} -- NOT sending the launch (would type into "
+                f"a live TUI). Re-run `fleet recycle` for '{label}' once the surface is confirmed idle.")
+            cmuxq("notify", "--surface", surf, "--title", "fleet recycle FAILED",
+                  "--body", f"recycle FAILED for {label}: respawn didn't take; "
+                            "still on the old session; re-run")
+            fs.log_event("recycle_abort", label=label, surface=surf, mode=mode,
+                         reason="respawn-not-confirmed")
+            return 1
+        log("confirmed after direct-kill fallback")
+    # SNAPSHOT the surface's store sid right after the verified kill but BEFORE relaunch. cmux's
+    # session-end does NOT reliably DROP the old entry from sessions[] (poll_session's fallback still
+    # sees it even once its lifecycle reads terminal), so a fresh-mode confirm could match this STALE
+    # sid and falsely report success even when the launch crashed -- then prime/wakes get typed into a
+    # dead shell (the 'claude not found' incident). Excluding pre_sid makes a crash correctly resolve to
+    # '' (no new session) -> WARN + no prime.
+    pre_sid = poll_session(surf, timeout=1)
     _fire_launch()
 
     # CONFIRM is tool-aware. claude binds a session at BOOT -> poll for it (a NEW sid for fresh, the
