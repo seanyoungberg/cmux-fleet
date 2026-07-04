@@ -90,6 +90,20 @@ def test_stall_does_not_fire_for_fresh_running(fs, monkeypatch, wake):
     assert wake == []
 
 
+def test_stall_does_not_fire_for_ancient_running(fs, monkeypatch, wake):
+    """The OTHER false-positive case (smoke test 2026-07-04): a 'running' record stale for HOURS is a
+    done-stuck ghost — cmux left the lifecycle at 'running' after the agent actually finished — NOT a live
+    stall. A real stall is caught FRESH (within a tick of crossing STALL_S), so anything past STALL_WINDOW
+    was never fresh-caught. Excluding it kills the observed false positives (a finished worker @8.6h)."""
+    _seed_parent_child()
+    ancient = NOW - (router.STALL_WINDOW + 3600)               # frozen an hour PAST the recent window
+    monkeypatch.setattr(fs, "read_hook_store", lambda: _store("running", ancient))
+    n = router.fleet_doctor_sweep(now=NOW)
+    assert n == 0
+    assert fs.inbox_pending("PARENT", kind="doctor") == []
+    assert wake == []
+
+
 def test_stall_dedups_across_ticks(fs, monkeypatch, wake):
     """A second sweep with the SAME stalled state must NOT re-alert — the no-storm guarantee."""
     _seed_parent_child()

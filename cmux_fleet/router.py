@@ -53,10 +53,17 @@ _retry_lock = threading.Lock()
 # recycle/rebind. The set persists across ticks in the long-lived daemon process (a restart re-alerts
 # once — never a storm). See docs/backlog.md 'NOTIFY-LAYER FAILURE CONDITIONS'.
 STALL_S = 600           # a fleet-bound 'running' record frozen longer than this = a dead/stalled turn
-                        # (the INVERSE of surface_busy's live-turn check). Deliberately generous: real
-                        # stalls ran 30-53m and a live turn re-stamps updatedAt every ~1-35s, so 10m
-                        # never clips a legit slow turn EXCEPT one blocked on a single >10m tool call —
-                        # the lone residual false-positive shape, and even that is ONE deduped nudge.
+                        # (the INVERSE of surface_busy's live-turn check). A live turn re-stamps updatedAt
+                        # every ~1-35s, so 10m never clips a legit slow turn EXCEPT one blocked on a single
+                        # >10m tool call (deduped to one nudge). Paired with STALL_UPPER below.
+STALL_WINDOW = 1800     # ...but ONLY fire while the stall is RECENT (age in (STALL_S, STALL_WINDOW)). The
+                        # daemon sweeps every ~2m, so a GENUINE stall is caught FRESH — within one tick of
+                        # crossing STALL_S, i.e. ~10-12m stale. A record already stale for HOURS was never
+                        # "caught fresh": it's an agent cmux left stuck at 'running' after it was actually
+                        # DONE (lifecycle never transitioned to idle) — a done-stuck ghost, not a live
+                        # stall. Smoke test 2026-07-04 found two (a finished worker @8.6h, loom-dev @6h)
+                        # that a bare `age > STALL_S` would false-flag as "stalled." The upper bound
+                        # excludes them (30m >> any fresh-caught stall) without missing a real one.
 LOW_CTX_PCT = 30        # context-remaining % at/under which to alert once (matches vitals' near-full flag)
 _doctor_fired = set()   # {(reason, label, session)} — parent-alert dedup across heartbeat ticks
 
@@ -322,12 +329,13 @@ def fleet_doctor_sweep(now=None):
             life = (rec.get("agentLifecycle") or "") if rec else ""
             ua = (rec.get("updatedAt") or 0) if rec else 0
 
-            # #1 stall — bound 'running' record frozen past STALL_S (inverse of surface_busy). A missing/
-            # zero updatedAt never fires (no false alarm on a malformed record).
-            if life == "running" and ua and (now - ua) > STALL_S:
+            # #1 stall — bound 'running' record frozen in the RECENT window (STALL_S, STALL_WINDOW). A
+            # missing/zero updatedAt never fires; a record stale for HOURS (a done-stuck ghost, not a live
+            # stall) is above the window and skipped — see STALL_WINDOW. A real stall is caught fresh.
+            if life == "running" and ua and STALL_S < (now - ua) < STALL_WINDOW:
                 _emit("stall", label, entry, surface, {"stalled_s": int(now - ua)})
             else:
-                _doctor_fired.discard(("stall", label, session))       # re-arm when it clears
+                _doctor_fired.discard(("stall", label, session))       # re-arm when it clears/ages out
 
             # #3 needs-input — bound record at needsInput. NO freshness gate: a genuine wait freezes
             # updatedAt for DAYS (loom-dev sat 46h; the live store holds a 46.3h needsInput record), so
