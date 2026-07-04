@@ -662,7 +662,9 @@ def cmd_launch(argv):
                                     "needed for an --adhoc agent, which has no toml group")
     ap.add_argument("--direction", default="down", help="split direction for --place pane")
     ap.add_argument("--cwd", help="override the launch cwd (absolute)")
-    ap.add_argument("--plugins", help="ad-hoc: comma-separated plugin names (adds to floor)")
+    ap.add_argument("--plugins", help="comma-separated plugin names to UNION onto the composed loadout "
+                                      "(role or floor) for THIS launch — the launch analog of recycle's "
+                                      "--add-plugin; works with or without --adhoc")
     ap.add_argument("--effort", default="", metavar="LEVEL",
                     help="session-preference override (low|medium|high|xhigh|max); layers over the loadout")
     ap.add_argument("--model", default="", metavar="MODEL", help="session-preference override; layers over the loadout")
@@ -694,7 +696,11 @@ def cmd_launch(argv):
         spec["group"] = a.group
     if a.label:
         spec["label"] = a.label
-    if a.adhoc and a.plugins:
+    if a.plugins:
+        # UNION onto the composed loadout regardless of role/ad-hoc. Was gated behind `a.adhoc`, which
+        # SILENTLY dropped `--plugins` on a ROSTER launch (the contract is "pass any valid flag at
+        # launch/recycle and it takes"; recycle's --add-plugin already unions unconditionally, so this
+        # aligns launch with it). A role that wants a plugin BY DEFAULT still belongs in the toml.
         spec["plugins"] = _dedup(spec["plugins"] + [p.strip() for p in a.plugins.split(",") if p.strip()])
     # one conductor = one group: a place=workspace conductor with no explicit group anchors its OWN group
     # (named for its label); a place=workspace child with no explicit group joins its parent's group.

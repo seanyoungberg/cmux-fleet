@@ -39,6 +39,23 @@ def test_launch_dry_run_composes(cli_env):
     assert "dry-run" in p.stdout.lower()
 
 
+def test_launch_plugins_unions_on_a_role(cli_env, tmp_path):
+    # REGRESSION (2026-07-04): `--plugins` was gated behind `--adhoc`, so it was SILENTLY dropped on a
+    # roster-ROLE launch. The contract is "pass any valid flag at launch/recycle and it takes" (recycle's
+    # --add-plugin already unions unconditionally). Assert `--plugins` unions onto a ROLE's composed
+    # loadout, with a control proving it is absent when not passed.
+    toml = tmp_path / "fleet.toml"
+    toml.write_text('[tool.claude]\nplugins = ["cmux-fleet"]\n'
+                    '[role.worker]\nkind = "child"\ncwd = "workers/w"\n'
+                    '[role.worker.claude]\nplugins = ["cmux-fleet"]\n')
+    env = {**cli_env, "CMUX_FLEET_TOML": str(toml)}
+    with_flag = run_fleet(env, "launch", "worker", "--label", "w1", "--parent", "FAKE",
+                          "--plugins", "extrap", "--dry-run")
+    assert "extrap" in with_flag.stdout            # unioned onto the ROLE launch (the fix)
+    without = run_fleet(env, "launch", "worker", "--label", "w2", "--parent", "FAKE", "--dry-run")
+    assert "extrap" not in without.stdout          # control: absent when the flag is not passed
+
+
 def test_config_renders(cli_env, tmp_path):
     # `fleet config --cwd <dir>` reads the settings stack; no cmux, no roster needed.
     p = run_fleet(cli_env, "config", "--cwd", str(tmp_path))
