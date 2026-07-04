@@ -68,6 +68,30 @@ def test_plugins_ls_table_and_json(cli_env, tmp_path):
     assert obs["type"] == "enabled" and obs["tools"] == ["claude"] and obs["source"] == "obs"
 
 
+def test_plugins_ls_truncates_long_description_but_show_and_json_keep_full(cli_env, tmp_path):
+    # `ls` is a scan table: a verbose multi-paragraph marketplace.json description must collapse to ONE
+    # truncated line there, while `show` and `--json` keep the FULL text. (Phase-3 polish.)
+    tail = "z" * 200                                            # a long first line, well past the ~60c cap
+    full_desc = f"First line is very long and keeps going {tail}\n\nSecond paragraph should never show in ls."
+    (tmp_path / "plugins.toml").write_text(
+        '[plugin.verbose]\ntype = "linked"\nsource = "berg"\ntools = ["claude"]\n'
+        f'description = {json.dumps(full_desc)}\n')
+    env = _env(cli_env, tmp_path, index=tmp_path / "plugins.toml")
+
+    ls = run_fleet(env, "plugins", "ls")
+    ls_row = next(l for l in ls.stdout.splitlines() if "verbose" in l and "linked" in l)
+    assert "…" in ls_row                                       # truncated with an ellipsis
+    assert tail not in ls_row                                  # the long tail is cut
+    assert "Second paragraph" not in ls.stdout                 # only the FIRST line ever reaches ls
+    assert len(ls_row) < 120                                   # the row is a scannable single line
+
+    # show + --json keep the full, untruncated description
+    show = run_fleet(env, "plugins", "show", "verbose")
+    assert tail in show.stdout                                 # full first line intact in show
+    data = json.loads(run_fleet(env, "plugins", "ls", "--json").stdout)
+    assert data[0]["description"] == full_desc                 # --json is never truncated
+
+
 # --- show: resolved path + which roles use it ----------------------------------------------------
 def test_plugins_show_resolves_path_and_finds_roles(cli_env, tmp_path):
     plugins_dir = _mkmarketplace(tmp_path / "mkt", {"memsearch": ["claude", "codex"]})

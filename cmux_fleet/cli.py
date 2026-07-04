@@ -212,6 +212,16 @@ def _dedup(seq):
     return out
 
 
+def _flatten_csv(values):
+    """Flatten a repeatable + comma-sep flag into a clean name list — `--use a,b --use c` (append) and
+    `--use a,b` (comma) both land as ['a','b','c']. Matches `--plugins`' comma shape AND `--add-plugin`'s
+    repeatable shape in one flag, so `--use` reads either way."""
+    out = []
+    for v in (values or []):
+        out += [s.strip() for s in str(v).split(",") if s.strip()]
+    return out
+
+
 def _flag_keys(tokens):
     return {t.split("=", 1)[0] for t in tokens if t.startswith("--")}
 
@@ -720,7 +730,13 @@ def cmd_launch(argv):
     ap.add_argument("--cwd", help="override the launch cwd (absolute)")
     ap.add_argument("--plugins", help="comma-separated plugin names to UNION onto the composed loadout "
                                       "(role or floor) for THIS launch — the launch analog of recycle's "
-                                      "--add-plugin; works with or without --adhoc")
+                                      "--add-plugin; works with or without --adhoc (legacy: linked-only)")
+    ap.add_argument("--use", action="append", default=[], metavar="NAME",
+                    help="index-aware plugin to UNION onto the composed loadout for THIS launch "
+                         "(repeatable or comma-sep). Routes through plugins.toml, so a `linked` name adds "
+                         "a --plugin-dir and an `enabled` name adds an enabledPlugins entry — reaching "
+                         "BOTH plugin types (unlike --plugins). Unindexed names fall back to today's "
+                         "linked/marketplace/abs-path behavior")
     ap.add_argument("--effort", default="", metavar="LEVEL",
                     help="session-preference override (low|medium|high|xhigh|max); layers over the loadout")
     ap.add_argument("--model", default="", metavar="MODEL", help="session-preference override; layers over the loadout")
@@ -758,6 +774,12 @@ def cmd_launch(argv):
         # launch/recycle and it takes"; recycle's --add-plugin already unions unconditionally, so this
         # aligns launch with it). A role that wants a plugin BY DEFAULT still belongs in the toml.
         spec["plugins"] = _dedup(spec["plugins"] + [p.strip() for p in a.plugins.split(",") if p.strip()])
+    if a.use:
+        # UNION index-aware names onto the resolved spec's `use` BEFORE adapter_compile, so they route
+        # through the index EXACTLY like a role's own `use` — a `linked` name composes an extra
+        # --plugin-dir, an `enabled` name an extra enabledPlugins entry (closing the gap where an external
+        # enabled plugin had no launch add-surface). Coexists with legacy --plugins (linked-only).
+        spec["use"] = _dedup(spec["use"] + _flatten_csv(a.use))
     # one conductor = one group: a place=workspace conductor with no explicit group anchors its OWN group
     # (named for its label); a place=workspace child with no explicit group joins its parent's group.
     if spec["place"] == "workspace" and not spec["group"]:
@@ -1180,6 +1202,14 @@ def _cmd_plugins_reconcile(rest):
     return 0
 
 
+def _one_line_desc(text, width=60):
+    """First line of a (possibly multi-paragraph) description, truncated to `width` chars with an ellipsis
+    — keeps `fleet plugins ls` a scannable one-row-per-plugin table when marketplace.json descriptions run
+    long. The FULL text stays in `show`/`describe` and `--json`, which never call this."""
+    line = (text or "").split("\n", 1)[0].strip()
+    return line if len(line) <= width else line[: width - 1].rstrip() + "…"
+
+
 def _cmd_plugins_ls(rest):
     ap = argparse.ArgumentParser(prog="fleet plugins ls", description="list the plugin index")
     ap.add_argument("--json", action="store_true")
@@ -1197,7 +1227,7 @@ def _cmd_plugins_ls(rest):
     rows = [("NAME", "TYPE", "TOOLS", "SOURCE", "DESCRIPTION")]
     for n, e in sorted(plugins.items()):
         rows.append((n, e["type"], ",".join(e["tools"]) or "-", e["source"] or "-",
-                     (e["description"] or "").split("\n")[0]))
+                     _one_line_desc(e["description"])))          # first line, ~60c — full text in show/--json
     w = [max(len(r[i]) for r in rows) for i in range(4)]                 # size the first 4 cols; desc runs free
     for i, r in enumerate(rows):
         print(f"  {r[0]:<{w[0]}}  {r[1]:<{w[1]}}  {r[2]:<{w[2]}}  {r[3]:<{w[3]}}  {r[4]}")
@@ -2278,13 +2308,16 @@ def _prepend_resume(args, tool, sid):
     return args
 
 
-def _replay_binding_argv(argv, tool, role, label, cwd, caller_tokens, add_plugins, resume_session):
+def _replay_binding_argv(argv, tool, role, label, cwd, caller_tokens, add_plugins, resume_session, add_use=()):
     """Recompose a launch command from a captured binding's argv — the SHARED core of recycle (reads a
     LIVE surface binding) and revive (reads the binding captured at archive time). Strips the binding's
     own --resume (callers control it), unions add-plugins as --plugin-dir, layers caller flag overrides,
     optionally re-adds `--resume <resume_session>`, and re-injects AGENT_ROLE/AGENT_LABEL (bindings
     capture null env, so the orchestration vars must be put back). Other env (tool-floor env) is NOT
-    recoverable from a binding — accepted, same as it's always been for recycle."""
+    recoverable from a binding — accepted, same as it's always been for recycle.
+    `add_use` (index-aware `--use` names) routes through the index into BOTH channels here too: a `linked`
+    name appends a --plugin-dir, an `enabled` name appends an enabledPlugins --settings (the wrapper deep-
+    merges multiple --settings, so a fresh one is safe alongside the binding's own)."""
     abs_cwd = cwd if os.path.isabs(cwd) else os.path.join(ROOT, cwd)
     base = _drop_keys(argv, {"--resume"})
     have = {base[i + 1] for i in range(len(base) - 1) if base[i] == "--plugin-dir"}
@@ -2294,21 +2327,33 @@ def _replay_binding_argv(argv, tool, role, label, cwd, caller_tokens, add_plugin
             if not pd:
                 print(f"[fleet] warn: plugin '{name}' not resolvable (marketplace unset or not found); skipping")
             continue
-        base += ["--plugin-dir", pd]
+        base += ["--plugin-dir", pd]; have.add(pd)
+    if add_use:                                                  # index-aware add on the ad-hoc replay path
+        use_linked, use_enabled, use_unresolved = _resolve_use(list(add_use), load_plugin_index())
+        for name in use_unresolved:
+            print(f"[fleet] warn: plugin '{name}' (use) not resolvable (marketplace unset or not found); skipping")
+        for pd in use_linked:
+            if pd not in have:
+                base += ["--plugin-dir", pd]; have.add(pd)
+        if use_enabled:                                          # extra --settings; wrapper deep-merges it in
+            base += ["--settings", json.dumps({"enabledPlugins": {ref: True for ref in _dedup(use_enabled)}})]
     base = _layer_tokens([base, list(caller_tokens or [])])      # flag overrides
     base = _prepend_resume(base, tool, resume_session)           # claude --resume flag | codex resume subcmd
     # profile-pin a recycled/revived child too (bindings capture null env -> re-inject the build env)
     return render_send_cmd(tool, base, {**_profile_env(), "AGENT_ROLE": role, "AGENT_LABEL": label}, abs_cwd)
 
 
-def _compose_from_registry(label, entry, caller_tokens, add_plugins, resume_session):
-    """Fallback compose from our registry spec (used only when cmux has no binding for the surface)."""
+def _compose_from_registry(label, entry, caller_tokens, add_plugins, resume_session, add_use=()):
+    """Fallback compose from our registry spec (used only when cmux has no binding for the surface).
+    `add_use` unions index-aware names onto the spec's `use`, so adapter_compile routes them through the
+    index into --plugin-dir / enabledPlugins exactly like the roster path."""
     tool = entry.get("tool", "claude")
     cwd = entry.get("cwd", "")
     abs_cwd = cwd if os.path.isabs(cwd) else os.path.join(ROOT, cwd)
     spec = {"tool": tool, "role": entry.get("role"), "label": label, "kind": entry.get("kind", "child"),
             "place": entry.get("place", "tab"), "group": entry.get("group", ""), "cwd": cwd,
             "abs_cwd": abs_cwd, "plugins": _dedup(list(entry.get("plugins", [])) + list(add_plugins or [])),
+            "use": _dedup(list(entry.get("use", [])) + list(add_use or [])),
             "flags": _layer_tokens([list(entry.get("flags", [])), list(caller_tokens or [])]),
             "env": {}, "settings": entry.get("settings", "")}
     bin_name, args, env = adapter_compile(tool, spec, [])
@@ -2316,7 +2361,7 @@ def _compose_from_registry(label, entry, caller_tokens, add_plugins, resume_sess
     return render_send_cmd(bin_name, args, env, abs_cwd)
 
 
-def _compose_from_roster(role, tool, label, caller_tokens, add_plugins, resume_session, cwd_override=""):
+def _compose_from_roster(role, tool, label, caller_tokens, add_plugins, resume_session, cwd_override="", add_use=()):
     """TOML-AUTHORITATIVE compose for a ROSTER role: re-resolve the CURRENT toml (floor + role config,
     incl. setting_sources / enable_plugins), compile it exactly as `fleet launch` does, then prepend the
     resume per tool. This is the source-of-truth path -- a recycle/revive of a rostered agent PICKS UP
@@ -2333,6 +2378,11 @@ def _compose_from_roster(role, tool, label, caller_tokens, add_plugins, resume_s
     spec["label"] = label                                        # registry label (resolve defaults to role)
     if add_plugins:
         spec["plugins"] = _dedup(spec["plugins"] + list(add_plugins))
+    if add_use:
+        # UNION `--use` names into the re-resolved spec's `use` BEFORE adapter_compile — index routes each
+        # to the right channel, so `--use <enabled>` reaches enabledPlugins on a roster recycle (the gap
+        # --add-plugin could never close). Coexists with a role's own `use` (unioned + deduped downstream).
+        spec["use"] = _dedup(spec.get("use", []) + list(add_use))
     cwd = cwd_override or spec["cwd"]
     abs_cwd = cwd if os.path.isabs(cwd) else os.path.join(ROOT, cwd)
     bin_name, args, env = adapter_compile(tool, spec, caller_tokens)
@@ -2349,12 +2399,14 @@ def _is_roster(role):
         return False
 
 
-def _compose_recycle_cmd(label, entry, caller_tokens, add_plugins, mode, explicit_session=""):
+def _compose_recycle_cmd(label, entry, caller_tokens, add_plugins, mode, explicit_session="", add_use=()):
     """Recompose the recycle launch. ROSTER agents (role in the toml) are TOML-AUTHORITATIVE: re-resolve
     the current toml so a recycle picks up floor/role changes since launch. AD-HOC / off-roster agents
     have no toml to resolve -> reproduce from cmux's ground-truth binding (registry spec as last resort).
     Identity + session come from the registry; FRESH drops the resume, RESUME re-adds it per tool.
-    One-off caller `--` flags apply this invocation only. Returns (send_cmd, checkpoint)."""
+    One-off caller `--` flags apply this invocation only. `add_use` unions index-aware `--use` names into
+    whichever compose path runs (roster/binding/registry) — reaching BOTH plugin channels. Returns
+    (send_cmd, checkpoint)."""
     tool = entry.get("tool", "claude")
     role = entry.get("role")
     b = _resume_binding(entry.get("surface", ""))
@@ -2367,13 +2419,16 @@ def _compose_recycle_cmd(label, entry, caller_tokens, add_plugins, mode, explici
         # RESUME pins the session's original cwd (registry) so a moved-role / worktree agent resumes where
         # its session actually lives; FRESH adopts the current toml cwd (picks up an intentional move).
         cwd_override = entry.get("cwd", "") if mode == "resume" else ""
-        return (_compose_from_roster(role, tool, label, caller_tokens, add_plugins, resume_session, cwd_override),
+        return (_compose_from_roster(role, tool, label, caller_tokens, add_plugins, resume_session,
+                                     cwd_override, add_use=add_use),
                 checkpoint)
     argv = _binding_argv(b.get("command", ""))                    # AD-HOC / off-roster -> reproduce
     if not argv:                                                  # no cmux binding -> registry fallback
-        return _compose_from_registry(label, entry, caller_tokens, add_plugins, resume_session), checkpoint
+        return _compose_from_registry(label, entry, caller_tokens, add_plugins, resume_session,
+                                      add_use=add_use), checkpoint
     cwd = b.get("cwd") or entry.get("cwd", "")
-    send_cmd = _replay_binding_argv(argv, tool, role, label, cwd, caller_tokens, add_plugins, resume_session)
+    send_cmd = _replay_binding_argv(argv, tool, role, label, cwd, caller_tokens, add_plugins,
+                                    resume_session, add_use=add_use)
     return send_cmd, checkpoint
 
 
@@ -2454,13 +2509,14 @@ def _cwd_of_sendcmd(send_cmd):
     return toks[1] if len(toks) >= 2 and toks[0] == "cd" else ""
 
 
-def _recycle_plan(label, entry, caller, add_plugin, mode, session, force, prime_override, no_prime):
+def _recycle_plan(label, entry, caller, add_plugin, mode, session, force, prime_override, no_prime, add_use=()):
     """Compose ONE recycle payload (the dict the detached exec consumes). Shared by single + bulk recycle
     so the mode/session/prime logic lives in exactly one place. FRESH boots clean -> auto-prime from the
-    latest handover; RESUME carries its context -> no prime unless asked."""
+    latest handover; RESUME carries its context -> no prime unless asked. `add_use` unions index-aware
+    `--use` names into the composed loadout (reaching BOTH plugin channels)."""
     surf = entry.get("surface", "")
     old_sid = (entry.get("session") or "").replace("claude-", "")
-    send_cmd, _checkpoint = _compose_recycle_cmd(label, entry, caller, add_plugin, mode, session)
+    send_cmd, _checkpoint = _compose_recycle_cmd(label, entry, caller, add_plugin, mode, session, add_use=add_use)
     prime = None
     if not no_prime:
         if prime_override:
@@ -2538,7 +2594,13 @@ def cmd_recycle(argv):
                     help="session-preference override for THIS restart; layers over the composed loadout")
     ap.add_argument("--force", action="store_true", help="skip the empty-draft guard (intentional go-live)")
     ap.add_argument("--add-plugin", action="append", default=[], metavar="NAME",
-                    help="union a marketplace plugin into this identity (repeatable; persisted)")
+                    help="union a marketplace plugin into this identity (repeatable; persisted; legacy: linked-only)")
+    ap.add_argument("--use", action="append", default=[], metavar="NAME",
+                    help="index-aware plugin to UNION into this identity for the restart (repeatable or "
+                         "comma-sep; persisted via the re-captured binding). Routes through plugins.toml so "
+                         "a `linked` name adds a --plugin-dir and an `enabled` name adds an enabledPlugins "
+                         "entry — reaching BOTH plugin types (unlike --add-plugin). Unindexed names fall "
+                         "back to today's behavior")
     ap.add_argument("--prime", help="override the post-fresh-boot priming prompt")
     ap.add_argument("--no-prime", action="store_true", help="don't send any priming prompt")
     ap.add_argument("--dry-run", action="store_true", help="resolve + print, do NOT recycle")
@@ -2587,7 +2649,8 @@ def cmd_recycle(argv):
         sys.exit(f"[fleet] recycle: could not verify session '{a.session}' under {label}'s projects dir "
                  f"(bad id, or the dir couldn't be resolved/enumerated). `fleet sessions {label}` to list "
                  f"resumable ids; add --force-session to skip this check if you're sure the id is valid.")
-    payload = _recycle_plan(label, entry, caller, a.add_plugin, mode, a.session, a.force, a.prime, a.no_prime)
+    payload = _recycle_plan(label, entry, caller, a.add_plugin, mode, a.session, a.force, a.prime, a.no_prime,
+                            add_use=_flatten_csv(a.use))
     provline, provwarn = _session_pref_provenance(entry.get("role"), entry.get("tool", "claude"),
                                                    payload["send_cmd"], a.effort, a.model)
 
@@ -2597,7 +2660,7 @@ def cmd_recycle(argv):
         print(provline)                                          # effort/model + provenance (source)
     if provwarn:
         print(provwarn)                                          # no-pin warning (floor-inherited effort)
-    if a.add_plugin or caller:
+    if a.add_plugin or a.use or caller:
         print("[fleet] overrides applied (persist for free: cmux re-captures this as the new binding)")
     print(f"[fleet] prime: {payload['prime'] if payload['prime'] else '(none)'}")
     if a.dry_run:
@@ -2640,7 +2703,8 @@ def _recycle_bulk(target, mode, caller, a):
     print(f"[fleet] recycle --{target} (mode={mode}{ov}) from {from_label}: {len(sel)} target(s), sequential + gated")
     payloads = []
     for label, entry in sel:
-        payload = _recycle_plan(label, entry, caller, a.add_plugin, mode, "", a.force, a.prime, a.no_prime)
+        payload = _recycle_plan(label, entry, caller, a.add_plugin, mode, "", a.force, a.prime, a.no_prime,
+                                add_use=_flatten_csv(a.use))
         payloads.append(payload)
         # per-agent RESOLVED effort/model (provenance) — mirror the single-target print so an operator
         # watching a bulk recycle sees what each agent is actually coming back on (a bulk recycle is
@@ -3196,7 +3260,7 @@ def cmd_profile(argv):
 def main():
     if len(sys.argv) < 2 or sys.argv[1] in ("-h", "--help"):
         print("usage: fleet <launch|config|ls|plugins|archive|revive|register|recycle|rm|vitals|find|graph|serve|paint|worktree|profile|daemon> ...\n"
-              "  launch <role|--adhoc NAME> [--tool t] [--place p] [--parent s] [--effort L] [--model M] [--dry-run] [-- <tool flags>]\n"
+              "  launch <role|--adhoc NAME> [--tool t] [--place p] [--parent s] [--effort L] [--model M] [--use NAME] [--dry-run] [-- <tool flags>]\n"
               "  config <role|--adhoc NAME|--cwd DIR> [--tool t]   effective config (base settings + fleet adds)\n"
               "  ls                                                live fleet x hook store; flags STALE + archived\n"
               "  plugins <reconcile|ls|show|describe> ...          the plugin INDEX: reconcile from sources + on-demand discovery\n"
@@ -3205,8 +3269,8 @@ def main():
               "                                                    bring a parked agent back (default RESUME last session; --fresh sheds; --session targets an arbitrary prior one)\n"
               "  register <label> [--surface UUID] [--parent s] [--session id]\n"
               "                                                    pull a LIVE-but-unregistered agent into the registry (recovery for a skipped auto-register)\n"
-              "  recycle [label] [--fresh] [--session id] [--effort L] [--model M] [--force] [--add-plugin N] [--prime T|--no-prime] [-- <flags>]\n"
-              "                                                    restart in place, same surface/identity (default self+RESUME; --fresh sheds; --effort/--model = session-pref override)\n"
+              "  recycle [label] [--fresh] [--session id] [--effort L] [--model M] [--force] [--add-plugin N] [--use NAME] [--prime T|--no-prime] [-- <flags>]\n"
+              "                                                    restart in place, same surface/identity (default self+RESUME; --fresh sheds; --use = index-aware plugin add, reaches linked + enabled)\n"
               "  recycle --all|--conductors|--children|--my-children [--include-muted] [--resume] [--dry-run]\n"
               "                                                    BULK restart (sequential + gated, skips self + muted); cross-conductor = the safe topology\n"
               "  sessions <label> [--all] [--json]                 list resumable prior sessions for the agent's surface (id, age, size, snippet)\n"
