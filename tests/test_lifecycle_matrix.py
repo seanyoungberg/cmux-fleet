@@ -112,17 +112,23 @@ def test_revive_roster_compose_resumes(monkeypatch):
 # --- GATE 2: effort/model provenance + no-pin warning --------------------------------------------
 def test_provenance_override(monkeypatch):
     monkeypatch.setattr(cli, "_is_roster", lambda role: True)
-    line, warn = cli._session_pref_provenance("w", "claude", "claude --effort max", "max", "")
-    assert "effort=max (override)" in line and warn == ""
+    # BOTH prefs overridden -> both read (override), no warning. (A --model is present so the model-gap
+    # warning added for the effort-pinned-but-no-model case is out of scope here; that gap is covered by
+    # its own tests in test_recycle.py.)
+    line, warn = cli._session_pref_provenance("w", "claude", "claude --effort max --model opus", "max", "opus")
+    assert "effort=max (override)" in line and "model=opus (override)" in line and warn == ""
 
 
 def test_provenance_role_pin(monkeypatch):
     monkeypatch.setattr(cli, "_is_roster", lambda role: True)
     monkeypatch.setattr(cli, "load_config", lambda: {
         "tool": {"claude": {"flags": "--effort high"}},
-        "role": {"w": {"claude": {"flags": "--effort xhigh"}}}})
-    line, warn = cli._session_pref_provenance("w", "claude", "claude --effort xhigh", "", "")
-    assert "effort=xhigh (role-pin)" in line and warn == ""      # role pin wins, no warning
+        "role": {"w": {"claude": {"flags": "--effort xhigh --model claude-opus-4-8"}}}})
+    # role pins BOTH effort and model -> both read (role-pin), no warning (model is pinned, so the
+    # model-gap warning does not fire).
+    line, warn = cli._session_pref_provenance("w", "claude",
+                                              "claude --effort xhigh --model claude-opus-4-8", "", "")
+    assert "effort=xhigh (role-pin)" in line and "model=claude-opus-4-8 (role-pin)" in line and warn == ""
 
 
 def test_provenance_floor_warns_no_pin(monkeypatch):
