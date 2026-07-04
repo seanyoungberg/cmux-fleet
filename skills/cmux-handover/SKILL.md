@@ -40,10 +40,12 @@ The natural tail of a handover is a **`fleet recycle --fresh`** — restart your
 
 > NOTE (2026-07-01): `fleet recycle` now DEFAULTS to **RESUME** (preserve context — the least-disruptive default). A handover recycle must pass **`--fresh`** to get a clean session; a bare `fleet recycle` would just continue the same session (no shed, no handover prime).
 
+**ALWAYS `--dry-run` first, and READ the `session-prefs:` line before the real recycle.** The dry-run prints the fully-composed launch plus a line like `session-prefs: effort=max (role-pin), model=claude-opus-4-8[1m] (floor)`. Confirm the **model and effort are what you expect** — if they're not what you intend (wrong model, an effort you didn't mean, a `(source)` you don't recognize), STOP and fix the cause (usually the role's toml or the `[tool.claude]` floor) *before* recycling. This is the cheap guard against a silent came-back-on-the-wrong-model recycle (the 2026-07-04 cmux-advisor incident: a `--model`-less recycle inherited a stale global default). The dry-run is a pure preview — it spawns nothing.
+
 ```
-fleet recycle --fresh              # self, FRESH session, same surface/identity — the handover pattern
-fleet recycle --fresh --dry-run    # see the composed launch + prime first
-fleet recycle --fresh -- --effort xhigh --add-plugin <name>   # fresh recycle WITH changed launch params
+fleet recycle --fresh --dry-run    # STEP 1 — preview; verify the `session-prefs:` model/effort line
+fleet recycle --fresh              # STEP 2 — only after the dry-run looks right: self, FRESH session, same seat
+fleet recycle --fresh -- --effort xhigh --add-plugin <name>   # a one-off launch-param change (also dry-run it first)
 ```
 
 What it does (see the `cmux-fleet` SKILL → recycle, and `docs/operations.md`): a **detached** worker waits until you go quiet (idle + empty input draft; `--force` to override), then uses cmux's native `respawn-pane` to tear you down and relaunch a fresh session **in the same surface** — so your label and all parent/child routing stay valid (only the session id changes). The launch is recomposed from cmux's own resume binding (accurate even if the registry is sparse), then it auto-primes the fresh instance to read this handover. A bare `fleet recycle` (no `--fresh`) instead RESUMES the same session — not what you want at handover time. You can recycle a **child** the same way: have it write its handover first, then `fleet recycle <label> --fresh`.
