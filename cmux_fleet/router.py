@@ -340,8 +340,11 @@ def fleet_doctor_sweep(now=None):
 
             # #2 low-ctx — context-remaining <= LOW_CTX_PCT (vitals' exact math). used=None
             # (codex/unparseable transcript) -> skip: no false alarm on an unknowable window.
-            used, model = features._context_used(rec.get("transcriptPath", "") if rec else "")
-            window = features._context_window(model or entry.get("tool", ""))
+            used, tmodel = features._context_used(rec.get("transcriptPath", "") if rec else "")
+            # window from the LAUNCHED model (carries the [1m] flavor), same as vitals' snapshot() — so the
+            # sweep's low-ctx % matches what `fleet vitals` shows (no divergence between alarm and table).
+            lmodel, _eff = features._launched_prefs(rec, entry.get("tool", "")) if rec else ("", "")
+            window = features._context_window(lmodel or tmodel or entry.get("tool", ""))
             pct = max(0, round(100 * (1 - used / window))) if (used is not None and window) else None
             if pct is not None and pct <= LOW_CTX_PCT:
                 _emit("low-ctx", label, entry, surface, {"ctx_pct_remaining": pct})
