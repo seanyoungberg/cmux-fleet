@@ -27,7 +27,7 @@
 # [defaults] (orchestration) -> [role] scalars -> tool config [tool.<t>] -> [role.<t>] -> caller `--`.
 import argparse, json, os, shlex, subprocess, sys, tempfile, time
 
-from .config import ROOT, STATE, CMUX, MARKETPLACE, FLOOR, FLEET_TOML, ADHOC_SUBDIR  # path resolver
+from .config import ROOT, STATE, CMUX, MARKETPLACE, FLOOR, FLEET_TOML, ADHOC_SUBDIR, load_plugin_index  # path resolver
 
 # The checkout/build root: the dir that holds bin/, .claude-plugin/, fleet.toml.example next to the
 # cmux_fleet package. In a repo/editable install this is the repo root (unchanged from the flat layout,
@@ -171,6 +171,10 @@ def resolve(cfg, role, tool_override, adhoc_name):
 
     # launch channels
     plugins = _dedup((tdef.get("plugins") or []) + (rtool.get("plugins") or []))
+    # `use` = mechanism-agnostic plugin list resolved through the index (design §3). Unioned floor ∪ role
+    # exactly like `plugins`; the index says linked vs enabled at compile time so a role author needn't.
+    # Coexists with legacy `plugins`/`enable_plugins` (the composed set is their union — adapter_compile).
+    use = _dedup((tdef.get("use") or []) + (rtool.get("use") or []))
     flags = _layer_tokens([shlex.split(tdef.get("flags", "")),           # tool-floor <- role
                            shlex.split(rtool.get("flags", ""))])
     env = {**(tdef.get("env") or {}), **(rtool.get("env") or {})}
@@ -190,6 +194,7 @@ def resolve(cfg, role, tool_override, adhoc_name):
         "group": orch.get("group", ""),
         "cwd": orch.get("cwd", ""),
         "plugins": plugins, "flags": flags, "env": env, "settings": settings,
+        "use": use,
         "enable_plugins": enable_plugins, "setting_sources": setting_sources,
         # worktree (config-gated, default-off): isolate this agent in a git worktree off its repo cwd.
         "worktree": bool(orch.get("worktree", False)),
@@ -239,17 +244,18 @@ def _layer_tokens(layers):
 
 
 # ---------------------------------------------------------------- tool adapters
-def _claude_settings_args(spec):
+def _claude_settings_args(spec, extra_enabled=()):
     """`--settings` args for claude: the role's `settings` (a file path or inline JSON) plus an
     enabledPlugins object synthesized from `enable_plugins` (EXTERNAL marketplace plugins to flip on
-    for this agent). enabledPlugins format is {"<plugin>@<marketplace>": true} (the same shape claude
-    writes in settings.json). We emit ONE --settings when we can (role settings is inline JSON or
-    absent -> fold them together); only when the role pins a settings FILE *and* also enables plugins
-    do we emit two --settings, which is safe because the cmux-claude-wrapper deep-merges multiple
+    for this agent) UNIONED with `extra_enabled` (index-resolved `use` entries of type=enabled, as
+    "<plugin>@<marketplace>" refs). enabledPlugins format is {"<plugin>@<marketplace>": true} (the same
+    shape claude writes in settings.json). We emit ONE --settings when we can (role settings is inline
+    JSON or absent -> fold them together); only when the role pins a settings FILE *and* also enables
+    plugins do we emit two --settings, which is safe because the cmux-claude-wrapper deep-merges multiple
     --settings (and its own hooks) into a single one before claude ever sees them (verified in
     Resources/bin/cmux-claude-wrapper). The JSON must be valid or the wrapper warns + drops it."""
     base = (spec.get("settings") or "").strip()
-    ep = {name: True for name in (spec.get("enable_plugins") or [])}
+    ep = {name: True for name in _dedup(list(spec.get("enable_plugins") or []) + list(extra_enabled))}
     if not ep:
         return ["--settings", base] if base else []
     if not base:
@@ -277,6 +283,44 @@ def _plugin_dir(name):
     return pd if os.path.exists(pd) else None
 
 
+def _linked_dir(name, source, index):
+    """Resolve a `type=linked` plugin name to a --plugin-dir path (or None to warn+skip). Generalizes
+    `_plugin_dir` to a NAMED marketplace: an absolute/~ path is used as-is; else join the plugin under
+    `[marketplace.<source>].path`. Falls back to `_plugin_dir` (the single default marketplace) when the
+    source has no path (kind=global, unknown, or absent) — which keeps default-marketplace resolution
+    byte-identical to today."""
+    expanded = os.path.expanduser(name)
+    if os.path.isabs(expanded):                              # abs/~ bypasses the marketplace (as today)
+        return expanded if os.path.exists(expanded) else None
+    mk = index["marketplaces"].get(source or "default")
+    if mk and mk.get("path"):
+        pd = os.path.join(mk["path"], name)
+        return pd if os.path.exists(pd) else None
+    return _plugin_dir(name)                                 # default marketplace / no source -> today's path
+
+
+def _resolve_use(use_names, index):
+    """Resolve the unioned `use` list through the index into the two native channels (design §3).
+    Returns (linked_dirs, enabled_refs, unresolved):
+      - in index & type=enabled -> "<name>@<source>" accumulated for enabledPlugins (via --settings).
+      - in index & type=linked  -> a --plugin-dir path via the entry's source marketplace.
+      - NOT in index            -> today's behavior: abs/~ path as-is, else bare name under the default
+                                   marketplace (`_plugin_dir`). This fall-through preserves back-compat.
+    A name that should resolve to a dir but doesn't (missing marketplace/dir) lands in `unresolved`
+    (caller warns + skips, exactly as the legacy --plugin-dir loop does)."""
+    linked, enabled, unresolved = [], [], []
+    for name in use_names:
+        entry = index["plugins"].get(name)
+        if entry and entry.get("type") == "enabled":
+            src = (entry.get("source") or "").strip()
+            enabled.append(f"{name}@{src}" if src else name)
+            continue
+        source = entry.get("source") if entry else ""        # linked (indexed) or unindexed fall-through
+        pd = _linked_dir(name, source, index)
+        (linked if pd else unresolved).append(pd if pd else name)
+    return linked, enabled, unresolved
+
+
 def adapter_compile(tool, spec, caller_tokens):
     """Compile {plugins, flags, env, settings} + caller passthrough -> (bin, arg_tokens, env_map)
     for the given tool. Adding a tool = adding a branch here + a [tool.<t>] block."""
@@ -290,21 +334,33 @@ def adapter_compile(tool, spec, caller_tokens):
         args = []
         if spec.get("setting_sources"):                      # which settings layers claude loads
             args += ["--setting-sources", spec["setting_sources"]]
-        for name in spec["plugins"]:                          # INTERNAL plugins: load + auto-enable
+        # index-aware `use` -> the SAME two channels the legacy keys feed (design §3). No `use` -> both
+        # lists empty -> the composition below is byte-identical to the pre-index path.
+        use_linked, use_enabled, use_unresolved = ([], [], [])
+        if spec.get("use"):
+            use_linked, use_enabled, use_unresolved = _resolve_use(spec["use"], load_plugin_index())
+            for name in use_unresolved:
+                print(f"[fleet] warn: plugin '{name}' (use) not resolvable (marketplace unset or not found); skipping")
+        seen = set()
+        for name in spec["plugins"]:                          # legacy INTERNAL plugins: load + auto-enable
             pd = _plugin_dir(name)
             if pd:
-                args += ["--plugin-dir", pd]
+                args += ["--plugin-dir", pd]; seen.add(pd)
             else:
                 print(f"[fleet] warn: plugin '{name}' not resolvable (marketplace unset or not found); skipping")
+        for pd in use_linked:                                 # `use` linked plugins, unioned + deduped by path
+            if pd not in seen:
+                args += ["--plugin-dir", pd]; seen.add(pd)
         args += merged
-        args += _claude_settings_args(spec)                  # role `settings` + EXTERNAL enabledPlugins
+        args += _claude_settings_args(spec, use_enabled)     # role `settings` + EXTERNAL/`use` enabledPlugins
         return "claude", args, env
 
     if tool == "codex":
-        # Stub: codex has its own plugin/settings vocabulary; flags+env passthrough work today.
-        # plugins/settings are claude concepts -> warn if a codex role tries to use them.
-        if spec["plugins"] or spec["settings"]:
-            print("[fleet] warn: 'plugins'/'settings' are claude-only; ignored for codex")
+        # Stub: codex has its own plugin/settings vocabulary; flags+env passthrough work today. The index
+        # can EXPRESS codex plugins (tools=["codex"] + [plugin.<n>.codex] blocks) but this phase does NOT
+        # provision CODEX_HOME (deferred) -> plugins/settings/use are still no-ops for codex, so warn.
+        if spec["plugins"] or spec["settings"] or spec.get("use"):
+            print("[fleet] warn: 'plugins'/'settings'/'use' are not yet provisioned for codex; ignored")
         return "codex", merged, env
 
     sys.exit(f"fleet: unknown tool '{tool}' (no adapter)")
@@ -992,6 +1048,15 @@ def cmd_config(argv):
         print(f"  --setting-sources: {spec['setting_sources']}")
     if spec.get("enable_plugins"):
         print(f"  enabledPlugins (via --settings): {', '.join(spec['enable_plugins'])}")
+    if spec.get("use") and spec["tool"] == "claude":       # index-resolved -> the two channels, kept distinct
+        u_linked, u_enabled, u_unres = _resolve_use(spec["use"], load_plugin_index())
+        print(f"  use (index): {', '.join(spec['use'])}")
+        if u_linked:
+            print(f"      -> --plugin-dir: {', '.join(u_linked)}")
+        if u_enabled:
+            print(f"      -> enabledPlugins: {', '.join(u_enabled)}")
+        if u_unres:
+            print(f"      -> unresolved (skipped): {', '.join(u_unres)}")
     print(f"  flags: {' '.join(spec['flags']) or '(none)'}")
     if spec["settings"]:
         print(f"  --settings: {spec['settings']}")

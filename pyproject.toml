@@ -37,6 +37,8 @@ packages = ["cmux_fleet"]
 # The `--init` seed roster, bundled INSIDE the package so a wheel install can read it via
 # importlib.resources (a checkout/editable install still reads it from the repo root via PLUGIN_ROOT).
 "fleet.toml.example" = "cmux_fleet/fleet.toml.example"
+# The plugin INDEX schema doc (plugins.toml), shipped alongside so a wheel install can reference it.
+"plugins.toml.example" = "cmux_fleet/plugins.toml.example"
 
 [tool.hatch.build.targets.sdist]
-include = ["cmux_fleet", "fleet.toml.example", "README.md", "LICENSE", "CHANGELOG.md"]
+include = ["cmux_fleet", "fleet.toml.example", "plugins.toml.example", "README.md", "LICENSE", "CHANGELOG.md"]
