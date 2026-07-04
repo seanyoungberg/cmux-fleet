@@ -130,6 +130,40 @@ def test_gate_allows_bind_when_resolved(monkeypatch):
     assert fleet._resume_and_gate("S", "cmd", "claude", "", lambda m: None) is True
 
 
+# --- Fix 1: --force is the escape hatch — it must short-circuit the ENTIRE quiet-gate (respawn now, no
+#     wait), not just the draft check. A desynced/STALE surface's lifecycle never reads idle/needsInput/
+#     unknown, so before this --force could NEVER satisfy the lifecycle check and burned the full 180s to
+#     an ABORT, identical to a non-force run. Non-force behavior is UNCHANGED. ------------------------
+def test_quiet_gate_force_short_circuits_even_when_running(monkeypatch):
+    from cmux_fleet import state as fleet_state
+    slept = []
+    monkeypatch.setattr(fleet.time, "sleep", lambda s: slept.append(s))
+    # a desynced/running surface: lifecycle never goes quiet AND a human draft would block too.
+    monkeypatch.setattr(fleet_state, "lifecycle", lambda surf: "running")
+    monkeypatch.setattr(fleet, "_input_draft_nonempty", lambda surf: True)
+    # force -> True IMMEDIATELY, no wait loop and no 2s settle sleep at all.
+    assert fleet._quiet_gate("S", 180, force=True) is True
+    assert slept == []                        # short-circuited before the wait loop AND the settle
+
+
+def test_quiet_gate_noforce_blocks_while_running(monkeypatch):
+    # non-force on a 'running' surface still times out (False) — the no-half-kill guard is UNCHANGED.
+    from cmux_fleet import state as fleet_state
+    monkeypatch.setattr(fleet.time, "sleep", lambda *_: None)
+    monkeypatch.setattr(fleet_state, "lifecycle", lambda surf: "running")
+    monkeypatch.setattr(fleet, "_input_draft_nonempty", lambda surf: False)
+    assert fleet._quiet_gate("S", 0.05, force=False) is False
+
+
+def test_quiet_gate_noforce_gated_by_nonempty_draft(monkeypatch):
+    # idle lifecycle but a human draft in the box -> non-force must NOT respawn (times out False).
+    from cmux_fleet import state as fleet_state
+    monkeypatch.setattr(fleet.time, "sleep", lambda *_: None)
+    monkeypatch.setattr(fleet_state, "lifecycle", lambda surf: "idle")
+    monkeypatch.setattr(fleet, "_input_draft_nonempty", lambda surf: True)
+    assert fleet._quiet_gate("S", 0.05, force=False) is False
+
+
 # --- fresh-after-cwd-move: a FRESH recycle must PERSIST the new cwd so the next default RESUME finds
 #     the new session (codex residual-blocker: compose-time pin was right, persistence was missing) -----
 def test_fresh_recycle_persists_new_cwd_then_resume_composes_from_new(fs, monkeypatch):

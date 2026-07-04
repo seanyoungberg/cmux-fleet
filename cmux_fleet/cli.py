@@ -1858,18 +1858,28 @@ def _input_draft_nonempty(surf):
 
 
 def _quiet_gate(surf, timeout, force):
-    """Block until the surface is at a quiet prompt (a non-running lifecycle AND empty draft), re-checked
-    after a 2s settle to avoid racing a turn start. force = skip the draft guard (still requires the
-    agent be not-'running'). Returns True when quiet, False on timeout.
+    """Wait for the surface to go quiet, then clear the respawn. Returns True when clear, False on timeout.
+
+    --force SHORT-CIRCUITS THE ENTIRE GATE: respawn now, no wait, regardless of lifecycle or draft. This
+    is the escape hatch — consistent with `rm --force` (which closes a mid-turn 'running' surface anyway)
+    and with the caller-side '--force to override' intent. It has to skip the WAIT, not just the draft
+    check: a desynced/STALE surface's lifecycle never reads idle/needsInput/unknown, so a force run that
+    still ran the lifecycle check could NEVER satisfy the gate and burned the full timeout to an ABORT —
+    identical to a non-force run (the exact bug this fixes).
+
+    NON-force (the default) is UNCHANGED: block until a NON-'running' lifecycle AND an empty draft,
+    re-checked after a 2s settle to avoid racing a turn start. Never half-kills a live turn.
     'unknown' counts as quiet: cmux's session-start sets agentLifecycle='unknown' on a fresh start OR a
     resume and explicitly does NOT claim 'running', so an agent that resumed-but-was-never-driven (no
     Stop hook yet -> never reaches 'idle') sits at 'unknown' awaiting input. Excluding it made a
-    just-resumed agent un-recyclable (the quiet-gate would block until 180s ABORT, and --force only
-    skips the DRAFT check, not the lifecycle check) -- so back-to-back resume recycles deadlocked."""
+    just-resumed agent un-recyclable (the gate would block until the ABORT) -- so back-to-back resume
+    recycles deadlocked."""
     from . import state as fs
+    if force:
+        return True          # --force = respawn now, no wait (consistent with rm --force). See docstring.
     def quiet():
         lc = fs.lifecycle(surf)
-        return lc in ("idle", "needsInput", "unknown") and (force or not _input_draft_nonempty(surf))
+        return lc in ("idle", "needsInput", "unknown") and not _input_draft_nonempty(surf)
     end = time.time() + timeout
     while time.time() < end:
         if quiet():
@@ -2311,7 +2321,16 @@ def _recycle_bulk(target, mode, caller, a):
     for label, entry in sel:
         payload = _recycle_plan(label, entry, caller, a.add_plugin, mode, "", a.force, a.prime, a.no_prime)
         payloads.append(payload)
+        # per-agent RESOLVED effort/model (provenance) — mirror the single-target print so an operator
+        # watching a bulk recycle sees what each agent is actually coming back on (a bulk recycle is
+        # exactly where a silent model/effort drift, like the storm-era Sonnet downgrade, would slip by).
+        provline, provwarn = _session_pref_provenance(
+            entry.get("role"), entry.get("tool", "claude"), payload["send_cmd"], a.effort, a.model)
         print(f"   {label:<24}{entry.get('kind','-'):<11}{(entry.get('surface') or '')[:8]}  mode={mode}")
+        if provline:
+            print(f"      {provline}")                          # effort/model + provenance (source)
+        if provwarn:
+            print(f"      {provwarn}")                          # no-pin warning (floor-inherited effort)
     for label, reason in skipped:
         hint = "; --include-muted to force" if reason.startswith("muted") else "; `fleet revive`/`recycle` it directly"
         print(f"   {label:<24}SKIP ({reason}{hint})")
