@@ -140,7 +140,7 @@ conductor and all its children form one collapsible sidebar group: clean visual 
 - **Children join the parent's group.** `place = tab|pane` children live in the conductor's workspace
   already; a `place = workspace` child with no explicit group joins its parent conductor's group.
 - **Lifecycle.** `recycle` and `revive` preserve the group (the surface stays in place, or is recreated
-  into the existing group). `fleet rm <conductor>` removes only that workspace by default and leaves any
+  into the existing group). `fleet rm <conductor>` by default closes + archives only that conductor's own workspace and leaves any
   other members ungrouped; `fleet rm <conductor> --with-group` dissolves the whole group (deletes it by
   ref, closing every member) and sweeps all of the group's members out of the registry. Swept members'
   worktree dirs and branches are left unmanaged (their registry rows are gone, so `fleet worktree clean`
