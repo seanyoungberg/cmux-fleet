@@ -162,23 +162,31 @@ def _window_flavor(model):
 
 
 def _context_window(model):
-    """Tokens of context for a model STRING — REAL per-agent (Fix 1). Precedence:
-      1. an explicit [Nk]/[Nm] window flavor on the string (the launch-encoded truth: [1m]->1M);
-      2. else a model-keyword map (opus/sonnet/haiku->200k, gpt-5/codex->272k, gemini->1M);
-      3. else the CMUX_FLEET_CONTEXT_WINDOW / [fleet].context_window manual override (DEMOTED to a
-         last-resort knob — the old code short-circuited on it FIRST, which made ctx-left meaningless on
-         a mixed-model fleet; now a real per-agent value always wins and this only catches unknowns);
-      4. else 200k."""
+    """Tokens of context for a model STRING. Precedence:
+      1. an explicit [Nk]/[Nm] window flavor on the string (the launch-encoded truth: [1m]->1M) — the ONLY
+         per-agent signal that reliably disambiguates opus-4-8's 200k vs 1M tier when it's present;
+      2. else the CMUX_FLEET_CONTEXT_WINDOW / [fleet].context_window override — the fleet's DECLARED
+         window. It sits ABOVE the keyword guess deliberately: a bare model string CANNOT disambiguate
+         200k vs 1M (the [1m] flavor is usually absent from the launch — stripped, or an explicit bare
+         `--model opus`/`claude-opus-4-8` that still runs 1M on this fleet), so a keyword guess of 200k
+         produces FALSE "over-full, recycle-now" alarms for agents actually on 1M (confirmed live
+         2026-07-04: cmux-advisor at 395k on a bare `--model claude-opus-4-8`, auto-compact off — a real
+         200k window is impossible). The declared window is the least-wrong denominator absent a flavor;
+      3. else a model-keyword map (opus/sonnet/haiku->200k, gpt-5/codex->272k, gemini->1M) — only for a
+         model the operator never declared a window for;
+      4. else 200k.
+    NOTE: TRUE per-agent windows on a genuinely mixed fleet need the launched [1m] flavor preserved (or a
+    real window signal) — see the vitals backlog. Absent that, flavor-or-declared-window is the honest floor."""
     flav = _window_flavor(model)
     if flav:
         return flav
+    if _CFG_WINDOW:                                       # the fleet's DECLARED window — beats the keyword
+        return int(_CFG_WINDOW)                           # guess (a bare model can't disambiguate 200k vs 1M)
     m = (model or "").lower()
     for key, win in (("haiku", 200000), ("sonnet", 200000), ("opus", 200000),
                      ("gpt-5", 272000), ("o3", 200000), ("codex", 272000), ("gemini", 1000000)):
         if key in m:
             return win
-    if _CFG_WINDOW:
-        return int(_CFG_WINDOW)
     return 200000
 
 
@@ -360,8 +368,9 @@ def cmd_vitals(argv):
     if near:
         print(f"\n  ! {len(near)} near-full (<=30% ctx left): "
               + ", ".join(r["label"] for r in near) + "  — recycle candidates")
-    print("\n(ctx = context REMAINING % of each agent's REAL window — derived per-agent from its launched "
-          "model flavor, e.g. [1m]=1M vs bare=200k; '—' = no usage yet / unparseable. role in --json.)")
+    print("\n(ctx = context REMAINING % of each agent's window — an explicit [1m]/[200k] flavor on the "
+          "launched model wins; else the fleet's declared window ([fleet].context_window); '—' = no usage "
+          "yet / unparseable. A bare model can't disambiguate 200k vs 1M, so we don't guess it. role in --json.)")
     return 0
 
 

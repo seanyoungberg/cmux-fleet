@@ -142,14 +142,16 @@ def test_context_window_keyword_map():
     assert ff._context_window("totally-unknown") == 200000         # safe default (no override set)
 
 
-def test_context_window_override_is_last_resort(monkeypatch):
-    # Fix 1 INVERTS the old precedence: the CMUX_FLEET_CONTEXT_WINDOW override no longer clobbers a real
-    # per-agent value. A flavor and a keyword both still win; the override only catches an UNKNOWN model.
+def test_context_window_override_beats_keyword_below_flavor(monkeypatch):
+    # Corrected precedence: an explicit [flavor] wins; else the fleet's DECLARED window (the override) —
+    # it sits ABOVE the keyword guess because a bare model string can't disambiguate opus-4-8's 200k vs
+    # 1M tier, so a keyword guess of 200k FALSE-alarms agents actually on 1M (cmux-advisor at 395k on a
+    # bare `--model claude-opus-4-8`, 2026-07-04). The keyword only catches a model with NO declared window.
     monkeypatch.setenv("CMUX_FLEET_CONTEXT_WINDOW", "777000")
     ff = _ff()
-    assert ff._context_window("claude-opus-4-8[1m]") == 1_000_000  # flavor beats the override
-    assert ff._context_window("claude-opus-4-8") == 200_000        # keyword beats the override
-    assert ff._context_window("totally-unknown") == 777_000        # only an unknown model reaches it
+    assert ff._context_window("claude-opus-4-8[1m]") == 1_000_000  # explicit flavor beats the declared window
+    assert ff._context_window("claude-opus-4-8") == 777_000        # declared window beats the bare-model keyword guess
+    assert ff._context_window("totally-unknown") == 777_000        # and catches unknown models too
 
 
 def test_window_flavor_parse():
