@@ -175,6 +175,7 @@ def test_fresh_recycle_persists_new_cwd_then_resume_composes_from_new(fs, monkey
     monkeypatch.setattr(fleet.time, "sleep", lambda *_: None)
     monkeypatch.setattr(fleet, "cmuxq", lambda *a, **k: "")
     monkeypatch.setattr(fleet, "_quiet_gate", lambda *a, **k: True)
+    monkeypatch.setattr(fleet_state, "lifecycle", lambda surf: "ended")            # old session confirmed dead
     monkeypatch.setattr(fleet, "poll_session", lambda surf, timeout=1: "")          # no stale pre_sid
     monkeypatch.setattr(fleet, "_poll_session_back", lambda *a, **k: "NEWSID")       # fresh bind
     payload = {"label": "w", "surface": "S", "send_cmd": "cd /NEW && claude x", "mode": "fresh",
@@ -193,3 +194,115 @@ def test_fresh_recycle_persists_new_cwd_then_resume_composes_from_new(fs, monkey
         "enable_plugins": [], "setting_sources": ""})
     resume, _ = fleet._compose_recycle_cmd("w", fleet_state.live_get("w"), [], [], "resume", "")
     assert "cd /NEW" in resume and "--resume NEWSID" in resume
+
+
+# --- verify-fresh-shell before firing the launch (recycle-verify-respawn fix) -----------------------
+# respawn-pane is ASYNC: its "OK" means "accepted", not "old process killed". The old bug fired the
+# launch on a fixed sleep(3) that could undershoot a slow/hung kill, typing the launch into the still-
+# live old TUI (berg-sandbox's 9h silent self-recycle). The fix polls the surface's agentLifecycle for a
+# terminal state ('', '-', 'ended') before ever calling _fire_launch, with a cmux-independent SIGINTx2
+# fallback (same mechanism cmd_archive/cmd_rm use) if respawn-pane itself errors or never confirms.
+def _base_payload(surf="S", old_sid="OLD"):
+    return {"label": "w", "surface": surf, "send_cmd": "cd /x && claude", "mode": "fresh",
+            "tool": "claude", "force": True, "prime": None, "old_session": old_sid, "cwd": "/x"}
+
+
+def test_verify_waits_out_a_slow_kill_before_launching(fs, monkeypatch):
+    # lifecycle reads non-terminal (old claude still alive) for two polls, THEN flips to 'ended' -- the
+    # launch must not fire until that flip, proving a poll rather than a fixed sleep.
+    from cmux_fleet import state as fleet_state
+    fleet_state.live_put("w", {"role": "w", "tool": "claude", "surface": "S", "cwd": "/x",
+                               "session": "claude-OLD", "kind": "child"})
+    monkeypatch.setattr(fleet.time, "sleep", lambda *_: None)
+    sent = []
+    def fake_cmuxq(*a, **k):
+        if a and a[0] == "respawn-pane":
+            return "OK"
+        sent.append(a)
+        return ""
+    monkeypatch.setattr(fleet, "cmuxq", fake_cmuxq)
+    monkeypatch.setattr(fleet, "poll_session", lambda surf, timeout=1: "")
+    monkeypatch.setattr(fleet, "_poll_session_back", lambda *a, **k: "NEWSID")
+    states = iter(["idle", "idle", "ended"])
+    monkeypatch.setattr(fleet_state, "lifecycle", lambda surf: next(states, "ended"))
+    assert fleet._recycle_exec_one(_base_payload()) == 0
+    assert next(states, "exhausted") == "exhausted"          # all 3 readings were consumed by the poll
+    assert any(c[0] == "send" for c in sent)                 # the launch DID fire, once confirmed dead
+    assert not any(c[0] == "notify" for c in sent)
+
+
+def test_respawn_error_falls_back_to_direct_kill_then_succeeds(fs, monkeypatch):
+    # respawn-pane errors on the first attempt (the confirmed 05:44 failure: 'Command timed out'). The
+    # fallback SIGINTs the old pid directly (cmux-independent) and re-respawns; once that confirms, the
+    # launch proceeds normally -- this is NOT the abort path.
+    from cmux_fleet import state as fleet_state
+    import signal
+    fleet_state.live_put("w", {"role": "w", "tool": "claude", "surface": "S", "cwd": "/x",
+                               "session": "claude-OLD", "kind": "child"})
+    monkeypatch.setattr(fleet.time, "sleep", lambda *_: None)
+    respawn_calls, other_calls = [], []
+    def fake_cmuxq(*a, **k):
+        if a and a[0] == "respawn-pane":
+            respawn_calls.append(a)
+            return "Error: Command timed out" if len(respawn_calls) == 1 else "OK"
+        other_calls.append(a)
+        return ""
+    monkeypatch.setattr(fleet, "cmuxq", fake_cmuxq)
+    monkeypatch.setattr(fleet, "poll_session", lambda surf, timeout=1: "")
+    monkeypatch.setattr(fleet, "_poll_session_back", lambda *a, **k: "NEWSID")
+    monkeypatch.setattr(fleet_state, "lifecycle", lambda surf: "ended")   # dead by the time we actually poll
+    monkeypatch.setattr(fleet, "_pid_for_surface", lambda surf: 4242)
+    killed = []
+    monkeypatch.setattr(fleet.os, "kill", lambda pid, sig: killed.append((pid, sig)))
+    assert fleet._recycle_exec_one(_base_payload()) == 0
+    assert len(respawn_calls) == 2                            # primary attempt + fallback re-respawn
+    assert killed == [(4242, signal.SIGINT), (4242, signal.SIGINT)]   # SIGINT x2, cmux-independent
+    assert any(c[0] == "send" for c in other_calls)            # launch fired after the fallback confirmed
+    assert not any(c[0] == "notify" for c in other_calls)      # not an abort
+
+
+def test_respawn_fails_even_after_fallback_aborts_without_launch(fs, monkeypatch):
+    # respawn-pane errors on BOTH the primary attempt and the direct-kill fallback -> ABORT: never type
+    # the launch into a possibly-live TUI, fire a desktop notify, and log the abort for the operator.
+    from cmux_fleet import state as fleet_state
+    calls = []
+    def fake_cmuxq(*a, **k):
+        calls.append(a)
+        if a and a[0] == "respawn-pane":
+            return "Error: Command timed out"
+        return ""
+    monkeypatch.setattr(fleet.time, "sleep", lambda *_: None)
+    monkeypatch.setattr(fleet, "cmuxq", fake_cmuxq)
+    monkeypatch.setattr(fleet, "_pid_for_surface", lambda surf: 4242)
+    monkeypatch.setattr(fleet.os, "kill", lambda pid, sig: None)
+    logged = []
+    monkeypatch.setattr(fleet_state, "log_event", lambda event, **fields: logged.append((event, fields)))
+    assert fleet._recycle_exec_one(_base_payload()) == 1
+    assert not any(c[0] == "send" for c in calls)              # launch NEVER sent
+    assert any(c[0] == "notify" for c in calls)                # desktop banner fired
+    assert logged and logged[0][0] == "recycle_abort"
+
+
+def test_direct_kill_skips_quietly_with_no_known_pid(fs, monkeypatch):
+    # a surface with no pid on record (already-gone entry) must not crash the fallback -- it just skips
+    # straight to the re-respawn attempt.
+    from cmux_fleet import state as fleet_state
+    fleet_state.live_put("w", {"role": "w", "tool": "claude", "surface": "S", "cwd": "/x",
+                               "session": "claude-OLD", "kind": "child"})
+    monkeypatch.setattr(fleet.time, "sleep", lambda *_: None)
+    respawn_calls = []
+    def fake_cmuxq(*a, **k):
+        if a and a[0] == "respawn-pane":
+            respawn_calls.append(a)
+            return "Error: Command timed out" if len(respawn_calls) == 1 else "OK"
+        return ""
+    monkeypatch.setattr(fleet, "cmuxq", fake_cmuxq)
+    monkeypatch.setattr(fleet, "poll_session", lambda surf, timeout=1: "")
+    monkeypatch.setattr(fleet, "_poll_session_back", lambda *a, **k: "NEWSID")
+    monkeypatch.setattr(fleet_state, "lifecycle", lambda surf: "ended")
+    monkeypatch.setattr(fleet, "_pid_for_surface", lambda surf: None)
+    killed = []
+    monkeypatch.setattr(fleet.os, "kill", lambda pid, sig: killed.append((pid, sig)))
+    assert fleet._recycle_exec_one(_base_payload()) == 0
+    assert killed == []                                        # no pid -> no kill attempted
+    assert len(respawn_calls) == 2
