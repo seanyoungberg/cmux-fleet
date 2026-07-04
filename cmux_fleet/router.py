@@ -7,6 +7,11 @@
 # via the shared fleet_state.wake_if_idle gate. Trigger = the bus (agent.hook.Stop); truth = cmux's hook store;
 # org chart = fleet.json (label-keyed live store). Only registered live members are acted on.
 #
+# Also subscribes to the `surface` category for real-time registry hygiene (fleet-doctor capability #1):
+# a tracked member's surface closing OUTSIDE `fleet rm`/`fleet archive` (accidental tab close, workspace
+# teardown) immediately archives its registry row instead of leaving a STALE lie until someone runs
+# `fleet ls`. Pure hygiene — no completion, no wake, no auto-relaunch (Tier-2 stays deferred).
+#
 #   python3 router.py            # OBSERVE: log decisions, write/send nothing
 #   python3 router.py --live     # ACTIVE: write inbox + notify; idle-wake unless notify-mode==passive
 import fcntl, json, os, pty, subprocess, sys, threading, time
@@ -187,7 +192,41 @@ def deliver(parent_surface, parent_label, child_entry, child_surface):
         log(f"[WOULD-QUEUE] {label} -> {parent_label} | {gist[:60]}")
 
 
+def _archive_closed_surface(ev):
+    """surface.closed -> registry hygiene. The event IS the ground truth that a tracked member's surface
+    just died (no lifecycle re-derivation needed): if the close came through `fleet rm`/`fleet archive`,
+    the entry is already off the live store by the time the frame arrives and the lookup below misses —
+    so anything that DOES resolve here closed outside the fleet CLI (accidental tab close, workspace
+    teardown). Archive it through the SAME shared path as `fleet archive`/`fleet rm --kill`
+    (_build_archive_entry + archive_put — third caller, kept shared), tagged via=surface-closed in the
+    ledger. Applies to muted members too (mute gates notification routing, not registry truth). NO
+    completion/notify/wake — the surface is gone, there is nothing to route to; a human (or a future
+    capability) decides whether to `fleet revive`."""
+    surface = (ev.get("payload") or {}).get("surface_id") or ""
+    entry = registry()["by_surface"].get(surface) if surface else None
+    if not entry:
+        return                                          # not a tracked live member's surface
+    label = entry["label"]
+    if not LIVE:
+        log(f"[stale] (observe) would archive {label}: surface {surface[:8]} closed outside fleet CLI")
+        return
+    from . import cli                                   # lazy: cli is heavy and never imports router (no cycle)
+    # binding capture is best-effort: unlike the CLI paths (which read it BEFORE closing), the surface
+    # is already gone here, so _resume_binding usually returns {} and last_session falls back to the
+    # registry session — "recorded but maybe-unresumable" beats a vanished agent.
+    fs.archive_put(label, cli._build_archive_entry(entry, cli._resume_binding(surface)))
+    fs.live_del(label)
+    fs.log_event("archived", label=label, role=entry.get("role"), session=entry.get("session"),
+                 via="surface-closed")
+    log(f"[stale] archived {label}: surface {surface[:8]} closed out from under the registry "
+        f"(origin={(ev.get('payload') or {}).get('origin', '?')}); revive with: fleet revive {label}")
+
+
 def handle(ev):
+    if ev.get("category") == "surface":
+        if ev.get("name") == "surface.closed":
+            _archive_closed_surface(ev)
+        return                                          # other surface.* frames are not ours to act on
     if ev.get("name") != "agent.hook.Stop":
         return
     p = ev.get("payload") or {}
@@ -327,7 +366,7 @@ def main():
         _stamp_health(force=True)      # baseline stamp so the daemon's wedge check has ground truth at once
     master, slave = pty.openpty()      # PTY or cmux block-buffers a low-volume stream (proven gotcha)
     proc = subprocess.Popen(
-        [CMUX, "events", "--category", "agent", "--reconnect",
+        [CMUX, "events", "--category", "agent", "--category", "surface", "--reconnect",
          "--cursor-file", CURSOR_FILE, "--no-ack"],    # heartbeat frames ON = a ~15s bus-liveness tick
         stdout=slave, stderr=slave, close_fds=True)
     os.close(slave)
