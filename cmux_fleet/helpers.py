@@ -230,11 +230,13 @@ def cmd_inbox_ack(argv):
         args.remove("--peer"); kind = "peer"
     if "--stale" in args:
         args.remove("--stale"); kind = "stale"
+    if "--doctor" in args:
+        args.remove("--doctor"); kind = "doctor"
     if "--surface" in args:
         i = args.index("--surface"); surface = args[i + 1]; del args[i:i + 2]
 
     if not args or not args[0].lstrip("-").isdigit():
-        sys.exit("usage: fleet inbox-ack <seq> [--peer | --stale] [--surface <surfaceId>]")
+        sys.exit("usage: fleet inbox-ack <seq> [--peer | --stale | --doctor] [--surface <surfaceId>]")
     if not surface:
         sys.exit("inbox-ack: no surface (set $CMUX_SURFACE_ID or pass --surface)")
 

@@ -46,6 +46,20 @@ RETRY_BACKOFF_S = (5, 10, 15)   # re-check at +5s, +15s, +30s after a skip, then
 _retrying = set()               # surfaces with an in-flight retry loop (dedup guard)
 _retry_lock = threading.Lock()
 
+# --- fleet-doctor heartbeat sweep dedup + thresholds (conditions #1/#2/#3) ------------------------
+# Driven once per heartbeat tick (daemon._heartbeat_tick), the sweep walks every LIVE child and emits a
+# DEDUPED parent alert on each bad condition. Dedup is edge-triggered per (reason, label, session): fire
+# once when a condition turns bad, re-arm when it clears; the session component resets the alarm on a
+# recycle/rebind. The set persists across ticks in the long-lived daemon process (a restart re-alerts
+# once — never a storm). See docs/backlog.md 'NOTIFY-LAYER FAILURE CONDITIONS'.
+STALL_S = 600           # a fleet-bound 'running' record frozen longer than this = a dead/stalled turn
+                        # (the INVERSE of surface_busy's live-turn check). Deliberately generous: real
+                        # stalls ran 30-53m and a live turn re-stamps updatedAt every ~1-35s, so 10m
+                        # never clips a legit slow turn EXCEPT one blocked on a single >10m tool call —
+                        # the lone residual false-positive shape, and even that is ONE deduped nudge.
+LOW_CTX_PCT = 30        # context-remaining % at/under which to alert once (matches vitals' near-full flag)
+_doctor_fired = set()   # {(reason, label, session)} — parent-alert dedup across heartbeat ticks
+
 
 def cmux(*args, timeout=10):
     try:
@@ -245,6 +259,96 @@ def _archive_closed_surface(ev):
         "label": label, "child_surface": surface, "via": "surface-closed", "origin": origin})
     log(f"[STALE-ALERT seq={seq}] {label} -> {parent} (surface closed; archived)")
     maybe_idle_wake(parent_surface, parent)
+
+
+def fleet_doctor_sweep(now=None):
+    """One heartbeat sweep (conditions #1/#2/#3): walk every LIVE child and emit a DEDUPED parent alert
+    on each bad condition — #1 stall (bound 'running' record frozen past STALL_S), #2 low-ctx
+    (context-remaining <= LOW_CTX_PCT), #3 needs-input (bound record at needsInput). Returns the count
+    of NEW alerts fired this tick.
+
+    Reuses the SAME inbox+wake rail completions/stale ride: one inbox kind='doctor' with a `reason`
+    field ('stall'|'low-ctx'|'needs-input') the awareness hook renders and `fleet inbox-ack --doctor`
+    clears. Rows are written regardless of the dial (they surface next turn via awareness — 'passive' is
+    a wake mute, not an inbox mute); the WAKE is dial-gated (fs.idlewake_on), the same coherent mute as
+    the heartbeat nudge. SKIPS conductors (no parent to alert — branch on KIND, stale-path parity) and
+    MUTED members (mute = 'this one is my manual concern, don't nudge me'; all three signals are
+    member-health nudges, exactly the chatter class mute governs — unlike _archive_closed_surface, where
+    a VANISHED surface is a hard integrity fact that alerts even muted). Self-contained + fail-safe per
+    member; no dependence on the router's --live/observe globals, so it runs from the daemon process."""
+    from . import features                              # lazy: the heavier view module, off the hot path
+    now = time.time() if now is None else now
+    members = fs.live_all()
+    st = fs.read_hook_store()
+    live_keys, woke = set(), set()
+    fired = 0
+
+    def _emit(reason, label, entry, surface, payload):
+        nonlocal fired
+        key = (reason, label, entry.get("session") or "")
+        if key in _doctor_fired:
+            return                                     # already alerted this occurrence -> dedup (no storm)
+        parent = entry.get("parent")                   # parent LABEL (durable); resolve like deliver()'s path
+        pe = members.get(parent)
+        parent_surface = pe.get("surface") if pe else parent   # fall back to a raw surface
+        if not parent_surface:
+            log(f"[fleet-doctor] {label}: unresolved parent '{parent}' -> {reason} not alerted")
+            return
+        seq = fs.inbox_put("doctor", parent_surface, {
+            "reason": reason, "label": label, "child_surface": surface, **payload})
+        _doctor_fired.add(key)
+        fired += 1
+        log(f"[DOCTOR-ALERT seq={seq}] {label} {reason} -> {parent}")
+        if fs.idlewake_on() and parent_surface not in woke:   # dial-gated wake, once per parent per tick
+            woke.add(parent_surface)
+            fs.wake_if_idle(parent_surface, f"(fleet-doctor) child {label} needs attention ({reason}); "
+                                            f"handle your pending fleet inbox items")
+
+    for label, entry in members.items():
+        try:
+            if entry.get("kind") == "conductor" or entry.get("muted"):
+                continue                               # conductors: no parent; muted: manual concern
+            surface, session = entry.get("surface") or "", entry.get("session") or ""
+            if not surface:
+                continue
+            live_keys.add((label, session))
+            rec = fs.resolve_bound_record(surface, st=st, bound=fs.bare_uuid(session))
+            life = (rec.get("agentLifecycle") or "") if rec else ""
+            ua = (rec.get("updatedAt") or 0) if rec else 0
+
+            # #1 stall — bound 'running' record frozen past STALL_S (inverse of surface_busy). A missing/
+            # zero updatedAt never fires (no false alarm on a malformed record).
+            if life == "running" and ua and (now - ua) > STALL_S:
+                _emit("stall", label, entry, surface, {"stalled_s": int(now - ua)})
+            else:
+                _doctor_fired.discard(("stall", label, session))       # re-arm when it clears
+
+            # #3 needs-input — bound record at needsInput. NO freshness gate: a genuine wait freezes
+            # updatedAt for DAYS (loom-dev sat 46h; the live store holds a 46.3h needsInput record), so
+            # 'fresh updatedAt' would MISS exactly what #3 exists to catch. Orphan needsInput records are
+            # excluded by resolving the BOUND record of a LIVE member — not by age (see resolve_bound_record).
+            if life == "needsInput":
+                _emit("needs-input", label, entry, surface, {})
+            else:
+                _doctor_fired.discard(("needs-input", label, session))  # re-arm on leaving needsInput
+
+            # #2 low-ctx — context-remaining <= LOW_CTX_PCT (vitals' exact math). used=None
+            # (codex/unparseable transcript) -> skip: no false alarm on an unknowable window.
+            used, model = features._context_used(rec.get("transcriptPath", "") if rec else "")
+            window = features._context_window(model or entry.get("tool", ""))
+            pct = max(0, round(100 * (1 - used / window))) if (used is not None and window) else None
+            if pct is not None and pct <= LOW_CTX_PCT:
+                _emit("low-ctx", label, entry, surface, {"ctx_pct_remaining": pct})
+            else:
+                _doctor_fired.discard(("low-ctx", label, session))     # re-arm above threshold / unknown
+        except Exception as e:
+            log(f"[fleet-doctor] {label}: sweep error {e}")
+
+    # prune dedup keys for members no longer live (removed) or whose session changed (recycle/rebind) —
+    # bounds the set AND lets a recycled-while-still-bad member re-alert fresh under its new session.
+    for k in [k for k in _doctor_fired if (k[1], k[2]) not in live_keys]:
+        _doctor_fired.discard(k)
+    return fired
 
 
 def handle(ev):

@@ -2813,7 +2813,7 @@ def main():
               "  peer-msg <to-label> \"<body>\" [--no-reply] [--reply-to <id>] [--expect-reply] [--no-wake]\n"
               "                                                    input-safe A2A: message a live PEER conductor (into its context, never its input box)\n"
               "  child-digest <session-frag> [N]                   print a child's last N transcript turns (the reliable content source)\n"
-              "  inbox-ack <seq> [--peer] [--surface UUID]         mark shown completions/peer msgs handled so they stop re-surfacing")
+              "  inbox-ack <seq> [--peer|--stale|--doctor] [--surface UUID]  mark shown completions/alerts/peer msgs handled so they stop re-surfacing")
         return 0
     sub, rest = sys.argv[1], sys.argv[2:]
     # Hook verbs are the per-turn hot path (a plugin shim shells into them on every UserPromptSubmit/Stop).

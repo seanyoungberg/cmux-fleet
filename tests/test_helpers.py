@@ -118,6 +118,18 @@ def test_inbox_ack_completion_default_kind(fs, monkeypatch):
     assert fs.inbox_pending("S", kind="completion") == []
 
 
+def test_inbox_ack_doctor_clears_only_doctor_stream(fs, monkeypatch):
+    """--doctor acks the fleet-doctor health-alert stream per-kind, leaving a co-pending completion
+    untouched (the alert channels are independent high-waters)."""
+    monkeypatch.setenv("CMUX_SURFACE_ID", "S")
+    fs.inbox_put("completion", "S", {"label": "w1", "gist": "done"})
+    fs.inbox_put("doctor", "S", {"reason": "stall", "label": "wedged", "child_surface": "X"})
+    hi = fs.max_seq(fs.inbox_pending("S", kind="doctor"))
+    fh.cmd_inbox_ack([str(hi), "--doctor"])
+    assert fs.inbox_pending("S", kind="doctor") == []            # doctor stream cleared...
+    assert len(fs.inbox_pending("S", kind="completion")) == 1    # ...completion untouched
+
+
 # --- child-digest --------------------------------------------------------------------------------
 def test_child_digest_no_transcript_returns_1(fs, capsys):
     rc = fh.cmd_child_digest(["nomatchfragment"])

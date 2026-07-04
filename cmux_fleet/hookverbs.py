@@ -26,6 +26,27 @@ def _read_stdin():
         return b""
 
 
+def _doctor_line(r):
+    """One rendered line for a kind='doctor' heartbeat-sweep alert (stall / low-ctx / needs-input). The
+    member is still LIVE — the affordance is inspect/drive/recycle, NOT revive (contrast the archived
+    'stale' rows). Unknown reasons degrade to a generic 'needs attention' rather than dropping."""
+    label = r.get("label", "?")
+    surf = (r.get("child_surface") or "")[:8]
+    reason = r.get("reason", "?")
+    if reason == "stall":
+        secs = int(r.get("stalled_s") or 0)
+        detail = (f"STALLED — turn 'running' but frozen ~{secs // 60}m (dead stream, no Stop hook fired); "
+                  f"check it, then recycle if wedged")
+    elif reason == "low-ctx":
+        detail = (f"LOW CONTEXT — {r.get('ctx_pct_remaining', '?')}% left; wrap up + recycle before it "
+                  f"runs out mid-task")
+    elif reason == "needs-input":
+        detail = "NEEDS INPUT — waiting at a question/permission gate; answer or drive it"
+    else:
+        detail = f"needs attention ({reason})"
+    return f"seq {r.get('seq')}  {label} (surface {surf}): {detail}"
+
+
 def cmd_hook_awareness(argv):
     """UserPromptSubmit: inject the conductor's pending inbox (child completions + peer messages) into
     CONTEXT via hookSpecificOutput.additionalContext — never the input box. Blank when empty. Fails open."""
@@ -34,8 +55,9 @@ def cmd_hook_awareness(argv):
         surface = os.environ.get("CMUX_SURFACE_ID", "")
         comp = fs.inbox_pending(surface, kind="completion") if surface else []
         stale = fs.inbox_pending(surface, kind="stale") if surface else []
+        doctor = fs.inbox_pending(surface, kind="doctor") if surface else []
         peers = fs.inbox_pending(surface, kind="peer") if surface else []
-        if not comp and not stale and not peers:
+        if not comp and not stale and not doctor and not peers:
             return 0
 
         lines = []
@@ -57,6 +79,13 @@ def cmd_hook_awareness(argv):
                              f"{(r.get('child_surface') or '')[:8]} closed ({r.get('origin','?')}); "
                              f"revive with: fleet revive {r.get('label','?')}")
             lines.append(f"  ack when handled: {fs.ACK} {fs.max_seq(stale)} --stale")
+        if doctor:
+            lines.append(f"[fleet-doctor] {len(doctor)} tracked member(s) flagged by the heartbeat sweep "
+                         f"(still LIVE — a health alert, not an archive; input-safe context note, not from "
+                         f"the human):")
+            for r in doctor:
+                lines.append("  - " + _doctor_line(r))
+            lines.append(f"  ack when handled: {fs.ACK} {fs.max_seq(doctor)} --doctor")
         if peers:
             lines.append(f"[peer] {len(peers)} peer message(s) for you (a DELIBERATE send from a peer "
                          f"conductor, NOT a child you dispatched; input-safe context note, not from the human):")

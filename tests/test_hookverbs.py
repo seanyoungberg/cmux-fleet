@@ -73,6 +73,33 @@ def test_awareness_surfaces_stale_alert(fs):
     assert "--stale" in ctx                                           # per-kind ack hint
 
 
+def test_awareness_surfaces_doctor_alert(fs):
+    """The fleet-doctor sweep's kind='doctor' health alerts render with a reason-specific line and a
+    --doctor ack hint — distinct from the archived 'stale' rows (still LIVE, no revive affordance)."""
+    fs.inbox_put("doctor", SURF, {"reason": "stall", "label": "wedged", "child_surface": "AAAA1111",
+                                  "stalled_s": 720})
+    fs.inbox_put("doctor", SURF, {"reason": "needs-input", "label": "asker", "child_surface": "BBBB2222"})
+    p = _run("hook-awareness")
+    assert p.returncode == 0
+    ctx = json.loads(p.stdout)["hookSpecificOutput"]["additionalContext"]
+    assert "[fleet-doctor]" in ctx and "wedged" in ctx and "asker" in ctx
+    assert "STALLED" in ctx and "NEEDS INPUT" in ctx                  # reason-specific rendering
+    assert "revive" not in ctx.split("[fleet-doctor]")[1]             # NOT an archive -> no revive hint
+    assert "--doctor" in ctx                                          # per-kind ack hint
+
+
+def test_awareness_doctor_and_stale_coexist(fs):
+    """A doctor health alert and a stale archive alert are DIFFERENT kinds and both surface independently
+    (a member can't be both, but the inbox carries both channels)."""
+    fs.inbox_put("stale", SURF, {"label": "gone", "child_surface": "DEAD", "via": "surface-closed",
+                                 "origin": "tab_close"})
+    fs.inbox_put("doctor", SURF, {"reason": "low-ctx", "label": "fullish", "child_surface": "CCCC",
+                                  "ctx_pct_remaining": 22})
+    ctx = json.loads(_run("hook-awareness").stdout)["hookSpecificOutput"]["additionalContext"]
+    assert "auto-archived" in ctx and "gone" in ctx                  # stale channel intact
+    assert "LOW CONTEXT" in ctx and "22%" in ctx and "fullish" in ctx  # doctor channel intact
+
+
 def test_awareness_no_surface_exits_clean(fs):
     fs.inbox_put("completion", SURF, {"label": "w1", "gist": "x"})
     p = _run("hook-awareness", surface=None)
