@@ -13,6 +13,8 @@ import argparse
 import html as _html
 import json
 import os
+import re
+import shlex
 import subprocess
 import sys
 import time
@@ -76,18 +78,107 @@ def _freshest_session(store, surf):
     return best
 
 
+# ─── per-agent context window (Fix 1: REAL per-agent, not a static global) ─────────────────────
+# The window is knowable PER AGENT from the model it launched with. opus-4-8 ships in both a 200k and a
+# 1M ([1m]) flavor, so the flavor — not a fleet-wide constant — is the truth. Precedence INVERTS the old
+# one: a real per-agent value (flavor, then keyword) wins; the CMUX_FLEET_CONTEXT_WINDOW /
+# [fleet].context_window override is DEMOTED to a manual last resort (only an unknown model reaches it).
+def _flag_val(tokens, name):
+    """Value of `--name V` (or `--name=V`) in a token list; True if a bare flag; else None. Local copy —
+    features.py is a dependency-light island and must not import cli.py (no circular import)."""
+    for i, t in enumerate(tokens):
+        if t == name:
+            return tokens[i + 1] if i + 1 < len(tokens) and not tokens[i + 1].startswith("-") else True
+        if t.startswith(name + "="):
+            return t.split("=", 1)[1]
+    return None
+
+
+def _launch_args(sess):
+    """Launch argv tokens from a hook-store session record's launchCommand. cmux stores it either as a
+    dict {'arguments':[...], 'launcher':...} (current builds) or a bare command string (older) — normalize
+    to a flat token list for --flag scanning. Mirrors cli._launchcmd's dict/str tolerance."""
+    lc = sess.get("launchCommand") if isinstance(sess, dict) else sess
+    if isinstance(lc, dict):
+        args = lc.get("arguments")
+        if isinstance(args, list):
+            return [str(a) for a in args]
+        lc = lc.get("command") or ""
+    if isinstance(lc, str) and lc:
+        try:
+            return shlex.split(lc)
+        except ValueError:
+            return lc.split()
+    return []
+
+
+def _launcher(sess):
+    """The launching tool ('claude'/'codex'/...) from a session record's launchCommand dict, or ''."""
+    lc = sess.get("launchCommand") if isinstance(sess, dict) else None
+    return (lc.get("launcher") or "").lower() if isinstance(lc, dict) else ""
+
+
+def _user_prefs():
+    """The GLOBAL default (model, effort) from ~/.claude/settings.json / env — the values a claude agent
+    launched WITHOUT a --model/--effort override inherits. This is where the window FLAVOR (e.g.
+    'claude-opus-4-8[1m]') lives for the common no-override case: the launchCommand rarely carries it, so
+    this default is ESSENTIAL to per-agent window resolution, not a nicety. Read fresh per call (cheap;
+    vitals is already a live-derive). '' when unknown. (Mirrors cli.compute_effective's model/effort
+    precedence: launch flag > settings > env.)"""
+    model = effort = ""
+    try:
+        d = json.load(open(os.path.expanduser("~/.claude/settings.json")))
+        model = d.get("model") or ""
+        effort = d.get("effortLevel") or ""
+    except Exception:
+        pass
+    return (model or os.environ.get("ANTHROPIC_MODEL", ""),
+            effort or os.environ.get("CLAUDE_CODE_EFFORT_LEVEL", ""))
+
+
+def _launched_prefs(sess, tool=""):
+    """(model, effort) an agent EFFECTIVELY launched with, per Claude Code's own precedence: a
+    --model/--effort launch flag (per-agent override) wins; else the global user default (settings/env).
+    The model string is returned WITH any [Nk]/[Nm] window flavor — that's the whole point, the window is
+    derived from it. The global default is applied only for CLAUDE agents (a codex agent must not inherit
+    the claude settings model); codex ctx is '—' anyway (used=None), so its window is cosmetic."""
+    args = _launch_args(sess)
+    fmodel, feffort = _flag_val(args, "--model"), _flag_val(args, "--effort")
+    is_claude = (tool or _launcher(sess) or "claude").lower() == "claude"
+    umodel, ueffort = _user_prefs() if is_claude else ("", "")
+    return (fmodel if isinstance(fmodel, str) else umodel,
+            feffort if isinstance(feffort, str) else ueffort)
+
+
+def _window_flavor(model):
+    """The window a [Nk]/[Nm] suffix flavor on a model string encodes (case-insensitive): '[1m]'->1_000_000,
+    '[200k]'->200_000, '[500000]'->500_000. None when the string carries no flavor. This is the
+    launch-encoded TRUTH about the window (opus-4-8 ships in both 200k and 1M flavors)."""
+    m = re.search(r"\[(\d+)\s*([km]?)\]", (model or "").lower())
+    if not m:
+        return None
+    n, unit = int(m.group(1)), m.group(2)
+    return n * 1_000_000 if unit == "m" else n * 1000 if unit == "k" else n
+
+
 def _context_window(model):
-    """Tokens of context for a model. Configurable (CMUX_FLEET_CONTEXT_WINDOW / [fleet].context_window)
-    because the model string can't disambiguate variants (e.g. opus-4-8 ships in 200k AND 1M flavors) —
-    a fleet usually runs one window, so one knob is right. The keyword map is only a fallback guess; the
-    ABSOLUTE token count and the relative ranking are correct regardless of this denominator."""
-    if _CFG_WINDOW:
-        return int(_CFG_WINDOW)
+    """Tokens of context for a model STRING — REAL per-agent (Fix 1). Precedence:
+      1. an explicit [Nk]/[Nm] window flavor on the string (the launch-encoded truth: [1m]->1M);
+      2. else a model-keyword map (opus/sonnet/haiku->200k, gpt-5/codex->272k, gemini->1M);
+      3. else the CMUX_FLEET_CONTEXT_WINDOW / [fleet].context_window manual override (DEMOTED to a
+         last-resort knob — the old code short-circuited on it FIRST, which made ctx-left meaningless on
+         a mixed-model fleet; now a real per-agent value always wins and this only catches unknowns);
+      4. else 200k."""
+    flav = _window_flavor(model)
+    if flav:
+        return flav
     m = (model or "").lower()
     for key, win in (("haiku", 200000), ("sonnet", 200000), ("opus", 200000),
                      ("gpt-5", 272000), ("o3", 200000), ("codex", 272000), ("gemini", 1000000)):
         if key in m:
             return win
+    if _CFG_WINDOW:
+        return int(_CFG_WINDOW)
     return 200000
 
 
@@ -95,7 +186,12 @@ def _context_used(path):
     """Approx context tokens occupied at the agent's last turn, from its transcript. claude records
     a per-turn usage block: input + cache_read + cache_creation = the whole prompt that turn = the live
     context size. codex's transcript only carries a CUMULATIVE session counter (not the live window), so
-    we don't guess it — codex returns None and vitals shows '—'. Returns (tokens|None, model)."""
+    we don't guess it — codex returns None and vitals shows '—'. Returns (tokens|None, model).
+
+    Returns None (not 0) when NO REAL usage record is found — an errored/empty/truncated transcript, or a
+    turn whose usage summed to 0 (Fix 3). A live agent's prompt is never 0 tokens, so a 0 total is "no
+    parseable usage" not "genuinely 0"; requiring a POSITIVE total keeps used=None -> pct_remaining None
+    -> vitals shows '—' instead of the garbage '0k 100%' (a 0 total made 1 - 0/window resolve to 100%)."""
     used, model = None, ""
     if not path or not os.path.exists(path):
         return None, ""
@@ -110,8 +206,10 @@ def _context_used(path):
                 model = msg.get("model") or model
                 u = msg.get("usage") or {}
                 if u:
-                    used = (u.get("input_tokens", 0) + u.get("cache_read_input_tokens", 0)
-                            + u.get("cache_creation_input_tokens", 0))
+                    tot = (u.get("input_tokens", 0) + u.get("cache_read_input_tokens", 0)
+                           + u.get("cache_creation_input_tokens", 0))
+                    if tot > 0:                                      # a REAL record; 0 == errored/empty turn
+                        used = tot
     except Exception:
         return None, model
     return used, model
@@ -148,7 +246,7 @@ def _infer_state(entry, session):
 def snapshot():
     """The whole live fleet as a list of view-rows, cheapest signals first. One row per live agent:
         label role kind tool parent surface ws state rank ctx_used ctx_pct_remaining window
-        model last_text last_age_s
+        model effort cwd last_text last_age_s
     Pure derive: registry + hook store + transcripts. No cmux screen reads (keeps it cheap)."""
     store = fs.read_hook_store()
     now = time.time()
@@ -157,7 +255,11 @@ def snapshot():
         surf = e.get("surface", "")
         sess = _freshest_session(store, surf)
         state = _infer_state(e, sess)
-        used, model = _context_used(sess.get("transcriptPath", ""))
+        used, tmodel = _context_used(sess.get("transcriptPath", ""))
+        # Fix 1: the LAUNCHED model carries the window flavor ([1m]); the transcript model doesn't.
+        # Prefer it, fall back to the transcript's, then the tool keyword — window is derived from it.
+        lmodel, effort = _launched_prefs(sess, e.get("tool", ""))
+        model = lmodel or tmodel
         window = _context_window(model or e.get("tool", ""))
         pct_remaining = None if used is None else max(0, round(100 * (1 - used / window)))
         updated = sess.get("updatedAt") or 0
@@ -167,7 +269,8 @@ def snapshot():
             "ws": sess.get("workspaceId", ""), "state": state,
             "rank": STATE_STYLE.get(state, ("", "", 9))[2],
             "ctx_used": used, "ctx_pct_remaining": pct_remaining, "window": window,
-            "model": model, "muted": bool(e.get("muted")),
+            "model": model, "effort": effort or "",                     # Fix 2: effort + cwd surfaced
+            "cwd": e.get("cwd", "") or sess.get("cwd", ""), "muted": bool(e.get("muted")),
             "last_text": fs.last_agent_text(sess.get("transcriptPath", ""), cap=120),
             "last_age_s": (now - updated) if updated else None,
         })
@@ -188,13 +291,38 @@ def _age(secs):
     return f"{secs // 3600}h{(secs % 3600) // 60:02d}"
 
 
+def _winlabel(win):
+    """Compact window size for display: 1_000_000 -> '1M', 200_000 -> '200k', 272_000 -> '272k'."""
+    return f"{win // 1_000_000}M" if win >= 1_000_000 and win % 1_000_000 == 0 else f"{win // 1000}k"
+
+
 def _ctx(r):
+    """context used / REAL per-agent window + remaining % (Fix 1 makes the denominator per-agent, so it's
+    shown: '456k/1M 54%'). '!' marks <=30% left; '—' when there's no parseable usage (Fix 3)."""
     if r["ctx_used"] is None:
         return "—"
     k = r["ctx_used"] / 1000.0
     pct = r["ctx_pct_remaining"]
     flag = "!" if (pct is not None and pct <= 30) else ""
-    return f"{k:.0f}k {pct}%{flag}"
+    return f"{k:.0f}k/{_winlabel(r['window'])} {pct}%{flag}"
+
+
+def _short_model(m):
+    """Compact a model string for the table (full string is in --json): drop the tool prefix, KEEP the
+    window flavor. 'claude-opus-4-8[1m]' -> 'opus-4-8[1m]'; 'gpt-5-codex' -> 'gpt-5-codex'; '' -> '-'."""
+    if not m:
+        return "-"
+    for pre in ("claude-", "codex-", "openai-"):
+        if m.startswith(pre):
+            return m[len(pre):]
+    return m
+
+
+def _short_cwd(c):
+    """The tail of a cwd for the table (full path is in --json): last two path segments, e.g.
+    '/Users/.../cmux-fleet/.worktrees/x' -> '.worktrees/x'. '' -> '-'."""
+    parts = [p for p in (c or "").rstrip("/").split("/") if p]
+    return "/".join(parts[-2:]) if parts else "-"
 
 
 def _fit(s, w):
@@ -219,21 +347,21 @@ def cmd_vitals(argv):
     if not rows:
         print("(no live agents)")
         return 0
-    win = rows[0]["window"]
-    print(f"FLEET VITALS ({len(rows)})   window≈{win // 1000}k   "
-          f"{'label':<22}{'role':<14}{'state':<13}{'ctx-left':<11}{'idle':<7}{'tool':<7}last")
+    print(f"FLEET VITALS ({len(rows)})   ctx = used / REAL per-agent window")
+    print(f"    {'label':<17}{'state':<12}{'ctx-left':<15}{'model':<13}{'eff':<7}{'cwd':<17}{'idle':<6}last")
     for r in rows:
         glyph = {"error": "✗", "needs-input": "◍", "review": "⊙", "working": "▶",
                  "done": "✓", "idle": "·", "pending": "…", "stale": "?", "gone": "✗"}.get(r["state"], "·")
         muted = " M" if r["muted"] else ""
-        print(f"  {glyph} {_fit(r['label'], 20):<20}{_fit(r['role'], 14):<14}{r['state']:<13}{_ctx(r):<11}"
-              f"{_age(r['last_age_s']):<7}{_fit(r['tool'], 7):<7}{_fit(r['last_text'], 42)}{muted}")
+        print(f"  {glyph} {_fit(r['label'], 16):<17}{r['state']:<12}{_ctx(r):<15}"
+              f"{_fit(_short_model(r['model']), 12):<13}{_fit(r['effort'] or '-', 6):<7}"
+              f"{_fit(_short_cwd(r['cwd']), 16):<17}{_age(r['last_age_s']):<6}{_fit(r['last_text'], 26)}{muted}")
     near = [r for r in rows if r["ctx_pct_remaining"] is not None and r["ctx_pct_remaining"] <= 30]
     if near:
         print(f"\n  ! {len(near)} near-full (<=30% ctx left): "
               + ", ".join(r["label"] for r in near) + "  — recycle candidates")
-    print(f"\n(ctx = context REMAINING %; assumes window {win // 1000}k — set CMUX_FLEET_CONTEXT_WINDOW "
-          "or [fleet].context_window to match your model.)")
+    print("\n(ctx = context REMAINING % of each agent's REAL window — derived per-agent from its launched "
+          "model flavor, e.g. [1m]=1M vs bare=200k; '—' = no usage yet / unparseable. role in --json.)")
     return 0
 
 
