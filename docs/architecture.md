@@ -299,10 +299,36 @@ registry `session` on every `Stop` (tool-aware, so a codex id never overwrites a
 claude agent's session), killing the "No conversation found" class on later
 archive/revive.
 
-For a roster role, recycle and revive are toml-authoritative: they re-resolve the
-current roster, so a restart picks up role or floor changes made since launch.
-Effort/model are session preferences (see operations.md): the recycle prints the
-effective value + source, and `--effort`/`--model` override for that restart.
+### Launch-config compilation: the one rule, stated once
+
+Every operation that composes a launch command — `launch`, `recycle` (single-target and bulk alike),
+`revive`, and `register` — follows the same rule, so this is worth stating once rather than
+re-deriving per verb:
+
+- **A roster role (has a `[role.<name>]` block in `fleet.toml`) is TOML-AUTHORITATIVE, always.** Every
+  one of the four verbs re-resolves the CURRENT toml on every call — never the toml as it was at
+  original launch time, never a captured binding. A restart of a roster agent picks up role/floor
+  changes made since it was first launched, full stop. There is no verb where a roster role's identity
+  is reconstructed from history instead of current config.
+- **An ad-hoc / off-roster identity has no toml to be authoritative, so it falls back to the captured
+  binding** (the exact command cmux recorded at bind time) — this is the one case where history is the
+  source of truth, and only because there's nothing else to consult.
+- **Caller `--` flags (one-off `--effort`, `--model`, `--add-plugin`, etc.) always layer on top with the
+  highest precedence, for that single invocation only.** They are never persisted anywhere — not into
+  the toml, not into the registry, not into a future respawn's defaults. If you want an override to
+  survive the NEXT restart too, it has to go in the toml (a role's `flags`) or be passed again.
+- **A mid-session interactive change (`/effort`, `/model`) does NOT survive a respawn.** Those write to
+  the GLOBAL `~/.claude/settings.json`, and a composed `--effort`/`--model` launch flag always overrides
+  a saved setting — so unless the role has its own pin in the toml, the next recycle/revive/launch
+  reverts to whatever the role/floor's toml flags say (or the floor default, if the role has no pin at
+  all). This is why `recycle`/`launch` print `[fleet] session-prefs: effort=X (source)` — the source
+  tells you whether what you're about to get is a role-pin (durable, survives respawns) or a
+  floor-inherited value (will NOT reflect an interactive change you made this session).
+
+None of this is a special case per verb — it's the same rule, checked in the code that composes each
+one (`_compose_recycle_cmd` for recycle/revive, `resolve()` for launch, the roster-vs-binding branch in
+`cmd_register`). If a future change to any of these ever needs to deviate from this rule, that's a
+sign something's wrong, not a sign the rule needs an exception.
 
 ## Worktrees
 
