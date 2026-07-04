@@ -45,6 +45,24 @@ def test_resolve_base(repo):
         wt.resolve_base(repo, "does-not-exist")
 
 
+def test_resolve_base_prefers_local_default_over_stale_origin(repo):
+    # 2026-07-03 dispatch bug: a local-merge session (merges never pushed) leaves origin/<default>
+    # frozen stale; the old cascade tried origin/<default> FIRST, so every new worktree silently
+    # branched off the last-pushed commit instead of current local main. Local default must win.
+    subprocess.run(["git", "-C", repo, "update-ref", "refs/remotes/origin/main", "HEAD"],
+                   check=True, capture_output=True)             # origin/main pinned at the old tip
+    (open(os.path.join(repo, "b.txt"), "w")).write("new\n")
+    _run(repo, "git", "add", "-A")
+    _run(repo, "git", "commit", "-qm", "local advance")          # local main moves past origin/main
+    assert wt.resolve_base(repo, "") == "main"                   # NOT "origin/main"
+    # sanity: the two refs really diverge, so the assertion above is meaningful
+    local = subprocess.run(["git", "-C", repo, "rev-parse", "main"],
+                           capture_output=True, text=True).stdout.strip()
+    origin = subprocess.run(["git", "-C", repo, "rev-parse", "origin/main"],
+                            capture_output=True, text=True).stdout.strip()
+    assert local != origin
+
+
 # ---------------------------------------------------------------- create
 def test_ensure_worktree_creates_and_is_idempotent(repo):
     p = wt.worktree_path(repo, ".worktrees", "alpha")
