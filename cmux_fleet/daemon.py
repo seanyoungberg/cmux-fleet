@@ -328,6 +328,17 @@ def _heartbeat_tick():
     skip muted agents. NO dead-session detection / auto-recycle. The whole backstop honors the dial:
     'notify-mode passive' is a fleet-wide wake mute (design 2.1), so the tick no-ops under it."""
     from . import state as fs
+    # fleet-doctor sweep (conditions #1/#2/#3): parent alerts on stall / low-ctx / needs-input, deduped.
+    # Runs BEFORE the dial gate below: it WRITES inbox rows regardless of the dial (they surface via
+    # awareness next turn — 'passive' is a wake mute, not an inbox mute), and its own wake is dial-gated
+    # internally. A bad sweep must never kill the tick, so it's isolated in its own try.
+    try:
+        from . import router
+        fired = router.fleet_doctor_sweep()
+        if fired:
+            print(f"[fleet-doctor] {fired} parent alert(s) fired this tick", flush=True)
+    except Exception as e:
+        print(f"[fleet-doctor] sweep error: {e}", flush=True)
     if not fs.idlewake_on():                          # 'passive' mutes the backstop too (coherent mute)
         print("[heartbeat] tick: muted (notify-mode=passive)", flush=True)
         return

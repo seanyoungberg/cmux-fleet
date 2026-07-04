@@ -1093,6 +1093,11 @@ def cmd_rm(argv):
         sys.exit(f"[fleet] rm: '{label}' is mid-turn (lifecycle=running on surface {surf[:8]}). "
                  f"Use --force to close it anyway, or --detach to drop the registry row and leave "
                  f"the surface running.")
+    if closing:
+        fs.expected_close_put(surf)                     # tombstone BEFORE any close: mark this a DELIBERATE
+                                                        # retirement so the router won't mis-read the
+                                                        # surface.closed frame as an accidental external
+                                                        # close and fire a spurious stale "revive?" alert
     group_note = ""
     if with_group and e.get("group"):
         gname = e["group"]
@@ -1136,6 +1141,9 @@ def cmd_rm(argv):
                                f"git worktree remove <path>; git branch -D fleet/<label>)")
             print(f"[fleet] about to dissolve group '{gname}' ({gref}); closing {1 + len(members)} "
                   f"member(s): {', '.join(sorted(registry_all))}")
+            for _m in members.values():                      # tombstone the OTHER members too (the group
+                fs.expected_close_put(_m.get("surface", ""))  # delete closes every member surface; target
+                                                             # surf is already tombstoned above via `closing`)
             cmuxq("workspace-group", "delete", gref)         # delete takes a REF -> closes ALL members
             for lbl, v in members.items():
                 fs.live_del(lbl); fs.archive_del(lbl)
@@ -1315,6 +1323,9 @@ def cmd_archive(argv):
     # post-launch overrides included) instead of the lossy registry-spec snapshot. The binding lives
     # on the surface; once close-surface runs it's gone, so read it first.
     b = _resume_binding(surf) if surf else {}
+    if surf:
+        fs.expected_close_put(surf)                     # deliberate archive: shield the router's
+                                                        # surface.closed handler from a spurious stale alert
     pid = _pid_for_surface(surf)
     if pid:
         try:
@@ -2813,7 +2824,7 @@ def main():
               "  peer-msg <to-label> \"<body>\" [--no-reply] [--reply-to <id>] [--expect-reply] [--no-wake]\n"
               "                                                    input-safe A2A: message a live PEER conductor (into its context, never its input box)\n"
               "  child-digest <session-frag> [N]                   print a child's last N transcript turns (the reliable content source)\n"
-              "  inbox-ack <seq> [--peer] [--surface UUID]         mark shown completions/peer msgs handled so they stop re-surfacing")
+              "  inbox-ack <seq> [--peer|--stale|--doctor] [--surface UUID]  mark shown completions/alerts/peer msgs handled so they stop re-surfacing")
         return 0
     sub, rest = sys.argv[1], sys.argv[2:]
     # Hook verbs are the per-turn hot path (a plugin shim shells into them on every UserPromptSubmit/Stop).

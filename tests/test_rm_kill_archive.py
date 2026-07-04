@@ -150,3 +150,39 @@ def test_rm_default_does_not_tear_down_worktree(fs, monkeypatch):
     fleet.cmd_rm(["w10"])
     assert fs.live_get("w10") is None and fs.archive_get("w10") is not None
     assert torn == []                                             # tree untouched without --kill
+
+
+# --- expected-close tombstone (fleet-doctor #5): a DELIBERATE close must not read as accidental --------
+# rm/archive/--with-group write a short-lived tombstone BEFORE tearing the surface down, so the router's
+# surface.closed handler can tell an intentional retirement from an accidental external close (and skip
+# the spurious `kind='stale'` "revive?" alert). Here: prove the CLI WRITES the tombstone.
+def test_rm_default_writes_expected_close_tombstone(fs, monkeypatch):
+    _seed(fs, "wt1", "SURF-WT1")
+    _stub_cmux(monkeypatch, fs)
+    fleet.cmd_rm(["wt1"])                                         # default close+archive
+    assert fs.expected_close_recent("SURF-WT1") is True          # tombstoned before the close
+
+
+def test_rm_kill_writes_expected_close_tombstone(fs, monkeypatch):
+    _seed(fs, "wt2", "SURF-WT2")
+    _stub_cmux(monkeypatch, fs)
+    fleet.cmd_rm(["wt2", "--kill"])
+    assert fs.expected_close_recent("SURF-WT2") is True
+
+
+def test_rm_detach_does_not_tombstone(fs, monkeypatch):
+    # --detach leaves the surface RUNNING (no close, no surface.closed frame) -> nothing to shield.
+    _seed(fs, "wt3", "SURF-WT3")
+    _stub_cmux(monkeypatch, fs)
+    fleet.cmd_rm(["wt3", "--detach"])
+    assert fs.expected_close_recent("SURF-WT3") is False
+
+
+def test_archive_writes_expected_close_tombstone(fs, monkeypatch):
+    _seed(fs, "wt4", "SURF-WT4")
+    _stub_cmux(monkeypatch, fs)
+    monkeypatch.setattr(fleet, "_pid_for_surface", lambda s: None)
+    monkeypatch.setattr(fleet, "_resume_binding", lambda surf: {})
+    fleet.cmd_archive(["wt4"])
+    assert fs.live_get("wt4") is None                            # archived...
+    assert fs.expected_close_recent("SURF-WT4") is True          # ...and tombstoned first

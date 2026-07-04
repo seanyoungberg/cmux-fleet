@@ -32,6 +32,8 @@ LOG = os.path.join(STATE, "log.jsonl")
 MODEFILE = os.path.join(STATE, "notify-mode")
 DRAFTMODE = os.path.join(STATE, "draft-through")        # policy override: 'clobber' | 'preserve' (default 'stale')
 DRAFTMARKS = os.path.join(STATE, "draft-marks.json")    # {surface: {text, since}} — stale-draft-gate age tracking
+EXPECTED_CLOSE = os.path.join(STATE, "expected-close.json")  # short-lived CLI-close tombstones (list of {surface_id, ts})
+EXPECTED_CLOSE_S = 10   # a CLI-written close tombstone shields _archive_closed_surface from this surface this long
 
 # Agent-helper command hints emitted into conductor context by the awareness/drain hooks. Phase 2
 # folded the four standalone plugin scripts into `fleet <verb>` subcommands, so these are now the app
@@ -266,6 +268,43 @@ def reconcile_session(label, sid_bare, tool=None, event_tool=None):
     return "backfill" if not stored else "reconcile"
 
 
+# --- expected-close tombstones (CLI <-> router registry-hygiene handshake) ------------------------
+# A DELIBERATE close (fleet rm / archive / --with-group dissolve) races the router's surface.closed
+# handler across processes: the CLI's live_del is meant to land before the router resolves the closed
+# surface, but registry() is mtime-cached at 1s granularity so the close can beat live_del's visibility
+# and _archive_closed_surface then mis-reads the intentional retirement as an accidental external close
+# (spurious `kind='stale'` "revive?" alert to the parent). The CLI stamps a short-lived tombstone BEFORE
+# it closes, and the router checks it — a deterministic signal that doesn't depend on lookup timing.
+def expected_close_put(surface_id, now=None):
+    """Tombstone `surface_id` as a DELIBERATE CLI close. Appends {surface_id, ts} and prunes expired rows
+    on write, so the file can't grow. No-op on an empty surface id. Best-effort (never raises into a
+    close path)."""
+    if not surface_id:
+        return
+    now = time.time() if now is None else now
+    try:
+        rows = [r for r in _read_json(EXPECTED_CLOSE, [])
+                if isinstance(r, dict) and (now - float(r.get("ts") or 0)) < EXPECTED_CLOSE_S]
+        rows.append({"surface_id": surface_id, "ts": now})
+        _atomic_write(EXPECTED_CLOSE, json.dumps(rows))
+    except Exception:
+        pass
+
+
+def expected_close_recent(surface_id, now=None):
+    """True iff `surface_id` was CLI-close-tombstoned within EXPECTED_CLOSE_S. Read-only + fail-open: a
+    missing/garbage file returns False, so a GENUINE external close (the path we must never suppress)
+    still archives + alerts."""
+    if not surface_id:
+        return False
+    now = time.time() if now is None else now
+    for r in _read_json(EXPECTED_CLOSE, []):
+        if isinstance(r, dict) and r.get("surface_id") == surface_id \
+                and (now - float(r.get("ts") or 0)) < EXPECTED_CLOSE_S:
+            return True
+    return False
+
+
 # --- identity: the ARCHIVE shelf (parked, revivable) ---------------------------------------
 def archive_all():
     return _read_json(ARCHIVE, {})
@@ -431,6 +470,31 @@ def lifecycle(surface):
 LIFECYCLE_STALE_S = 90   # a 'running' record that has not ticked within this window is not a live turn
 
 
+def resolve_bound_record(surface, st=None, bound=None):
+    """The hook-store session record for `surface`'s FLEET-BOUND session (registry truth, kept honest by
+    the reconciliation lane), falling back to the freshest record on the surface when the binding can't
+    be matched; {} when nothing claims the surface. This is the shared record-resolution behind BOTH the
+    wake gate (surface_busy — 'is this a fresh live turn?') and its inverse in the fleet-doctor sweep
+    ('is this bound 'running' record frozen = a dead stall?' / 'is it at needsInput?'). Resolving against
+    the fleet BINDING rather than max-updatedAt is what defeats the days-old orphan records (e.g. surf
+    1A5E3168's ~3-day 'running' ghost, and the many stale 'needsInput' orphans) — an orphan belongs to a
+    session no live member is bound to, so it is simply never the resolved record for a live member.
+    `st`/`bound` may be passed to skip re-reading the hook store / registry per call — the sweep walks
+    every member off ONE store read and already holds each entry's bound session."""
+    st = read_hook_store() if st is None else st
+    recs = [s for s in (st.get("sessions") or {}).values() if s.get("surfaceId") == surface]
+    if not recs:
+        return {}                               # nothing claims this surface
+    if bound is None:
+        bound = bare_uuid((entry_for_surface(surface) or {}).get("session", ""))
+    rec = None
+    if bound:
+        rec = next((s for s in recs if bare_uuid(s.get("sessionId", "")) == bound), None)
+    if rec is None:                             # no fleet-bound record -> fall back to the freshest
+        rec = max(recs, key=lambda s: s.get("updatedAt") or 0)
+    return rec
+
+
 def surface_busy(surface, now=None):
     """True ONLY when `surface` is genuinely mid-turn (a fresh, live 'running' record) — the single case
     the wake gate must never interrupt. Hardened two ways against the stale read that stalled
@@ -446,17 +510,8 @@ def surface_busy(surface, now=None):
     false 'busy' — the failure we are killing — can never silence an idle surface."""
     now = time.time() if now is None else now
     try:
-        recs = [s for s in (read_hook_store().get("sessions") or {}).values()
-                if s.get("surfaceId") == surface]
-        if not recs:
-            return False                        # nothing claims this surface -> not provably busy
-        bound = bare_uuid((entry_for_surface(surface) or {}).get("session", ""))
-        rec = None
-        if bound:
-            rec = next((s for s in recs if bare_uuid(s.get("sessionId", "")) == bound), None)
-        if rec is None:                         # no fleet-bound record -> fall back to the freshest
-            rec = max(recs, key=lambda s: s.get("updatedAt") or 0)
-        if rec.get("agentLifecycle") != "running":
+        rec = resolve_bound_record(surface)
+        if not rec or rec.get("agentLifecycle") != "running":
             return False
         return (now - (rec.get("updatedAt") or 0)) <= LIFECYCLE_STALE_S
     except Exception:

@@ -402,6 +402,53 @@ def test_handle_observe_mode_does_not_archive_on_surface_closed(fs, monkeypatch)
     assert fs.archive_get("worker") is None
 
 
+# --- expected-close tombstone suppresses the spurious stale alert on a DELIBERATE CLI close (#5) -------
+# `fleet rm --kill` / `fleet archive` / `--with-group` intentionally close a surface. The CLI's live_del
+# races the router's surface.closed handler (registry() is mtime-cached), so the entry can still resolve
+# and _archive_closed_surface would mis-fire a duplicate archive + a `kind='stale'` "revive?" alert on an
+# intentional retirement. The CLI stamps a short-lived tombstone BEFORE closing; the router skips on it.
+def test_handle_skips_archive_and_alert_on_expected_cli_close(fs, monkeypatch):
+    """A tracked surface with a FRESH expected-close tombstone -> _archive_closed_surface no-ops: no
+    duplicate archive, no stale alert to the parent, no wake. (The CLI already reconciled the registry.)"""
+    from cmux_fleet import cli
+    fs.live_put("parent", {"surface": "PARENT", "kind": "conductor", "role": "c", "session": "claude-parent"})
+    fs.live_put("worker", {"surface": "CHILD", "kind": "child", "role": "w", "parent": "parent",
+                           "tool": "claude", "session": "claude-worker-uuid"})
+    monkeypatch.setattr(router, "LIVE", True)
+    monkeypatch.setattr(router, "_reg", {"mtime": 0, "by_label": {}, "by_surface": {}})
+    monkeypatch.setattr(cli, "_resume_binding", lambda surf: {})
+    waked = []
+    monkeypatch.setattr(router, "maybe_idle_wake", lambda parent_surface, label: waked.append(parent_surface))
+
+    fs.expected_close_put("CHILD")                       # the CLI tombstoned it just before closing
+    router.handle(_surface_closed_ev("CHILD"))
+
+    assert fs.archive_get("worker") is None              # NOT re-archived by the router
+    assert fs.inbox_pending("PARENT", kind="stale") == []  # ...and NO spurious "revive?" alert
+    assert waked == []
+
+
+def test_handle_still_archives_when_tombstone_expired(fs, monkeypatch):
+    """An EXPIRED tombstone must NOT suppress: a genuine external close that happens to reuse a surface id
+    long after some prior CLI close still archives + alerts (the real external-close path is unchanged)."""
+    import time as _time
+    from cmux_fleet import cli
+    fs.live_put("parent", {"surface": "PARENT", "kind": "conductor", "role": "c", "session": "claude-parent"})
+    fs.live_put("worker", {"surface": "CHILD", "kind": "child", "role": "w", "parent": "parent",
+                           "tool": "claude", "session": "claude-worker-uuid"})
+    monkeypatch.setattr(router, "LIVE", True)
+    monkeypatch.setattr(router, "_reg", {"mtime": 0, "by_label": {}, "by_surface": {}})
+    monkeypatch.setattr(cli, "_resume_binding", lambda surf: {})
+    monkeypatch.setattr(router, "maybe_idle_wake", lambda parent_surface, label: None)
+
+    fs.expected_close_put("CHILD", now=_time.time() - (fs.EXPECTED_CLOSE_S + 60))   # stale tombstone
+    router.handle(_surface_closed_ev("CHILD"))
+
+    assert fs.live_get("worker") is None                 # archived (expired tombstone doesn't shield)
+    assert fs.archive_get("worker") is not None
+    assert len(fs.inbox_pending("PARENT", kind="stale")) == 1   # genuine external-close path intact
+
+
 def test_member_by_session_matches_bare_uuid_tool_aware(monkeypatch):
     """The registry-truth fallback matches a bus session id to a live member by bare uuid, is TOOL-AWARE
     (never binds a codex id onto a claude agent), and FAILS OPEN to a uuid-only match when the bus id
