@@ -106,7 +106,7 @@ mode dial below).
 | `fleet recycle [label]` | restart in place, same surface and identity (default RESUME; `--fresh` sheds, `--session <id>`, `--force`; bulk `--all\|--conductors\|--children\|--my-children`) |
 | `fleet sessions <label>` | list resumable prior sessions for the agent's surface (id, age, size, snippet) |
 | `fleet archive` / `revive` | park a live agent / bring a parked one back (`revive --fresh\|--session`) |
-| `fleet rm <label>` | drop a label (`--kill` closes it, `--with-group` dissolves its group) |
+| `fleet rm <label>` | close + archive a label (revivable; `--detach` drops the row only, `--force` overrides the mid-turn guard, `--with-group` dissolves its group) |
 | `fleet mute` / `unmute` | stop / resume pushing a child's completions to its parent |
 | `fleet vitals` / `find` / `graph` / `serve` / `paint` | read-only views (triage, lookup, tree, localhost, sidebar) |
 | `fleet worktree ls` / `clean` | manage fleet-owned git worktrees (config-gated) |

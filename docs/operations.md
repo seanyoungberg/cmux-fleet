@@ -24,7 +24,7 @@ fleet recycle [label] [--fresh] [--session id] [--force] [-- <flags>]   # restar
 fleet recycle --all|--conductors|--children|--my-children [--include-muted]  # bulk restart, sequential + gated
 fleet sessions <label>                      # list resumable prior sessions (id, age, size, snippet)
 fleet archive <label>   / fleet revive <label> [--fresh] [--session id]     # park / bring back
-fleet rm <label> [--kill] [--with-group] [--wip-commit]   # drop; optionally close + dissolve group
+fleet rm <label> [--detach] [--force] [--with-group] [--wip-commit]   # close + archive (default); --detach drops row only
 fleet mute <label> / unmute <label>
 
 # views (read-only, no LLM)
@@ -303,8 +303,16 @@ For a roster role, both recycle and revive are toml-authoritative: they
 re-resolve the current roster, so they pick up floor or role changes made since
 the agent launched.
 
-- **rm** drops a label from the live and archive stores. `--kill` also stops the
-  process and closes its tab (for a throwaway). `--with-group` dissolves the
+- **rm** retires a label: by default it writes a recovery row to the archive,
+  stops the process, and closes the surface — so a removed label can never leave
+  a zombie surface running (revive it later with `fleet revive`). A surface that
+  is mid-turn ("running") is refused; `--force` closes it anyway. `--detach` is
+  the explicit opt-in for the old soft behavior: drop the registry row only and
+  leave the surface running (for handing a pane to a human to drive directly).
+  Note detach ≠ mute — a muted child stays tracked, a detached label is fully
+  untracked. `--kill` remains as an alias for the default; the one thing it
+  still adds is worktree teardown for a worktree-isolated agent
+  (refuse-if-dirty; `--wip-commit` to snapshot). `--with-group` dissolves the
   agent's workspace-group by ref (closing every member surface) and sweeps all of
   that group's members out of the registry, so no stale rows linger. A swept
   member's worktree dir and branch are left unmanaged: because the registry rows
