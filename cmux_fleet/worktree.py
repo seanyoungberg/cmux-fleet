@@ -8,7 +8,8 @@
 #
 # Layout:  <repo>/<worktree_dir>/<label>/        (worktree_dir default ".worktrees", gitignored)
 # Branch:  <prefix><label>                        (prefix default "fleet/")
-# Base:    explicit > origin/<default> > <default> > HEAD   (no auto-fetch in v0.1)
+# Base:    explicit > <default> > origin/<default> > HEAD   (no auto-fetch in v0.1; local default
+#          first so an unpushed local-merge session never pins new trees to a stale origin ref)
 #
 # Teardown is REFUSE-IF-DIRTY by default (an explicit --wip-commit is the escape hatch) and ALWAYS
 # keeps the branch. Nothing here ever merges or auto-deletes a branch. See docs/operations.md and
@@ -67,7 +68,11 @@ def _branch_exists(repo, branch):
 
 def resolve_base(repo, explicit=""):
     """Resolve the base ref a NEW worktree branch is cut from. Cascade:
-    explicit (then origin/<explicit>) > origin/<default> > <default> > HEAD. No fetch (v0.1)."""
+    explicit (then origin/<explicit>) > <default> > origin/<default> > HEAD. No fetch (v0.1).
+    LOCAL <default> before origin/<default>: in a local-merge dev session (merges never pushed),
+    origin/<default> can sit frozen-stale for days -- preferring it silently pinned every new worktree
+    to whatever was last pushed instead of the current local default (confirmed 2026-07-03: a batch
+    worktree branched off a days-old origin/main mid-session)."""
     if explicit:
         if _ref_exists(repo, explicit):
             return explicit
@@ -75,7 +80,7 @@ def resolve_base(repo, explicit=""):
             return f"origin/{explicit}"
         raise WorktreeError(f"base ref '{explicit}' not found (tried '{explicit}' and 'origin/{explicit}')")
     default = _default_branch(repo)
-    for ref in (f"origin/{default}", default, "HEAD"):
+    for ref in (default, f"origin/{default}", "HEAD"):
         if _ref_exists(repo, ref):
             return ref
     return "HEAD"

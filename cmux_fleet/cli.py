@@ -672,6 +672,9 @@ def cmd_launch(argv):
     ap.add_argument("--no-worktree", action="store_true",
                     help="force-disable worktree even if the role sets worktree=true")
     ap.add_argument("--worktree-base", help="base ref for a NEW worktree branch (default: repo default branch)")
+    ap.add_argument("--force", action="store_true",
+                    help="overwrite an already-LIVE label's registry row (only when you KNOW its old "
+                         "surface is already dead by other means)")
     ap.add_argument("--dry-run", action="store_true", help="resolve + print, do NOT spawn")
     a = ap.parse_args(argv)
     if not a.role and not a.adhoc:
@@ -764,6 +767,30 @@ def cmd_launch(argv):
         return 0
     if not a.parent:
         sys.exit("[fleet] ABORT: no --parent and no $CMUX_SURFACE_ID")
+
+    # live-label guard (registry/surface 1:1 invariant, same family as the rm flip): register() is a
+    # bare live_put overwrite, so launching into a label whose row still points at a live surface would
+    # silently orphan that surface with NO trail at all (not even a "removed" event). Refuse unless the
+    # old row is clearly STALE (dead lifecycle + a recorded session -- the same predicate `fleet ls`
+    # flags); a pending/unverifiable row refuses too (fail closed). --force is the operator override
+    # for "I KNOW the old surface is already dead by other means"; same spirit as cmd_register's
+    # already-live-under-a-different-surface refusal.
+    from . import state as fs
+    prior = fs.live_get(spec["label"])
+    if prior and prior.get("surface"):
+        prior_surf = prior["surface"]
+        stale = fs.lifecycle(prior_surf) in ("", "-", "ended") and bool(prior.get("session"))
+        if stale:
+            print(f"[fleet] note: label '{spec['label']}' had a STALE registry row (surface "
+                  f"{prior_surf[:8]} gone); overwriting it")
+        elif a.force:
+            print(f"[fleet] WARN: --force overwriting live label '{spec['label']}' -- if surface "
+                  f"{prior_surf[:8]} is still alive it is now fully untracked")
+        else:
+            sys.exit(f"[fleet] launch: label '{spec['label']}' is already LIVE under surface "
+                     f"{prior_surf}; refusing to overwrite its registry row (that would silently "
+                     f"orphan the old surface, with no trace). `fleet rm {spec['label']}` it first, "
+                     f"or re-run with --force if you KNOW the old surface is already dead.")
 
     os.makedirs(spec["abs_cwd"], exist_ok=True)
     if a.adhoc:                                          # ad-hoc cwds are created fresh at launch ->
@@ -1011,10 +1038,19 @@ def cmd_ls(argv):
 
 
 def cmd_rm(argv):
-    """Drop a label from live/archive. --kill also stops the process + closes its tab (throwaway), and
-    for a worktree-isolated agent tears the worktree down (refuse-if-dirty; --wip-commit to override;
-    branch always kept); it ALSO force-archives first (see below) so a killed agent is never left with no
-    recovery trace. --with-group also dissolves the agent's workspace-group: deleting the group by ref
+    """Remove a label AND its live surface together (registry-active <=> live surface, 1:1, no
+    exceptions by default). Default = the archive-equivalent teardown: force-archive a recovery row
+    first, SIGINT the process, close the surface -- so a bare `rm` can never again silently abandon a
+    still-live surface (the book-keeper zombie incident: a pane left running ~40h, invisible to `fleet
+    ls`). A surface that is mid-turn ('running') is REFUSED by default; --force closes it anyway.
+    --detach is the explicit opt-in for the OLD soft behavior: drop the registry row ONLY, never touch
+    the surface -- for handing a pane to a human to drive directly without killing in-progress work.
+    NOTE detach != mute: `fleet mute` is a notification-ROUTING concept (the child stays tracked,
+    completions just aren't pushed); a detached label is fully untracked. --kill is kept as an accepted
+    alias for the close+archive default (same precedent as recycle's kept --resume alias); the one
+    thing it still adds is worktree teardown for a worktree-isolated agent (refuse-if-dirty;
+    --wip-commit to snapshot; branch always kept) -- `fleet worktree clean <label>` is the dedicated
+    verb for that otherwise. --with-group also dissolves the agent's workspace-group: deleting the group by ref
     closes EVERY member surface, so we then SWEEP all live+archive entries in that group out of the
     registry (otherwise they linger as orphaned rows for dead surfaces). Before touching anything,
     --with-group cross-checks the registry's belief about that group's membership against cmux's REAL
@@ -1028,15 +1064,35 @@ def cmd_rm(argv):
     left ungrouped."""
     from . import state as fs; import signal
     kill = "--kill" in argv
+    detach = "--detach" in argv
+    force = "--force" in argv
     wipc = "--wip-commit" in argv
     with_group = "--with-group" in argv
-    args = [a for a in argv if a not in ("--kill", "--wip-commit", "--with-group")]
+    args = [a for a in argv if a not in ("--kill", "--detach", "--force", "--wip-commit", "--with-group")]
     if not args:
-        sys.exit("usage: fleet rm <label> [--kill] [--wip-commit] [--with-group]")
+        sys.exit("usage: fleet rm <label> [--detach] [--force] [--kill] [--wip-commit] [--with-group]")
     label = args[0]
-    e = fs.live_get(label) or fs.archive_get(label)
+    if detach and kill:
+        sys.exit("[fleet] rm: --detach and --kill are contradictory (leave the surface running vs "
+                 "tear everything down) -- pick one")
+    if detach and with_group:
+        sys.exit("[fleet] rm: --detach and --with-group are contradictory (a group dissolve closes "
+                 "every member surface) -- pick one")
+    e_live = fs.live_get(label)
+    e = e_live or fs.archive_get(label)
     if not e:
         sys.exit(f"fleet rm: no such label '{label}'")
+    # running-surface guard (ships WITH the default flip -- it's the flip's own footgun): the default
+    # now CLOSES the surface, so a mid-turn agent would be killed half-way. A SYNCHRONOUS check +
+    # refuse, deliberately NOT recycle's async quiet-gate: an async wait here would race the exact
+    # rm-then-relaunch workflow that caused the incident (two surfaces transiently contending for one
+    # label). idle/needsInput/unknown proceed as already-safe (_quiet_gate's own vocabulary of quiet).
+    surf = (e_live or {}).get("surface", "")
+    closing = not detach and bool(surf)
+    if closing and not force and fs.lifecycle(surf) == "running":
+        sys.exit(f"[fleet] rm: '{label}' is mid-turn (lifecycle=running on surface {surf[:8]}). "
+                 f"Use --force to close it anyway, or --detach to drop the registry row and leave "
+                 f"the surface running.")
     group_note = ""
     if with_group and e.get("group"):
         gname = e["group"]
@@ -1086,20 +1142,19 @@ def cmd_rm(argv):
                 fs.log_event("removed", label=lbl, role=v.get("role"), via="group-dissolve")
         else:
             group_note = f"\n[fleet] group '{gname}' not found live; nothing to dissolve"
-    killed_and_archived = False
-    if kill and e.get("surface"):
-        surf = e["surface"]
-        # force-archive-on-kill: --kill was the ONLY removal path that left NO recovery trace (plain rm
-        # and `fleet archive` both shelve an entry) -- quietly breaking the "prune freely, agents are
-        # recoverable" doctrine. Capture the binding + write the archive row BEFORE tearing the surface
-        # down, so a killed agent degrades to "recorded but maybe-unresumable" rather than vanishing.
-        # An empty/pending last_session (never bound / wedged agent) is still a valid marker -- `fleet
-        # revive` just relaunches fresh in that case; refusing to archive would block killing a wedged
-        # agent that needs to stay killable.
+    archived = False
+    if closing:
+        # close+archive is now the DEFAULT removal path (was --kill-only): capture the binding + write
+        # the archive row BEFORE tearing the surface down, so a removed agent degrades to "recorded but
+        # maybe-unresumable" rather than vanishing ("prune freely, agents are recoverable"). An
+        # empty/pending last_session (never bound / wedged agent) is still a valid marker -- `fleet
+        # revive` just relaunches fresh in that case; refusing to archive would block removing a wedged
+        # agent that needs to stay removable.
         b = _resume_binding(surf)
-        fs.archive_put(label, _build_archive_entry(e, b))
-        fs.log_event("archived", label=label, role=e.get("role"), session=e.get("session"), via="kill")
-        killed_and_archived = True
+        fs.archive_put(label, _build_archive_entry(e_live, b))
+        fs.log_event("archived", label=label, role=e.get("role"), session=e.get("session"),
+                     via="kill" if kill else "rm")
+        archived = True
         pid = _pid_for_surface(surf)
         if pid:
             try:
@@ -1119,11 +1174,16 @@ def cmd_rm(argv):
             wt_note += (f"\n[fleet]   ({label}'s tree is dirty; reclaim manually: "
                         f"git -C {m['repo']} worktree remove {m['path']} after committing/stashing)")
     fs.live_del(label)
-    if not killed_and_archived:
+    if not archived:
         fs.archive_del(label)
-    fs.log_event("removed", label=label, role=e.get("role"), killed=kill, with_group=with_group)
-    tail = f" (killed + closed; archived for recovery: fleet revive {label})" if killed_and_archived \
-        else (" (killed + closed)" if kill else "")
+    fs.log_event("removed", label=label, role=e.get("role"), killed=kill, detached=detach,
+                 with_group=with_group)
+    if archived:
+        tail = f" (closed + archived for recovery: fleet revive {label})"
+    elif detach and surf:
+        tail = " (DETACHED: registry row dropped, surface left running untracked -- detach != mute)"
+    else:
+        tail = ""
     print(f"[fleet] removed {label}{tail}{group_note}{wt_note}")
     return 0
 
@@ -1359,6 +1419,16 @@ def cmd_revive(argv):
             spec["abs_cwd"] = fresh_cwd if os.path.isabs(fresh_cwd) else os.path.join(ROOT, fresh_cwd)
     disp = "FRESH (no resume)" if a.fresh else f"resume {sess[:12] or '-'}"
     print(f"[fleet] revive {a.label} (tool={tool}, {disp}, source={source})\n[fleet] launch: {send_cmd}")
+    # session-prefs provenance on the live output, for parity with launch/recycle (revive was the one
+    # launch-composing verb that never printed it).
+    _eff = _flag_val(caller, "--effort"); _mdl = _flag_val(caller, "--model")
+    provline, provwarn = _session_pref_provenance(
+        e.get("role"), tool, send_cmd,
+        _eff if isinstance(_eff, str) else "", _mdl if isinstance(_mdl, str) else "")
+    if provline:
+        print(provline)                                          # effort/model + provenance (source)
+    if provwarn:
+        print(provwarn)                                          # no-pin warning (floor-inherited effort)
     if a.dry_run:
         print("[fleet] dry-run"); return 0
     if not a.parent:
@@ -1380,7 +1450,10 @@ def cmd_revive(argv):
     sid = _resume_binding(surf).get("checkpoint_id", "") or sid   # ground-truth session over a bridge poll id
     register(surf, spec, a.parent, sid, ws)
     fs.archive_del(a.label)
-    fs.log_event("revived", label=a.label, role=spec["role"], surface=surf, session=sid, fresh=a.fresh)
+    fs.log_event("revived", label=a.label, role=spec["role"], surface=surf, session=sid, fresh=a.fresh,
+                 # ledger parity with log_launch/recycled: ground-truth effort/model off the composed
+                 # command; plugins deterministic from the entry + --add-plugin union (already in spec).
+                 effective={**_sendcmd_session_prefs(send_cmd), "plugins": spec["plugins"]})
     if a.fresh:                                                   # shed -> prime from the handover (like a fresh recycle)
         ho = _latest_handover(spec["abs_cwd"])
         prime = (f"You were just REVIVED into a FRESH session (same identity: label '{a.label}', "
@@ -1983,6 +2056,24 @@ def _compose_recycle_cmd(label, entry, caller_tokens, add_plugins, mode, explici
     return send_cmd, checkpoint
 
 
+def _sendcmd_session_prefs(send_cmd):
+    """GROUND-TRUTH session prefs {'effort','model'} read off a COMPOSED send_cmd's own tokens (str
+    value or None per key). This is the one source that sees a caller's one-off --effort/--model
+    override: caller tokens are only ever merged into the final command string by adapter_compile's
+    token-layering, never written back onto a spec dict, so spec-reading paths (compute_effective)
+    are blind to exactly that case. Shared by _session_pref_provenance (the live print) and the
+    recycled/revived log_event `effective` fields (the ledger) -- one source of truth, not a fork."""
+    try:
+        toks = shlex.split(send_cmd or "")
+    except ValueError:
+        toks = []
+    out = {}
+    for name in ("--effort", "--model"):
+        val = _flag_val(toks, name)
+        out[name[2:]] = val if isinstance(val, str) else None
+    return out
+
+
 def _session_pref_provenance(role, tool, send_cmd, effort_override, model_override):
     """(provenance_line, warning) for the SESSION-PREFERENCE flags (effort/model) on a recycle/launch —
     makes 'why did it come back on X' obvious (the cmux-advisor-came-back-on-high surprise). The effective
@@ -1990,7 +2081,7 @@ def _session_pref_provenance(role, tool, send_cmd, effort_override, model_overri
     binding(ad-hoc). WARNS when a ROSTER role inherits the [tool.<t>] floor effort with NO role pin: a
     mid-session /effort writes to GLOBAL settings and is overridden by the launch flag, so it won't survive
     the respawn — pin the role (the durable authority) or pass --effort."""
-    toks = shlex.split(send_cmd or "")
+    prefs = _sendcmd_session_prefs(send_cmd)
     roster = _is_roster(role)
     cfg = load_config() if roster else {}
     tdef = (cfg.get("tool", {}) or {}).get(tool, {}) or {}
@@ -1998,10 +2089,10 @@ def _session_pref_provenance(role, tool, send_cmd, effort_override, model_overri
     rtool = (rblock.get(tool) if isinstance(rblock.get(tool), dict) else {}) or {}
     parts, warn = [], ""
     for name, override in (("--effort", effort_override), ("--model", model_override)):
-        val = _flag_val(toks, name)
-        if not val or val is True:
-            continue
         key = name[2:]
+        val = prefs[key]
+        if not val:
+            continue
         if override:
             src = "override"
         elif not roster:
@@ -2053,7 +2144,10 @@ def _recycle_plan(label, entry, caller, add_plugin, mode, session, force, prime_
                      + ", then continue where it left off.")
     return {"label": label, "surface": surf, "send_cmd": send_cmd, "mode": mode,
             "tool": entry.get("tool", "claude"), "force": force, "prime": prime, "old_session": old_sid,
-            "cwd": _cwd_of_sendcmd(send_cmd)}          # effective launch cwd, persisted after a FRESH bind
+            "cwd": _cwd_of_sendcmd(send_cmd),          # effective launch cwd, persisted after a FRESH bind
+            # deterministic plugin set (entry + add_plugin union) for the recycled event's `effective`
+            # field -- no token-scan needed for this part, unlike effort/model.
+            "plugins": _dedup(list(entry.get("plugins", [])) + list(add_plugin or []))}
 
 
 def _bulk_targets(target, from_surface, from_label, include_muted):
@@ -2335,6 +2429,10 @@ def _recycle_exec_one(p):
     def log(m):
         print(f"[recycle {time.strftime('%H:%M:%S')}] {label}: {m}", flush=True)
 
+    # ledger parity with log_launch: the EFFECTIVE effort/model, read off the composed command itself
+    # (_sendcmd_session_prefs -- the only source that sees a one-off --effort/--model on THIS recycle).
+    effective = {**_sendcmd_session_prefs(send_cmd), "plugins": p.get("plugins", [])}
+
     log(f"start mode={mode} surface={surf} force={force}")
     if not _quiet_gate(surf, 180, force):
         log("ABORT: surface never went quiet within 180s; NOT respawning (no half-kill). Re-run when idle or pass --force.")
@@ -2383,7 +2481,7 @@ def _recycle_exec_one(p):
                 e["cwd"] = p["cwd"]                      # PERSIST the fresh cwd so the next RESUME finds the new session
         fs.live_put(label, e)
         fs.log_event("recycled", label=label, role=e.get("role"), surface=surf,
-                     session=e.get("session") or "", mode=mode)
+                     session=e.get("session") or "", mode=mode, effective=effective)
         log(f"respawned ({mode}); session re-binds on first turn ({p.get('tool')} registers lazily)")
         sid = old_sid if mode == "resume" else ""        # for the prime gate (prime IS the first turn)
         if prime:
@@ -2424,7 +2522,8 @@ def _recycle_exec_one(p):
             if mode == "fresh" and p.get("cwd"):
                 e["cwd"] = p["cwd"]                      # PERSIST the fresh cwd (a role move -> new session lives here)
             fs.live_put(label, e)
-            fs.log_event("recycled", label=label, role=e.get("role"), surface=surf, session=sid, mode=mode)
+            fs.log_event("recycled", label=label, role=e.get("role"), surface=surf, session=sid,
+                         mode=mode, effective=effective)
         if prime and sid:
             time.sleep(3)                                # let the fresh TUI settle before sending input
 
