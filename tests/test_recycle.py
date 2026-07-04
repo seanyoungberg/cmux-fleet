@@ -306,3 +306,128 @@ def test_direct_kill_skips_quietly_with_no_known_pid(fs, monkeypatch):
     assert fleet._recycle_exec_one(_base_payload()) == 0
     assert killed == []                                        # no pid -> no kill attempted
     assert len(respawn_calls) == 2
+
+
+# --- Part 1: _fire_launch must VERIFY the ENTER submitted -- RE-KICK the Enter, NEVER re-send the paste.
+#     The terminating newline can lose the paste-settle race, leaving the launch as an inert DRAFT at the
+#     shell; the downstream self-heal then re-sends the WHOLE TEXT on top of it -> the doubled/tripled
+#     draft seen in orphan surface AAF4EC13. These drive _recycle_exec_one to a CLEAN fresh bind (so
+#     _fire_launch runs exactly once), count the send-key enter re-kicks, and assert the launch TEXT is
+#     sent exactly once no matter how many kicks it takes. --------------------------------------------
+def _run_recycle_counting_keys(monkeypatch, surfaced_seq):
+    """Run ONE fresh recycle to a clean bind, driving _agent_surfaced by `surfaced_seq` (bool per check)
+    with _resume_menu_visible always False. Returns (n_send_text, n_sendkey_enter)."""
+    from cmux_fleet import state as fleet_state
+    fleet_state.live_put("w", {"role": "w", "tool": "claude", "surface": "S", "cwd": "/x",
+                               "session": "claude-OLD", "kind": "child"})
+    monkeypatch.setattr(fleet.time, "sleep", lambda *_: None)
+    calls = []
+    def fake_cmuxq(*a, **k):
+        calls.append(a)
+        return "OK" if a and a[0] == "respawn-pane" else ""
+    monkeypatch.setattr(fleet, "cmuxq", fake_cmuxq)
+    monkeypatch.setattr(fleet, "_quiet_gate", lambda *a, **k: True)
+    monkeypatch.setattr(fleet_state, "lifecycle", lambda surf: "ended")          # old session confirmed dead
+    monkeypatch.setattr(fleet, "poll_session", lambda surf, timeout=1: "")        # no stale pre_sid
+    monkeypatch.setattr(fleet, "_poll_session_back", lambda *a, **k: "NEWSID")     # clean fresh bind -> no self-heal
+    surfaced = iter(surfaced_seq)
+    monkeypatch.setattr(fleet, "_agent_surfaced", lambda surf: next(surfaced))
+    monkeypatch.setattr(fleet, "_resume_menu_visible", lambda surf: False)
+    assert fleet._recycle_exec_one(_base_payload()) == 0
+    n_send_text = sum(1 for c in calls if c and c[0] == "send")
+    n_sendkey_enter = sum(1 for c in calls if c[:1] == ("send-key",) and c[-1:] == ("enter",))
+    return n_send_text, n_sendkey_enter
+
+
+def test_enter_rekick_normal_surfaced_first_check(fs, monkeypatch):
+    # already submitted on the first check (a TUI marker is up) -> no re-kick at all, just the initial
+    # send + enter; the launch TEXT is sent exactly once.
+    n_send, n_enter = _run_recycle_counting_keys(monkeypatch, [True])
+    assert n_send == 1                                        # paste sent once, never resent
+    assert n_enter == 1                                       # only the initial enter, zero re-kicks
+
+
+def test_enter_rekick_one_miss_then_lands(fs, monkeypatch):
+    # first check both-False (still at the shell), second check True -> EXACTLY one extra send-key enter,
+    # and the paste is NOT resent.
+    n_send, n_enter = _run_recycle_counting_keys(monkeypatch, [False, True])
+    assert n_send == 1                                        # NEVER re-send the text
+    assert n_enter == 2                                       # initial enter + exactly one re-kick
+
+
+def test_enter_rekick_exhausts_all_kicks(fs, monkeypatch):
+    # never surfaces across all 5 kicks -> exactly 5 EXTRA send-key enter calls (6 total incl. the
+    # initial), still no text resent, and _fire_launch returns so the outer poll/self-heal/WARN logic
+    # runs unchanged after it (the function does NOT itself abort here).
+    n_send, n_enter = _run_recycle_counting_keys(monkeypatch, [False] * 5)
+    assert n_send == 1                                        # paste sent once even after 5 dead kicks
+    assert n_enter == 6                                       # 1 initial + 5 re-kicks (the 5 "extra")
+
+
+# --- Part 2: when the launch is sent but NOTHING binds even after the existing self-heal re-fire, the
+#     tail WARN must ESCALATE like the respawn-abort path (a desktop notify + a recycle_abort event),
+#     not fail silently -- the same silent-failure class that left berg-sandbox down ~9h. Same event
+#     type as the respawn-abort path (a different `reason`) so one consumer catches both classes. -------
+def test_no_session_after_launch_escalates(fs, monkeypatch):
+    from cmux_fleet import state as fleet_state
+    fleet_state.live_put("w", {"role": "w", "tool": "claude", "surface": "S", "cwd": "/x",
+                               "session": "claude-OLD", "kind": "child"})
+    monkeypatch.setattr(fleet.time, "sleep", lambda *_: None)
+    calls = []
+    def fake_cmuxq(*a, **k):
+        calls.append(a)
+        return "OK" if a and a[0] == "respawn-pane" else ""
+    monkeypatch.setattr(fleet, "cmuxq", fake_cmuxq)
+    monkeypatch.setattr(fleet, "_quiet_gate", lambda *a, **k: True)
+    monkeypatch.setattr(fleet_state, "lifecycle", lambda surf: "ended")
+    monkeypatch.setattr(fleet, "poll_session", lambda surf, timeout=1: "")
+    monkeypatch.setattr(fleet, "_poll_session_back", lambda *a, **k: "")           # nothing binds, both polls
+    monkeypatch.setattr(fleet, "_agent_surfaced", lambda surf: True)               # keep _fire_launch's kick loop short
+    monkeypatch.setattr(fleet, "_resume_menu_visible", lambda surf: False)
+    logged = []
+    monkeypatch.setattr(fleet_state, "log_event", lambda event, **fields: logged.append((event, fields)))
+    assert fleet._recycle_exec_one(_base_payload()) == 0       # WARN path proceeds (does not itself abort)
+    assert any(c and c[0] == "notify" for c in calls)          # desktop banner fired (was a silent WARN before)
+    aborts = [f for e, f in logged if e == "recycle_abort"]
+    assert aborts and aborts[0]["reason"] == "no-session-after-launch"
+    assert sum(1 for c in calls if c and c[0] == "send") == 2  # initial + ONE self-heal re-fire, no runaway resend
+
+
+# --- Part 3: _session_pref_provenance needs a MODEL-analog of the effort floor-warning. The per-key loop
+#     only warns when a flag IS present (its body runs solely when `val` is truthy), so a roster role with
+#     NO --model token anywhere printed NO warning and silently rode the AMBIENT global default (the
+#     sonnet-instead-of-opus surprise that bit an unpinned role). ------------------------------------
+def test_provenance_warns_when_roster_role_has_no_model(monkeypatch):
+    monkeypatch.setattr(fleet, "_is_roster", lambda role: True)
+    monkeypatch.setattr(fleet, "load_config", lambda: {"tool": {"claude": {}}, "role": {"r": {}}})
+    _line, warn = fleet._session_pref_provenance("r", "claude", "cd /x && claude", None, None)
+    assert warn and "role 'r'" in warn and "--model" in warn    # non-empty and names the role
+
+
+def test_provenance_no_model_warn_when_pinned(monkeypatch):
+    monkeypatch.setattr(fleet, "_is_roster", lambda role: True)
+    monkeypatch.setattr(fleet, "load_config",
+                        lambda: {"tool": {"claude": {}},
+                                 "role": {"r": {"claude": {"flags": "--model claude-opus-4-8"}}}})
+    line, warn = fleet._session_pref_provenance("r", "claude", "cd /x && claude --model claude-opus-4-8", None, None)
+    assert warn == ""                                           # model IS pinned -> no gap warning
+    assert "model=claude-opus-4-8 (role-pin)" in line
+
+
+def test_provenance_no_model_warn_for_adhoc_role(monkeypatch):
+    # non-roster (ad-hoc) rides the binding, not a role pin -> the gate must NOT warn (matches the
+    # existing `roster` gating on the effort branch).
+    monkeypatch.setattr(fleet, "_is_roster", lambda role: False)
+    _line, warn = fleet._session_pref_provenance("adhoc", "claude", "cd /x && claude", None, None)
+    assert warn == ""
+
+
+def test_provenance_model_gap_does_not_overwrite_effort_floor_warn(monkeypatch):
+    # effort rides the [tool] floor (a warning) AND --model is absent (also a warning) on the SAME call:
+    # the effort floor-warning must WIN (`warn = warn or ...`), never get clobbered by the model gap.
+    monkeypatch.setattr(fleet, "_is_roster", lambda role: True)
+    monkeypatch.setattr(fleet, "load_config",
+                        lambda: {"tool": {"claude": {"flags": "--effort high"}}, "role": {"r": {}}})
+    _line, warn = fleet._session_pref_provenance("r", "claude", "cd /x && claude --effort high", None, None)
+    assert "floor" in warn and "effort" in warn                # effort floor-warning won
+    assert "no --model anywhere" not in warn                   # model gap did NOT overwrite it

@@ -2129,6 +2129,16 @@ def _session_pref_provenance(role, tool, send_cmd, effort_override, model_overri
         else:
             src = "settings/env"
         parts.append(f"{key}={val} ({src})")
+    # MODEL-ANALOG of the effort floor-warning above: the loop only warns when a flag IS present (its
+    # body runs solely when `val` is truthy), so it structurally CANNOT cover "no --model at all". A
+    # roster role with NO --model token anywhere (no role pin, no caller override) silently rides the
+    # AMBIENT global default -- the sonnet-instead-of-opus surprise that bit an unpinned role. Placed
+    # OUTSIDE the loop; `warn = warn or (...)` so an effort floor-warning already set this call still
+    # wins (one caller `if provwarn:` print, no new plumbing).
+    if not prefs.get("model") and roster and not model_override:
+        warn = warn or (f"[fleet] note: no --model anywhere for role '{role}' — this recycle will ride "
+                        f"whatever the AMBIENT global default is right now, not a fixed identity. Pin it "
+                        f"in [role.{role}.{tool}].flags, or pass --model.")
     return ("[fleet] session-prefs: " + ", ".join(parts)) if parts else "", warn
 
 
@@ -2493,6 +2503,22 @@ def _recycle_exec_one(p):
         log("launching agent into the fresh shell")
         cmuxq("send", "--surface", surf, guarded)
         cmuxq("send-key", "--surface", surf, "enter")
+        # VERIFY the ENTER actually SUBMITTED the paste -- mirrors _send_launch_and_confirm's shape
+        # (retry the ENTER, never the paste). The terminating newline can lose the paste-settle race,
+        # leaving the launch as an inert DRAFT at the shell; the downstream self-heal then re-sends the
+        # WHOLE TEXT on top of it -> the doubled/tripled draft seen in orphan surface AAF4EC13. So we
+        # ONLY ever re-kick a bare Enter here -- the launch text is NEVER resent. Either signal means
+        # the line submitted: _agent_surfaced (a TUI marker painted) OR _resume_menu_visible (claude's
+        # resume-summary menu is up). Bounded to max_kicks (~10s worst case), tiny vs the outer
+        # _poll_session_back(90) ceiling that runs AFTER this returns; re-kicks stop the instant a TUI
+        # surfaces, so a slow boot is never spammed.
+        kicks, max_kicks = 0, 5
+        while kicks < max_kicks:
+            if _agent_surfaced(surf) or _resume_menu_visible(surf):
+                return                                       # submitted -> stop re-kicking
+            cmuxq("send-key", "--surface", surf, "enter")    # re-kick the ENTER only, never the paste
+            kicks += 1
+            time.sleep(2)
 
     def _direct_kill():
         """cmux-INDEPENDENT teardown of the old claude process: SIGINT x2 (clean TUI exit) straight to
@@ -2606,6 +2632,15 @@ def _recycle_exec_one(p):
             sid = _poll_session_back(surf, old_sid, mode, 60, exclude=exclude)
         if not sid:
             log(f"WARN: no {'resumed' if mode == 'resume' else 'fresh'} session bound; check the surface manually")
+            # ESCALATE (mirror the respawn-abort path above): the launch was sent but nothing bound even
+            # after the self-heal re-fire -- the SAME silent-failure class that left berg-sandbox down
+            # ~9h undetected. Same recycle_abort event type (different reason) so any future consumer
+            # (e.g. the conductor-liveness sweep) picks up both failure classes uniformly.
+            cmuxq("notify", "--surface", surf, "--title", "fleet recycle FAILED",
+                  "--body", f"recycle FAILED for {label}: launch sent but no "
+                            f"{'resumed' if mode == 'resume' else 'fresh'} session bound; check the surface manually")
+            fs.log_event("recycle_abort", label=label, surface=surf, mode=mode,
+                         reason="no-session-after-launch")
         else:
             if mode == "resume":
                 # prefer cmux's CHECKPOINT (the id it will `--resume`) over a possibly-bridge poll id, so
