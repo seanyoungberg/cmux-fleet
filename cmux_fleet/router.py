@@ -7,6 +7,12 @@
 # via the shared fleet_state.wake_if_idle gate. Trigger = the bus (agent.hook.Stop); truth = cmux's hook store;
 # org chart = fleet.json (label-keyed live store). Only registered live members are acted on.
 #
+# Also subscribes to the `surface` category for real-time registry hygiene (fleet-doctor capability #1):
+# a tracked member's surface closing OUTSIDE `fleet rm`/`fleet archive` (accidental tab close, workspace
+# teardown) immediately archives its registry row instead of leaving a STALE lie until someone runs
+# `fleet ls`, then ALERTS the member's parent conductor through the SAME inbox+idle-wake channel
+# completions use (kind='stale', no desktop notify). No auto-relaunch (Tier-2 stays deferred).
+#
 #   python3 router.py            # OBSERVE: log decisions, write/send nothing
 #   python3 router.py --live     # ACTIVE: write inbox + notify; idle-wake unless notify-mode==passive
 import fcntl, json, os, pty, subprocess, sys, threading, time
@@ -122,12 +128,18 @@ def last_assistant_text(path, cap=160):
     return fs.last_agent_text(path, cap)
 
 
+def _alert_pending(surface):
+    """Wake-worthy inbox rows: child completions OR stale-member alerts. Peer messages are excluded on
+    purpose — their send path (fleet peer-msg) does its own wake."""
+    return fs.inbox_pending(surface, kind="completion") or fs.inbox_pending(surface, kind="stale")
+
+
 def maybe_idle_wake(parent_surface, label):
     if not (LIVE and fs.idlewake_on()):
         return
-    if not fs.inbox_pending(parent_surface, kind="completion"):
+    if not _alert_pending(parent_surface):
         return
-    if fs.wake_if_idle(parent_surface, "(auto-wake) handle your pending child completions"):
+    if fs.wake_if_idle(parent_surface, "(auto-wake) handle your pending fleet inbox items"):
         log(f"[IDLE-WAKE] {label}: empty prompt -> submitted wake trigger")
     elif fs.surface_busy(parent_surface):               # skip-on-RUNNING -> parent goes idle soon -> retry
         log(f"[idle-wake] skip {label}: mid-turn -> scheduling bounded retry")
@@ -154,10 +166,10 @@ def _idle_wake_retry_loop(surface, label):
             time.sleep(delay)
             if not fs.idlewake_on():                    # dial muted mid-retry -> stop
                 return
-            if not fs.inbox_pending(surface, kind="completion"):
+            if not _alert_pending(surface):
                 log(f"[idle-wake-retry] {label}: inbox drained before wake -> done")
                 return                                  # handled meanwhile (woken elsewhere / acked)
-            if fs.wake_if_idle(surface, "(auto-wake) handle your pending child completions"):
+            if fs.wake_if_idle(surface, "(auto-wake) handle your pending fleet inbox items"):
                 log(f"[idle-wake-retry] {label}: woke after ~{delay}s backoff")
                 return
             if not fs.surface_busy(surface):            # turn ended but still not wakeable (draft/no prompt)
@@ -187,7 +199,59 @@ def deliver(parent_surface, parent_label, child_entry, child_surface):
         log(f"[WOULD-QUEUE] {label} -> {parent_label} | {gist[:60]}")
 
 
+def _archive_closed_surface(ev):
+    """surface.closed -> registry hygiene. The event IS the ground truth that a tracked member's surface
+    just died (no lifecycle re-derivation needed): if the close came through `fleet rm`/`fleet archive`,
+    the entry is already off the live store by the time the frame arrives and the lookup below misses —
+    so anything that DOES resolve here closed outside the fleet CLI (accidental tab close, workspace
+    teardown). Archive it through the SAME shared path as `fleet archive`/`fleet rm --kill`
+    (_build_archive_entry + archive_put — third caller, kept shared), tagged via=surface-closed in the
+    ledger. Applies to muted members too (mute gates notification routing, not registry truth). Then
+    ALERT the member's parent conductor through the SAME channel completions ride (inbox kind='stale'
+    + maybe_idle_wake) — NOT a completion row (nothing finished; there is no gist/transcript to route)
+    and no `cmux notify` desktop banner (registry-integrity signal, quieter than a completion). A
+    conductor's own surface closing alerts nobody (no parent); the heartbeat/human notices. A human (or
+    a future capability) decides whether to `fleet revive`."""
+    surface = (ev.get("payload") or {}).get("surface_id") or ""
+    entry = registry()["by_surface"].get(surface) if surface else None
+    if not entry:
+        return                                          # not a tracked live member's surface
+    label = entry["label"]
+    if not LIVE:
+        log(f"[stale] (observe) would archive {label}: surface {surface[:8]} closed outside fleet CLI")
+        return
+    from . import cli                                   # lazy: cli is heavy and never imports router (no cycle)
+    # binding capture is best-effort: unlike the CLI paths (which read it BEFORE closing), the surface
+    # is already gone here, so _resume_binding usually returns {} and last_session falls back to the
+    # registry session — "recorded but maybe-unresumable" beats a vanished agent.
+    fs.archive_put(label, cli._build_archive_entry(entry, cli._resume_binding(surface)))
+    fs.live_del(label)
+    fs.log_event("archived", label=label, role=entry.get("role"), session=entry.get("session"),
+                 via="surface-closed")
+    origin = (ev.get("payload") or {}).get("origin", "?")
+    log(f"[stale] archived {label}: surface {surface[:8]} closed out from under the registry "
+        f"(origin={origin}); revive with: fleet revive {label}")
+    if entry.get("kind") == "conductor":                # branch on KIND, not role (same as the Stop path):
+        return                                          # a conductor has no parent to alert
+    # Muted members still alert: mute suppresses the child's COMPLETION push specifically; a tracked
+    # member vanishing is a registry-integrity signal the parent needs regardless of the chatter dial.
+    parent = entry.get("parent")                        # parent LABEL (durable); resolve like deliver()'s path
+    pe = registry()["by_label"].get(parent)
+    parent_surface = pe.get("surface") if pe else parent   # fall back to a raw surface
+    if not parent_surface:
+        log(f"[stale] {label}: unresolved parent '{parent}' -> archived without alert")
+        return
+    seq = fs.inbox_put("stale", parent_surface, {
+        "label": label, "child_surface": surface, "via": "surface-closed", "origin": origin})
+    log(f"[STALE-ALERT seq={seq}] {label} -> {parent} (surface closed; archived)")
+    maybe_idle_wake(parent_surface, parent)
+
+
 def handle(ev):
+    if ev.get("category") == "surface":
+        if ev.get("name") == "surface.closed":
+            _archive_closed_surface(ev)
+        return                                          # other surface.* frames are not ours to act on
     if ev.get("name") != "agent.hook.Stop":
         return
     p = ev.get("payload") or {}
@@ -327,7 +391,7 @@ def main():
         _stamp_health(force=True)      # baseline stamp so the daemon's wedge check has ground truth at once
     master, slave = pty.openpty()      # PTY or cmux block-buffers a low-volume stream (proven gotcha)
     proc = subprocess.Popen(
-        [CMUX, "events", "--category", "agent", "--reconnect",
+        [CMUX, "events", "--category", "agent", "--category", "surface", "--reconnect",
          "--cursor-file", CURSOR_FILE, "--no-ack"],    # heartbeat frames ON = a ~15s bus-liveness tick
         stdout=slave, stderr=slave, close_fds=True)
     os.close(slave)

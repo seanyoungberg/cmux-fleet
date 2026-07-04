@@ -62,6 +62,17 @@ def test_awareness_surfaces_peer(fs):
     assert "[peer]" in ctx and "status check please" in ctx and "cmux-advisor" in ctx
 
 
+def test_awareness_surfaces_stale_alert(fs):
+    fs.inbox_put("stale", SURF, {"label": "worker", "child_surface": "DEADBEEF-1234",
+                                 "via": "surface-closed", "origin": "tab_close"})
+    p = _run("hook-awareness")
+    assert p.returncode == 0
+    ctx = json.loads(p.stdout)["hookSpecificOutput"]["additionalContext"]
+    assert "auto-archived" in ctx and "worker" in ctx and "tab_close" in ctx
+    assert "fleet revive worker" in ctx                               # the recovery hint
+    assert "--stale" in ctx                                           # per-kind ack hint
+
+
 def test_awareness_no_surface_exits_clean(fs):
     fs.inbox_put("completion", SURF, {"label": "w1", "gist": "x"})
     p = _run("hook-awareness", surface=None)
@@ -100,6 +111,24 @@ def test_drain_completion_blocks_in_auto(fs):
     assert p.returncode == 0
     out = json.loads(p.stdout)
     assert out["decision"] == "block" and "all done" in out["reason"]
+
+
+def test_drain_stale_blocks_in_auto_and_mutes_in_passive(fs):
+    # same dial as completions: passive is a fleet-wide push mute (awareness still shows it next turn)
+    _set_mode(fs, "auto")
+    fs.inbox_put("stale", SURF, {"label": "worker", "child_surface": "DEADBEEF-1234",
+                                 "via": "surface-closed", "origin": "workspace_teardown"})
+    p = _run("hook-drain")
+    assert p.returncode == 0
+    out = json.loads(p.stdout)
+    assert out["decision"] == "block" and "worker" in out["reason"] and "--stale" in out["reason"]
+
+    _set_mode(fs, "passive")
+    fs.inbox_put("stale", SURF, {"label": "worker2", "child_surface": "CAFEBABE-5678",
+                                 "via": "surface-closed", "origin": "tab_close"})
+    p = _run("hook-drain")
+    assert p.returncode == 0
+    assert p.stdout.strip() == ""                                     # muted like completions
 
 
 def test_drain_no_surface_exits_clean(fs):
