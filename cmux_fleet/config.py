@@ -102,3 +102,59 @@ ADHOC_SUBDIR = _resolve("CMUX_FLEET_ADHOC_SUBDIR",   "adhoc_subdir",   "_meta/ag
 # `fleet vitals` context-remaining % denominator. 0 -> fleet_features guesses from the model string
 # (a fleet usually runs one window, so one knob is right; the model string can't tell 200k from 1M).
 CONTEXT_WINDOW = int(_resolve("CMUX_FLEET_CONTEXT_WINDOW", "context_window", "0") or "0")
+
+# The plugin INDEX (plugins.toml): env > [fleet].plugin_index > <toml-dir>/plugins.toml. Absent file ->
+# empty index (never an error). This is a SEPARATE file from the roster fleet.toml so the machine-
+# reconciled index and the hand-authored roster own themselves (design §2d). Resolution reads both.
+PLUGIN_INDEX = _resolve_path("CMUX_FLEET_PLUGIN_INDEX", "plugin_index", os.path.join(TOML_DIR, "plugins.toml"))
+
+
+def load_plugin_index(path=None):
+    """Parse the plugins.toml INDEX into {"marketplaces": {...}, "plugins": {...}}. Absent/unreadable ->
+    an (all-but-)empty index with NO error (so a fleet with no plugins.toml composes exactly as before).
+
+      marketplaces[<name>] = {"kind": "local"|"global", "path"?: <abs>}
+      plugins[<name>]      = {"type": "linked"|"enabled", "source", "tools": [...], "description",
+                              "install", "tool_overrides": {<tool>: {...}}}   # [plugin.<n>.<tool>] blocks
+
+    Back-compat: a configured [fleet].marketplace / $CMUX_FLEET_MARKETPLACE synthesizes
+    marketplaces["default"] so bare unindexed names (and source="default") resolve under it, exactly as
+    the single-marketplace path does today. Named [marketplace.<x>] entries are purely additive."""
+    path = path or PLUGIN_INDEX
+    marketplaces, plugins = {}, {}
+    if MARKETPLACE:                                          # synthesize the legacy single marketplace
+        marketplaces["default"] = {"kind": "local", "path": MARKETPLACE}
+    if tomllib and os.path.exists(path):
+        anchor = os.path.dirname(os.path.abspath(path))     # relative marketplace paths anchor to plugins.toml's dir
+        try:
+            with open(path, "rb") as f:
+                doc = tomllib.load(f)
+        except (OSError, ValueError) as e:
+            _warn(f"warning: plugin index {path} is unreadable/malformed ({e}); using empty index")
+            doc = {}
+        for name, mk in (doc.get("marketplace") or {}).items():
+            if not isinstance(mk, dict):
+                continue
+            if str(mk.get("kind", "")).strip() == "global":
+                marketplaces[name] = {"kind": "global"}     # user-installed CC marketplace -> enabledPlugins
+                continue
+            entry = {"kind": "local"}
+            raw = str(mk.get("path", "")).strip()
+            if raw:
+                p = os.path.expanduser(raw)
+                entry["path"] = p if os.path.isabs(p) else os.path.normpath(os.path.join(anchor, p))
+            marketplaces[name] = entry
+        for name, pl in (doc.get("plugin") or {}).items():
+            if not isinstance(pl, dict):
+                continue
+            scalars = {k: v for k, v in pl.items() if not isinstance(v, dict)}
+            overrides = {k: v for k, v in pl.items() if isinstance(v, dict)}   # [plugin.<n>.<tool>] -> parsed + stored
+            plugins[name] = {
+                "type": str(scalars.get("type", "linked")),
+                "source": str(scalars.get("source", "")),
+                "tools": list(scalars.get("tools") or []),
+                "description": str(scalars.get("description", "")),
+                "install": str(scalars.get("install", "")),
+                "tool_overrides": overrides,
+            }
+    return {"marketplaces": marketplaces, "plugins": plugins}

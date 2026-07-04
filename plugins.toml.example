@@ -1,0 +1,53 @@
+# plugins.toml — the plugin INDEX. Copy next to fleet.toml (default <toml-dir>/plugins.toml) or point
+# $CMUX_FLEET_PLUGIN_INDEX / [fleet].plugin_index at it. Entirely optional: no file = empty index (no
+# error), and rosters that use only `plugins`/`enable_plugins` never need it.
+#
+# The index defines each plugin ONCE; rosters reference it by name via `use = [...]` and the index
+# decides the load MECHANISM (linked -> --plugin-dir, enabled -> enabledPlugins). This is a separate
+# file from fleet.toml so a machine-reconciled index and a hand-authored roster own themselves.
+#
+# ---------------------------------------------------------------------------------------------------
+# [marketplace.<name>]  — where plugins come from. Several are allowed.
+#   path = "<dir>"       a LOCAL marketplace dir; bare plugin names resolve to <path>/<name>.
+#                        relative paths anchor to THIS file's dir. env [fleet].marketplace synthesizes
+#                        a [marketplace.default] automatically (back-compat with bare `plugins=` names).
+#   kind = "global"      a user-installed Claude Code marketplace; its plugins load via enabledPlugins.
+# ---------------------------------------------------------------------------------------------------
+[marketplace.berg-plugins]
+path = "~/code/claude-marketplace/plugins"
+
+[marketplace.obsidian-skills]
+kind = "global"
+
+# ---------------------------------------------------------------------------------------------------
+# [plugin.<name>]  — one entry per plugin.
+#   type        "linked" (loads via --plugin-dir; our authored/forked tools) or
+#               "enabled" (loads via enabledPlugins; public plugins installed globally-as-disabled).
+#   source      a [marketplace.<name>] ref (or "default").
+#   tools       supported tools, e.g. ["claude"] or ["claude","codex"].
+#   description one line, for discovery.
+#   install     e.g. "global-disabled" for enabled plugins (installed once, flipped on per-agent).
+# [plugin.<name>.<tool>]  — optional per-tool override block (mirrors [role.<r>.<tool>]). Phase 1
+#   parses + stores it; a later phase consumes it (e.g. codex hook manifests). Skill-only plugins
+#   with no hooks need no per-tool block — they are universal.
+# ---------------------------------------------------------------------------------------------------
+[plugin.cmux-fleet]
+type        = "linked"
+source      = "berg-plugins"
+tools       = ["claude"]
+description = "Native cmux parent/child orchestration — launch/place/drive children, notify flow."
+
+[plugin.memsearch]
+type        = "linked"
+source      = "berg-plugins"
+tools       = ["claude", "codex"]      # carries .claude-plugin AND .codex-plugin
+description = "Automatic semantic memory (recall + summarize) for coding agents."
+[plugin.memsearch.codex]               # per-tool override: codex reads a different hook manifest
+notes = "codex loads via CODEX_HOME + hooks/codex-hooks.json (provisioning deferred to a later phase)."
+
+[plugin.obsidian]
+type        = "enabled"                # -> enabledPlugins, NOT --plugin-dir
+source      = "obsidian-skills"
+install     = "global-disabled"
+tools       = ["claude"]
+description = "Obsidian vault skills (public; consumed as-is, not forked)."
