@@ -6,6 +6,12 @@
 # decides the load MECHANISM (linked -> --plugin-dir, enabled -> enabledPlugins). This is a separate
 # file from fleet.toml so a machine-reconciled index and a hand-authored roster own themselves.
 #
+# `fleet plugins reconcile` populates/refreshes this file from the marketplaces + ~/.claude settings:
+# it OWNS the derivable fields (type/source/tools/origin, and description while un-curated) and PRESERVES
+# hand-authored data (a `curated = true` description, [plugin.<n>.<tool>] blocks, hand-added entries).
+# `fleet plugins ls|show|describe` reads it back for on-demand discovery. Reconcile regenerates the file
+# (freeform comments are not round-tripped); a second reconcile right after the first is a no-op.
+#
 # ---------------------------------------------------------------------------------------------------
 # [marketplace.<name>]  — where plugins come from. Several are allowed.
 #   path = "<dir>"       a LOCAL marketplace dir; bare plugin names resolve to <path>/<name>.
@@ -24,8 +30,11 @@ kind = "global"
 #   type        "linked" (loads via --plugin-dir; our authored/forked tools) or
 #               "enabled" (loads via enabledPlugins; public plugins installed globally-as-disabled).
 #   source      a [marketplace.<name>] ref (or "default").
-#   tools       supported tools, e.g. ["claude"] or ["claude","codex"].
-#   description one line, for discovery.
+#   tools       supported tools, e.g. ["claude"] or ["claude","codex"]. DERIVED from which manifests the
+#               plugin dir carries (.claude-plugin -> claude, .codex-plugin -> codex).
+#   origin      source-kind, DERIVED from the marketplace.json: "path" (local) or "url" (git entry).
+#   description one line, for discovery. DERIVED from marketplace.json/plugin.json; add `curated = true`
+#               to hand-author it (reconcile then keeps it and reports drift instead of overwriting).
 #   install     e.g. "global-disabled" for enabled plugins (installed once, flipped on per-agent).
 # [plugin.<name>.<tool>]  — optional per-tool override block (mirrors [role.<r>.<tool>]). Phase 1
 #   parses + stores it; a later phase consumes it (e.g. codex hook manifests). Skill-only plugins

@@ -115,7 +115,7 @@ def load_plugin_index(path=None):
 
       marketplaces[<name>] = {"kind": "local"|"global", "path"?: <abs>}
       plugins[<name>]      = {"type": "linked"|"enabled", "source", "tools": [...], "description",
-                              "install", "tool_overrides": {<tool>: {...}}}   # [plugin.<n>.<tool>] blocks
+                              "install", "origin", "tool_overrides": {<tool>: {...}}}  # [plugin.<n>.<tool>]
 
     Back-compat: a configured [fleet].marketplace / $CMUX_FLEET_MARKETPLACE synthesizes
     marketplaces["default"] so bare unindexed names (and source="default") resolve under it, exactly as
@@ -155,6 +155,7 @@ def load_plugin_index(path=None):
                 "tools": list(scalars.get("tools") or []),
                 "description": str(scalars.get("description", "")),
                 "install": str(scalars.get("install", "")),
+                "origin": str(scalars.get("origin", "")),   # source-kind (local "path" vs git "url"); derived by reconcile
                 "tool_overrides": overrides,
             }
     return {"marketplaces": marketplaces, "plugins": plugins}
