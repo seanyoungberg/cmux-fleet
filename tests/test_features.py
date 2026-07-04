@@ -91,17 +91,141 @@ def test_context_used_none_for_missing_or_codex(tmp_path):
     assert ff._context_used(str(p))[0] is None               # codex counter is cumulative -> we don't guess
 
 
-def test_context_window_configurable(monkeypatch):
-    monkeypatch.setenv("CMUX_FLEET_CONTEXT_WINDOW", "1000000")
+def test_context_used_none_for_zero_token_usage(tmp_path):
+    # Fix 3: a usage block that sums to 0 (an errored/empty turn) is NOT a real context reading — used
+    # stays None so vitals shows '—', never the garbage '0k 100%' (a 0 total made 1 - 0/window == 100%).
     ff = _ff()
-    assert ff._context_window("claude-opus-4-8") == 1000000   # config override wins over the guess map
+    p = tmp_path / "errored.jsonl"
+    p.write_text(json.dumps({"type": "assistant", "message": {"model": "claude-opus-4-8",
+        "usage": {"input_tokens": 0, "cache_read_input_tokens": 0, "cache_creation_input_tokens": 0}}}))
+    assert ff._context_used(str(p))[0] is None               # 0-token usage -> None, not 0
 
 
-def test_context_window_guess_map():
+def test_context_used_last_positive_survives_trailing_zero(tmp_path):
+    # a REAL turn followed by a 0-token errored turn keeps the last real reading (doesn't reset to None).
+    ff = _ff()
+    p = tmp_path / "t.jsonl"
+    p.write_text("\n".join(json.dumps(x) for x in [
+        {"type": "assistant", "message": {"model": "claude-opus-4-8",
+            "usage": {"input_tokens": 100, "cache_read_input_tokens": 5000, "cache_creation_input_tokens": 0}}},
+        {"type": "assistant", "message": {"model": "claude-opus-4-8", "usage": {"input_tokens": 0}}},
+    ]))
+    assert ff._context_used(str(p))[0] == 5100
+
+
+def test_unparseable_transcript_renders_dash_not_full(tmp_path):
+    # Fix 3 at the format boundary: a garbage/truncated transcript -> used None -> pct None -> '—'.
+    ff = _ff()
+    p = tmp_path / "garbage.jsonl"
+    p.write_text("not json at all\n{broken")
+    used, _ = ff._context_used(str(p))
+    assert used is None
+    pct = None if used is None else max(0, round(100 * (1 - used / 200000)))
+    assert ff._ctx(_row("x", ctx_used=used, ctx_pct_remaining=pct)) == "—"   # NOT "0k 100%"
+
+
+# ── per-agent context WINDOW (Fix 1: real per-agent, flavor-aware; override demoted) ──────────
+def test_context_window_flavor_is_the_truth():
+    # Fix 1: an explicit [Nk]/[Nm] flavor wins — same keyword, DIFFERENT flavor -> DIFFERENT window.
+    ff = _ff()
+    assert ff._context_window("claude-opus-4-8[1m]") == 1_000_000
+    assert ff._context_window("claude-opus-4-8") == 200_000        # bare opus -> default 200k
+    assert ff._context_window("claude-opus-4-8[200k]") == 200_000
+    assert ff._context_window("some-model[500k]") == 500_000
+
+
+def test_context_window_keyword_map():
     ff = _ff()
     assert ff._context_window("claude-sonnet-4-6") == 200000
-    assert ff._context_window("gpt-5-codex") in (272000,)
-    assert ff._context_window("totally-unknown") == 200000    # safe default
+    assert ff._context_window("gpt-5-codex") == 272000
+    assert ff._context_window("gemini-2-5-pro") == 1000000
+    assert ff._context_window("totally-unknown") == 200000         # safe default (no override set)
+
+
+def test_context_window_override_beats_keyword_below_flavor(monkeypatch):
+    # Corrected precedence: an explicit [flavor] wins; else the fleet's DECLARED window (the override) —
+    # it sits ABOVE the keyword guess because a bare model string can't disambiguate opus-4-8's 200k vs
+    # 1M tier, so a keyword guess of 200k FALSE-alarms agents actually on 1M (cmux-advisor at 395k on a
+    # bare `--model claude-opus-4-8`, 2026-07-04). The keyword only catches a model with NO declared window.
+    monkeypatch.setenv("CMUX_FLEET_CONTEXT_WINDOW", "777000")
+    ff = _ff()
+    assert ff._context_window("claude-opus-4-8[1m]") == 1_000_000  # explicit flavor beats the declared window
+    assert ff._context_window("claude-opus-4-8") == 777_000        # declared window beats the bare-model keyword guess
+    assert ff._context_window("totally-unknown") == 777_000        # and catches unknown models too
+
+
+def test_window_flavor_parse():
+    ff = _ff()
+    assert ff._window_flavor("claude-opus-4-8[1m]") == 1_000_000
+    assert ff._window_flavor("x[1M]") == 1_000_000                 # case-insensitive
+    assert ff._window_flavor("x[200k]") == 200_000
+    assert ff._window_flavor("x[500000]") == 500_000              # bare integer
+    assert ff._window_flavor("claude-opus-4-8") is None            # no flavor
+
+
+# ── launched-model resolution (Fix 1 linchpin: effective model = launch flag > global default) ─
+def test_launched_prefs_flag_overrides_global_default(monkeypatch):
+    ff = _ff()
+    monkeypatch.setattr(ff, "_user_prefs", lambda: ("claude-opus-4-8[1m]", "medium"))
+    sess = {"launchCommand": {"launcher": "claude",
+            "arguments": ["claude", "--model", "claude-opus-4-8", "--effort", "high"]}}
+    assert ff._launched_prefs(sess, "claude") == ("claude-opus-4-8", "high")
+
+
+def test_launched_prefs_inherits_global_default(monkeypatch):
+    # the [1m] flavor lives in the global default; an agent launched with NO --model inherits it.
+    ff = _ff()
+    monkeypatch.setattr(ff, "_user_prefs", lambda: ("claude-opus-4-8[1m]", "medium"))
+    sess = {"launchCommand": {"launcher": "claude",
+            "arguments": ["claude", "--dangerously-skip-permissions"]}}
+    assert ff._launched_prefs(sess, "claude") == ("claude-opus-4-8[1m]", "medium")
+
+
+def test_launched_prefs_codex_ignores_claude_default(monkeypatch):
+    ff = _ff()
+    monkeypatch.setattr(ff, "_user_prefs", lambda: ("claude-opus-4-8[1m]", "medium"))
+    sess = {"launchCommand": {"launcher": "codex", "arguments": ["codex"]}}
+    assert ff._launched_prefs(sess, "codex") == ("", "")           # no claude model bleed onto codex
+
+
+def test_launch_args_dict_and_string_forms():
+    ff = _ff()
+    assert ff._launch_args({"launchCommand": {"arguments": ["claude", "--model", "opus"]}}) \
+        == ["claude", "--model", "opus"]
+    assert ff._launch_args({"launchCommand": "claude --model opus"}) == ["claude", "--model", "opus"]
+    assert ff._launch_args({}) == []
+
+
+def test_snapshot_surfaces_effort_cwd_and_real_window(monkeypatch):
+    # Fix 1 + Fix 2 end-to-end: two claude agents, same used tokens, DIFFERENT launched flavor -> DIFFERENT
+    # real window -> DIFFERENT remaining %; effort + cwd land on the row.
+    ff = _ff()
+    from cmux_fleet import state as fs
+    fs.live_put("big", {"role": "r", "kind": "child", "tool": "claude", "cwd": "/work/big",
+                        "surface": "S-BIG", "parent": "", "status": "live"})
+    fs.live_put("small", {"role": "r", "kind": "child", "tool": "claude", "cwd": "/work/small",
+                          "surface": "S-SMALL", "parent": "", "status": "live"})
+    store = {"sessions": {
+        "u-big": {"surfaceId": "S-BIG", "updatedAt": 100, "transcriptPath": "big.jsonl",
+                  "agentLifecycle": "running", "workspaceId": "W1", "sessionId": "u-big",
+                  "launchCommand": {"launcher": "claude",
+                      "arguments": ["claude", "--model", "claude-opus-4-8[1m]", "--effort", "high"]}},
+        "u-small": {"surfaceId": "S-SMALL", "updatedAt": 100, "transcriptPath": "small.jsonl",
+                    "agentLifecycle": "running", "workspaceId": "W2", "sessionId": "u-small",
+                    "launchCommand": {"launcher": "claude",
+                        "arguments": ["claude", "--model", "claude-opus-4-8", "--effort", "low"]}},
+    }, "activeSessionsBySurface": {}}
+    monkeypatch.setattr(fs, "read_hook_store", lambda: store)
+    monkeypatch.setattr(ff, "_context_used", lambda path: (400_000, "claude-opus-4-8"))
+    monkeypatch.setattr(fs, "last_agent_text", lambda path, cap=160: "")
+    rows = {r["label"]: r for r in ff.snapshot()}
+    assert rows["big"]["window"] == 1_000_000 and rows["small"]["window"] == 200_000
+    assert rows["big"]["model"] == "claude-opus-4-8[1m]"           # launched model carries the flavor
+    assert rows["big"]["effort"] == "high" and rows["small"]["effort"] == "low"
+    assert rows["big"]["cwd"] == "/work/big" and rows["small"]["cwd"] == "/work/small"
+    # same 400k used, different REAL window -> different remaining %
+    assert rows["big"]["ctx_pct_remaining"] == 60                  # 400k/1M -> 60% left
+    assert rows["small"]["ctx_pct_remaining"] == 0                 # 400k/200k -> over-full -> 0%
 
 
 # ── parentage tree (label-keyed, cycle-safe) ──────────────────────────────────────────────────
@@ -211,6 +335,30 @@ def test_ctx_flags_near_full():
     assert ff._ctx(_row("x", ctx_used=180000, ctx_pct_remaining=10)).endswith("%!")
     assert not ff._ctx(_row("x", ctx_used=20000, ctx_pct_remaining=90)).endswith("!")
     assert ff._ctx(_row("x")) == "—"
+
+
+def test_ctx_shows_real_window():
+    # Fix 1: the denominator is now the REAL per-agent window, shown as used/window.
+    ff = _ff()
+    big = dict(_row("x", ctx_used=456000, ctx_pct_remaining=54)); big["window"] = 1_000_000
+    assert ff._ctx(big) == "456k/1M 54%"
+    small = dict(_row("y", ctx_used=150000, ctx_pct_remaining=25))   # _row window is 200000
+    assert ff._ctx(small) == "150k/200k 25%!"
+
+
+def test_winlabel():
+    ff = _ff()
+    assert ff._winlabel(1_000_000) == "1M" and ff._winlabel(200_000) == "200k"
+    assert ff._winlabel(272_000) == "272k"
+
+
+def test_short_model_and_cwd():
+    ff = _ff()
+    assert ff._short_model("claude-opus-4-8[1m]") == "opus-4-8[1m]"
+    assert ff._short_model("gpt-5-codex") == "gpt-5-codex"
+    assert ff._short_model("") == "-"
+    assert ff._short_cwd("/Users/x/repo/.worktrees/feat") == ".worktrees/feat"
+    assert ff._short_cwd("") == "-"
 
 
 def test_fit_truncates():
