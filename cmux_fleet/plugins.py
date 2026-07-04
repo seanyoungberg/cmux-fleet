@@ -22,6 +22,7 @@
 # no-op: parse(render(model)) == model for our value types, so the file is byte-identical (idempotent).
 import json
 import os
+import re
 
 try:
     import tomllib
@@ -332,3 +333,109 @@ def run_reconcile(index_path, marketplaces, settings_paths, *, prune):
     new_plugins, diff = reconcile_plugins(existing_plugins, derived, prune=prune)
     new_text = render_index(raw_marketplaces, new_plugins)
     return new_text, diff, existing_text
+
+
+# ---------------------------------------------------------------- install-from-URL (Phase 4b, design §5b)
+# The `fleet plugins add <ref>` engine — the PURE, safety-critical half. The CLI (cli._cmd_plugins_add)
+# does the I/O (clone/copy, reconcile, write) and the human-facing report; everything that DECIDES a
+# technique lives here so the never-auto-enable contract is unit-testable in isolation (test_plugin_add).
+#
+# THE SAFETY CONTRACT (Berg-ratified — the whole point): `add` may auto-clone a NEW plugin and wire the
+# index, but it NEVER enables it, NEVER adds it to a role's `use`, NEVER runs its hooks. So the decision
+# these functions make is ONLY "linked vs enabled" (where the hook code will come from) — and if that call
+# is ambiguous they return 'ambiguous'/'error' so the caller STOPS and reports rather than defaulting a
+# security-relevant choice.
+_URL_SCHEME = re.compile(r"^(https?|git|ssh|file)://", re.I)   # a clonable remote/local URL scheme
+_SCP_LIKE = re.compile(r"^[^/@\s]+@[^/@:\s]+:")               # git SSH shorthand: user@host:owner/repo
+_MKT_NAME = re.compile(r"^[A-Za-z0-9_-]+$")                   # a marketplace identifier (a toml key; no dots/slashes)
+
+
+def classify_ref(ref):
+    """PURE syntactic classification of an `add <ref>` (no filesystem access). One of:
+       'git-url'          a clonable URL — http(s)/git/ssh/file scheme, git SSH shorthand, or a *.git suffix
+       'path'             a local filesystem path (absolute, ~, ./ or ../)
+       'name@marketplace' a public ref whose right side is a bare marketplace identifier
+       'bare'             a lone name — NOT resolvable to a technique; the caller STOPs (never guesses)
+    Order matters: a git SSH shorthand (git@host:owner/repo) is a URL, NOT a name@marketplace — the part
+    after '@' carries a host/':' — so URL/scp/.git are matched BEFORE the '@'-marketplace split."""
+    ref = (ref or "").strip()
+    if not ref:
+        return "bare"
+    if _URL_SCHEME.match(ref) or _SCP_LIKE.match(ref) or ref.endswith(".git"):
+        return "git-url"
+    if ref.startswith(("/", "~", "./", "../")):
+        return "path"
+    if "@" in ref:
+        name, _, mkt = ref.partition("@")
+        if name and _MKT_NAME.match(mkt):                    # a clean name@bare-marketplace ref
+            return "name@marketplace"
+    return "bare"
+
+
+def plugin_name_from_ref(ref):
+    """Derive the index NAME an `add <ref>` keys on: the already-indexed idempotency check AND the clone
+    destination dir name. name@marketplace -> the name; a git URL or path -> the final path component with
+    a git SSH 'user@host:' prefix, a trailing '.git', and trailing slashes stripped."""
+    ref = (ref or "").strip()
+    kind = classify_ref(ref)
+    if kind == "name@marketplace":
+        return ref.partition("@")[0]
+    base = re.sub(r"^[^/@]+@[^/:]+:", "", ref)               # git@host:owner/repo -> owner/repo (no-op otherwise)
+    base = base.rstrip("/")
+    if base.endswith(".git"):
+        base = base[:-4]
+    base = base.rstrip("/")
+    return os.path.basename(base) or base
+
+
+def infer_technique(ref, marketplace_opt, as_opt, marketplaces):
+    """Decide the load technique for `add`, WITHOUT ever guessing on an ambiguous ref (the safety hinge).
+    Returns (technique, reason), technique ∈ {'linked','enabled','ambiguous','error'}:
+      - --as wins (validated to linked|enabled).
+      - else --marketplace decides: a kind=global marketplace -> enabled; a local one -> linked; unknown -> error.
+      - else infer from the ref: git-url/path -> linked; name@marketplace -> enabled; bare -> AMBIGUOUS.
+    'ambiguous' and 'error' both make the caller STOP + report (rc != 0). A bare name is NEVER defaulted to a
+    technique: linked-vs-enabled decides where third-party hook code comes from, so an unclear call is refused."""
+    if as_opt:
+        if as_opt in ("linked", "enabled"):
+            return (as_opt, f"--as {as_opt}")
+        return ("error", f"--as must be 'linked' or 'enabled' (got {as_opt!r})")
+    if marketplace_opt:
+        mk = marketplaces.get(marketplace_opt)
+        if mk is None:
+            return ("error", f"unknown marketplace {marketplace_opt!r}; declare [marketplace.{marketplace_opt}] first")
+        return ("enabled" if mk.get("kind") == "global" else "linked",
+                f"--marketplace {marketplace_opt} (kind={mk.get('kind', 'local')})")
+    kind = classify_ref(ref)
+    if kind in ("git-url", "path"):
+        return ("linked", f"inferred {kind}")
+    if kind == "name@marketplace":
+        return ("enabled", "inferred name@marketplace")
+    return ("ambiguous", f"cannot infer linked-vs-enabled from bare name {ref!r}")
+
+
+def _read_raw_index(index_path):
+    """Read the raw plugins.toml at `index_path` -> (raw_marketplaces, raw_plugins, existing_text). An
+    absent/malformed file -> ({}, {}, "") (never an error), matching run_reconcile's tolerance."""
+    existing_text, doc = "", {}
+    if tomllib and os.path.exists(index_path):
+        try:
+            with open(index_path, encoding="utf-8") as f:
+                existing_text = f.read()
+            doc = tomllib.loads(existing_text)
+        except (OSError, ValueError):
+            doc = {}
+    return (doc.get("marketplace") or {}), (doc.get("plugin") or {}), existing_text
+
+
+def add_enabled_index_text(index_path, name, source):
+    """Return (new_text, existing_text) for plugins.toml with a NEW type=enabled entry ADDED as
+    install=global-disabled. Existing marketplaces + plugins are preserved verbatim; only the one entry
+    is inserted. This writes NOTHING and NEVER touches any claude settings file — it records the index
+    INTENT only, so `add --as enabled` is structurally incapable of emitting an enabledPlugins entry
+    (true OR false). The human completes the global-DISABLED install; `fleet recycle --use` enables it."""
+    raw_marketplaces, raw_plugins, existing_text = _read_raw_index(index_path)
+    plugins = dict(raw_plugins)
+    plugins[name] = {"type": "enabled", "source": source or "", "tools": ["claude"],
+                     "install": "global-disabled"}
+    return render_index(raw_marketplaces, plugins), existing_text

@@ -1313,14 +1313,151 @@ def _cmd_plugins_describe(rest):
     return 0
 
 
+# ---------------------------------------------------------------- plugins add (install-from-URL, design §5b)
+# THE SAFETY CONTRACT (Berg-ratified): `add` may auto-clone a NEW plugin and wire the index, but it NEVER
+# enables it, NEVER adds it to a role's `use`, NEVER runs its hooks. Concretely, every code path below
+# writes ONLY plugins.toml (the index) — never a claude settings file, never fleet.toml — so `add` is
+# STRUCTURALLY incapable of producing an enabledPlugins entry or a role-use edit. The one decision it makes
+# is linked-vs-enabled (where hook code comes from); an ambiguous call STOPs and reports (never guesses).
+def _add_linked(a, name, note, marketplaces):
+    """LINKED add: clone the git URL (or copy the local path) into a LOCAL marketplace's path, then
+    reconcile the LINKED channel (settings_paths=[]) so the index gains a type=linked entry. Touches NO
+    role and NO claude settings. --dry-run prints the plan and clones/writes NOTHING."""
+    import shutil
+    from . import plugins as fp
+    kind = fp.classify_ref(a.ref)
+    if kind not in ("git-url", "path"):                      # e.g. `--as linked` on a name@marketplace ref
+        print(f"[fleet] plugins add: a LINKED add needs a git URL or a local path to clone/copy "
+              f"(ref '{a.ref}' is neither); pass one, or use --as enabled.", file=sys.stderr)
+        return 2
+    target = a.marketplace or "default"
+    mk = marketplaces.get(target)
+    if not mk or mk.get("kind") == "global" or not mk.get("path"):
+        print(f"[fleet] plugins add: no LOCAL marketplace '{target}' to clone into — declare "
+              f"[marketplace.{target}] path=... in {PLUGIN_INDEX}, or set $CMUX_FLEET_MARKETPLACE.",
+              file=sys.stderr)
+        return 2
+    dest = os.path.join(mk["path"], name)
+    plan = (f"add '{name}' as LINKED ({note})\n"
+            f"  clone/copy:  {a.ref}\n"
+            f"          ->   {dest}\n"
+            f"  then reconcile (type=linked, tools from manifests). NO role, NO enable, NO hook run.")
+    if a.dry_run:
+        print(f"[dry-run] {plan}\n[dry-run] nothing cloned or written")
+        return 0
+    if os.path.exists(dest):
+        print(f"[fleet] plugins add: destination already exists ({dest}); skipping clone, reconciling.")
+    else:
+        if kind == "path" and not os.path.isdir(os.path.expanduser(a.ref)):
+            print(f"[fleet] plugins add: local path '{a.ref}' is not a directory.", file=sys.stderr)
+            return 2
+        os.makedirs(mk["path"], exist_ok=True)
+        try:
+            if kind == "git-url":
+                subprocess.run(["git", "clone", "--depth", "1", a.ref, dest],
+                               check=True, capture_output=True, text=True)
+            else:                                            # local path -> copy the tree (no network)
+                shutil.copytree(os.path.expanduser(a.ref), dest)
+        except (subprocess.CalledProcessError, OSError) as e:
+            detail = (getattr(e, "stderr", "") or "").strip() or str(e)
+            print(f"[fleet] plugins add: clone/copy failed: {detail}", file=sys.stderr)
+            return 1
+    # reconcile the LINKED channel ONLY (settings_paths=[]): the enabled channel is never scanned or
+    # written by an `add linked`, and existing enabled index entries are preserved untouched.
+    new_text, _diff, existing_text = fp.run_reconcile(PLUGIN_INDEX, marketplaces, [], prune=False)
+    if new_text != existing_text:
+        os.makedirs(os.path.dirname(os.path.abspath(PLUGIN_INDEX)), exist_ok=True)
+        with open(PLUGIN_INDEX, "w", encoding="utf-8") as f:
+            f.write(new_text)
+    print(f"[fleet] plugins add: wired '{name}' as LINKED into the index ({PLUGIN_INDEX}).")
+    print(f"  cloned into: {dest}")
+    print(f"  NOT enabled — no role loads it and no hook has run. Enable it for ONE agent when ready:")
+    print(f"      fleet recycle <agent> --use {name}")
+    return 0
+
+
+def _add_enabled(a, name, note):
+    """ENABLED add: record a type=enabled entry as install=global-disabled and PRINT the exact steps to
+    finish the global-DISABLED install + the per-agent enable. Writes ONLY plugins.toml — never a claude
+    settings file — so it cannot emit an enabledPlugins entry. --dry-run prints the plan and writes NOTHING."""
+    from . import plugins as fp
+    source = a.marketplace or (a.ref.partition("@")[2] if "@" in a.ref else "")
+    if not source:                                           # e.g. `--as enabled` on a bare/URL/path ref
+        print(f"[fleet] plugins add: an ENABLED add needs a marketplace — pass name@marketplace or "
+              f"--marketplace <name> (ref '{a.ref}' names none).", file=sys.stderr)
+        return 2
+    plan = (f"add '{name}' as ENABLED ({note})\n"
+            f"  index:  [plugin.{name}] type=enabled source={source} install=global-disabled\n"
+            f"  the global install is left to you (fleet never auto-runs plugin code). NO role, NO enable.")
+    if a.dry_run:
+        print(f"[dry-run] {plan}\n[dry-run] nothing installed or written")
+        return 0
+    new_text, _existing = fp.add_enabled_index_text(PLUGIN_INDEX, name, source)
+    os.makedirs(os.path.dirname(os.path.abspath(PLUGIN_INDEX)), exist_ok=True)
+    with open(PLUGIN_INDEX, "w", encoding="utf-8") as f:
+        f.write(new_text)
+    print(f"[fleet] plugins add: wired '{name}' as ENABLED (install=global-disabled) into {PLUGIN_INDEX}.")
+    print(f"  NOT installed and NOT enabled — fleet does not auto-run third-party plugin code.")
+    print(f"  Finish the global-DISABLED install yourself with claude's plugin CLI, e.g.:")
+    print(f"      claude plugin marketplace add <{source}-source>   # if marketplace '{source}' isn't added yet")
+    print(f"      claude plugin install {name}@{source}             # install; leave it DISABLED")
+    print(f"  Then enable it for ONE agent when ready:")
+    print(f"      fleet recycle <agent> --use {name}")
+    return 0
+
+
+def _cmd_plugins_add(rest):
+    """`fleet plugins add <ref> [--as linked|enabled] [--marketplace <name>] [--dry-run]` — index a NEW
+    plugin at the SAFE default: clone/wire it, but NEVER enable it, add it to a role, or run its hooks."""
+    from . import plugins as fp
+    ap = argparse.ArgumentParser(prog="fleet plugins add",
+                                 description="index a NEW plugin (SAFE default: never enables it)")
+    ap.add_argument("ref", help="a git URL, a local path, or a name@marketplace ref")
+    ap.add_argument("--as", dest="as_", choices=["linked", "enabled"],
+                    help="force the technique (default: inferred from the ref)")
+    ap.add_argument("--marketplace", help="target (linked) / source (enabled) marketplace; default 'default'")
+    ap.add_argument("--dry-run", action="store_true",
+                    help="infer + print the plan; clone/install/write NOTHING")
+    a = ap.parse_args(rest)
+
+    index = load_plugin_index()
+    name = fp.plugin_name_from_ref(a.ref)
+
+    # 1. already indexed? -> a no-op that points at the enable one-liner (idempotent; never re-clones).
+    if name in index["plugins"]:
+        cur = index["plugins"][name]
+        print(f"plugin '{name}' is already indexed (type={cur['type']}); nothing to do.")
+        print(f"  enable it per-agent with:  fleet recycle <agent> --use {name}")
+        return 0
+
+    # 2. infer the technique — an ambiguous or invalid call STOPs (never defaults a security-relevant choice).
+    technique, reason = fp.infer_technique(a.ref, a.marketplace, a.as_, index["marketplaces"])
+    if technique == "ambiguous":
+        print(f"[fleet] plugins add: STOP — {reason}.\n"
+              f"  Loading a plugin runs its hook code, so linked-vs-enabled is a safety call and fleet will "
+              f"not guess.\n  Re-run with an explicit --as linked|enabled (or --marketplace <name>).",
+              file=sys.stderr)
+        return 2
+    if technique == "error":
+        print(f"[fleet] plugins add: {reason}.", file=sys.stderr)
+        return 2
+
+    if technique == "linked":
+        return _add_linked(a, name, reason, index["marketplaces"])
+    return _add_enabled(a, name, reason)
+
+
 def cmd_plugins(argv):
-    """`fleet plugins <reconcile|ls|show|describe>` — the plugin index's reconcile helper + on-demand
-    discovery (design §4/§6). Discovery is NEVER auto-loaded; a conductor consults it when deciding what
-    to dispatch a child with. None of these verbs touch launch composition."""
-    verbs = {"reconcile": _cmd_plugins_reconcile, "ls": _cmd_plugins_ls,
+    """`fleet plugins <add|reconcile|ls|show|describe>` — the plugin index's install/reconcile helpers +
+    on-demand discovery (design §4/§5b/§6). Discovery is NEVER auto-loaded; a conductor consults it when
+    deciding what to dispatch a child with. `add` wires a NEW plugin but NEVER enables/loads it (the safe
+    default). None of these verbs enable a plugin, edit a role, or run a plugin's hooks."""
+    verbs = {"add": _cmd_plugins_add, "reconcile": _cmd_plugins_reconcile, "ls": _cmd_plugins_ls,
              "show": _cmd_plugins_show, "describe": _cmd_plugins_describe}
     if not argv or argv[0] in ("-h", "--help") or argv[0] not in verbs:
-        print("usage: fleet plugins <reconcile|ls|show|describe> ...\n"
+        print("usage: fleet plugins <add|reconcile|ls|show|describe> ...\n"
+              "  add <ref> [--as linked|enabled] [--marketplace N] [--dry-run]\n"
+              "                                             index a NEW plugin (SAFE: never enables it / adds it to a role / runs a hook)\n"
               "  reconcile [--dry-run] [--prune] [--json]   scan marketplaces + ~/.claude settings; refresh the index\n"
               "  ls [--json]                                table: name · type · tools · source · description\n"
               "  show <name> [--json]                       full entry + resolved --plugin-dir path + roles that use it\n"
@@ -3263,7 +3400,7 @@ def main():
               "  launch <role|--adhoc NAME> [--tool t] [--place p] [--parent s] [--effort L] [--model M] [--use NAME] [--dry-run] [-- <tool flags>]\n"
               "  config <role|--adhoc NAME|--cwd DIR> [--tool t]   effective config (base settings + fleet adds)\n"
               "  ls                                                live fleet x hook store; flags STALE + archived\n"
-              "  plugins <reconcile|ls|show|describe> ...          the plugin INDEX: reconcile from sources + on-demand discovery\n"
+              "  plugins <add|reconcile|ls|show|describe> ...      the plugin INDEX: add-from-URL (safe: never enables) + reconcile + on-demand discovery\n"
               "  archive <label>                                   park a live agent (revivable)\n"
               "  revive <label> [--fresh] [--session id] [--place p] [--parent s] [--add-plugin N] [-- <flags>]\n"
               "                                                    bring a parked agent back (default RESUME last session; --fresh sheds; --session targets an arbitrary prior one)\n"
