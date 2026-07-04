@@ -5,6 +5,10 @@ description: Write a point-in-time session handover for the next instance of thi
 
 # cmux-handover
 
+> **Defers to `loom:handover` when present.** If the `loom` plugin is loaded, its `loom:handover` skill is
+> the authority for this convention (tapestry-fleet's vault-seated agents) — use that one instead. This
+> skill is the standalone fallback for cmux-fleet used without loom (the productized-plugin path).
+
 A handover is a **point-in-time brain dump of this session** for whoever picks up this agent next — a relaunch of you, or the conductor reading you cold. It is NOT a vault entity and NOT maintained; it is working memory in the agent's own space.
 
 ## Where it lives
