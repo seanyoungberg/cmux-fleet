@@ -273,15 +273,18 @@ def test_handle_skips_delivery_on_tool_mismatch(fs, monkeypatch):
 # The router also subscribes to `--category surface`: a tracked member's surface closing OUTSIDE
 # `fleet rm`/`fleet archive` (accidental tab close, workspace teardown — verified live: both emit
 # surface.closed per member surface; a WINDOW close does NOT, known gap) must immediately move the
-# registry row live -> archive. Pure hygiene: no completion queued, no wake — the surface is gone.
+# registry row live -> archive, then ALERT the member's parent through the SAME inbox+idle-wake
+# channel completions ride (kind='stale' — NOT a completion row: nothing finished, no gist to route).
+# A conductor's own surface closing alerts nobody (no parent to tell).
 def _surface_closed_ev(surface_id):
     return {"name": "surface.closed", "category": "surface", "occurred_at": "2026-07-03T23:28:23Z",
             "payload": {"kind": "terminal", "origin": "tab_close", "surface_id": surface_id}}
 
 
 def test_handle_archives_registry_on_surface_closed(fs, monkeypatch):
-    """A surface.closed for a LIVE member archives it via the shared _build_archive_entry path
-    (via=surface-closed in the ledger) and queues/wakes NOTHING."""
+    """A surface.closed for a LIVE child archives it via the shared _build_archive_entry path
+    (via=surface-closed in the ledger), queues a kind='stale' alert to its PARENT (never a completion
+    row — nothing finished), and attempts the parent wake the same way deliver() does."""
     import json as _json
     from cmux_fleet import cli
     fs.live_put("parent", {"surface": "PARENT", "kind": "conductor", "role": "c",
@@ -303,8 +306,13 @@ def test_handle_archives_registry_on_surface_closed(fs, monkeypatch):
     assert arch is not None                                           # ...parked on the archive shelf
     assert arch["last_session"] == "claude-worker-uuid"               # resumable via the registry session
     assert arch["cwd"] == "/tmp/w"
-    assert fs.inbox_pending("PARENT", kind="completion") == []        # NO completion queued
-    assert waked == []                                                # NO wake attempted
+    assert fs.inbox_pending("PARENT", kind="completion") == []        # NOT a completion row
+    alerts = fs.inbox_pending("PARENT", kind="stale")                 # ...but the parent IS alerted
+    assert len(alerts) == 1
+    assert alerts[0]["label"] == "worker"
+    assert alerts[0]["child_surface"] == "CHILD"
+    assert alerts[0]["via"] == "surface-closed"
+    assert waked == ["PARENT"]                                        # wake attempted, like deliver()
     assert fs.live_get("parent") is not None                          # bystanders untouched
     with open(fs.LOG) as f:                                          # ledger row distinguishable from
         last = _json.loads(f.read().strip().splitlines()[-1])        # an operator-initiated archive
@@ -313,19 +321,57 @@ def test_handle_archives_registry_on_surface_closed(fs, monkeypatch):
 
 
 def test_handle_archives_muted_member_on_surface_closed(fs, monkeypatch):
-    """Mute gates notification routing, NOT registry truth: a muted member's surface closing is just
-    as stale a row as an unmuted one's -> still archived."""
+    """Mute gates the child's COMPLETION push specifically, NOT registry truth: a muted member's
+    surface closing is just as stale a row as an unmuted one's -> still archived, and the parent is
+    still ALERTED (a tracked member vanishing is a registry-integrity signal, not completion chatter)."""
     from cmux_fleet import cli
+    fs.live_put("parent", {"surface": "PARENT", "kind": "conductor", "role": "c",
+                           "session": "claude-parent"})
     fs.live_put("muted-worker", {"surface": "MUTED", "kind": "child", "role": "w", "parent": "parent",
                                  "muted": True, "session": "claude-m"})
     monkeypatch.setattr(router, "LIVE", True)
     monkeypatch.setattr(router, "_reg", {"mtime": 0, "by_label": {}, "by_surface": {}})
     monkeypatch.setattr(cli, "_resume_binding", lambda surf: {})
+    monkeypatch.setattr(router, "maybe_idle_wake", lambda parent_surface, label: None)
 
     router.handle(_surface_closed_ev("MUTED"))
 
     assert fs.live_get("muted-worker") is None
     assert fs.archive_get("muted-worker") is not None
+    assert len(fs.inbox_pending("PARENT", kind="stale")) == 1         # muted still alerts
+
+
+def test_handle_conductor_surface_closed_archives_without_alert(fs, monkeypatch):
+    """A CONDUCTOR's own surface closing is archived like any stale row but alerts NOBODY — it has no
+    parent to tell (branch on KIND, not role, same as the Stop path)."""
+    from cmux_fleet import cli
+    fs.live_put("boss", {"surface": "BOSS", "kind": "conductor", "role": "c",
+                         "session": "claude-boss"})
+    monkeypatch.setattr(router, "LIVE", True)
+    monkeypatch.setattr(router, "_reg", {"mtime": 0, "by_label": {}, "by_surface": {}})
+    monkeypatch.setattr(cli, "_resume_binding", lambda surf: {})
+    waked = []
+    monkeypatch.setattr(router, "maybe_idle_wake", lambda parent_surface, label: waked.append(parent_surface))
+
+    router.handle(_surface_closed_ev("BOSS"))
+
+    assert fs.live_get("boss") is None                                # archived...
+    assert fs.archive_get("boss") is not None
+    assert fs.inbox_read() == []                                      # ...but NO alert queued anywhere
+    assert waked == []                                                # and no wake attempted
+
+
+def test_maybe_idle_wake_fires_on_stale_only_inbox(monkeypatch):
+    """A pending stale alert is wake-worthy on its own: maybe_idle_wake must not early-return just
+    because no COMPLETION is pending (the pre-alert gate only counted completions)."""
+    monkeypatch.setattr(router, "LIVE", True)
+    monkeypatch.setattr(fs, "idlewake_on", lambda: True)
+    monkeypatch.setattr(fs, "inbox_pending",
+                        lambda surf, kind=None: [{"seq": 1}] if kind == "stale" else [])
+    woke = []
+    monkeypatch.setattr(fs, "wake_if_idle", lambda surf, msg: woke.append(surf) or True)
+    router.maybe_idle_wake("S", "cond")
+    assert woke == ["S"]
 
 
 def test_handle_ignores_surface_closed_for_untracked_surface(fs, monkeypatch):

@@ -219,7 +219,8 @@ def cmd_child_digest(argv):
 # =================================================================================================
 # inbox-ack — a conductor runs this after handling the items it was shown, to mark them done so they
 # stop re-surfacing. Acks an EXACT seq (race-safe: later arrivals have a higher seq and survive).
-# Default kind is `completion`; --peer acks the peer stream. Self-IDs via $CMUX_SURFACE_ID.
+# Default kind is `completion`; --peer acks the peer stream, --stale the stale-member alerts.
+# Self-IDs via $CMUX_SURFACE_ID.
 # =================================================================================================
 def cmd_inbox_ack(argv):
     args = list(argv)
@@ -227,11 +228,13 @@ def cmd_inbox_ack(argv):
     kind = "completion"
     if "--peer" in args:
         args.remove("--peer"); kind = "peer"
+    if "--stale" in args:
+        args.remove("--stale"); kind = "stale"
     if "--surface" in args:
         i = args.index("--surface"); surface = args[i + 1]; del args[i:i + 2]
 
     if not args or not args[0].lstrip("-").isdigit():
-        sys.exit("usage: fleet inbox-ack <seq> [--peer] [--surface <surfaceId>]")
+        sys.exit("usage: fleet inbox-ack <seq> [--peer | --stale] [--surface <surfaceId>]")
     if not surface:
         sys.exit("inbox-ack: no surface (set $CMUX_SURFACE_ID or pass --surface)")
 

@@ -10,7 +10,8 @@
 # Also subscribes to the `surface` category for real-time registry hygiene (fleet-doctor capability #1):
 # a tracked member's surface closing OUTSIDE `fleet rm`/`fleet archive` (accidental tab close, workspace
 # teardown) immediately archives its registry row instead of leaving a STALE lie until someone runs
-# `fleet ls`. Pure hygiene — no completion, no wake, no auto-relaunch (Tier-2 stays deferred).
+# `fleet ls`, then ALERTS the member's parent conductor through the SAME inbox+idle-wake channel
+# completions use (kind='stale', no desktop notify). No auto-relaunch (Tier-2 stays deferred).
 #
 #   python3 router.py            # OBSERVE: log decisions, write/send nothing
 #   python3 router.py --live     # ACTIVE: write inbox + notify; idle-wake unless notify-mode==passive
@@ -127,12 +128,18 @@ def last_assistant_text(path, cap=160):
     return fs.last_agent_text(path, cap)
 
 
+def _alert_pending(surface):
+    """Wake-worthy inbox rows: child completions OR stale-member alerts. Peer messages are excluded on
+    purpose — their send path (fleet peer-msg) does its own wake."""
+    return fs.inbox_pending(surface, kind="completion") or fs.inbox_pending(surface, kind="stale")
+
+
 def maybe_idle_wake(parent_surface, label):
     if not (LIVE and fs.idlewake_on()):
         return
-    if not fs.inbox_pending(parent_surface, kind="completion"):
+    if not _alert_pending(parent_surface):
         return
-    if fs.wake_if_idle(parent_surface, "(auto-wake) handle your pending child completions"):
+    if fs.wake_if_idle(parent_surface, "(auto-wake) handle your pending fleet inbox items"):
         log(f"[IDLE-WAKE] {label}: empty prompt -> submitted wake trigger")
     elif fs.surface_busy(parent_surface):               # skip-on-RUNNING -> parent goes idle soon -> retry
         log(f"[idle-wake] skip {label}: mid-turn -> scheduling bounded retry")
@@ -159,10 +166,10 @@ def _idle_wake_retry_loop(surface, label):
             time.sleep(delay)
             if not fs.idlewake_on():                    # dial muted mid-retry -> stop
                 return
-            if not fs.inbox_pending(surface, kind="completion"):
+            if not _alert_pending(surface):
                 log(f"[idle-wake-retry] {label}: inbox drained before wake -> done")
                 return                                  # handled meanwhile (woken elsewhere / acked)
-            if fs.wake_if_idle(surface, "(auto-wake) handle your pending child completions"):
+            if fs.wake_if_idle(surface, "(auto-wake) handle your pending fleet inbox items"):
                 log(f"[idle-wake-retry] {label}: woke after ~{delay}s backoff")
                 return
             if not fs.surface_busy(surface):            # turn ended but still not wakeable (draft/no prompt)
@@ -199,9 +206,12 @@ def _archive_closed_surface(ev):
     so anything that DOES resolve here closed outside the fleet CLI (accidental tab close, workspace
     teardown). Archive it through the SAME shared path as `fleet archive`/`fleet rm --kill`
     (_build_archive_entry + archive_put — third caller, kept shared), tagged via=surface-closed in the
-    ledger. Applies to muted members too (mute gates notification routing, not registry truth). NO
-    completion/notify/wake — the surface is gone, there is nothing to route to; a human (or a future
-    capability) decides whether to `fleet revive`."""
+    ledger. Applies to muted members too (mute gates notification routing, not registry truth). Then
+    ALERT the member's parent conductor through the SAME channel completions ride (inbox kind='stale'
+    + maybe_idle_wake) — NOT a completion row (nothing finished; there is no gist/transcript to route)
+    and no `cmux notify` desktop banner (registry-integrity signal, quieter than a completion). A
+    conductor's own surface closing alerts nobody (no parent); the heartbeat/human notices. A human (or
+    a future capability) decides whether to `fleet revive`."""
     surface = (ev.get("payload") or {}).get("surface_id") or ""
     entry = registry()["by_surface"].get(surface) if surface else None
     if not entry:
@@ -218,8 +228,23 @@ def _archive_closed_surface(ev):
     fs.live_del(label)
     fs.log_event("archived", label=label, role=entry.get("role"), session=entry.get("session"),
                  via="surface-closed")
+    origin = (ev.get("payload") or {}).get("origin", "?")
     log(f"[stale] archived {label}: surface {surface[:8]} closed out from under the registry "
-        f"(origin={(ev.get('payload') or {}).get('origin', '?')}); revive with: fleet revive {label}")
+        f"(origin={origin}); revive with: fleet revive {label}")
+    if entry.get("kind") == "conductor":                # branch on KIND, not role (same as the Stop path):
+        return                                          # a conductor has no parent to alert
+    # Muted members still alert: mute suppresses the child's COMPLETION push specifically; a tracked
+    # member vanishing is a registry-integrity signal the parent needs regardless of the chatter dial.
+    parent = entry.get("parent")                        # parent LABEL (durable); resolve like deliver()'s path
+    pe = registry()["by_label"].get(parent)
+    parent_surface = pe.get("surface") if pe else parent   # fall back to a raw surface
+    if not parent_surface:
+        log(f"[stale] {label}: unresolved parent '{parent}' -> archived without alert")
+        return
+    seq = fs.inbox_put("stale", parent_surface, {
+        "label": label, "child_surface": surface, "via": "surface-closed", "origin": origin})
+    log(f"[STALE-ALERT seq={seq}] {label} -> {parent} (surface closed; archived)")
+    maybe_idle_wake(parent_surface, parent)
 
 
 def handle(ev):

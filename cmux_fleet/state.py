@@ -136,7 +136,7 @@ def inbox_next_seq():
 
 
 def inbox_put(kind, to_surface, payload):
-    """Append one message addressed to a surface. kind: 'completion' | 'peer'. BOTH carry a single `to`
+    """Append one message addressed to a surface. kind: 'completion' | 'peer' | 'stale'. ALL carry a single `to`
     field (normalized, critic issue #7) so one reader selects 'for me'. Returns the seq."""
     seq = inbox_next_seq()
     rec = {"seq": seq, "ts": time.time(), "kind": kind, "to": to_surface}

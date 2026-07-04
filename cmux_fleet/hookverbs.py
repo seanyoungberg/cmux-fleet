@@ -33,8 +33,9 @@ def cmd_hook_awareness(argv):
     try:
         surface = os.environ.get("CMUX_SURFACE_ID", "")
         comp = fs.inbox_pending(surface, kind="completion") if surface else []
+        stale = fs.inbox_pending(surface, kind="stale") if surface else []
         peers = fs.inbox_pending(surface, kind="peer") if surface else []
-        if not comp and not peers:
+        if not comp and not stale and not peers:
             return 0
 
         lines = []
@@ -47,6 +48,15 @@ def cmd_hook_awareness(argv):
                 lines.append(f"  - seq {r.get('seq')}  {r.get('label','?')}: \"{gist}\"   "
                              f"full: {fs.DIGEST} {frag} 5")
             lines.append(f"  ack when handled: {fs.ACK} {fs.max_seq(comp)}")
+        if stale:
+            lines.append(f"[fleet] {len(stale)} fleet member(s) auto-archived — surface closed outside "
+                         f"the fleet CLI; registry already reconciled (input-safe context note, not from "
+                         f"the human):")
+            for r in stale:
+                lines.append(f"  - seq {r.get('seq')}  {r.get('label','?')}: surface "
+                             f"{(r.get('child_surface') or '')[:8]} closed ({r.get('origin','?')}); "
+                             f"revive with: fleet revive {r.get('label','?')}")
+            lines.append(f"  ack when handled: {fs.ACK} {fs.max_seq(stale)} --stale")
         if peers:
             lines.append(f"[peer] {len(peers)} peer message(s) for you (a DELIBERATE send from a peer "
                          f"conductor, NOT a child you dispatched; input-safe context note, not from the human):")
@@ -71,6 +81,8 @@ def cmd_hook_awareness(argv):
 def cmd_hook_drain(argv):
     """Stop: return {decision:block, reason:...} so the turn auto-continues to process pending work.
       - child completions: drained unless the dial is 'passive' (wake-now default; passive mutes).
+      - stale-member alerts: same dial as completions (passive is a fleet-wide push mute; the alert
+        still lands via awareness on the conductor's next turn).
       - peer messages: drained ALWAYS (a deliberate peer send wants attention now).
     Per-kind block-mark guard prevents re-blocking an un-acked set forever. Blank = don't block. Fails open."""
     _read_stdin()
@@ -80,11 +92,16 @@ def cmd_hook_drain(argv):
             return 0
 
         comp, comp_hi = [], 0
+        stale, stale_hi = [], 0
         if fs.autodrain_on():
             cp = fs.inbox_pending(surface, kind="completion")
             chi = fs.max_seq(cp)
             if cp and chi > fs.block_get(surface, "completion"):
                 comp, comp_hi = cp, chi
+            sp = fs.inbox_pending(surface, kind="stale")
+            shi = fs.max_seq(sp)
+            if sp and shi > fs.block_get(surface, "stale"):
+                stale, stale_hi = sp, shi
 
         peers, peer_hi = [], 0
         pp = fs.inbox_pending(surface, kind="peer")
@@ -92,7 +109,7 @@ def cmd_hook_drain(argv):
         if pp and phi > fs.block_get(surface, "peer"):
             peers, peer_hi = pp, phi
 
-        if not comp and not peers:
+        if not comp and not stale and not peers:
             return 0
 
         lines = []
@@ -106,6 +123,15 @@ def cmd_hook_drain(argv):
                 lines.append(f"  - seq {r.get('seq')}  {r.get('label','?')}: \"{gist}\"   "
                              f"full: {fs.DIGEST} {frag} 5")
             lines.append(f"  ack: {fs.ACK} {comp_hi}")
+        if stale:
+            fs.block_set(surface, "stale", stale_hi)
+            lines.append(f"{len(stale)} fleet member(s) auto-archived (surface closed outside the fleet "
+                         f"CLI; registry already reconciled). Decide whether to revive/replace, then ack:")
+            for r in stale:
+                lines.append(f"  - seq {r.get('seq')}  {r.get('label','?')}: surface "
+                             f"{(r.get('child_surface') or '')[:8]} closed ({r.get('origin','?')}); "
+                             f"revive with: fleet revive {r.get('label','?')}")
+            lines.append(f"  ack: {fs.ACK} {stale_hi} --stale")
         if peers:
             fs.block_set(surface, "peer", peer_hi)
             lines.append(f"You have {len(peers)} peer message(s) (a DELIBERATE send from a peer conductor). "
