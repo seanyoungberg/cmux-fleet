@@ -17,6 +17,8 @@ Proven here:
 """
 import tomllib
 
+import pytest
+
 from cmux_fleet import plugins as fp
 
 
@@ -63,7 +65,7 @@ def test_tools_derived_from_manifest_presence(tmp_path):
         "codex-only": ["codex"],              # one manifest   -> ["codex"]
         "empty": [],                          # no manifest    -> skipped (not a plugin)
     })
-    derived = fp.derive_entries({"berg": _local(plugins_dir)}, [])
+    derived, _coll = fp.derive_entries({"berg": _local(plugins_dir)}, [])
     assert derived["dual"]["tools"] == ["claude", "codex"]
     assert derived["claude-only"]["tools"] == ["claude"]
     assert derived["codex-only"]["tools"] == ["codex"]
@@ -80,7 +82,7 @@ def test_origin_and_description_from_marketplace_json(tmp_path):
         {"name": "git", "description": "a git one",
          "source": {"source": "url", "url": "https://x/git.git", "ref": "main"}},
     ])
-    derived = fp.derive_entries({"berg": _local(plugins_dir)}, [])
+    derived, _coll = fp.derive_entries({"berg": _local(plugins_dir)}, [])
     assert derived["loc"]["origin"] == "path" and derived["loc"]["description"] == "a local one"
     assert derived["git"]["origin"] == "url" and derived["git"]["description"] == "a git one"
 
@@ -89,7 +91,7 @@ def test_description_falls_back_to_plugin_json(tmp_path):
     # a plugin dir the marketplace.json does NOT list -> description from its own plugin.json.
     plugins_dir = _mkmarketplace(tmp_path / "mkt", {"orphan": ["claude"]},
                                  mjson=[{"name": "other", "description": "x", "source": "./plugins/other"}])
-    derived = fp.derive_entries({"berg": _local(plugins_dir)}, [])
+    derived, _coll = fp.derive_entries({"berg": _local(plugins_dir)}, [])
     assert derived["orphan"]["description"] == "orphan via plugin.json"
     assert derived["orphan"]["origin"] == "path"          # default when not in marketplace.json
 
@@ -98,7 +100,7 @@ def test_description_falls_back_to_plugin_json(tmp_path):
 def test_enabled_entries_derived_from_settings(tmp_path):
     settings = tmp_path / "settings.json"
     settings.write_text('{"enabledPlugins": {"obsidian@obs": false, "live@lw": true}}')
-    derived = fp.derive_entries({}, [str(settings)])
+    derived, _coll = fp.derive_entries({}, [str(settings)])
     assert derived["obsidian"]["type"] == "enabled"
     assert derived["obsidian"]["source"] == "obs"
     assert derived["obsidian"]["tools"] == ["claude"]
@@ -110,7 +112,7 @@ def test_linked_dir_wins_over_enabled_ref_of_same_name(tmp_path):
     plugins_dir = _mkmarketplace(tmp_path / "mkt", {"dup": ["claude", "codex"]})
     settings = tmp_path / "settings.json"
     settings.write_text('{"enabledPlugins": {"dup@somewhere": false}}')
-    derived = fp.derive_entries({"berg": _local(plugins_dir)}, [str(settings)])
+    derived, _coll = fp.derive_entries({"berg": _local(plugins_dir)}, [str(settings)])
     assert derived["dup"]["type"] == "linked"             # the local checkout is the stronger signal
     assert derived["dup"]["tools"] == ["claude", "codex"]
 
@@ -201,3 +203,64 @@ def test_prune_only_removes_unbacked_and_only_under_flag(tmp_path):
     assert "ghost" not in tomllib.loads(text_prune)["plugin"]     # dropped under --prune
     assert "real" in tomllib.loads(text_prune)["plugin"]          # a backed entry is kept
     assert ("prune", "ghost") in {(a, n) for a, n, _ in diff_prune.changes}
+
+
+# --- SAFETY: present-but-unparseable index ABORTS; absent/empty starts fresh (review Finding 1) ---
+def test_run_reconcile_aborts_on_malformed_populated_index(tmp_path):
+    """The data-loss regression guard: a POPULATED index that no longer parses must NOT be treated as
+    empty and regenerated from sources — run_reconcile raises IndexParseError so the caller writes
+    nothing. Before the fix this returned new_text derived from an empty existing set, dropping every
+    hand-authored entry, curated description, per-tool block, and [marketplace.*] block."""
+    plugins_dir = _mkmarketplace(tmp_path / "mkt", {"real": ["claude"]})
+    index = tmp_path / "plugins.toml"
+    populated = ('[marketplace.berg]\npath = "mkt/plugins"\n'
+                 '[plugin.handmade]\ntype = "linked"\nsource = "berg"\ntools = ["claude"]\n'
+                 'description = "curated by hand"\ncurated = true\n'
+                 'this is a typo that breaks the parse\n')       # a lone junk line -> TOMLDecodeError
+    index.write_text(populated)
+    with pytest.raises(fp.IndexParseError) as ei:
+        fp.run_reconcile(str(index), {"berg": _local(plugins_dir)}, [], prune=False)
+    assert str(index) in str(ei.value)                            # the message names the offending file
+    assert index.read_text() == populated                         # byte-unchanged (run_reconcile never writes)
+
+
+def test_run_reconcile_starts_fresh_on_absent_index(tmp_path):
+    """Regression guard the OTHER way: an ABSENT index is the normal first-run path — reconcile must NOT
+    abort, it derives from sources into a fresh file."""
+    plugins_dir = _mkmarketplace(tmp_path / "mkt", {"real": ["claude"]})
+    index = tmp_path / "plugins.toml"                             # never created
+    text, diff, existing = fp.run_reconcile(str(index), {"berg": _local(plugins_dir)}, [], prune=False)
+    assert existing == ""
+    assert "real" in tomllib.loads(text)["plugin"]                # derived fresh, no error
+
+
+def test_run_reconcile_starts_fresh_on_empty_index(tmp_path):
+    """An EMPTY / whitespace-only file carries no curated data at risk, so it is treated as absent (start
+    fresh) rather than an abort — proves the abort keys on unparseable-CONTENT, not mere presence."""
+    plugins_dir = _mkmarketplace(tmp_path / "mkt", {"real": ["claude"]})
+    index = tmp_path / "plugins.toml"
+    index.write_text("   \n\n")                                   # present but blank
+    text, diff, _ = fp.run_reconcile(str(index), {"berg": _local(plugins_dir)}, [], prune=False)
+    assert "real" in tomllib.loads(text)["plugin"]                # no IndexParseError; derived fresh
+
+
+# --- cross-marketplace name collision is SURFACED, not silent (review Finding 2) ------------------
+def test_cross_marketplace_collision_reported(tmp_path):
+    """Two LOCAL marketplaces both carry a plugin named `alpha`. The winner stays last-alphabetically
+    (mkt2), but derive_entries reports the collision and run_reconcile emits a `collision` note + count —
+    so *which* marketplace's code loads is visible, never silent."""
+    dir1 = _mkmarketplace(tmp_path / "m1", {"alpha": ["claude"], "solo1": ["claude"]})
+    dir2 = _mkmarketplace(tmp_path / "m2", {"alpha": ["claude"], "solo2": ["claude"]})
+    mkts = {"mkt1": _local(dir1), "mkt2": _local(dir2)}
+
+    derived, collisions = fp.derive_entries(mkts, [])
+    assert derived["alpha"]["source"] == "mkt2"                   # last-wins policy unchanged
+    assert collisions["alpha"] == ["mkt1", "mkt2"]               # declaration order; last is the winner
+    assert "solo1" not in collisions and "solo2" not in collisions   # non-colliding names untouched
+
+    index = tmp_path / "plugins.toml"                             # absent -> a clean fresh reconcile
+    _text, diff, _ = fp.run_reconcile(str(index), mkts, [], prune=False)
+    assert ("collision", "alpha") in {(k, n) for k, n, _ in diff.notes}
+    assert diff.counts()["collision"] == 1
+    detail = next(d for k, n, d in diff.notes if k == "collision" and n == "alpha")
+    assert "mkt1" in detail and "mkt2" in detail and "using mkt2" in detail

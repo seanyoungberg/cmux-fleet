@@ -29,6 +29,20 @@ try:
 except ModuleNotFoundError:                      # py<3.11 — engine degrades to "no existing index to read"
     tomllib = None
 
+
+class IndexParseError(Exception):
+    """The existing plugins.toml is PRESENT and non-empty but does not parse. Raised only by the WRITE
+    paths (reconcile / add) via `_load_index_doc`, so they ABORT rather than regenerate the file from
+    sources alone — which would silently discard every hand-authored entry, curated description, per-tool
+    block, and [marketplace.*] definition (the header promises these are PRESERVED; a lone typo must not
+    invert that to total loss). The read-only LAUNCH path (config.load_plugin_index) intentionally does
+    NOT raise this — it fails open so a malformed index still lets an agent launch on an empty index."""
+
+    def __init__(self, path, cause):
+        self.path = path
+        self.cause = cause
+        super().__init__(f"{path} is malformed: {cause}")
+
 # Fields reconcile OWNS: pure functions of the sources, overwritten on every run. `origin` = source-kind
 # (a local `path` marketplace entry vs a git `url` one, from marketplace.json). `description` is
 # machine-owned too but only while un-curated (handled specially so a `curated=true` desc is preserved).
@@ -115,8 +129,14 @@ def derive_entries(marketplaces, settings_paths):
           description + origin from that marketplace's marketplace.json (else the plugin's own plugin.json).
       (b) each `enabledPlugins` {name@mkt: on/off} in a claude settings JSON — a `type=enabled` entry;
           a globally-DISABLED one records install="global-disabled" (the per-agent-flip candidate).
-    A linked dir wins over an enabled ref of the same name (a local checkout is the stronger signal)."""
+    A linked dir wins over an enabled ref of the same name (a local checkout is the stronger signal).
+
+    Returns (derived, collisions). `collisions` maps a name carried by >1 LOCAL marketplace to the list of
+    those marketplace names in declaration order — the LAST wins (unchanged last-alphabetically policy),
+    but the caller surfaces it (a reconcile `collision` note) so *which* marketplace's code loads is never
+    a silent choice (review Finding 2)."""
     derived = {}
+    collisions = {}                                       # name -> [mkt_name, ...] declaration order (last wins)
     for mkt_name, mk in sorted(marketplaces.items()):
         path = mk.get("path")
         if not path or not os.path.isdir(path):          # kind=global or a missing dir contributes nothing here
@@ -129,6 +149,9 @@ def derive_entries(marketplaces, settings_paths):
             tools = _manifest_tools(pdir)
             if not tools:                                 # no manifest -> not a plugin
                 continue
+            prior = derived.get(sub)
+            if prior is not None and prior.get("source") != mkt_name:   # same name, different marketplace
+                collisions.setdefault(sub, [prior["source"]]).append(mkt_name)
             m = meta.get(sub, {})
             derived[sub] = {
                 "type": "linked",
@@ -157,7 +180,7 @@ def derive_entries(marketplaces, settings_paths):
                 "description": "",                         # not derivable for a global plugin (hand-set allowed)
                 "install": "" if on else "global-disabled",
             }
-    return derived
+    return derived, collisions
 
 
 # ---------------------------------------------------------------- merge (existing index <- derived)
@@ -168,14 +191,14 @@ class Diff:
 
     def __init__(self):
         self.changes = []                                 # (action, name, detail): add | update | prune
-        self.notes = []                                   # (kind,   name, detail): preserve | drift
+        self.notes = []                                   # (kind,   name, detail): preserve | drift | collision
 
     @property
     def has_changes(self):
         return bool(self.changes)
 
     def counts(self):
-        c = {"add": 0, "update": 0, "prune": 0, "preserve": 0, "drift": 0}
+        c = {"add": 0, "update": 0, "prune": 0, "preserve": 0, "drift": 0, "collision": 0}
         for action, _, _ in self.changes:
             c[action] += 1
         for kind, _, _ in self.notes:
@@ -233,10 +256,15 @@ def _merge_entry(cur, der):
     return merged, changes, drift
 
 
-def reconcile_plugins(existing_plugins, derived, *, prune):
+def reconcile_plugins(existing_plugins, derived, *, prune, collisions=None):
     """Merge `derived` (from derive_entries) into `existing_plugins` (the raw doc['plugin'] table, an
-    entry being a scalar dict possibly plus nested per-tool tables). Returns (new_plugins, Diff)."""
+    entry being a scalar dict possibly plus nested per-tool tables). Returns (new_plugins, Diff).
+    `collisions` (name -> [mkt, ...]) becomes an informational `collision` note per colliding name — the
+    winner (last marketplace) is unchanged, just no longer silent (review Finding 2)."""
     diff = Diff()
+    for name in sorted(collisions or {}):
+        mkts = collisions[name]
+        diff.notes.append(("collision", name, f"in [{', '.join(mkts)}] — using {mkts[-1]}"))
     new = {}
     for name in sorted(set(existing_plugins) | set(derived)):
         cur = dict(existing_plugins.get(name) or {})
@@ -314,23 +342,50 @@ def render_index(marketplaces, plugins, header=HEADER):
 
 
 # ---------------------------------------------------------------- top-level pass (read -> merge -> render)
+def _load_index_doc(index_path):
+    """The ONE raw read the WRITE paths (reconcile / add) share. Returns (doc, existing_text) and draws
+    the safety line the whole review turns on:
+      • ABSENT file, or py<3.11 with no `tomllib`  -> ({}, "")            start fresh (unchanged behavior).
+      • EMPTY / whitespace-only file               -> ({}, existing_text) start fresh (a blank file is
+        not "curated data at risk"; overwriting it loses nothing).
+      • PRESENT + non-empty but WON'T PARSE        -> raise IndexParseError — the caller ABORTs and writes
+        NOTHING, so a lone typo can never regenerate the file from sources and drop hand-authored data.
+    An OSError reading a file that exists is also an abort: we can't confirm it's empty, so we refuse to
+    treat it as empty and clobber it. (config.load_plugin_index does its OWN tolerant read for LAUNCH —
+    it must fail open and is deliberately NOT routed through here.)"""
+    if not tomllib or not os.path.exists(index_path):
+        return {}, ""
+    try:
+        with open(index_path, encoding="utf-8") as f:
+            existing_text = f.read()
+    except OSError as e:
+        raise IndexParseError(index_path, e) from e
+    if not existing_text.strip():                         # empty / whitespace-only -> start fresh, no loss
+        return {}, existing_text
+    try:
+        return tomllib.loads(existing_text), existing_text
+    except ValueError as e:                               # tomllib.TOMLDecodeError subclasses ValueError
+        raise IndexParseError(index_path, e) from e
+
+
+def assert_index_parseable(index_path):
+    """Raise IndexParseError if the existing index is present-but-unparseable; a no-op otherwise. Lets a
+    WRITE path that has other side-effects to sequence (e.g. `add --as linked` clones a repo) fail BEFORE
+    doing them, so a malformed index aborts having truly touched nothing."""
+    _load_index_doc(index_path)
+
+
 def run_reconcile(index_path, marketplaces, settings_paths, *, prune):
-    """One reconcile pass. Reads the raw existing index at `index_path` (absent/malformed -> empty),
-    derives from the sources, merges, and renders — but WRITES NOTHING (the caller decides, so --dry-run
-    is just "don't write"). Returns (new_text, diff, existing_text). `marketplaces` is the resolved map
-    from config.load_plugin_index()['marketplaces']; `settings_paths` are the claude settings JSONs."""
-    existing_text, doc = "", {}
-    if tomllib and os.path.exists(index_path):
-        try:
-            with open(index_path, encoding="utf-8") as f:
-                existing_text = f.read()
-            doc = tomllib.loads(existing_text)
-        except (OSError, ValueError):
-            doc = {}
+    """One reconcile pass. Reads the raw existing index at `index_path` (absent/empty -> start fresh;
+    present-but-unparseable -> raise IndexParseError, so the caller ABORTs and writes nothing), derives
+    from the sources, merges, and renders — but WRITES NOTHING (the caller decides, so --dry-run is just
+    "don't write"). Returns (new_text, diff, existing_text). `marketplaces` is the resolved map from
+    config.load_plugin_index()['marketplaces']; `settings_paths` are the claude settings JSONs."""
+    doc, existing_text = _load_index_doc(index_path)
     raw_marketplaces = doc.get("marketplace") or {}       # re-emitted verbatim (relative paths preserved)
     existing_plugins = doc.get("plugin") or {}
-    derived = derive_entries(marketplaces, settings_paths)
-    new_plugins, diff = reconcile_plugins(existing_plugins, derived, prune=prune)
+    derived, collisions = derive_entries(marketplaces, settings_paths)
+    new_plugins, diff = reconcile_plugins(existing_plugins, derived, prune=prune, collisions=collisions)
     new_text = render_index(raw_marketplaces, new_plugins)
     return new_text, diff, existing_text
 
@@ -416,15 +471,9 @@ def infer_technique(ref, marketplace_opt, as_opt, marketplaces):
 
 def _read_raw_index(index_path):
     """Read the raw plugins.toml at `index_path` -> (raw_marketplaces, raw_plugins, existing_text). An
-    absent/malformed file -> ({}, {}, "") (never an error), matching run_reconcile's tolerance."""
-    existing_text, doc = "", {}
-    if tomllib and os.path.exists(index_path):
-        try:
-            with open(index_path, encoding="utf-8") as f:
-                existing_text = f.read()
-            doc = tomllib.loads(existing_text)
-        except (OSError, ValueError):
-            doc = {}
+    absent/empty file -> ({}, {}, existing_text) (start fresh); a present-but-unparseable file raises
+    IndexParseError (so `add` ABORTs rather than clobbering hand-authored data), matching run_reconcile."""
+    doc, existing_text = _load_index_doc(index_path)
     return (doc.get("marketplace") or {}), (doc.get("plugin") or {}), existing_text
 
 

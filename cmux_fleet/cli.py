@@ -1163,8 +1163,13 @@ def _cmd_plugins_reconcile(rest):
     a = ap.parse_args(rest)
 
     index = load_plugin_index()
-    new_text, diff, existing_text = fp.run_reconcile(
-        PLUGIN_INDEX, index["marketplaces"], _claude_settings_paths(), prune=a.prune)
+    try:
+        new_text, diff, existing_text = fp.run_reconcile(
+            PLUGIN_INDEX, index["marketplaces"], _claude_settings_paths(), prune=a.prune)
+    except fp.IndexParseError as e:
+        print(f"[fleet] plugins reconcile: existing index {e.path} is malformed ({e.cause}); "
+              f"refusing to overwrite it — fix or delete it, then re-run.", file=sys.stderr)
+        return 2
     wrote = False
     if not a.dry_run and new_text != existing_text:
         os.makedirs(os.path.dirname(os.path.abspath(PLUGIN_INDEX)), exist_ok=True)
@@ -1183,7 +1188,7 @@ def _cmd_plugins_reconcile(rest):
         return 0
 
     sym = {"add": "+", "update": "~", "prune": "-"}
-    note_sym = {"preserve": "=", "drift": "!"}
+    note_sym = {"preserve": "=", "drift": "!", "collision": "!"}
     print(f"fleet plugins reconcile — index {PLUGIN_INDEX}")
     for action, n, d in diff.changes:
         print(f"  {sym[action]} {action:8} {n:24} {d}")
@@ -1192,7 +1197,7 @@ def _cmd_plugins_reconcile(rest):
     if not diff.changes and not diff.notes:
         print("  (index already in sync with sources)")
     print(f"  {counts['add']} added, {counts['update']} updated, {counts['prune']} pruned, "
-          f"{counts['preserve']} preserved, {counts['drift']} drift")
+          f"{counts['preserve']} preserved, {counts['drift']} drift, {counts['collision']} collision")
     if a.dry_run:
         print("  [dry-run] nothing written")
     elif wrote:
@@ -1345,6 +1350,12 @@ def _add_linked(a, name, note, marketplaces):
     if a.dry_run:
         print(f"[dry-run] {plan}\n[dry-run] nothing cloned or written")
         return 0
+    try:                                                     # bail BEFORE cloning if the index won't parse
+        fp.assert_index_parseable(PLUGIN_INDEX)
+    except fp.IndexParseError as e:
+        print(f"[fleet] plugins add: existing index {e.path} is malformed ({e.cause}); refusing to "
+              f"overwrite it — fix or delete it, then re-run. (Nothing cloned.)", file=sys.stderr)
+        return 2
     if os.path.exists(dest):
         print(f"[fleet] plugins add: destination already exists ({dest}); skipping clone, reconciling.")
     else:
@@ -1363,7 +1374,8 @@ def _add_linked(a, name, note, marketplaces):
             print(f"[fleet] plugins add: clone/copy failed: {detail}", file=sys.stderr)
             return 1
     # reconcile the LINKED channel ONLY (settings_paths=[]): the enabled channel is never scanned or
-    # written by an `add linked`, and existing enabled index entries are preserved untouched.
+    # written by an `add linked`, and existing enabled index entries are preserved untouched. (The index
+    # was already checked parseable above, before the clone, so this cannot raise IndexParseError.)
     new_text, _diff, existing_text = fp.run_reconcile(PLUGIN_INDEX, marketplaces, [], prune=False)
     if new_text != existing_text:
         os.makedirs(os.path.dirname(os.path.abspath(PLUGIN_INDEX)), exist_ok=True)
@@ -1392,7 +1404,12 @@ def _add_enabled(a, name, note):
     if a.dry_run:
         print(f"[dry-run] {plan}\n[dry-run] nothing installed or written")
         return 0
-    new_text, _existing = fp.add_enabled_index_text(PLUGIN_INDEX, name, source)
+    try:
+        new_text, _existing = fp.add_enabled_index_text(PLUGIN_INDEX, name, source)
+    except fp.IndexParseError as e:
+        print(f"[fleet] plugins add: existing index {e.path} is malformed ({e.cause}); refusing to "
+              f"overwrite it — fix or delete it, then re-run.", file=sys.stderr)
+        return 2
     os.makedirs(os.path.dirname(os.path.abspath(PLUGIN_INDEX)), exist_ok=True)
     with open(PLUGIN_INDEX, "w", encoding="utf-8") as f:
         f.write(new_text)
