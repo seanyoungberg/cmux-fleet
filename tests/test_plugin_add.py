@@ -317,3 +317,62 @@ def test_add_linked_no_marketplace_stops(cli_env, tmp_path):
     p = run_fleet(env, "plugins", "add", str(src), expect=2)
     assert "no LOCAL marketplace" in (p.stdout + p.stderr)
     assert not index.exists()
+
+
+# ================================================================ SAFETY — malformed index ABORTS ===
+# A PRESENT-but-unparseable plugins.toml must ABORT the write (rc 2, file byte-unchanged) rather than
+# regenerate from sources — which would silently discard every hand-authored entry (review Finding 1).
+# `_MALFORMED` is a POPULATED index (a curated entry + a marketplace def) plus one junk line that breaks
+# the TOML parse — so the assertion "file byte-unchanged" proves the curated data was NOT lost.
+_MALFORMED = ('[marketplace.berg]\npath = "mkt/plugins"\n'
+              '[plugin.handmade]\ntype = "linked"\nsource = "berg"\ntools = ["claude"]\n'
+              'description = "curated by hand"\ncurated = true\n'
+              'this line is a typo that breaks the parse\n')
+
+
+def test_reconcile_aborts_on_malformed_index_file_unchanged(cli_env, tmp_path):
+    """`fleet plugins reconcile` on a malformed populated index -> rc 2, message names the file, and the
+    file is BYTE-UNCHANGED (the pre-fix behavior regenerated it from sources, losing the curated data)."""
+    mkt = tmp_path / "mkt" / "plugins"
+    mkt.mkdir(parents=True)
+    index = tmp_path / "plugins.toml"
+    index.write_text(_MALFORMED)
+    env = _env(cli_env, tmp_path, index=index, marketplace=mkt)
+    p = run_fleet(env, "plugins", "reconcile", expect=2)
+    assert "malformed" in (p.stdout + p.stderr) and str(index) in (p.stdout + p.stderr)
+    assert index.read_text() == _MALFORMED                   # curated data untouched
+
+
+def test_add_linked_aborts_on_malformed_index_nothing_cloned(cli_env, tmp_path):
+    """`add --as linked` on a malformed populated index -> rc 2, index BYTE-UNCHANGED, and NOTHING cloned
+    (the abort fires before the clone, so no stray checkout is left behind)."""
+    src = _mkplugin_src(tmp_path / "src", "newplug")
+    mkt = tmp_path / "mkt" / "plugins"
+    mkt.mkdir(parents=True)
+    index = tmp_path / "plugins.toml"
+    index.write_text(_MALFORMED)
+    env = _env(cli_env, tmp_path, index=index, marketplace=mkt)
+    p = run_fleet(env, "plugins", "add", str(src), "--as", "linked", expect=2)
+    assert "malformed" in (p.stdout + p.stderr) and str(index) in (p.stdout + p.stderr)
+    assert index.read_text() == _MALFORMED                   # curated data untouched
+    assert not (mkt / "newplug").exists()                    # bailed BEFORE cloning
+
+
+def test_add_enabled_aborts_on_malformed_index_file_unchanged(cli_env, tmp_path):
+    """`add name@marketplace` (enabled) on a malformed populated index -> rc 2, index BYTE-UNCHANGED."""
+    index = tmp_path / "plugins.toml"
+    index.write_text(_MALFORMED)
+    env = _env(cli_env, tmp_path, index=index)
+    p = run_fleet(env, "plugins", "add", "obsidian@obsidian-skills", expect=2)
+    assert "malformed" in (p.stdout + p.stderr) and str(index) in (p.stdout + p.stderr)
+    assert index.read_text() == _MALFORMED                   # curated data untouched
+
+
+def test_add_on_absent_index_starts_fresh(cli_env, tmp_path):
+    """Regression guard: the abort must NOT fire on the normal first-run path — an ABSENT index still lets
+    an enabled add create a fresh file with the new entry."""
+    index = tmp_path / "plugins.toml"                        # never created
+    env = _env(cli_env, tmp_path, index=index)
+    p = run_fleet(env, "plugins", "add", "obsidian@obsidian-skills")
+    assert "ENABLED" in p.stdout
+    assert tomllib.loads(index.read_text())["plugin"]["obsidian"]["type"] == "enabled"
