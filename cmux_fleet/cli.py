@@ -3433,7 +3433,7 @@ def main():
               "  mute <label> | unmute <label>                     stop/resume pushing a child's completions to its parent (parent reads on demand)\n"
               "  rm <label> [--detach] [--force] [--kill] [--wip-commit] [--with-group]\n"
               "                                                    close + archive a label (revivable; refuses mid-turn, --force overrides); --detach drops the row only; --kill adds worktree teardown; --with-group dissolves its workspace-group\n"
-              "  vitals [--json] [--paint]                         cheapest-first triage table + each agent's context-remaining %\n"
+              "  vitals [--json] [--paint] [--watch [--interval N]] cheapest-first triage table + each agent's context-remaining %\n"
               "  find <query> [--turns N] [--json]                 content-aware session lookup (label/role/cwd or transcript)\n"
               "  graph [--html] [--out FILE]                       fleet parentage tree (text, or self-contained HTML)\n"
               "  serve [--port N]                                  thin read-only localhost view (graph HTML + vitals.json); no daemon\n"
