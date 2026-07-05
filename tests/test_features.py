@@ -365,3 +365,27 @@ def test_fit_truncates():
     ff = _ff()
     assert ff._fit("short", 10) == "short"
     assert ff._fit("a-very-long-label-here", 8) == "a-very-…"
+
+
+# ── vitals watch/dock render + change-fingerprint ─────────────────────────────────────────────
+def test_render_vitals_carries_the_board():
+    ff = _ff()
+    _c = dict(effort="high", cwd="/Users/x/repo")            # snapshot fields the _row helper omits
+    rows = [dict(_row("alpha", state="working", ctx_used=100000, ctx_pct_remaining=50, last_text="doing X"), **_c),
+            dict(_row("bravo", state="needs-input", ctx_used=180000, ctx_pct_remaining=10, last_text="blocked"), **_c)]
+    out = ff._render_vitals(rows)
+    assert "FLEET VITALS (2)" in out and "alpha" in out and "bravo" in out
+    assert "doing X" in out and "blocked" in out
+    assert "1 near-full" in out and "bravo" in out.split("near-full")[1]   # <=30% flagged in footer
+
+
+def test_vitals_fp_excludes_age_but_tracks_meaning():
+    ff = _ff()
+    base = _row("a", state="working", ctx_pct_remaining=50, last_text="hi")
+    # idle/last-age tick every second — must NOT move the fingerprint (else the dock loop churns)
+    older = dict(base, last_age_s=999)
+    assert ff._vitals_fp([base]) == ff._vitals_fp([older])
+    # a real change (state / ctx / last-text) MUST move it
+    assert ff._vitals_fp([base]) != ff._vitals_fp([dict(base, state="needs-input")])
+    assert ff._vitals_fp([base]) != ff._vitals_fp([dict(base, ctx_pct_remaining=49)])
+    assert ff._vitals_fp([base]) != ff._vitals_fp([dict(base, last_text="bye")])

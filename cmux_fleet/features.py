@@ -340,12 +340,51 @@ def _fit(s, w):
 
 
 # ─── vitals: cheapest-first triage table (+ context-remaining %) ───────────────────────────────
+def _render_vitals(rows):
+    """Render the vitals board to a single string (the human table). Pure: no I/O. Shared by the
+    one-shot `fleet vitals` and the `--watch` dock loop so they never drift."""
+    lines = [f"FLEET VITALS ({len(rows)})   ctx = used / REAL per-agent window",
+             f"    {'label':<17}{'state':<12}{'ctx-left':<15}{'model':<13}{'eff':<7}{'cwd':<17}{'idle':<6}last"]
+    for r in rows:
+        glyph = {"error": "✗", "needs-input": "◍", "review": "⊙", "working": "▶",
+                 "done": "✓", "idle": "·", "pending": "…", "stale": "?", "gone": "✗"}.get(r["state"], "·")
+        muted = " M" if r["muted"] else ""
+        lines.append(f"  {glyph} {_fit(r['label'], 16):<17}{r['state']:<12}{_ctx(r):<15}"
+                     f"{_fit(_short_model(r['model']), 12):<13}{_fit(r['effort'] or '-', 6):<7}"
+                     f"{_fit(_short_cwd(r['cwd']), 16):<17}{_age(r['last_age_s']):<6}{_fit(r['last_text'], 26)}{muted}")
+    near = [r for r in rows if r["ctx_pct_remaining"] is not None and r["ctx_pct_remaining"] <= 30]
+    if near:
+        lines.append(f"\n  ! {len(near)} near-full (<=30% ctx left): "
+                     + ", ".join(r["label"] for r in near) + "  — recycle candidates")
+    lines.append("\n(ctx = context REMAINING % of each agent's window — an explicit [1m]/[200k] flavor on the "
+                 "launched model wins; else the fleet's declared window ([fleet].context_window); '—' = no usage "
+                 "yet / unparseable. A bare model can't disambiguate 200k vs 1M, so we don't guess it. role in --json.)")
+    return "\n".join(lines)
+
+
+def _vitals_fp(rows):
+    """Change-fingerprint for the watch loop: the fields that mean 'the board meaningfully changed'.
+    Deliberately EXCLUDES idle/last-age (they tick every second → would force churn). A heartbeat in
+    the loop refreshes ages anyway. Mirrors the on-change-only discipline of `_paint`."""
+    return "\n".join(f"{r['label']}|{r['state']}|{r['ctx_pct_remaining']}|{r['last_text']}" for r in rows)
+
+
 def cmd_vitals(argv):
-    """fleet vitals [--json] [--paint]   one-glance triage: who needs you, who's near-full.
-    Rows are most-urgent first (error/needs-input/review/working/done/idle). `ctx` is context-REMAINING
-    % from each agent's transcript token usage — a `!` marks <=30% left (recycle candidate, Berg's ask)."""
+    """fleet vitals [--json] [--paint] [--watch [--interval N]]   one-glance triage: who needs you, who's
+    near-full. Rows are most-urgent first (error/needs-input/review/working/done/idle). `ctx` is context-
+    REMAINING % from each agent's transcript token usage — a `!` marks <=30% left (recycle candidate).
+    `--watch` is the dock-pane mode: clears+reprints only on the fleet's change-fingerprint (no churn)."""
     as_json = "--json" in argv
     paint = "--paint" in argv
+    watch = "--watch" in argv
+    interval = 2.0
+    if "--interval" in argv:
+        try:
+            interval = max(0.5, float(argv[argv.index("--interval") + 1]))
+        except (ValueError, IndexError):
+            interval = 2.0
+    if watch and not as_json:
+        return _watch_vitals(paint, interval)
     rows = snapshot()
     if paint:
         _paint(rows)
@@ -355,23 +394,32 @@ def cmd_vitals(argv):
     if not rows:
         print("(no live agents)")
         return 0
-    print(f"FLEET VITALS ({len(rows)})   ctx = used / REAL per-agent window")
-    print(f"    {'label':<17}{'state':<12}{'ctx-left':<15}{'model':<13}{'eff':<7}{'cwd':<17}{'idle':<6}last")
-    for r in rows:
-        glyph = {"error": "✗", "needs-input": "◍", "review": "⊙", "working": "▶",
-                 "done": "✓", "idle": "·", "pending": "…", "stale": "?", "gone": "✗"}.get(r["state"], "·")
-        muted = " M" if r["muted"] else ""
-        print(f"  {glyph} {_fit(r['label'], 16):<17}{r['state']:<12}{_ctx(r):<15}"
-              f"{_fit(_short_model(r['model']), 12):<13}{_fit(r['effort'] or '-', 6):<7}"
-              f"{_fit(_short_cwd(r['cwd']), 16):<17}{_age(r['last_age_s']):<6}{_fit(r['last_text'], 26)}{muted}")
-    near = [r for r in rows if r["ctx_pct_remaining"] is not None and r["ctx_pct_remaining"] <= 30]
-    if near:
-        print(f"\n  ! {len(near)} near-full (<=30% ctx left): "
-              + ", ".join(r["label"] for r in near) + "  — recycle candidates")
-    print("\n(ctx = context REMAINING % of each agent's window — an explicit [1m]/[200k] flavor on the "
-          "launched model wins; else the fleet's declared window ([fleet].context_window); '—' = no usage "
-          "yet / unparseable. A bare model can't disambiguate 200k vs 1M, so we don't guess it. role in --json.)")
+    print(_render_vitals(rows))
     return 0
+
+
+def _watch_vitals(paint, interval):
+    """Dock-pane loop: poll `snapshot()` every `interval`s; repaint the terminal only when the board's
+    change-fingerprint moves (or on a slow heartbeat, so idle ages don't freeze). Uses ANSI cursor-home
+    + clear-to-end instead of a full `clear` so the board sits still and readable instead of flashing."""
+    HOME_CLEAR = "\x1b[H\x1b[J"            # cursor home, then erase from cursor to end of screen
+    HEARTBEAT = 12.0                       # force a redraw at least this often (refresh idle ages)
+    prev_fp, last_draw = None, 0.0
+    try:
+        while True:
+            rows = snapshot()
+            if paint:
+                _paint(rows)
+            fp = _vitals_fp(rows)
+            now = time.time()
+            if fp != prev_fp or (now - last_draw) >= HEARTBEAT:
+                body = _render_vitals(rows) if rows else "(no live agents)"
+                sys.stdout.write(HOME_CLEAR + body + "\n")
+                sys.stdout.flush()
+                prev_fp, last_draw = fp, now
+            time.sleep(interval)
+    except KeyboardInterrupt:
+        return 0
 
 
 # ─── find: content-aware session lookup ────────────────────────────────────────────────────────
