@@ -1496,6 +1496,15 @@ def _pid_for_surface(surface):
     return None
 
 
+def _surface_pids(surface):
+    """The set of pids currently ALIVE on `surface` per the hook store — the pre-respawn safety
+    snapshot for the recycle verify: any of these still alive AFTER the respawn means the old agent
+    survived the kill, so we must NOT relaunch over it (the 'never type into a live TUI' invariant)."""
+    from . import state as fs
+    return {s.get("pid") for s in (_store().get("sessions") or {}).values()
+            if s.get("surfaceId") == surface and fs.pid_alive(s.get("pid"))}
+
+
 def cmd_ls(argv):
     """Reconcile the live registry against cmux's hook store. Flags STALE = registry says live but the
     surface has no live session (a closed tab / crash never fires an archive transition)."""
@@ -2184,6 +2193,54 @@ def cmd_register(argv):
     return 0
 
 
+def cmd_unstick(argv):
+    """Reap a FROZEN, dead-pid hook-store record for a label's surface -- the ghost a SessionEnd-less
+    death leaves (SIGKILL / abrupt kill / the SessionEnd store-write race, root-caused 2026-07-06),
+    which freezes agentLifecycle non-terminal ('running'/'idle'/'unknown') with a dead or None pid and
+    makes `fleet ls` show a false 'live', recycle refuse ('old session still ALIVE'), and the doctor
+    trust a dead 'running'. Clears the ghost from cmux's ~/.cmuxterm/*-hook-sessions.json WITHOUT the
+    hand-editing that the incident recovery needed. SAFETY: a record whose pid is ALIVE is NEVER touched --
+    if the surface's agent is genuinely live, unstick reaps nothing and says so; a surface holding BOTH
+    a live record and a dead ghost keeps the live one. --dry-run previews. With the ghost gone, `fleet
+    recycle <label>` / `revive` recover cleanly (a fresh SessionStart also self-cleans) -- unstick is the
+    belt to recycle's now-pid-aware suspenders, for when you want the record cleared without relaunching."""
+    from . import state as fs
+    ap = argparse.ArgumentParser(prog="fleet unstick", add_help=True)
+    ap.add_argument("label", nargs="?", help="registry label (default: self via $CMUX_SURFACE_ID)")
+    ap.add_argument("--surface", default="", help="target surface UUID directly (overrides label lookup)")
+    ap.add_argument("--dry-run", action="store_true", help="preview what would be reaped; touch nothing")
+    a = ap.parse_args(argv)
+    surf, label = a.surface, a.label
+    if not surf:
+        if not label:
+            label = fs.label_for_surface(os.environ.get("CMUX_SURFACE_ID", "")) or ""
+        if label:
+            surf = (fs.live_get(label) or {}).get("surface", "")
+        if not surf:
+            surf = os.environ.get("CMUX_SURFACE_ID", "")
+    if not surf:
+        sys.exit("[fleet] unstick: need a <label> (live in the registry) or --surface <uuid>.")
+    res = fs.reap_dead_surface_records(surf, dry_run=a.dry_run)
+    tag = f"{label} = " if label else ""
+    for lk in res["live_kept"]:
+        print(f"[fleet] unstick: {tag}surface {surf[:8]} has a LIVE record (session "
+              f"{(lk['sid'] or '')[:12]}, pid {lk['pid']}, {lk['life']}) -- left untouched.")
+    if not res["reaped"]:
+        print(f"[fleet] unstick: {tag}surface {surf[:8]} -- no frozen dead-pid records to reap "
+              f"(nothing stuck, or the agent is genuinely live).")
+        return 0
+    verb = "would reap" if a.dry_run else "reaped"
+    for r in res["reaped"]:
+        print(f"[fleet] unstick: {verb} ghost session {(r['sid'] or '')[:12]} "
+              f"(lifecycle {r['life']!r}, pid {r['pid']}, {r['file']}) on surface {surf[:8]}")
+    if not a.dry_run:
+        fs.log_event("unstick", label=label or "", surface=surf,
+                     reaped=[r["sid"] for r in res["reaped"]])
+        print(f"[fleet] unstick: {tag}surface {surf[:8]} cleared -- `fleet recycle "
+              f"{label or '<label>'}` or `fleet revive` will now recover it (or relaunch to self-clean).")
+    return 0
+
+
 # ---------------------------------------------------------------- sessions (list resumable priors)
 def _tool_store(tool):
     """Just ONE tool's hook store (~/.cmuxterm/<tool>-hook-sessions.json), for TOOL-SCOPED surface reads —
@@ -2374,6 +2431,13 @@ def _quiet_gate(surf, timeout, force):
         return True          # --force = respawn now, no wait (consistent with rm --force). See docstring.
     def quiet():
         lc = fs.lifecycle(surf)
+        # A 'running' record on a DEAD process is a frozen ghost (SessionEnd-less death), NOT a live
+        # turn -- there is nothing to interrupt, so it counts as quiet. Without this a self-bricked
+        # agent (the 2026-07-06 dead-agent class: lifecycle frozen 'running', pid dead) could never be
+        # recovered by a plain `fleet recycle` -- the gate would block the full 180s and ABORT, forcing
+        # --force. The pid, not the string, is the authority (see _confirmed_gone).
+        if lc == "running" and not fs.surface_has_live_pid(surf):
+            return True
         return lc in ("idle", "needsInput", "unknown") and not _input_draft_nonempty(surf)
     end = time.time() + timeout
     while time.time() < end:
@@ -3056,20 +3120,34 @@ def _recycle_exec_one(p):
         except (ProcessLookupError, PermissionError):
             pass
 
+    def _confirmed_gone(old_pids):
+        """The old agent is gone iff EITHER cmux flipped the lifecycle TERMINAL ('', '-', 'ended' --
+        SessionEnd fired and cmux dropped/ended the record, the happy path) OR the PID is conclusive:
+        no live process remains on this surface AND none of the pids snapshotted pre-respawn is still
+        alive. The pid branch is the SessionEnd-freeze fix (root-caused 2026-07-06): an abrupt death
+        (SIGKILL) or a SessionEnd store-write race (the berg-sandbox incident) leaves the record frozen
+        NON-terminal ('running'/'idle'/'unknown') with a dead/None pid -- the lifecycle string is then a
+        permanent lie, but a dead pid cannot host a TUI, so the agent is provably gone and relaunch is
+        safe. Including the pre-respawn snapshot is the SAFETY FLOOR: if the ORIGINAL claude survived the
+        respawn (wedged cmux), its pid is STILL ALIVE -> not gone -> we correctly refuse and never type
+        into a live TUI (the exact failure the verify shipped to prevent)."""
+        if fs.lifecycle(surf) in ("", "-", "ended"):
+            return True
+        return not fs.surface_has_live_pid(surf) and not any(fs.pid_alive(p) for p in old_pids)
+
     def _respawn_and_verify(kill_first=False):
         """One respawn-pane attempt, verified by polling for the OLD claude session's death instead of
         a blind sleep. respawn-pane is ASYNC and normally near-instant, but `out=='OK'` means 'command
         accepted', NOT 'old process killed' -- the old claude actually dies a few seconds later (see the
-        module docstring above). We poll cmux's hook store for this surface's agentLifecycle to read a
-        TERMINAL state ('', '-', 'ended' -- the exact 'stale/non-live' vocabulary _bulk_targets/
-        _live_session_for already use elsewhere in this file for 'this surface's claude is dead'),
-        rather than testing raw sessions[] entry absence: cmux does not reliably DROP the old entry (see
-        the pre_sid comment below), but it does reliably flip agentLifecycle to a terminal value once the
-        SessionEnd hook fires, and that's the most-validated 'is the old TUI actually gone' signal this
-        codebase has. `kill_first` runs the cmux-independent SIGINTx2 fallback before respawning --
-        for when cmux itself was too wedged for respawn-pane's own kill to land. Returns True once
-        confirmed dead; False if `out` reports an error or the poll exhausts `_RESPAWN_VERIFY_TIMEOUT`
-        without ever seeing a terminal state."""
+        module docstring above). Confirmation is pid-aware (see _confirmed_gone): a terminal
+        agentLifecycle is the happy signal, but the AUTHORITATIVE one is 'the old pid is dead' -- because
+        a SessionEnd-less death (SIGKILL) or a cmux write race can freeze the lifecycle non-terminal
+        forever (the dead-agent brick class). We snapshot the surface's live pids BEFORE the respawn so
+        a claude that SURVIVES the kill (its pid still alive) can never be mistaken for gone. `kill_first`
+        runs the cmux-independent SIGINTx2 fallback before respawning -- for when cmux itself was too
+        wedged for respawn-pane's own kill to land. Returns True once confirmed dead; False if `out`
+        reports an error or the poll exhausts `_RESPAWN_VERIFY_TIMEOUT` while a live pid persists."""
+        old_pids = _surface_pids(surf)                    # pre-respawn safety snapshot (alive pids only)
         if kill_first:
             _direct_kill()
         out = cmuxq("respawn-pane", "--surface", surf, "--command", "exec /bin/zsh -il")
@@ -3078,12 +3156,41 @@ def _recycle_exec_one(p):
             return False
         end = time.time() + _RESPAWN_VERIFY_TIMEOUT
         while time.time() < end:
-            if fs.lifecycle(surf) in ("", "-", "ended"):
+            if _confirmed_gone(old_pids):
                 return True
             time.sleep(1)
-        return fs.lifecycle(surf) in ("", "-", "ended")
+        return _confirmed_gone(old_pids)
+
+    def _graceful_close(timeout=6):
+        """Close the OLD session GRACEFULLY before respawn-pane so cmux's lifecycle reaches a clean
+        terminal state and EVERY consumer (this verify, `fleet ls`, the fleet-doctor, vitals) sees
+        honest state -- not a frozen 'running' ghost. SIGINT x2 straight to the pid is claude's clean
+        TUI exit; empirically it fires SessionEnd even mid-turn (~0.5s; the 2026-07-06 sandbox matrix),
+        and cmux then drops the record. Best-effort + bounded: skips when the pid is already dead
+        (nothing to close -- the pid-aware verify handles the ghost), returns the instant the lifecycle
+        goes terminal or the process dies, and ALWAYS falls through to the respawn. This is an HONESTY
+        step, NOT the confirming signal: a fired SessionEnd can still be clobbered by a cmux write race
+        (the berg-sandbox incident), which is exactly why _confirmed_gone -- not this -- authorizes the
+        relaunch."""
+        import signal
+        pid = _pid_for_surface(surf)
+        if not pid or not fs.pid_alive(pid):
+            return                                        # already gone -> pid-aware verify confirms
+        log(f"graceful close: SIGINT x2 -> pid {pid} (let claude fire SessionEnd before respawn)")
+        try:
+            os.kill(int(pid), signal.SIGINT); time.sleep(0.5); os.kill(int(pid), signal.SIGINT)
+        except (ProcessLookupError, PermissionError, ValueError):
+            return
+        end = time.time() + timeout
+        while time.time() < end:
+            if fs.lifecycle(surf) in ("", "-", "ended") or not fs.pid_alive(pid):
+                log("graceful close: old session reached a clean terminal lifecycle (SessionEnd fired)")
+                return
+            time.sleep(0.5)
+        log("graceful close: no terminal lifecycle within window; proceeding to respawn (pid-verify decides)")
 
     log("quiet; respawn-pane -> fresh interactive shell (cmux kills the old agent in place)")
+    _graceful_close()
     if not _respawn_and_verify():
         log(f"respawn not confirmed within {_RESPAWN_VERIFY_TIMEOUT}s; falling back to a direct "
             "SIGINTx2 kill (cmux-independent) then re-respawning")
@@ -3427,6 +3534,7 @@ def main():
               "                                                    restart in place, same surface/identity (default self+RESUME; --fresh sheds; --use = index-aware plugin add, reaches linked + enabled)\n"
               "  recycle --all|--conductors|--children|--my-children [--include-muted] [--resume] [--dry-run]\n"
               "                                                    BULK restart (sequential + gated, skips self + muted); cross-conductor = the safe topology\n"
+              "  unstick [label] [--surface UUID] [--dry-run]      reap a frozen dead-pid hook-store ghost (SessionEnd-less death) so ls/recycle/doctor stop trusting a dead 'running'; never touches a LIVE record\n"
               "  sessions <label> [--all] [--json]                 list resumable prior sessions for the agent's surface (id, age, size, snippet)\n"
               "  broadcast \"<msg>\" [--target all|all-conductors|all-children|my-children] [--no-wake] [--expect-reply] [--dry-run]\n"
               "                                                    input-safe heads-up to live agents (e.g. after a toml/floor change); never restarts them\n"
@@ -3458,7 +3566,7 @@ def main():
     from . import helpers as fh
     fns = {"launch": cmd_launch, "config": cmd_config, "ls": cmd_ls, "plugins": cmd_plugins,
            "archive": cmd_archive, "revive": cmd_revive, "register": cmd_register, "recycle": cmd_recycle,
-           "sessions": cmd_sessions,
+           "unstick": cmd_unstick, "sessions": cmd_sessions,
            "_recycle-exec": cmd_recycle_exec, "_recycle-bulk-exec": cmd_recycle_bulk_exec,
            "broadcast": cmd_broadcast,
            "mute": lambda a: cmd_mute(a, mute=True), "unmute": lambda a: cmd_mute(a, mute=False),

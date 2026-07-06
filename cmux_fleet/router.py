@@ -329,6 +329,21 @@ def fleet_doctor_sweep(now=None):
             life = (rec.get("agentLifecycle") or "") if rec else ""
             ua = (rec.get("updatedAt") or 0) if rec else 0
 
+            # #0 dead-pid guard — a bound record on a DEAD process is a SessionEnd-less ghost (the
+            # 2026-07-06 dead-agent class: an abrupt kill or a SessionEnd store-write race freezes the
+            # lifecycle non-terminal with a dead/None pid), NOT a live member. Its frozen string would
+            # fire FALSE health alerts — worst of all a 'needsInput' ghost, which has NO freshness gate
+            # and would nudge the parent forever. The pid is authoritative: if it's dead, the member is
+            # DOWN, so suppress all three signals, re-arm their dedup, and log once. `fleet unstick`
+            # (or a `fleet recycle`, now pid-aware) clears the ghost record itself; the daemon only
+            # READS cmux's store, so it deliberately does not rewrite it here.
+            if rec and life not in ("", "-", "ended") and not fs.pid_alive(rec.get("pid")):
+                for r in ("stall", "needs-input", "low-ctx"):
+                    _doctor_fired.discard((r, label, session))
+                log(f"[fleet-doctor] {label}: bound record {life!r} on a DEAD pid {rec.get('pid')} "
+                    f"(surface {surface[:8]}) — down; suppressing health alerts. `fleet unstick {label}` to clear")
+                continue
+
             # #1 stall — bound 'running' record frozen in the RECENT window (STALL_S, STALL_WINDOW). A
             # missing/zero updatedAt never fires; a record stale for HOURS (a done-stuck ghost, not a live
             # stall) is above the window and skipped — see STALL_WINDOW. A real stall is caught fresh.

@@ -6,6 +6,43 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Fixed
+
+- **Dead-agent recycle brick — `fleet recycle` is now pid-aware (root cause: the
+  SessionEnd freeze).** A self-recycle that left its seat DEAD with a hook-store record
+  frozen at a non-terminal `agentLifecycle` (`running`) and a dead/`None` pid could never
+  be recovered: `_respawn_and_verify` confirmed "old agent gone" ONLY via a terminal
+  lifecycle string, which is **SessionEnd-driven** — and an abrupt death (SIGKILL) fires
+  no SessionEnd, while even a SessionEnd that *does* fire can be clobbered by a cmux
+  store-write race under load (the live 2026-07-05 berg-sandbox incident), leaving the
+  string frozen. Every recycle (even `--force`) then aborted forever ("old session still
+  ALIVE"). The confirm is now **pid-authoritative**: a terminal lifecycle is still the
+  happy signal, but a dead/`None` old pid is conclusive proof the agent is gone (a dead
+  pid cannot host a TUI). A pre-respawn snapshot of the surface's live pids is the safety
+  floor — if the original claude *survives* the respawn (wedged cmux), its pid is still
+  alive and the verify correctly refuses, never typing into a live TUI. The quiet-gate is
+  likewise pid-aware, so a frozen `running` ghost recovers on a plain `fleet recycle`
+  (no `--force`). Empirically grounded by a sandbox kill-mechanism matrix (SIGKILL freezes
+  the record; SIGTERM/SIGINT×2/respawn-pane fire SessionEnd and clear it).
+
+### Added
+
+- **Graceful session-close before respawn (`fleet recycle`).** Recycle now sends a bounded
+  SIGINT×2 to the old agent before `respawn-pane`, giving claude a moment to fire its
+  SessionEnd hook so cmux's lifecycle reaches a clean terminal state and every consumer
+  (`fleet ls`, the fleet-doctor, vitals) sees honest state instead of a frozen `running`
+  ghost. Best-effort and bounded — it always falls through to the respawn, and the
+  pid-aware verify (not this) authorizes the relaunch.
+- **`fleet unstick [label] [--surface UUID] [--dry-run]`.** Reaps a frozen dead-pid
+  hook-store ghost (the SessionEnd-less death) from cmux's `~/.cmuxterm/*-hook-sessions.json`
+  without hand-editing, so `ls`/`recycle`/the doctor stop trusting a dead `running`. Refuses
+  to touch a record whose pid is alive; a surface holding both a live record and a dead ghost
+  keeps the live one.
+- **fleet-doctor dead-pid guard.** The heartbeat sweep now suppresses health alerts for a
+  bound record whose process is dead (a down member reading as live) — chiefly the frozen
+  `needsInput` ghost, which has no freshness gate and would otherwise nudge the parent every
+  tick forever. Pid-gated: a live pid still alerts normally.
+
 ## [0.3.1] - 2026-07-01
 
 ### Fixed

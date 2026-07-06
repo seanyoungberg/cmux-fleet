@@ -459,6 +459,96 @@ def lifecycle(surface):
     return best
 
 
+# --- pid liveness + dead-record reaping (the SessionEnd-freeze backstop, 2026-07-06) --------
+# WHY: `lifecycle()` returns cmux's raw agentLifecycle, which is SessionEnd-driven. Empirically
+# (sandbox matrix, see the recycle-sessionend brief) an agent killed WITHOUT a clean SessionEnd —
+# SIGKILL/abrupt death, OR the incident's SessionEnd-store-write race under cmux load — leaves the
+# record FROZEN at its last value ('running'/'idle'/'unknown') with a DEAD or None pid. That string
+# is then a permanent lie: recycle's terminal-check never passes, ls shows a false 'live', the doctor
+# trusts a dead 'running'. The one signal that never lies is the PID: a dead/None pid == the agent is
+# gone, regardless of the lifecycle string. These helpers make the pid the authority for "is it gone".
+def pid_alive(pid):
+    """True iff `pid` is a live process. None/0/garbage -> False. os.kill(pid, 0) sends no signal but
+    raises ProcessLookupError for a dead pid; EPERM means it exists under another uid (still alive)."""
+    try:
+        os.kill(int(pid), 0)
+    except (TypeError, ValueError):
+        return False            # None / non-numeric
+    except ProcessLookupError:
+        return False            # no such process -> dead
+    except PermissionError:
+        return True             # exists, owned by another uid -> alive
+    except OSError:
+        return False
+    return True
+
+
+def surface_has_live_pid(surface):
+    """True iff any hook-store record for `surface` carries a live pid — the pid-authoritative answer
+    to 'is a real agent process still attached to this surface?' (used by recycle's respawn-verify to
+    refuse relaunching over a claude that survived the respawn, and to positively confirm death)."""
+    surf = (surface or "").upper()
+    for s in (read_hook_store().get("sessions") or {}).values():
+        if (s.get("surfaceId") or "").upper() == surf and pid_alive(s.get("pid")):
+            return True
+    return False
+
+
+def reap_dead_surface_records(surface, dry_run=False):
+    """Remove FROZEN, provably-dead session records for `surface` from cmux's per-tool hook stores
+    (~/.cmuxterm/<tool>-hook-sessions.json) — the ghost a SessionEnd-less death leaves behind. SAFETY:
+    a record whose pid is ALIVE is NEVER touched (that is a real live agent; a surface can legitimately
+    hold a live record AND a dead ghost — e.g. a recovered seat — and only the ghost is reaped). Also
+    clears activeSessionsBySurface / activeSessionsByWorkspace pointers that referenced a reaped session
+    so the surface reads as free. Returns {'reaped': [...], 'live_kept': [...], 'files': [...]}. Pure
+    read on dry_run. Note: cmux may hold its own in-memory copy; this fixes what the FLEET reads (the
+    file), which is what recycle/ls/doctor consult — a fresh SessionStart or cmux's own reap reconciles
+    cmux's UI afterward."""
+    surf = (surface or "").upper()
+    reaped, live_kept, files = [], [], []
+    for path in sorted(glob.glob(os.path.join(HOOKSTORE, "*-hook-sessions.json"))):
+        try:
+            d = json.load(open(path))
+        except Exception:
+            continue
+        sessions = d.get("sessions") or {}
+        drop = []
+        for sid, s in list(sessions.items()):
+            if (s.get("surfaceId") or "").upper() != surf:
+                continue
+            if pid_alive(s.get("pid")):
+                live_kept.append({"sid": sid, "pid": s.get("pid"), "life": s.get("agentLifecycle")})
+            else:
+                drop.append(sid)
+        if not drop:
+            continue
+        for sid in drop:
+            reaped.append({"sid": sid, "pid": sessions[sid].get("pid"),
+                           "life": sessions[sid].get("agentLifecycle"), "file": os.path.basename(path)})
+        if dry_run:
+            files.append(path)
+            continue
+        dropped_ids = set(drop) | {bare_uuid(x) for x in drop}
+        for sid in drop:
+            sessions.pop(sid, None)
+
+        def _points_at_dropped(v):
+            # cmux's active-pointer VALUE is a dict ({"sessionId": ..., "updatedAt": ...}); older/other
+            # shapes may store a bare sid string. Handle both, then match against the reaped sessions.
+            sid = v.get("sessionId") if isinstance(v, dict) else v
+            return sid in dropped_ids or bare_uuid(sid or "") in dropped_ids
+
+        abs_ = d.get("activeSessionsBySurface") or {}
+        for k in [k for k, v in abs_.items() if k.upper() == surf or _points_at_dropped(v)]:
+            abs_.pop(k, None)
+        abw = d.get("activeSessionsByWorkspace") or {}
+        for k in [k for k, v in abw.items() if _points_at_dropped(v)]:
+            abw.pop(k, None)
+        _atomic_write(path, json.dumps(d, indent=2))
+        files.append(path)
+    return {"reaped": reaped, "live_kept": live_kept, "files": files}
+
+
 # --- wake-gate liveness: staleness + bound-session cross-check (design 2.2a) ----------------
 # lifecycle() above returns the freshest record's RAW agentLifecycle (for display: `fleet ls`, vitals,
 # the cli.py liveness checks). The WAKE GATE needs a stricter question — "is this surface in a GENUINE,

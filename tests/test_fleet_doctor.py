@@ -7,6 +7,8 @@
 # Hermetic: the hook store is mocked (fs.read_hook_store), the wake is captured (fs.wake_if_idle) so
 # nothing shells out to cmux, and ctx is controlled via features._context_used. Inbox assertions read
 # the file-backed inbox, robust to module reloads.
+import os
+
 import pytest
 
 from cmux_fleet import router
@@ -17,6 +19,10 @@ NOW = 1_800_000_000.0
 STALL_S = router.STALL_S
 STALE_UA = NOW - (STALL_S + 60)            # frozen well past the stall threshold
 FRESH_UA = NOW - 5                          # a live turn re-stamped 5s ago
+# A LIVE member's hook-store record carries a live pid; the sweep's #0 dead-pid guard (2026-07-06)
+# treats a dead/None pid as a down ghost and suppresses its health alerts, so every "live member"
+# fixture below must model a live pid or the stall/needsInput/low-ctx cases would never fire.
+LIVE_PID = os.getpid()
 
 
 @pytest.fixture(autouse=True)
@@ -47,9 +53,9 @@ def _seed_parent_child(child_extra=None, session="claude-cccccccc-1111-2222-3333
     return session
 
 
-def _store(life, ua, surface="CHILD", sid="cccccccc-1111-2222-3333-444444444444", transcript=""):
+def _store(life, ua, surface="CHILD", sid="cccccccc-1111-2222-3333-444444444444", transcript="", pid=LIVE_PID):
     return {"sessions": {sid: {"sessionId": sid, "surfaceId": surface, "agentLifecycle": life,
-                               "updatedAt": ua, "transcriptPath": transcript}},
+                               "updatedAt": ua, "transcriptPath": transcript, "pid": pid}},
             "activeSessionsBySurface": {}}
 
 
@@ -188,6 +194,25 @@ def test_needs_input_does_not_fire_for_working_child(fs, monkeypatch, wake):
     assert fs.inbox_pending("PARENT", kind="doctor") == []
 
 
+# ── #0 dead-pid guard (the SessionEnd-freeze class, 2026-07-06) ────────────────────────────────────
+def test_dead_pid_ghost_suppresses_false_alerts(fs, monkeypatch, wake):
+    """A bound record frozen at 'needsInput' on a DEAD process is a SessionEnd-less ghost (an abrupt
+    kill or the SessionEnd store-write race), NOT a live wait. Because #3 has no freshness gate, without
+    the pid guard this ghost would nudge the parent EVERY tick, forever (the down-agent-reads-as-live
+    class). The pid is authoritative: a dead pid -> suppress, no alert."""
+    _seed_parent_child()
+    # freshly-frozen needsInput (would pass #3) but the process behind it is dead (pid does not exist).
+    monkeypatch.setattr(fs, "read_hook_store", lambda: _store("needsInput", NOW - 100, pid=999_999))
+    assert router.fleet_doctor_sweep(now=NOW) == 0                 # guard suppresses the false alert
+    assert fs.inbox_pending("PARENT", kind="doctor") == []
+    # a None pid (the exact berg-sandbox incident fingerprint) is likewise treated as down.
+    monkeypatch.setattr(fs, "read_hook_store", lambda: _store("running", STALE_UA, pid=None))
+    assert router.fleet_doctor_sweep(now=NOW) == 0
+    # and a LIVE pid on the same frozen record still alerts (the guard is pid-gated, not blanket-off).
+    monkeypatch.setattr(fs, "read_hook_store", lambda: _store("running", STALE_UA, pid=LIVE_PID))
+    assert router.fleet_doctor_sweep(now=NOW) == 1
+
+
 def test_needs_input_dedups_then_rearms_on_leaving(fs, monkeypatch, wake):
     _seed_parent_child()
     store = {"v": _store("needsInput", NOW - 100)}
@@ -272,9 +297,9 @@ def test_orphan_record_on_surface_does_not_mask_bound(fs, monkeypatch, wake):
     orphan_id = "22222222-2222-2222-2222-222222222222"
     _seed_parent_child(session=f"claude-{bound_id}")
     store = {"sessions": {
-        bound_id: {"sessionId": bound_id, "surfaceId": "CHILD",
+        bound_id: {"sessionId": bound_id, "surfaceId": "CHILD", "pid": LIVE_PID,
                    "agentLifecycle": "running", "updatedAt": STALE_UA, "transcriptPath": ""},
-        orphan_id: {"sessionId": orphan_id, "surfaceId": "CHILD",   # fresher, but NOT the bound session
+        orphan_id: {"sessionId": orphan_id, "surfaceId": "CHILD", "pid": LIVE_PID,  # fresher, but NOT the bound session
                     "agentLifecycle": "running", "updatedAt": NOW - 1, "transcriptPath": ""},
     }, "activeSessionsBySurface": {}}
     monkeypatch.setattr(fs, "read_hook_store", lambda: store)

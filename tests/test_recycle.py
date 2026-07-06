@@ -147,12 +147,27 @@ def test_quiet_gate_force_short_circuits_even_when_running(monkeypatch):
 
 
 def test_quiet_gate_noforce_blocks_while_running(monkeypatch):
-    # non-force on a 'running' surface still times out (False) — the no-half-kill guard is UNCHANGED.
+    # non-force on a GENUINELY LIVE 'running' surface still times out (False) — the no-half-kill guard is
+    # UNCHANGED. 'Genuinely live' = a live pid backs the record; the pid-aware quiet check only treats a
+    # 'running' record as quiet when its process is DEAD (a frozen ghost), which this is not.
     from cmux_fleet import state as fleet_state
     monkeypatch.setattr(fleet.time, "sleep", lambda *_: None)
     monkeypatch.setattr(fleet_state, "lifecycle", lambda surf: "running")
+    monkeypatch.setattr(fleet_state, "surface_has_live_pid", lambda surf: True)   # a real live turn
     monkeypatch.setattr(fleet, "_input_draft_nonempty", lambda surf: False)
     assert fleet._quiet_gate("S", 0.05, force=False) is False
+
+
+def test_quiet_gate_noforce_passes_a_dead_pid_running_ghost(monkeypatch):
+    # THE dead-agent recovery path: a record frozen 'running' whose PROCESS is dead (a SessionEnd-less
+    # death — SIGKILL or the store-write race) is NOT a live turn, so a plain `fleet recycle` must clear
+    # the gate immediately instead of blocking 180s to an ABORT (which forced --force before the fix).
+    from cmux_fleet import state as fleet_state
+    monkeypatch.setattr(fleet.time, "sleep", lambda *_: None)
+    monkeypatch.setattr(fleet_state, "lifecycle", lambda surf: "running")
+    monkeypatch.setattr(fleet_state, "surface_has_live_pid", lambda surf: False)  # process is dead -> ghost
+    monkeypatch.setattr(fleet, "_input_draft_nonempty", lambda surf: False)
+    assert fleet._quiet_gate("S", 0.05, force=False) is True
 
 
 def test_quiet_gate_noforce_gated_by_nonempty_draft(monkeypatch):
@@ -223,6 +238,11 @@ def test_verify_waits_out_a_slow_kill_before_launching(fs, monkeypatch):
     monkeypatch.setattr(fleet, "cmuxq", fake_cmuxq)
     monkeypatch.setattr(fleet, "poll_session", lambda surf, timeout=1: "")
     monkeypatch.setattr(fleet, "_poll_session_back", lambda *a, **k: "NEWSID")
+    # old agent still shows a LIVE pid (respawn's kill is slow) so the pid branch of the verify never
+    # short-circuits — confirmation must come from the terminal lifecycle flip, proving the poll. The
+    # graceful-close pre-step is a no-op here (no pid on record to close).
+    monkeypatch.setattr(fleet_state, "surface_has_live_pid", lambda surf: True)
+    monkeypatch.setattr(fleet, "_pid_for_surface", lambda surf: None)
     states = iter(["idle", "idle", "ended"])
     monkeypatch.setattr(fleet_state, "lifecycle", lambda surf: next(states, "ended"))
     assert fleet._recycle_exec_one(_base_payload()) == 0
@@ -252,6 +272,9 @@ def test_respawn_error_falls_back_to_direct_kill_then_succeeds(fs, monkeypatch):
     monkeypatch.setattr(fleet, "_poll_session_back", lambda *a, **k: "NEWSID")
     monkeypatch.setattr(fleet_state, "lifecycle", lambda surf: "ended")   # dead by the time we actually poll
     monkeypatch.setattr(fleet, "_pid_for_surface", lambda surf: 4242)
+    # graceful-close pre-step sees the pid as already gone -> skips (no SIGINT); this test isolates the
+    # respawn-error -> direct-kill FALLBACK path, whose SIGINTx2 is the only kill we expect to see.
+    monkeypatch.setattr(fleet_state, "pid_alive", lambda pid: False)
     killed = []
     monkeypatch.setattr(fleet.os, "kill", lambda pid, sig: killed.append((pid, sig)))
     assert fleet._recycle_exec_one(_base_payload()) == 0
@@ -281,6 +304,73 @@ def test_respawn_fails_even_after_fallback_aborts_without_launch(fs, monkeypatch
     assert not any(c[0] == "send" for c in calls)              # launch NEVER sent
     assert any(c[0] == "notify" for c in calls)                # desktop banner fired
     assert logged and logged[0][0] == "recycle_abort"
+
+
+# --- THE dead-agent brick, reproduced (2026-07-05 berg-sandbox; root-caused + fixed 2026-07-06) -------
+# A self-recycle left the seat DEAD with a hook-store record FROZEN at 'running' + pid None: no clean
+# SessionEnd fired (a SIGKILL-class death, or a cmux SessionEnd store-write race under load), so the
+# lifecycle never reached a terminal value. The OLD verify confirmed 'old agent gone' ONLY via a terminal
+# lifecycle string -> it never matched -> EVERY recycle (even --force) aborted forever ('old session still
+# ALIVE'). The pid-aware verify fixes it: a dead/None pid is conclusive proof the agent is gone.
+def test_dead_agent_frozen_running_pid_none_recycles_without_force(fs, monkeypatch):
+    from cmux_fleet import state as fleet_state
+    fleet_state.live_put("w", {"role": "w", "tool": "claude", "surface": "S", "cwd": "/x",
+                               "session": "claude-OLD", "kind": "child"})
+    monkeypatch.setattr(fleet.time, "sleep", lambda *_: None)
+    sent = []
+    def fake_cmuxq(*a, **k):
+        if a and a[0] == "respawn-pane":
+            return "OK"
+        sent.append(a)
+        return ""
+    monkeypatch.setattr(fleet, "cmuxq", fake_cmuxq)
+    # THE incident fingerprint: lifecycle frozen NON-terminal 'running', but the process is DEAD.
+    monkeypatch.setattr(fleet_state, "lifecycle", lambda surf: "running")
+    monkeypatch.setattr(fleet_state, "surface_has_live_pid", lambda surf: False)   # pid dead/None -> gone
+    monkeypatch.setattr(fleet, "_surface_pids", lambda surf: set())                # no live pid snapshot
+    monkeypatch.setattr(fleet, "_pid_for_surface", lambda surf: None)              # nothing to gracefully close
+    monkeypatch.setattr(fleet, "poll_session", lambda surf, timeout=1: "")
+    monkeypatch.setattr(fleet, "_poll_session_back", lambda *a, **k: "NEWSID")
+    logged = []
+    monkeypatch.setattr(fleet_state, "log_event", lambda event, **f: logged.append((event, f)))
+    # NO --force: recovery must work on the DEFAULT path (force was the pre-fix manual workaround). The
+    # pid-aware quiet-gate clears the frozen 'running' immediately (dead process = no live turn), and the
+    # pid-aware verify confirms the old agent gone, so the relaunch proceeds.
+    payload = {"label": "w", "surface": "S", "send_cmd": "cd /x && claude", "mode": "fresh",
+               "tool": "claude", "force": False, "prime": None, "old_session": "OLD", "cwd": "/x"}
+    assert fleet._recycle_exec_one(payload) == 0
+    assert any(c[0] == "send" for c in sent)                  # launch DID fire (confirmed + relaunched)
+    assert not any(c[0] == "notify" for c in sent)            # NOT the abort path
+    assert not any(e[0] == "recycle_abort" for e in logged)   # never aborted
+    assert fleet_state.live_get("w")["session"] == "claude-NEWSID"
+
+
+def test_dead_agent_recycle_refuses_when_old_pid_still_alive(fs, monkeypatch):
+    # SAFETY FLOOR: if respawn does NOT kill the old claude (wedged cmux) its pid stays ALIVE and the
+    # lifecycle is non-terminal -> the verify must NOT confirm-gone (never type into a live TUI). Abort.
+    from cmux_fleet import state as fleet_state
+    fleet_state.live_put("w", {"role": "w", "tool": "claude", "surface": "S", "cwd": "/x",
+                               "session": "claude-OLD", "kind": "child"})
+    monkeypatch.setattr(fleet.time, "sleep", lambda *_: None)
+    monkeypatch.setattr(fleet, "_RESPAWN_VERIFY_TIMEOUT", 0.05)                     # don't burn the 30s poll
+    calls = []
+    def fake_cmuxq(*a, **k):
+        calls.append(a)
+        return "OK" if a and a[0] == "respawn-pane" else ""
+    monkeypatch.setattr(fleet, "cmuxq", fake_cmuxq)
+    monkeypatch.setattr(fleet_state, "lifecycle", lambda surf: "running")          # never terminal
+    monkeypatch.setattr(fleet_state, "surface_has_live_pid", lambda surf: True)     # old claude SURVIVED
+    monkeypatch.setattr(fleet, "_surface_pids", lambda surf: {4242})                # pid still alive
+    monkeypatch.setattr(fleet_state, "pid_alive", lambda pid: True)
+    monkeypatch.setattr(fleet, "_pid_for_surface", lambda surf: None)               # graceful close no-op
+    monkeypatch.setattr(fleet.os, "kill", lambda pid, sig: None)
+    logged = []
+    monkeypatch.setattr(fleet_state, "log_event", lambda event, **f: logged.append((event, f)))
+    payload = {"label": "w", "surface": "S", "send_cmd": "cd /x && claude", "mode": "fresh",
+               "tool": "claude", "force": True, "prime": None, "old_session": "OLD", "cwd": "/x"}
+    assert fleet._recycle_exec_one(payload) == 1                  # ABORT
+    assert not any(c[0] == "send" for c in calls)                # never typed the launch into the live TUI
+    assert any(e[0] == "recycle_abort" for e in logged)
 
 
 def test_direct_kill_skips_quietly_with_no_known_pid(fs, monkeypatch):
