@@ -408,6 +408,42 @@ def ws_uuid_for_surface(surf):
     return ""
 
 
+def surface_ws_from_tree(tree_text, surf):
+    """Parse `cmux tree` TEXT -> the workspace UUID that CONTAINS `surf`, or '' if `surf` is not in the
+    tree (genuinely closed). PURE (no shell-out) so register's workspace derivation and the router's
+    move-vs-close arbiter share ONE parser and both stay unit-testable without a live cmux. Walks the
+    nested `window > workspace > pane > surface` lines exactly like surface_loc, tracking the most
+    recent workspace line seen before the matching surface line."""
+    import re
+    UUID = r"[0-9A-Fa-f]{8}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{12}"
+    ws = ""
+    for line in (tree_text or "").splitlines():
+        mw = re.search(r"workspace\s+workspace:\d+\s+(" + UUID + ")", line)
+        if mw:
+            ws = mw.group(1); continue
+        ms = re.search(r"surface\s+surface:\d+\s+(" + UUID + ")", line)
+        if ms and ms.group(1).upper() == surf.upper():
+            return ws
+    return ""
+
+
+def current_ws_for_surface(surf):
+    """The workspace UUID that CURRENTLY contains `surf`, from cmux's live TREE (the visual ground
+    truth), falling back to the hook store only when the tree can't be read. Prefer the TREE because the
+    hook store's workspaceId FREEZES when a surface is MOVED across workspaces (root cause #3) -- so
+    register/`move` record where the surface lives NOW, not where it was first bound. '' if unlocatable."""
+    return surface_ws_from_tree(cmuxq("tree", "--all", "--id-format", "both"), surf) or ws_uuid_for_surface(surf)
+
+
+def _all_workspace_uuids(tree_text):
+    """Every workspace UUID present in `cmux tree` TEXT (pure). Used to snapshot the workspace set
+    before/after a `workspace-group create` so `group init` can spot the empty scaffolding anchor cmux
+    spawns and close it (the 2026-07-02 empty-anchor footgun)."""
+    import re
+    UUID = r"[0-9A-Fa-f]{8}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{12}"
+    return {m.group(1) for m in re.finditer(r"workspace\s+workspace:\d+\s+(" + UUID + ")", tree_text or "")}
+
+
 def _ref_to_uuid(kind, ref):
     import re
     txt = cmuxq("tree", "--all", "--id-format", "both")
@@ -2251,7 +2287,12 @@ def cmd_register(argv):
 
     # derive tool + workspace + cwd from the SAME validated live record (bindings, not flags).
     tool = _tool_for_surface(surf) or src.get("tool", "claude")
-    ws = rec.get("workspaceId") or ws_uuid_for_surface(surf) or (surface_loc(surf)[0] or "")
+    # workspace from cmux GROUND TRUTH (the live tree), NOT the bound record's workspaceId: after a
+    # cross-workspace MOVE the hook-store workspaceId FREEZES at the OLD workspace (root cause #3), so
+    # trusting `rec` here re-registered moved children straight back into their old shared workspace
+    # (observed 2026-07-07: children re-registered to the shared ws, not their new 43/44/45).
+    # current_ws_for_surface reads the tree first; rec.workspaceId is only the last-ditch fallback.
+    ws = current_ws_for_surface(surf) or rec.get("workspaceId") or ""
     surf_cwd = rec.get("cwd") or _surface_cwd(surf) or ""
 
     # rebuild the spec: roster role (toml-authoritative, berg's proven recipe) > archive/live entry >
@@ -2281,6 +2322,206 @@ def cmd_register(argv):
           + ("; promoted from archive" if promoted else "")
           + ("; updated in place" if live and not arch else ""))
     return 0
+
+
+def _self_entry(surface_flag=""):
+    """(surface, label, entry) for the CALLING conductor: --surface override, else $CMUX_SURFACE_ID,
+    resolved to its registry row. entry is {} when the caller isn't a registered member."""
+    from . import state as fs
+    surf = surface_flag or os.environ.get("CMUX_SURFACE_ID", "")
+    label = fs.label_for_surface(surf) or ""
+    entry = (fs.live_get(label) or {}) if label else {}
+    return surf, label, entry
+
+
+def cmd_group(argv):
+    """Workspace-group management for the one-conductor-one-group layout (children grouped under their
+    conductor, matching berg-sandbox). Membership ops here NEVER move a surface, so agents stay live --
+    the SAFE lane (contrast `fleet move`, which relocates a live surface). Subcommands:
+
+      init [--name NAME] [--surface UUID]
+          Anchor THIS conductor's OWN existing workspace as a named group and RECORD it in the registry,
+          so `fleet launch --place workspace` children inherit + join it. Safe sequence: workspace-group
+          create --from <my-ws> -> set-anchor <my-ws> -> close any PROVABLY-EMPTY scaffolding anchor cmux
+          spawned (the 2026-07-02 footgun). Idempotent: a re-run on an existing group just re-records it.
+          NAME defaults to the conductor's label.
+
+      add <label> [--name NAME] [--surface UUID]
+          Retrofit an already-live child's workspace INTO the conductor's group via the surface-preserving
+          `workspace-group add` -- the child stays live (no move). Records the group on the child's row.
+    """
+    from . import state as fs
+    ap = argparse.ArgumentParser(prog="fleet group", add_help=True)
+    ap.add_argument("sub", choices=["init", "add"], help="init (anchor my workspace as a group) | add <label>")
+    ap.add_argument("label", nargs="?", help="child label (for `add`)")
+    ap.add_argument("--name", default="", help="group name (default: the conductor's label)")
+    ap.add_argument("--surface", default="", help="caller surface UUID (default $CMUX_SURFACE_ID)")
+    a = ap.parse_args(argv)
+
+    self_surf, self_label, self_entry = _self_entry(a.surface)
+    if not self_label or not self_entry:
+        sys.exit("[fleet] group: caller is not a registered member (need $CMUX_SURFACE_ID or --surface "
+                 "pointing at a live conductor). Run from the conductor, or pass --surface.")
+
+    if a.sub == "init":
+        name = a.name or self_entry.get("group") or self_label
+        my_ws = current_ws_for_surface(self_surf) or self_entry.get("workspace") or ""
+        if not my_ws:
+            sys.exit(f"[fleet] group init: cannot resolve {self_label}'s current workspace from cmux.")
+        gref = _group_ref(name)
+        if gref:                                            # group already exists -> just (re)record it
+            fs.live_put(self_label, {**self_entry, "group": name, "place": "workspace"})
+            fs.log_event("group-init", label=self_label, via="existing", group=name)
+            print(f"[fleet] group '{name}' ({gref}) already exists; recorded on {self_label}. "
+                  f"Children launched with --place workspace (no --group) now join it.")
+            return 0
+        # bootstrap: snapshot workspaces, create anchored on MY ws, set-anchor, close the empty scaffold.
+        before = _all_workspace_uuids(cmuxq("tree", "--all", "--id-format", "both"))
+        cmuxq("workspace-group", "create", "--name", name, "--from", my_ws)   # ALWAYS explicit --from
+        gref = _group_ref(name)
+        if not gref:
+            sys.exit(f"[fleet] group init: `workspace-group create` did not register a group named "
+                     f"'{name}'. No registry change. Inspect: cmux workspace-group list --json")
+        cmuxq("workspace-group", "set-anchor", "--group", gref, "--workspace", my_ws)  # my ws IS the anchor
+        after = _all_workspace_uuids(cmuxq("tree", "--all", "--id-format", "both"))
+        closed = []
+        for ws in sorted(after - before - {my_ws}):
+            if not _term_surface_in(ws):                    # PROVABLY empty -> the scaffolding anchor
+                cmuxq("close-workspace", "--workspace", ws)
+                closed.append(ws)
+            else:
+                print(f"[fleet] group init: note: new NON-empty workspace {ws} appeared; NOT closing "
+                      f"(inspect: cmux tree). It is not part of group '{name}'.")
+        fs.live_put(self_label, {**self_entry, "group": name, "place": "workspace"})
+        fs.log_event("group-init", label=self_label, via="bootstrap", group=name)
+        tail = f"; closed {len(closed)} empty scaffold workspace(s)" if closed else ""
+        print(f"[fleet] group '{name}' ({gref}) anchored on {self_label}'s workspace{tail}. "
+              f"Children launched with --place workspace (no --group) now join it.")
+        return 0
+
+    # --- add <label> ---------------------------------------------------------------------------
+    if not a.label:
+        sys.exit("[fleet] group add: need a child <label>.")
+    child = fs.live_get(a.label)
+    if not child:
+        sys.exit(f"[fleet] group add: '{a.label}' is not a live registry member.")
+    name = a.name or self_entry.get("group")
+    if not name:
+        sys.exit(f"[fleet] group add: {self_label} has no group yet -- run `fleet group init` first "
+                 f"(or pass --name).")
+    gref = _group_ref(name)
+    if not gref:
+        sys.exit(f"[fleet] group add: no cmux group named '{name}' (run `fleet group init`). "
+                 f"Inspect: cmux workspace-group list --json")
+    child_ws = current_ws_for_surface(child.get("surface", "")) or child.get("workspace") or ""
+    if not child_ws:
+        sys.exit(f"[fleet] group add: cannot resolve {a.label}'s current workspace from cmux.")
+    cmuxq("workspace-group", "add", "--group", gref, "--workspace", child_ws)   # SAFE: no surface move
+    fs.live_put(a.label, {**child, "group": name, "place": "workspace", "workspace": child_ws})
+    fs.log_event("group-add", label=a.label, via="workspace-group-add", group=name)
+    print(f"[fleet] added {a.label} (workspace {child_ws[:8]}) to group '{name}' ({gref}); "
+          f"surface preserved -- {a.label} stays live.")
+    return 0
+
+
+def cmd_move(argv):
+    """Relocate a LIVE child into another workspace ATOMICALLY -- the one safe verb that replaces the
+    manual `cmux move-* ` + `fleet register` recovery dance (the 2026-07-07 incident).
+
+      fleet move <label> (--to-workspace <ws> | --own-workspace) [--name TITLE]
+
+    Order (each step de-risks the next):
+      1. TOMBSTONE expected_close on the surface FIRST, so the router never mis-reads the move's
+         surface.closed frame as a real close and auto-archives the child (belt; the router's own
+         move-vs-close tree check is the suspenders -- defense in depth).
+      2. MOVE the surface: `move-surface --workspace <ws>` into an existing workspace, or
+         `move-tab-to-new-workspace` for --own-workspace (a fresh workspace; if the conductor has a
+         group, the new workspace is ADDED to it via the surface-preserving `workspace-group add`).
+      3. RECONCILE the registry `workspace`/`place`/`group` from cmux TREE ground truth (never the frozen
+         hook-store record -- root cause #3).
+      4. VERIFY the agent is still live and report; the surface/session are unchanged throughout.
+
+    NEVER archives and NEVER recycles -- same surface, same session, same identity, new workspace."""
+    from . import state as fs
+    ap = argparse.ArgumentParser(prog="fleet move", add_help=True)
+    ap.add_argument("label", help="the live child to relocate")
+    ap.add_argument("--to-workspace", default="", metavar="WS",
+                    help="target workspace UUID or workspace:<n> ref (must already exist)")
+    ap.add_argument("--own-workspace", action="store_true",
+                    help="move the child into a FRESH workspace (joins the conductor's group if one exists)")
+    ap.add_argument("--name", default="", help="title for the new workspace (--own-workspace; default: label)")
+    a = ap.parse_args(argv)
+    if bool(a.to_workspace) == bool(a.own_workspace):
+        sys.exit("[fleet] move: pass exactly one of --to-workspace <ws> | --own-workspace.")
+
+    child = fs.live_get(a.label)
+    if not child:
+        sys.exit(f"[fleet] move: '{a.label}' is not a live registry member (nothing to move).")
+    surf = child.get("surface", "")
+    if not surf:
+        sys.exit(f"[fleet] move: '{a.label}' has no surface recorded; cannot move.")
+    cur_ws = current_ws_for_surface(surf)
+    if not cur_ws:
+        sys.exit(f"[fleet] move: surface {surf[:8]} for '{a.label}' is not in cmux's tree (already closed?). "
+                 f"Use `fleet revive {a.label}` to relaunch, not move.")
+
+    # resolve the target BEFORE tombstoning/moving, so a bad target aborts with nothing touched.
+    target_uuid = ""
+    if a.to_workspace:
+        target_uuid = (a.to_workspace if _looks_like_uuid(a.to_workspace)
+                       else _ref_to_uuid("workspace", a.to_workspace))
+        if not target_uuid:
+            sys.exit(f"[fleet] move: could not resolve --to-workspace '{a.to_workspace}' to a workspace "
+                     f"(pass a UUID or a workspace:<n> ref). Inspect: cmux list-workspaces")
+        if target_uuid.upper() == cur_ws.upper():
+            print(f"[fleet] move: {a.label} is already in workspace {cur_ws[:8]}; nothing to do.")
+            return 0
+
+    # 1. suppress the spurious archive (belt) BEFORE any surface op emits surface.closed.
+    fs.expected_close_put(surf)
+
+    # 2. move the surface (UUID preserved).
+    if a.to_workspace:
+        cmuxq("move-surface", "--surface", surf, "--workspace", target_uuid, "--focus", "false")
+        new_group = child.get("group", "")               # group membership follows the target workspace
+    else:
+        cmuxq("move-tab-to-new-workspace", "--surface", surf, "--title", a.name or a.label,
+              "--focus", "false")
+        new_group = ""
+        pe = fs.live_get(child.get("parent") or "") or {}
+        gname = pe.get("group") or ""
+        gref = _group_ref(gname) if gname else ""
+        new_ws_early = current_ws_for_surface(surf)
+        if gref and new_ws_early:
+            cmuxq("workspace-group", "add", "--group", gref, "--workspace", new_ws_early)  # surface-preserving
+            new_group = gname
+
+    # 3. reconcile from TREE ground truth (root cause #3: never trust the frozen hook-store workspaceId).
+    new_ws = current_ws_for_surface(surf)
+    if not new_ws:
+        sys.exit(f"[fleet] move: after the move, surface {surf[:8]} could not be located in any workspace "
+                 f"-- NOT touching the registry. Inspect: cmux tree --all. (The expected-close tombstone "
+                 f"will lapse; if the surface is truly gone, `fleet register`/`revive` to recover.)")
+    fs.live_put(a.label, {**child, "workspace": new_ws, "place": "workspace", "group": new_group})
+    fs.log_event("moved", label=a.label, role=child.get("role"), session=child.get("session"),
+                 via="fleet-move")
+
+    # 4. verify liveness; a post-move hook-store desync is cosmetic (completions self-recover via the
+    # registry session), so warn rather than fail.
+    live_note = ""
+    if not fs.surface_has_live_agent(surf):
+        live_note = (f"\n[fleet]   note: cmux's hook store reads {a.label} as not-live post-move (a known "
+                     f"binding desync). Completions still route via the registry session; if `fleet ls` "
+                     f"shows STALE, `fleet recycle {a.label}` rebinds it.")
+    print(f"[fleet] moved {a.label}: surface {surf[:8]} {cur_ws[:8]} -> {new_ws[:8]}"
+          + (f" (group '{new_group}')" if new_group else "") + f"; same session, still live.{live_note}")
+    return 0
+
+
+def _looks_like_uuid(s):
+    import re
+    return bool(re.fullmatch(r"[0-9A-Fa-f]{8}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{12}",
+                             s or ""))
 
 
 def cmd_unstick(argv):
@@ -3652,7 +3893,7 @@ def cmd_profile(argv):
 
 def main():
     if len(sys.argv) < 2 or sys.argv[1] in ("-h", "--help"):
-        print("usage: fleet <launch|config|ls|plugins|archive|revive|register|recycle|unstick|sessions|broadcast|mute|unmute|rm|vitals|usage|find|graph|serve|paint|worktree|profile|daemon|drive-child|peer-msg|child-digest|inbox|inbox-ack> ...\n"
+        print("usage: fleet <launch|config|ls|plugins|archive|revive|register|recycle|move|group|unstick|sessions|broadcast|mute|unmute|rm|vitals|usage|find|graph|serve|paint|worktree|profile|daemon|drive-child|peer-msg|child-digest|inbox|inbox-ack> ...\n"
               "  launch <role|--adhoc NAME> [--tool t] [--place p] [--parent s] [--effort L] [--model M] [--use NAME] [--provider NAME] [--dry-run] [-- <tool flags>]\n"
               "  config <role|--adhoc NAME|--cwd DIR> [--tool t]   effective config (base settings + fleet adds)\n"
               "  ls [--scope mine|all|conductors|children] [--json] live fleet x hook store; flags STALE + archived (default mine = you + your children; --scope all = the world)\n"
@@ -3662,6 +3903,9 @@ def main():
               "                                                    bring a parked agent back (default RESUME last session; --fresh sheds; --session targets an arbitrary prior one)\n"
               "  register <label> [--surface UUID] [--parent s] [--session id]\n"
               "                                                    pull a LIVE-but-unregistered agent into the registry (recovery for a skipped auto-register)\n"
+              "  move <label> (--to-workspace WS | --own-workspace) [--name TITLE]\n"
+              "                                                    relocate a LIVE child to another workspace atomically (same surface/session; no archive, no recycle); --own-workspace joins the conductor's group\n"
+              "  group <init [--name N] | add <label> [--name N]>  make THIS conductor's workspace a named group (init) or retrofit a live child into it (add); membership ops keep agents live (the safe lane)\n"
               "  recycle [label] [--fresh] [--session id] [--effort L] [--model M] [--force] [--add-plugin N] [--use NAME] [--prime T|--no-prime] [-- <flags>]\n"
               "                                                    restart in place, same surface/identity (default self+RESUME; --fresh sheds; --use = index-aware plugin add, reaches linked + enabled)\n"
               "  recycle --scope mine|all|conductors|children [--include-muted] [--dry-run]\n"
@@ -3700,6 +3944,7 @@ def main():
     from . import helpers as fh
     fns = {"launch": cmd_launch, "config": cmd_config, "ls": cmd_ls, "plugins": cmd_plugins,
            "archive": cmd_archive, "revive": cmd_revive, "register": cmd_register, "recycle": cmd_recycle,
+           "move": cmd_move, "group": cmd_group,
            "unstick": cmd_unstick, "sessions": cmd_sessions,
            "_recycle-exec": cmd_recycle_exec, "_recycle-bulk-exec": cmd_recycle_bulk_exec,
            "broadcast": cmd_broadcast,

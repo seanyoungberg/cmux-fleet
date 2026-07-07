@@ -296,6 +296,7 @@ def test_handle_archives_registry_on_surface_closed(fs, monkeypatch):
     monkeypatch.setattr(router, "_reg", {"mtime": 0, "by_label": {}, "by_surface": {}})  # force a reload
     # the surface is already gone when the frame arrives -> binding capture yields {} (no cmux shell-out)
     monkeypatch.setattr(cli, "_resume_binding", lambda surf: {})
+    monkeypatch.setattr(router, "_surface_ws_now", lambda s: "")     # surface is GONE (a true close)
     waked = []
     monkeypatch.setattr(router, "maybe_idle_wake", lambda parent_surface, label: waked.append(parent_surface))
 
@@ -332,6 +333,7 @@ def test_handle_archives_muted_member_on_surface_closed(fs, monkeypatch):
     monkeypatch.setattr(router, "LIVE", True)
     monkeypatch.setattr(router, "_reg", {"mtime": 0, "by_label": {}, "by_surface": {}})
     monkeypatch.setattr(cli, "_resume_binding", lambda surf: {})
+    monkeypatch.setattr(router, "_surface_ws_now", lambda s: "")     # surface is GONE (a true close)
     monkeypatch.setattr(router, "maybe_idle_wake", lambda parent_surface, label: None)
 
     router.handle(_surface_closed_ev("MUTED"))
@@ -350,6 +352,7 @@ def test_handle_conductor_surface_closed_archives_without_alert(fs, monkeypatch)
     monkeypatch.setattr(router, "LIVE", True)
     monkeypatch.setattr(router, "_reg", {"mtime": 0, "by_label": {}, "by_surface": {}})
     monkeypatch.setattr(cli, "_resume_binding", lambda surf: {})
+    monkeypatch.setattr(router, "_surface_ws_now", lambda s: "")     # surface is GONE (a true close)
     waked = []
     monkeypatch.setattr(router, "maybe_idle_wake", lambda parent_surface, label: waked.append(parent_surface))
 
@@ -395,11 +398,80 @@ def test_handle_observe_mode_does_not_archive_on_surface_closed(fs, monkeypatch)
     fs.live_put("worker", {"surface": "CHILD", "kind": "child", "role": "w", "session": "claude-w"})
     monkeypatch.setattr(router, "LIVE", False)
     monkeypatch.setattr(router, "_reg", {"mtime": 0, "by_label": {}, "by_surface": {}})
+    monkeypatch.setattr(router, "_surface_ws_now", lambda s: "")     # surface is GONE (a true close)
 
     router.handle(_surface_closed_ev("CHILD"))
 
     assert fs.live_get("worker") is not None                          # untouched
     assert fs.archive_get("worker") is None
+
+
+# --- MOVE vs CLOSE: a surface that MOVED across workspaces still EXISTS, so it must NOT be archived ----
+# Root cause #3 / the 2026-07-07 incident: `cmux move-tab-to-new-workspace` emits surface.closed for the
+# moved surface even though it persists in its new workspace. The old handler read that as a close and
+# auto-archived three LIVE children. The fix positively confirms the surface against the live tree
+# (_surface_ws_now): a non-empty workspace == still alive == a MOVE, so skip the archive (and reconcile
+# the registry `workspace` so ls/graph stay honest even without `fleet move`).
+def test_handle_skips_archive_when_surface_moved(fs, monkeypatch):
+    """A surface.closed for a surface that STILL EXISTS (moved to a new workspace) must NOT archive the
+    child, must NOT alert the parent, and must reconcile the registry `workspace` to the new one."""
+    fs.live_put("parent", {"surface": "PARENT", "kind": "conductor", "role": "c",
+                           "session": "claude-parent"})
+    fs.live_put("worker", {"surface": "CHILD", "kind": "child", "role": "w", "parent": "parent",
+                           "tool": "claude", "session": "claude-worker-uuid", "cwd": "/tmp/w",
+                           "workspace": "WS-OLD"})
+    monkeypatch.setattr(router, "LIVE", True)
+    monkeypatch.setattr(router, "_reg", {"mtime": 0, "by_label": {}, "by_surface": {}})
+    monkeypatch.setattr(router, "_surface_ws_now", lambda s: "WS-NEW")   # surface PRESENT -> a MOVE
+    waked = []
+    monkeypatch.setattr(router, "maybe_idle_wake", lambda parent_surface, label: waked.append(parent_surface))
+
+    router.handle(_surface_closed_ev("CHILD"))
+
+    w = fs.live_get("worker")
+    assert w is not None                                             # NOT archived -- still live
+    assert w["workspace"] == "WS-NEW"                                # registry workspace reconciled
+    assert fs.archive_get("worker") is None                         # nothing parked
+    assert fs.inbox_pending("PARENT", kind="stale") == []           # parent NOT alerted (nothing wrong)
+    assert waked == []                                              # ...and no wake
+
+
+def test_handle_move_reconcile_is_observe_safe(fs, monkeypatch):
+    """OBSERVE mode detects the move but writes NOTHING (same contract as every observe path): the
+    registry workspace is left as-is; a LIVE router is the only one that reconciles it."""
+    fs.live_put("worker", {"surface": "CHILD", "kind": "child", "role": "w", "parent": "parent",
+                           "session": "claude-w", "workspace": "WS-OLD"})
+    monkeypatch.setattr(router, "LIVE", False)
+    monkeypatch.setattr(router, "_reg", {"mtime": 0, "by_label": {}, "by_surface": {}})
+    monkeypatch.setattr(router, "_surface_ws_now", lambda s: "WS-NEW")
+
+    router.handle(_surface_closed_ev("CHILD"))
+
+    assert fs.live_get("worker")["workspace"] == "WS-OLD"           # untouched in observe mode
+    assert fs.archive_get("worker") is None                        # and never archived
+
+
+def test_surface_ws_from_tree_parses_move_vs_close():
+    """The pure parser shared by register + the router: finds the workspace CONTAINING a surface, or ''
+    when the surface is absent (closed). No cmux shell-out."""
+    from cmux_fleet import cli
+    tree = (
+        "window window:1 9FBB70C6-7B17-4DA5-B54D-8FF3641D24E2\n"
+        "  workspace workspace:11 AAAAAAAA-0000-0000-0000-000000000011 \"old\"\n"
+        "    pane pane:15 CCCCCCCC-0000-0000-0000-0000000000c1\n"
+        "      surface surface:61 11111111-1111-1111-1111-111111111111 [terminal]\n"
+        "  workspace workspace:42 BBBBBBBB-0000-0000-0000-000000000042 \"new\"\n"
+        "    pane pane:56 CCCCCCCC-0000-0000-0000-0000000000c2\n"
+        "      surface surface:99 22222222-2222-2222-2222-222222222222 [terminal]\n"
+    )
+    # a surface present in the tree -> its CURRENT workspace (the arbiter says "moved, still alive")
+    assert cli.surface_ws_from_tree(tree, "22222222-2222-2222-2222-222222222222") \
+        == "BBBBBBBB-0000-0000-0000-000000000042"
+    assert cli.surface_ws_from_tree(tree, "11111111-1111-1111-1111-111111111111") \
+        == "AAAAAAAA-0000-0000-0000-000000000011"
+    # a surface NOT in the tree -> '' (genuinely closed -> the router archives)
+    assert cli.surface_ws_from_tree(tree, "DEADBEEF-0000-0000-0000-00000000dead") == ""
+    assert cli.surface_ws_from_tree("", "11111111-1111-1111-1111-111111111111") == ""
 
 
 # --- expected-close tombstone suppresses the spurious stale alert on a DELIBERATE CLI close (#5) -------

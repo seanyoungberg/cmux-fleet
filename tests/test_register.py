@@ -22,6 +22,9 @@ def _patch_cmux(monkeypatch, session="SESS", ws="WS-1", store=None, tool="claude
     rec = {"sessionId": session, "workspaceId": ws, "cwd": surf_cwd} if live else None
     monkeypatch.setattr(fleet, "_live_session_for", lambda surf: rec)
     monkeypatch.setattr(fleet, "ws_uuid_for_surface", lambda surf: ws)
+    # register derives the workspace from cmux TREE ground-truth (current_ws_for_surface), not the frozen
+    # bind record -- stub it so unit tests never shell out to `cmux tree`. Default: agrees with `ws`.
+    monkeypatch.setattr(fleet, "current_ws_for_surface", lambda surf: ws)
     monkeypatch.setattr(fleet, "_tool_for_surface", lambda surf: tool)
     monkeypatch.setattr(fleet, "_surface_cwd", lambda surf: surf_cwd)
     monkeypatch.setattr(fleet, "_is_roster", lambda role: roster)
@@ -41,6 +44,28 @@ def test_register_promotes_archived_with_explicit_surface(fs, monkeypatch):
     assert e["role"] == "homelab" and e["kind"] == "conductor" and e["workspace"] == "WS-1"
     assert e["plugins"] == ["a"] and e["flags"] == ["--f"]   # spec rebuilt from the archive entry
     assert fs.archive_get("homelab") is None            # archive->live promotion: shelf entry removed
+
+
+def test_register_uses_tree_workspace_not_frozen_bind_record(fs, monkeypatch):
+    # root cause #3 (2026-07-07): after a cross-workspace MOVE the bind record's workspaceId FREEZES at
+    # the OLD workspace, so register must record where the surface lives NOW (cmux tree ground-truth),
+    # not the frozen value -- else a moved child re-registers back into its old shared workspace.
+    fs.archive_put("moved", {"role": "moved", "tool": "claude", "kind": "child", "cwd": "/x/m",
+                             "place": "workspace", "group": "g"})
+    _patch_cmux(monkeypatch, session="S", ws="WS-OLD")   # frozen bind record + hook store both say OLD
+    monkeypatch.setattr(fleet, "current_ws_for_surface", lambda surf: "WS-NEW")   # the tree = ground truth
+    assert fleet.cmd_register(["moved", "--surface", "SURF-M", "--parent", "P"]) == 0
+    assert fs.live_get("moved")["workspace"] == "WS-NEW"   # tree wins over the frozen workspaceId
+
+
+def test_register_falls_back_to_bind_record_when_tree_unreadable(fs, monkeypatch):
+    # if the tree can't be read (current_ws_for_surface -> ''), fall back to the bind record's
+    # workspaceId rather than registering an empty workspace.
+    fs.archive_put("w", {"role": "w", "tool": "claude", "kind": "child", "cwd": "/x/w", "place": "tab"})
+    _patch_cmux(monkeypatch, session="S", ws="WS-REC")
+    monkeypatch.setattr(fleet, "current_ws_for_surface", lambda surf: "")   # tree unreadable
+    assert fleet.cmd_register(["w", "--surface", "SURF-W", "--parent", "P"]) == 0
+    assert fs.live_get("w")["workspace"] == "WS-REC"   # fell back to rec.workspaceId
 
 
 def test_register_discovers_surface_by_agent_label(fs, monkeypatch):

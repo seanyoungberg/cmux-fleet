@@ -253,6 +253,18 @@ def deliver(parent_surface, parent_label, child_entry, child_surface):
         log(f"[WOULD-QUEUE] {label} -> {parent_label} | {gist[:60]}")
 
 
+def _surface_ws_now(surface):
+    """The workspace UUID that CURRENTLY contains `surface` per cmux's live TREE, or '' when the surface
+    is GONE (truly closed). The move-vs-close arbiter for _archive_closed_surface: a MOVED surface
+    resolves to its NEW workspace (it still exists somewhere); a genuinely CLOSED one resolves to ''.
+    Ground truth is the TREE, never the hook store -- the per-surface hook record DESYNCS on a move (root
+    cause #3), so only the tree can tell a move from a close. Uses the router's own cmux() wrapper (which
+    swallows subprocess errors -> ''), so an unreadable tree fails CLOSED to '': a genuine external close
+    still archives, and the fix only ADDS a skip when the surface can be POSITIVELY located as alive."""
+    from . import cli                                    # lazy: cli is heavy and never imports router
+    return cli.surface_ws_from_tree(cmux("tree", "--all", "--id-format", "both"), surface)
+
+
 def _archive_closed_surface(ev):
     """surface.closed -> registry hygiene. The event IS the ground truth that a tracked member's surface
     just died (no lifecycle re-derivation needed): if the close came through `fleet rm`/`fleet archive`,
@@ -276,6 +288,27 @@ def _archive_closed_surface(ev):
         # NOT an accidental external close. The CLI already archived + reconciled the registry; skip the
         # duplicate archive AND the spurious `kind='stale'` "revive?" alert to the parent (fleet-doctor #5).
         log(f"[stale] skip {label}: expected CLI close (surface {surface[:8]})")
+        return
+    # MOVE-vs-CLOSE (root cause #3, the 2026-07-07 incident): cmux emits surface.closed when a surface
+    # LEAVES a workspace -- including a cross-workspace MOVE, where the surface still EXISTS in its new
+    # workspace. Archiving here would EVICT a live child (three moved children auto-archived that day).
+    # POSITIVELY confirm against the live tree: if the surface resolves to a workspace it MOVED, not
+    # closed -> never archive, never alert (nothing is wrong). Reconcile the registry `workspace` to
+    # where it lives NOW so ls/graph stay honest even for a RAW `cmux move` (no `fleet move`); the
+    # completion lane already self-recovers via _member_by_session, so `workspace` is the last stale
+    # field. Fails CLOSED (ws_now == '' on an unreadable tree) so a genuine external close still archives.
+    ws_now = _surface_ws_now(surface)
+    if ws_now:
+        clean = registry()["by_label"].get(label)
+        moved = bool(clean and clean.get("workspace") != ws_now)
+        if LIVE and moved:
+            fs.live_put(label, {**clean, "workspace": ws_now})
+            fs.log_event("moved", label=label, role=entry.get("role"), session=entry.get("session"),
+                         via="surface-move")
+        log(f"[move] {label}: surface {surface[:8]} still present in workspace {ws_now[:8]} "
+            f"(MOVED, not closed); no archive"
+            + ("; reconciled registry workspace" if (LIVE and moved) else "")
+            + ("; (observe) would reconcile workspace" if (not LIVE and moved) else ""))
         return
     if not LIVE:
         log(f"[stale] (observe) would archive {label}: surface {surface[:8]} closed outside fleet CLI")
