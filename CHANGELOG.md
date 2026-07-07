@@ -6,6 +6,19 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [0.6.0] - 2026-07-07
+
+### Added
+
+- **Provider config + usage tracking (`[providers]`, `fleet usage`, `--provider`)** — a `[providers]` section
+  in `fleet.toml` (per tool: subscription/api/vertex; current accounts as defaults, inert until configured);
+  a Claude usage poller (`GET /api/oauth/usage` → 5h / 7day / Fable-scoped / metered) and a codex usage poller
+  (newest rollout `rate_limits`, zero-auth, stale-flagged) driven on the daemon timer; a read-only
+  `fleet usage` view; and a `--provider tool:name` launch flag with claude token-file injection (tokens
+  resolve under the fleet state dir, `0600`). Codex account-selection is a marked-provisional stub pending a
+  live mechanism test; recycle-with-account and policy auto-switch are deferred to later phases. Phase 1 of
+  the usage-ops provider-config design.
+
 ## [0.5.2] - 2026-07-07
 
 ### Added
