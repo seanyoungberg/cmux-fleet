@@ -1,16 +1,16 @@
-"""Layer 3 — the plugin INDEX spine (plugins.toml) + index-aware `use` resolution.
+"""Layer 3 — the plugin INDEX spine (plugins.toml) + index-aware `plugins` resolution.
 
-Phase-1 build of the plugin-management redesign (design §2b/§2c/§3). Everything here is exercised
-through the real `fleet` CLI's `--dry-run` compose path (same harness as test_e2e_cli.py) against
-SCRATCH tomls — the live ~/.config/cmux-fleet/fleet.toml and prod state are never touched.
+The plugin-management redesign (design §2b/§2c/§3). Everything here is exercised through the real `fleet`
+CLI's `--dry-run` compose path (same harness as test_e2e_cli.py) against SCRATCH tomls — the live
+~/.config/cmux-fleet/fleet.toml and prod state are never touched.
 
 Coverage:
-  - a `use` list (linked + enabled) composes BOTH native channels in one command (design receipt #1/#2)
+  - a `plugins` list (linked + enabled) composes BOTH native channels in one command (design receipt #1/#2)
   - multi-marketplace: a plugin from each of two [marketplace.*] resolves to the right --plugin-dir
   - a [plugin.<n>.<tool>] per-tool block parses + is retrievable (no crash, stored)
-  - an unindexed `use` name falls back to today's behavior (abs-path as-is / bare name under default mkt)
-  - THE CRITICAL ONE: a legacy roster (plugins/enable_plugins/marketplace) composes BYTE-IDENTICALLY
-    whether or not an (unrelated) plugins.toml is present — the additive change didn't move legacy comp.
+  - an unindexed `plugins` name falls back to a linked --plugin-dir (abs-path as-is / bare under default mkt)
+  - an unindexed roster composes BYTE-IDENTICALLY whether or not an (unrelated) plugins.toml is present —
+    an unrelated index never perturbs fall-through composition.
 """
 import os
 
@@ -44,8 +44,8 @@ def _env(cli_env, tmp_path, *, index=None, marketplace=None):
     return e
 
 
-# --- (a) use = linked + enabled composes both channels in ONE command (receipt #1/#2) ------------
-def test_use_linked_and_enabled_compose_together(cli_env, tmp_path):
+# --- (a) plugins = linked + enabled composes both channels in ONE command (receipt #1/#2) --------
+def test_plugins_linked_and_enabled_compose_together(cli_env, tmp_path):
     berg = tmp_path / "mkt-berg"
     cmux_fleet_dir = _mkplugin(berg, "cmux-fleet")
     memsearch_dir = _mkplugin(berg, "memsearch")
@@ -56,9 +56,9 @@ def test_use_linked_and_enabled_compose_together(cli_env, tmp_path):
         '[plugin.memsearch]\ntype = "linked"\nsource = "berg"\ntools = ["claude","codex"]\n'
         '[plugin.obsidian]\ntype = "enabled"\nsource = "obs"\ninstall = "global-disabled"\ntools = ["claude"]\n')
     (tmp_path / "fleet.toml").write_text(
-        '[tool.claude]\nuse = ["cmux-fleet"]\n'                       # floor use
+        '[tool.claude]\nplugins = ["cmux-fleet"]\n'                       # floor plugins
         '[role.researcher]\nkind = "child"\ncwd = "workers/r"\n'
-        '[role.researcher.claude]\nuse = ["memsearch", "obsidian"]\n')  # role use (unioned onto floor)
+        '[role.researcher.claude]\nplugins = ["memsearch", "obsidian"]\n')  # role plugins (unioned onto floor)
     env = _env(cli_env, tmp_path, index=tmp_path / "plugins.toml")
     p = run_fleet(env, "launch", "researcher", "--label", "r1", "--parent", "FAKE", "--dry-run")
     argv = _launch_argv(p.stdout)
@@ -84,7 +84,7 @@ def test_multi_marketplace_linked_paths(cli_env, tmp_path):
         '[plugin.beta]\ntype = "linked"\nsource = "two"\n')
     (tmp_path / "fleet.toml").write_text(
         '[role.w]\nkind = "child"\ncwd = "w"\n'
-        '[role.w.claude]\nuse = ["alpha", "beta"]\n')
+        '[role.w.claude]\nplugins = ["alpha", "beta"]\n')
     env = _env(cli_env, tmp_path, index=tmp_path / "plugins.toml")
     p = run_fleet(env, "launch", "w", "--label", "w1", "--parent", "FAKE", "--dry-run")
     argv = _launch_argv(p.stdout)
@@ -107,13 +107,13 @@ def test_per_tool_block_parses_and_is_stored(cli_env, tmp_path):
     assert ms["type"] == "linked" and ms["source"] == "berg"
     assert ms["tools"] == ["claude", "codex"]          # tools list expressible
     assert ms["description"] == "memory"
-    # the per-tool override block is parsed + retrievable under tool_overrides (Phase 1: stored, not consumed)
+    # the per-tool override block is parsed + retrievable under tool_overrides (stored, not yet consumed)
     assert ms["tool_overrides"]["codex"]["notes"] == "reads hooks/codex-hooks.json"
     assert ms["tool_overrides"]["codex"]["hook"] == "codex-hooks.json"
 
 
-# --- (d) an unindexed `use` name falls back to today's behavior (back-compat fall-through) -------
-def test_unindexed_use_falls_back_to_abspath_and_default_marketplace(cli_env, tmp_path):
+# --- (d) an unindexed `plugins` name falls back to a linked --plugin-dir (fall-through) -----------
+def test_unindexed_plugins_falls_back_to_abspath_and_default_marketplace(cli_env, tmp_path):
     mkt = tmp_path / "default-mkt"
     bare_dir = _mkplugin(mkt, "bareplug")            # a bare name resolvable under the default marketplace
     abs_dir = tmp_path / "loose" / "abs-plug"
@@ -122,19 +122,19 @@ def test_unindexed_use_falls_back_to_abspath_and_default_marketplace(cli_env, tm
     (tmp_path / "plugins.toml").write_text('[plugin.somethingelse]\ntype = "linked"\nsource = "x"\n')
     (tmp_path / "fleet.toml").write_text(
         '[role.w]\nkind = "child"\ncwd = "w"\n'
-        f'[role.w.claude]\nuse = ["bareplug", "{abs_dir}"]\n')
+        f'[role.w.claude]\nplugins = ["bareplug", "{abs_dir}"]\n')
     env = _env(cli_env, tmp_path, index=tmp_path / "plugins.toml", marketplace=mkt)
     p = run_fleet(env, "launch", "w", "--label", "w1", "--parent", "FAKE", "--dry-run")
     argv = _launch_argv(p.stdout)
-    assert f"--plugin-dir {bare_dir}" in argv          # bare name -> default marketplace (today's path)
-    assert f"--plugin-dir {abs_dir}" in argv           # abs path -> used as-is (today's bypass)
+    assert f"--plugin-dir {bare_dir}" in argv          # bare name -> default marketplace (fall-through)
+    assert f"--plugin-dir {abs_dir}" in argv           # abs path -> used as-is (fall-through bypass)
 
 
 def test_absent_index_is_empty_not_error(cli_env, tmp_path):
-    # No plugins.toml at all -> empty index, no error; an unindexed `use` bare name with no marketplace
-    # simply warns + skips (exactly the legacy --plugin-dir loop behavior).
+    # No plugins.toml at all -> empty index, no error; an unindexed `plugins` bare name with no marketplace
+    # simply warns + skips.
     (tmp_path / "fleet.toml").write_text(
-        '[role.w]\nkind = "child"\ncwd = "w"\n[role.w.claude]\nuse = ["ghost"]\n')
+        '[role.w]\nkind = "child"\ncwd = "w"\n[role.w.claude]\nplugins = ["ghost"]\n')
     env = _env(cli_env, tmp_path)                      # index points at an absent file
     p = run_fleet(env, "launch", "w", "--label", "w1", "--parent", "FAKE", "--dry-run")
     assert "dry-run" in p.stdout.lower()
@@ -149,7 +149,7 @@ def test_fleet_plugin_index_pointer(cli_env, tmp_path):
         '[marketplace.m]\npath = "m"\n[plugin.p]\ntype = "linked"\nsource = "m"\n')
     (tmp_path / "fleet.toml").write_text(
         '[fleet]\nplugin_index = "custom-index.toml"\n'          # relative -> anchors to the toml's dir
-        '[role.w]\nkind="child"\ncwd="w"\n[role.w.claude]\nuse=["p"]\n')
+        '[role.w]\nkind="child"\ncwd="w"\n[role.w.claude]\nplugins=["p"]\n')
     env = {**cli_env, "CMUX_FLEET_TOML": str(tmp_path / "fleet.toml")}
     env.pop("CMUX_FLEET_PLUGIN_INDEX", None)                    # no env override -> the [fleet] pointer wins
     env.pop("CMUX_FLEET_MARKETPLACE", None)
@@ -164,7 +164,7 @@ def test_default_index_location_next_to_fleet_toml(cli_env, tmp_path):
     d = _mkplugin(mkt, "p")
     (tmp_path / "plugins.toml").write_text(
         '[marketplace.m]\npath = "m"\n[plugin.p]\ntype = "linked"\nsource = "m"\n')
-    (tmp_path / "fleet.toml").write_text('[role.w]\nkind="child"\ncwd="w"\n[role.w.claude]\nuse=["p"]\n')
+    (tmp_path / "fleet.toml").write_text('[role.w]\nkind="child"\ncwd="w"\n[role.w.claude]\nplugins=["p"]\n')
     env = {**cli_env, "CMUX_FLEET_TOML": str(tmp_path / "fleet.toml")}
     env.pop("CMUX_FLEET_PLUGIN_INDEX", None)           # rely on the <toml-dir>/plugins.toml default
     env.pop("CMUX_FLEET_MARKETPLACE", None)
@@ -172,20 +172,19 @@ def test_default_index_location_next_to_fleet_toml(cli_env, tmp_path):
     assert f"--plugin-dir {d}" in _launch_argv(p.stdout)
 
 
-# --- THE CRITICAL BACK-COMPAT TEST: legacy composition is byte-identical, index present or not ----
-def test_legacy_composition_unchanged_by_index(cli_env, tmp_path):
-    """The live fleet.toml uses plugins/enable_plugins/marketplace (NO `use`). Prove the additive index
-    machinery does not alter its composition: the composed claude argv must be byte-identical whether an
-    (unrelated) plugins.toml exists or not. This is the load-bearing back-compat guarantee."""
-    mkt = tmp_path / "legacy-mkt"
-    _mkplugin(mkt, "legacyplug")
-    # a roster shaped exactly like the current live fleet.toml: legacy keys only, no `use` anywhere
+# --- an unrelated index never perturbs fall-through composition ----------------------------------
+def test_unindexed_composition_unchanged_by_index(cli_env, tmp_path):
+    """A roster of UNINDEXED plugin names (resolved via $MARKETPLACE fall-through) must compose the same
+    claude argv whether or not an UNRELATED plugins.toml exists. Proves the index only ever ADDS routing
+    for names it actually lists — it never moves the composition of names it doesn't."""
+    mkt = tmp_path / "mkt"
+    _mkplugin(mkt, "someplug")
+    # a roster referencing a plugin the index does NOT list -> pure fall-through under $MARKETPLACE
     (tmp_path / "fleet.toml").write_text(
-        '[tool.claude]\nplugins = ["legacyplug"]\n'
+        '[tool.claude]\nplugins = ["someplug"]\n'
         '[role.worker]\nkind = "child"\ncwd = "workers/w"\n'
-        '[role.worker.claude]\nplugins = ["legacyplug"]\nenable_plugins = ["ext@berg-plugins"]\n'
-        'setting_sources = "user,local"\n')
-    # an unrelated index that the legacy roster never references
+        '[role.worker.claude]\nplugins = ["someplug"]\nsetting_sources = "user,local"\n')
+    # an unrelated index that the roster never references
     (tmp_path / "plugins.toml").write_text(
         '[marketplace.berg]\npath = "elsewhere"\n'
         '[plugin.unused]\ntype = "linked"\nsource = "berg"\ntools = ["claude"]\n')
@@ -195,8 +194,7 @@ def test_legacy_composition_unchanged_by_index(cli_env, tmp_path):
 
     a = _launch_argv(run_fleet(with_index, "launch", "worker", "--label", "w1", "--parent", "FAKE", "--dry-run").stdout)
     b = _launch_argv(run_fleet(without_index, "launch", "worker", "--label", "w1", "--parent", "FAKE", "--dry-run").stdout)
-    assert a == b, f"index presence changed legacy composition:\n WITH: {a}\n WITHOUT: {b}"
-    # and the legacy channels are exactly what they were pre-change
-    assert f"--plugin-dir {os.path.join(str(mkt), 'legacyplug')}" in a
-    assert '"enabledPlugins": {"ext@berg-plugins": true}' in a
+    assert a == b, f"index presence changed unindexed composition:\n WITH: {a}\n WITHOUT: {b}"
+    # and the fall-through channel is exactly the default-marketplace --plugin-dir
+    assert f"--plugin-dir {os.path.join(str(mkt), 'someplug')}" in a
     assert "--setting-sources user,local" in a

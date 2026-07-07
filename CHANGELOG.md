@@ -6,6 +6,24 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Changed
+
+- **Plugin loadout is now one key + one flag.** The mechanism-agnostic roster key `use` is renamed
+  **`plugins`**, and the launch/recycle/revive add-flag is a single repeatable **`--plugin`** (replacing
+  `--use` / `--plugins` / `--add-plugin`). A role names its plugins in one `plugins = [...]` list; the index
+  (`plugins.toml`) still decides linked (`--plugin-dir`) vs enabled (`enabledPlugins`) per plugin, so the
+  type distinction stays index-internal. A name not in the index loads as a linked `--plugin-dir` (default
+  marketplace / absolute path), exactly as before.
+
+### Removed
+
+- **The legacy plugin keys and flags (no external users).** The pre-index roster keys `plugins` (linked-only,
+  index-bypassing) and `enable_plugins` (enabled-only) are deleted — their capabilities are fully covered by
+  the index-resolved `plugins` key (its not-in-index fall-through is the old `plugins` behavior; its enabled
+  type is the old `enable_plugins`). The `--plugins` and `--add-plugin` flags are deleted (subsumed by
+  `--plugin`, which reaches both plugin types). The live roster was already 100% on `use`, so migration was a
+  straight `use → plugins` rename.
+
 ## [0.8.0] - 2026-07-08
 
 ### Added

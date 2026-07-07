@@ -70,7 +70,7 @@ def _roster_resolve_to(cwd):
     return lambda cfg, role, tool, adhoc: {
         "tool": "claude", "role": "w", "label": "w", "kind": "child", "place": "tab", "group": "",
         "cwd": cwd, "plugins": [], "flags": [], "env": {}, "settings": "",
-        "enable_plugins": [], "setting_sources": ""}
+        "setting_sources": ""}
 
 
 def test_compose_from_roster_resume_pins_cwd_override(monkeypatch):
@@ -104,7 +104,7 @@ def test_revive_roster_compose_resumes(monkeypatch):
     monkeypatch.setattr(cli, "resolve", lambda cfg, role, tool, adhoc: {
         "tool": "claude", "role": "w", "label": "w", "kind": "child", "place": "tab", "group": "",
         "cwd": "/tmp/x", "plugins": [], "flags": [], "env": {}, "settings": "",
-        "enable_plugins": [], "setting_sources": ""})
+        "setting_sources": ""})
     send = cli._compose_from_roster("w", "claude", "w", [], [], "SESSID")
     assert "--resume SESSID" in send
 

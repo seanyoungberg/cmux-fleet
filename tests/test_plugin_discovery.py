@@ -7,7 +7,7 @@ touched (reconcile's settings source is redirected via $CMUX_FLEET_CLAUDE_SETTIN
 Covers:
   - `plugins ls` renders the index (table + --json)
   - `plugins show <name>` gives the resolved --plugin-dir path and finds the ROLES that use it
-    (index-native `use` AND legacy `plugins`/`enable_plugins`)
+    (every role/floor `plugins` reference)
   - `plugins describe <name>` lists the skills a plugin exposes, FOLLOWING symlinked skill dirs
   - `plugins reconcile --dry-run` writes NOTHING; a real run then a re-run is idempotent (--json counts)
   - `plugins show <missing>` is a clean non-zero, not a crash
@@ -99,23 +99,23 @@ def test_plugins_show_resolves_path_and_finds_roles(cli_env, tmp_path):
         f'[marketplace.berg]\npath = "{plugins_dir}"\n'
         '[plugin.memsearch]\ntype = "linked"\nsource = "berg"\ntools = ["claude","codex"]\n'
         'description = "memory"\norigin = "path"\n')
-    # roster: floor references it via the index-native `use`; a role references it via legacy `plugins`
+    # roster: the floor references it via `plugins`; a role references it via `plugins` too (both surface)
     (tmp_path / "fleet.toml").write_text(
-        '[tool.claude]\nuse = ["memsearch"]\n'
+        '[tool.claude]\nplugins = ["memsearch"]\n'
         '[role.researcher]\nkind = "child"\ncwd = "w"\n'
         '[role.researcher.claude]\nplugins = ["memsearch"]\n')
     env = _env(cli_env, tmp_path, index=tmp_path / "plugins.toml")
 
     p = run_fleet(env, "plugins", "show", "memsearch")
     assert str(plugins_dir / "memsearch") in p.stdout          # resolved --plugin-dir path
-    assert "tool.claude" in p.stdout and "use" in p.stdout      # floor `use`
-    assert "role.researcher.claude" in p.stdout                 # role, via legacy `plugins`
+    assert "tool.claude" in p.stdout                            # floor `plugins`
+    assert "role.researcher.claude" in p.stdout                 # role `plugins`
 
     data = json.loads(run_fleet(env, "plugins", "show", "memsearch", "--json").stdout)
     assert data["found"] and data["resolved_dir"] == str(plugins_dir / "memsearch")
     used = {(u["scope"], u["key"]) for u in data["used_by"]}
-    assert ("tool.claude", "use") in used
-    assert ("role.researcher.claude", "plugins") in used       # legacy ref surfaced too
+    assert ("tool.claude", "plugins") in used
+    assert ("role.researcher.claude", "plugins") in used       # both references surfaced
 
 
 def test_plugins_show_missing_is_clean_error(cli_env, tmp_path):

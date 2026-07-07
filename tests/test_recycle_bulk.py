@@ -111,7 +111,7 @@ def test_bulk_dryrun_prints_resolved_effort_model_per_agent(fs, monkeypatch, cap
     monkeypatch.setattr(cli, "_compose_recycle_cmd",
                         lambda *a, **k: ("cd /x && claude --effort xhigh --model opus", ""))
     a = types.SimpleNamespace(effort="xhigh", model="opus", dry_run=True, include_muted=False,
-                              add_plugin=[], use=[], force=False, prime=None, no_prime=False)
+                              plugin=[], force=False, prime=None, no_prime=False)
     rc = cli._recycle_bulk("children", "resume", ["--effort", "xhigh", "--model", "opus"], a)
     out = capsys.readouterr().out
     assert rc == 0

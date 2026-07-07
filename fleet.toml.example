@@ -18,7 +18,7 @@
 #                                   #   (also synthesizes [marketplace.default] for the plugin index below.)
 # plugin_index = ""                 # path to the plugins.toml INDEX (see plugins.toml.example); "" ->
 #                                   #   <this-file's-dir>/plugins.toml. Absent file = empty index, no error.
-#                                   #   The index powers `use = [...]` (mechanism-agnostic).  env: CMUX_FLEET_PLUGIN_INDEX
+#                                   #   The index powers the `plugins = [...]` roster key.  env: CMUX_FLEET_PLUGIN_INDEX
 # floor_claudemd = ""               # CLAUDE.md symlinked into freshly-created ad-hoc cwds; "" = none.  env: CMUX_FLEET_FLOOR
 # adhoc_subdir = "agents/ad-hoc"    # where `--adhoc <name>` agents get a cwd (relative to root).  env: CMUX_FLEET_ADHOC_SUBDIR
 
@@ -39,12 +39,11 @@ kind  = "child"
 place = "tab"
 
 [tool.claude]
-# plugins = ["cmux-fleet"]          # give every claude agent the conductor toolkit (needs marketplace set,
-#                                   #   or use an absolute path to this plugin dir)
-# use     = ["cmux-fleet"]          # mechanism-agnostic alternative: names resolve through the plugin
-#                                   #   INDEX (plugins.toml) — the index says linked (--plugin-dir) vs
-#                                   #   enabled (enabledPlugins), so you don't pick the mechanism here.
-#                                   #   Unions floor ∪ role like `plugins`; coexists with plugins/enable_plugins.
+# plugins = ["cmux-fleet"]          # give every claude agent the conductor toolkit. Names resolve through
+#                                   #   the INDEX (plugins.toml) — the index says linked (--plugin-dir) vs
+#                                   #   enabled (enabledPlugins), so you don't pick the mechanism here. A
+#                                   #   name not in the index loads as a linked --plugin-dir (under
+#                                   #   [fleet].marketplace, or an absolute path). Unioned floor ∪ role.
 flags   = "--effort high"
 
 [tool.codex]

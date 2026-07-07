@@ -221,7 +221,7 @@ def test_codex_flags_effort_as_last_bare_token_is_dropped_not_crashed():
 
 def test_adapter_compile_codex_translates_effort_and_claude_stays_verbatim():
     spec = {"tool": "codex", "role": "w", "label": "w", "flags": [], "env": {},
-            "plugins": [], "settings": "", "use": [], "enable_plugins": [], "setting_sources": ""}
+            "plugins": [], "settings": "", "setting_sources": ""}
     binn, args, _ = fleet.adapter_compile("codex", spec, ["--effort", "high"])
     assert binn == "codex"
     assert "--effort" not in args and "-c" in args and "model_reasoning_effort=high" in args

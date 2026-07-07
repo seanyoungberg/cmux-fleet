@@ -1,8 +1,9 @@
 # plugins.toml — the plugin INDEX. Copy next to fleet.toml (default <toml-dir>/plugins.toml) or point
 # $CMUX_FLEET_PLUGIN_INDEX / [fleet].plugin_index at it. Entirely optional: no file = empty index (no
-# error), and rosters that use only `plugins`/`enable_plugins` never need it.
+# error), and a roster whose `plugins` names are all bare/absolute (resolved under [fleet].marketplace)
+# never needs it.
 #
-# The index defines each plugin ONCE; rosters reference it by name via `use = [...]` and the index
+# The index defines each plugin ONCE; rosters reference it by name via `plugins = [...]` and the index
 # decides the load MECHANISM (linked -> --plugin-dir, enabled -> enabledPlugins). This is a separate
 # file from fleet.toml so a machine-reconciled index and a hand-authored roster own themselves.
 #

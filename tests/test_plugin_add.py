@@ -1,15 +1,15 @@
 """Layer 3 — `fleet plugins add <ref>` (install-from-URL at the SAFE default), Phase 4b (design §5b).
 
 THE SAFETY CONTRACT (Berg-ratified — the whole point of this phase): `add` may auto-clone a NEW plugin and
-wire the index, but it NEVER enables it, NEVER adds it to a role's `use`, and NEVER runs its hooks. The
-human flips it on later with `fleet recycle <agent> --use <name>`. These tests PROVE that contract:
+wire the index, but it NEVER enables it, NEVER adds it to a role.s `plugins`, and NEVER runs its hooks. The
+human flips it on later with `fleet recycle <agent> --plugin <name>`. These tests PROVE that contract:
 
   - the PURE engine (classify/infer/name/add_enabled_index_text) makes only the linked-vs-enabled call and
     REFUSES (STOPs) on an ambiguous ref instead of defaulting a security-relevant choice;
   - a real `add` of a fixture plugin leaves the claude settings file byte-identical (never an enabledPlugins
-    entry), the roster byte-identical (never a role `use` edit), and never fires the plugin's hook;
-  - the added plugin is AVAILABLE (resolvable via `--use`) but NOT auto-loaded by a role launch;
-  - `--dry-run` clones/writes NOTHING; an already-indexed ref is an idempotent no-op that points at `--use`.
+    entry), the roster byte-identical (never a role `plugins` edit), and never fires the plugin's hook;
+  - the added plugin is AVAILABLE (resolvable via `--plugin`) but NOT auto-loaded by a role launch;
+  - `--dry-run` clones/writes NOTHING; an already-indexed ref is an idempotent no-op that points at `--plugin`.
 
 Every source is a tmp_path fixture (a local plugin dir or a throwaway `git init` repo) — NOTHING here clones
 from the network or touches the live ~/.config/cmux-fleet, ~/.claude, or prod state (claude settings are
@@ -147,7 +147,7 @@ def test_add_enabled_index_text_records_disabled_and_preserves(tmp_path):
 # ================================================================ E2E — the never-auto-enable proofs ==
 def test_add_linked_local_path_never_enables(cli_env, tmp_path):
     """THE safety test. `add` a local plugin dir -> the index gains a type=linked entry and NOTHING else:
-    no enabledPlugins, no role `use` edit, no hook run; the plugin is available via `--use` but a plain
+    no enabledPlugins, no role `plugins` edit, no hook run; the plugin is available via `--plugin` but a plain
     role launch does NOT auto-load it."""
     sentinel = tmp_path / "HOOK_RAN"
     src = _mkplugin_src(tmp_path / "src", "newplug", sentinel=sentinel)
@@ -164,7 +164,7 @@ def test_add_linked_local_path_never_enables(cli_env, tmp_path):
     settings_before, fleet_before = settings.read_text(), fleet.read_text()
     p = run_fleet(env, "plugins", "add", str(src))
     assert "LINKED" in p.stdout
-    assert "recycle <agent> --use newplug" in p.stdout       # told the human how to enable (didn't do it)
+    assert "recycle <agent> --plugin newplug" in p.stdout       # told the human how to enable (didn't do it)
 
     # the index gained a type=linked entry; linked never records an `install`; no enable map anywhere
     doc = tomllib.loads(index.read_text())
@@ -183,10 +183,10 @@ def test_add_linked_local_path_never_enables(cli_env, tmp_path):
     assert (mkt / "newplug" / ".claude-plugin" / "plugin.json").exists()
     plain = run_fleet(env, "launch", "worker", "--label", "w1", "--parent", "FAKE", "--dry-run")
     assert "newplug" not in plain.stdout                     # add did NOT auto-load it
-    # control: it IS loadable on demand via --use (proves add only made it available, didn't enable it)
+    # control: it IS loadable on demand via --plugin (proves add only made it available, didn't enable it)
     ctl = run_fleet(env, "launch", "worker", "--label", "w2", "--parent", "FAKE",
-                    "--use", "newplug", "--dry-run")
-    assert str(mkt / "newplug") in ctl.stdout                # --plugin-dir <mkt>/newplug appears ONLY with --use
+                    "--plugin", "newplug", "--dry-run")
+    assert str(mkt / "newplug") in ctl.stdout                # --plugin-dir <mkt>/newplug appears ONLY with --plugin
 
 
 def test_add_linked_from_git_repo_never_enables(cli_env, tmp_path):
@@ -223,7 +223,7 @@ def test_add_enabled_records_global_disabled_never_enables(cli_env, tmp_path):
 
     p = run_fleet(env, "plugins", "add", "obsidian@obsidian-skills")
     assert "ENABLED" in p.stdout and "global-disabled" in p.stdout
-    assert "recycle <agent> --use obsidian" in p.stdout
+    assert "recycle <agent> --plugin obsidian" in p.stdout
 
     e = tomllib.loads(index.read_text())["plugin"]["obsidian"]
     assert e["type"] == "enabled" and e["source"] == "obsidian-skills"
@@ -255,7 +255,7 @@ def test_add_already_indexed_is_noop_pointer(cli_env, tmp_path):
     before = index.read_text()
     env = _env(cli_env, tmp_path, index=index)
     p = run_fleet(env, "plugins", "add", "https://github.com/x/loom.git")   # basename -> 'loom' (indexed)
-    assert "already indexed" in p.stdout and "--use loom" in p.stdout
+    assert "already indexed" in p.stdout and "--plugin loom" in p.stdout
     assert index.read_text() == before                       # byte-identical: no write, no clone attempted
 
 

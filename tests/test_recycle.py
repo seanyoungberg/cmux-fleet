@@ -221,7 +221,7 @@ def test_fresh_recycle_persists_new_cwd_then_resume_composes_from_new(fs, monkey
     monkeypatch.setattr(fleet, "resolve", lambda *a: {
         "tool": "claude", "role": "w", "label": "w", "kind": "child", "place": "tab", "group": "",
         "cwd": "/NEW", "plugins": [], "flags": [], "env": {}, "settings": "",
-        "enable_plugins": [], "setting_sources": ""})
+        "setting_sources": ""})
     resume, _ = fleet._compose_recycle_cmd("w", fleet_state.live_get("w"), [], [], "resume", "")
     assert "cd /NEW" in resume and "--resume NEWSID" in resume
 

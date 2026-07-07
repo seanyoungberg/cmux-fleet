@@ -302,7 +302,7 @@ writes.
   fleet recycle                 # recycle self, RESUME (preserve context) — the default
   fleet recycle --fresh         # shed context + prime from the handover (the handover pattern)
   fleet recycle worker --session <id>          # resume an arbitrary prior session
-  fleet recycle worker --fresh --add-plugin some-plugin -- --model opus
+  fleet recycle worker --fresh --plugin some-plugin -- --model opus
   fleet recycle --children      # restart my live children, sequential + gated (RESUME each)
   ```
 

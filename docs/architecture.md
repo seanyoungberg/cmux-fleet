@@ -313,7 +313,7 @@ re-deriving per verb:
 - **An ad-hoc / off-roster identity has no toml to be authoritative, so it falls back to the captured
   binding** (the exact command cmux recorded at bind time) — this is the one case where history is the
   source of truth, and only because there's nothing else to consult.
-- **Caller `--` flags (one-off `--effort`, `--model`, `--add-plugin`, etc.) always layer on top with the
+- **Caller `--` flags (one-off `--effort`, `--model`, `--plugin`, etc.) always layer on top with the
   highest precedence, for that single invocation only.** They are never persisted anywhere — not into
   the toml, not into the registry, not into a future respawn's defaults. If you want an override to
   survive the NEXT restart too, it has to go in the toml (a role's `flags`) or be passed again.
