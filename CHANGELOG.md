@@ -6,6 +6,33 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [0.5.0] - 2026-07-07
+
+### Added
+
+- **`fleet inbox` verb** — an on-demand read of your pending inbox (child completions,
+  auto-archive/health alerts, and peer messages, oldest-first, each with its `inbox-ack`
+  command). The catch-up read for wakes that queued while an agent was down: run it at session
+  start or after a recycle, since the push path can't replay across a fresh session.
+  `fleet inbox [--scope mine|<label>|all] [--json]`.
+- **Unified `--scope` model across every scope-aware verb.** One vocabulary —
+  `--scope mine|all|conductors|children` (plus a bare `<label>` where a verb single-targets) — on
+  `ls`, `vitals`, `inbox`, `graph`, `recycle`, `broadcast`, and `mute`. Only the default varies, by
+  risk: **read verbs default to `mine`** (you + your children; `--scope all` for the whole fleet,
+  with a hint when `mine` is just you), while **act verbs require an explicit scope** (`recycle`
+  bare = self, `broadcast` errors without `--scope`). A human at a plain shell with no
+  `$CMUX_SURFACE_ID` still gets the whole fleet by default. One shared `scope_matches` predicate
+  backs every selector so a read's view set and an act's target set can't drift; on `mine`, reads
+  include you and acts exclude you (self is always the bare form).
+
+### Changed
+
+- **`broadcast --target` and `recycle`'s bulk `--all/--conductors/--children/--my-children`** migrate
+  onto the unified `--scope`; the old spellings are kept as hidden, deprecated aliases.
+- The conductor boot skills (`ground`, `cmux-fleet`, `cmux-handover`) now teach the `--scope` model
+  and the boot ritual: run `fleet inbox` at session start (instead of hand-reading state) and
+  `fleet ls --scope mine` to know your fleet.
+
 ## [0.4.0] - 2026-07-07
 
 ### Added
