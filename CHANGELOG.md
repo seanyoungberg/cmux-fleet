@@ -6,6 +6,27 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [0.7.0] - 2026-07-07
+
+### Added
+
+- **`fleet move` + `fleet group`** — relocate a live child to its own workspace (or another) as one atomic,
+  wake-safe step, and manage the conductor's workspace-group (init/add) so children can launch straight into
+  it. Replaces the manual `move-surface` + `register` dance.
+
+### Fixed
+
+- **Router no longer archives a live child on a workspace MOVE.** The surface-close reconciler confirms
+  against cmux's live tree and archives only on a true close (surface gone), reconciling the registry
+  `workspace` on a move. Fails closed (unreadable tree still archives). Fixes the incident where relocating
+  three live children auto-archived them.
+- **Tool-aware launch flags.** `--effort`/`--model`/permission flags translate per tool at the adapter
+  boundary (claude `--effort` → codex `-c model_reasoning_effort=`, etc.), so a codex child no longer dies on
+  a claude-only flag. Reasoning tier passes through (codex accepts `xhigh`).
+- **Launch verification + never-bound sweep.** A launch that dies on arrival (bad flag, missing binary) is
+  caught loudly instead of sitting `pending` forever; the daemon detects and alerts a child that launched but
+  never bound.
+
 ## [0.6.0] - 2026-07-07
 
 ### Added
