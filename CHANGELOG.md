@@ -6,6 +6,24 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [0.5.2] - 2026-07-07
+
+### Added
+
+- **`--json` on `fleet ls` and `fleet graph`** — machine-readable output for the two listing verbs that
+  lacked it (`ls` reconciles once, then renders JSON or a byte-identical text table).
+
+### Changed
+
+- **Backward-compat cruft removed** (no external users): `broadcast --target` and `recycle`'s bulk
+  `--all/--conductors/--children/--my-children` alias flags are gone — `--scope` is the only spelling. The
+  `--resume` no-op alias is removed (RESUME is the default). Retired flags scrubbed from examples.
+- **Vocabulary consistency:** prose synonyms unified to one term per concept (`worker`→`child`,
+  `seat`/`terminal`→`surface`, `park`→`archive`, `queue`→`inbox`; the handover-skill `worker`-overload
+  fixed); stale tool references updated (`fleet.py`/`router.py` → the `cmux_fleet` package +
+  `fleet daemon start`); `main()` usage synced with the dispatch table; a session-vs-transcript and
+  `--force` glossary added.
+
 ## [0.5.1] - 2026-07-07
 
 ### Fixed
