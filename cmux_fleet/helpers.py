@@ -217,6 +217,69 @@ def cmd_child_digest(argv):
 
 
 # =================================================================================================
+# inbox — the on-demand READ of your pending inbox. The awareness/drain hooks push these same rows into
+# a conductor's context as they land; this is the PULL for when a conductor missed the live wakes — most
+# of all right after a recycle, where a fresh instance has no memory of completions/peer-msgs/alerts that
+# queued while it was down. Thin read-only wrapper over fs.inbox_pending() (ALL kinds, oldest→newest);
+# clear items with `fleet inbox-ack`. Self-IDs via $CMUX_SURFACE_ID; --surface reads another agent's
+# inbox (debug); --json emits the raw pending records.
+# =================================================================================================
+def _inbox_line(r):
+    """One compact line for a pending row, uniform across kinds: seq · [kind] · who-it's-from · a
+    one-line gist. Condenses what the awareness hook renders in full, so a catch-up read fits at a glance."""
+    seq, kind = r.get("seq"), r.get("kind", "?")
+    who = r.get("from_label") or r.get("label", "?")           # peer carries from_label; the rest carry label
+    if kind == "completion":
+        gist = (r.get("gist") or "").strip().replace("\n", " ")[:100]
+        summary = f'"{gist}"' if gist else "(done, no gist)"
+    elif kind == "stale":
+        summary = (f"surface {(r.get('child_surface') or '')[:8]} closed ({r.get('origin','?')}); "
+                   f"revive: fleet revive {r.get('label','?')}")
+    elif kind == "doctor":
+        summary = f"{r.get('reason','?')} — still LIVE, needs attention (inspect/drive/recycle)"
+    elif kind == "peer":
+        body = (r.get("body") or "").strip().replace("\n", " ")[:100]
+        rexp = " · REPLY EXPECTED" if r.get("reply_expected") else ""
+        summary = f"({r.get('ptype','peer-msg')} {r.get('msg_id','?')}) {body}{rexp}"
+    else:
+        summary = "(unknown kind)"
+    return f"seq {seq}  [{kind}]  {who}: {summary}"
+
+
+def cmd_inbox(argv):
+    args = list(argv)
+    as_json = "--json" in args
+    if as_json:
+        args.remove("--json")
+    surface = os.environ.get("CMUX_SURFACE_ID", "")
+    if "--surface" in args:
+        i = args.index("--surface"); surface = args[i + 1] if i + 1 < len(args) else ""; del args[i:i + 2]
+    if not surface:
+        sys.exit("inbox: no surface (set $CMUX_SURFACE_ID or pass --surface)")
+
+    pending = fs.inbox_pending(surface)                        # every kind addressed to me, oldest→newest
+    if as_json:
+        print(json.dumps(pending, indent=2))
+        return 0
+
+    label = fs.label_for_surface(surface) or surface[:8]
+    if not pending:
+        print(f"[inbox] {label} (surface {surface[:8]}): 0 pending")
+        return 0
+
+    print(f"[inbox] {label} (surface {surface[:8]}): {len(pending)} pending (oldest first)")
+    for r in pending:
+        print("  " + _inbox_line(r))
+    # per-kind ack hint (each stream has its own high-water; ack through the last seq shown per kind)
+    flag = {"completion": "", "peer": " --peer", "stale": " --stale", "doctor": " --doctor"}
+    hints = [f"{fs.ACK} {fs.max_seq([r for r in pending if r.get('kind') == k])}{flag[k]}"
+             for k in ("completion", "peer", "stale", "doctor")
+             if any(r.get("kind") == k for r in pending)]
+    print("  ack when handled: " + "   ".join(hints))
+    return 0
+
+
+# =================================================================================================
 # inbox-ack — a conductor runs this after handling the items it was shown, to mark them done so they
 # stop re-surfacing. Acks an EXACT seq (race-safe: later arrivals have a higher seq and survive).
 # Default kind is `completion`; --peer acks the peer stream, --stale the stale-member alerts.

@@ -3586,6 +3586,7 @@ def main():
               "  peer-msg <to-label> \"<body>\" [--no-reply] [--reply-to <id>] [--expect-reply] [--no-wake]\n"
               "                                                    input-safe A2A: message a live PEER conductor (into its context, never its input box)\n"
               "  child-digest <session-frag> [N]                   print a child's last N transcript turns (the reliable content source)\n"
+              "  inbox [--json] [--surface UUID]                   your pending inbox on demand (completions + stale + doctor + peer msgs, oldest first) — the catch-up read after a recycle\n"
               "  inbox-ack <seq> [--peer|--stale|--doctor] [--surface UUID]  mark shown completions/alerts/peer msgs handled so they stop re-surfacing")
         return 0
     sub, rest = sys.argv[1], sys.argv[2:]
@@ -3607,7 +3608,7 @@ def main():
            "vitals": ff.cmd_vitals, "find": ff.cmd_find, "graph": ff.cmd_graph,
            "serve": ff.cmd_serve, "paint": ff.cmd_paint,
            "drive-child": fh.cmd_drive_child, "peer-msg": fh.cmd_peer_msg,
-           "child-digest": fh.cmd_child_digest, "inbox-ack": fh.cmd_inbox_ack}
+           "child-digest": fh.cmd_child_digest, "inbox": fh.cmd_inbox, "inbox-ack": fh.cmd_inbox_ack}
     if sub in fns:
         return fns[sub](rest)
     sys.exit(f"fleet: unknown subcommand '{sub}'")

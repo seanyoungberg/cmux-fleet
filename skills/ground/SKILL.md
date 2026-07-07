@@ -14,6 +14,9 @@ Before researching context, check what is already filed: past handovers (`./hand
 ## Conductors: dispatch
 To spawn, drive, or observe child agents, use the **`/cmux-fleet:cmux-fleet`** skill: launch, drive, completions arrive on their own, digest (`fleet launch` / `recycle` / `archive`). Do not re-derive dispatch.
 
+## Conductors: catch up on boot (and after a recycle)
+Completions/peer-msgs/alerts arrive on their own **while you're live** — but a fresh instance (you, just now, especially after `fleet recycle`) never saw the wakes that queued while it was down. So at session start, pull the state the push path can't replay: run **`fleet inbox`** — your pending inbox on demand (child completions + auto-archive/health alerts + peer messages, oldest first). Ack what you handle with `fleet inbox-ack`. This is the catch-up read; don't hand-read the state file. (`fleet ls` / `fleet vitals` for the live fleet picture.)
+
 ## Conductors: handover
 At session end, when context runs low, or before a relaunch, write a point-in-time handover with **`/cmux-fleet:cmux-handover`**. It is the file `fleet recycle --fresh` auto-primes the next instance to read (a bare `fleet recycle` now RESUMES — it does not prime).
 
