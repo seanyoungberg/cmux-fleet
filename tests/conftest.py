@@ -32,6 +32,12 @@ os.environ.pop("CMUX_FLEET_TOML", None)
 os.environ.pop("CMUX_FLEET_ROOT", None)
 os.environ.pop("CMUX_FLEET_MARKETPLACE", None)
 os.environ.pop("CMUX_FLEET_FLOOR", None)
+# Also drop the AMBIENT caller surface: the scope-aware read verbs (ls/vitals/inbox/graph) default to
+# `--scope mine` and self-ID from $CMUX_SURFACE_ID. If the dev runs the suite from inside a live cmux
+# agent, that surface would leak in and silently scope every bare `fleet ls` to the dev's own (empty, in
+# the throwaway registry) fleet. Popping it once makes the default the no-surface path (graceful -> all);
+# tests that exercise a specific caller set CMUX_SURFACE_ID themselves via monkeypatch/env.
+os.environ.pop("CMUX_SURFACE_ID", None)
 
 sys.path.insert(0, REPO)          # so `import cmux_fleet...` resolves in-process
 

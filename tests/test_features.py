@@ -265,6 +265,44 @@ def test_tree_orphan_promotes_ancestor_first():
     assert order[0][0] in ("a", "b")                         # an ancestor, never the leaf 'c'
 
 
+# ── --scope filtering on the view rows (vitals _apply_scope, graph _scope_subtree) ────────────
+def _scope_rows():
+    # a two-conductor fleet: adv owns k1 (which owns grandkid gk); peer owns ok
+    return [
+        {"label": "adv", "kind": "conductor", "parent": ""},
+        {"label": "k1", "kind": "child", "parent": "adv"},
+        {"label": "gk", "kind": "child", "parent": "k1"},
+        {"label": "peer", "kind": "conductor", "parent": ""},
+        {"label": "ok", "kind": "child", "parent": "peer"},
+    ]
+
+
+def test_vitals_apply_scope_mine_kinds_and_all():
+    ff = _ff()
+    rows = _scope_rows()
+    # reads' mine = self + DIRECT children (not grandkids); include_self=True is baked into _apply_scope
+    assert {r["label"] for r in ff._apply_scope(rows, "mine", "adv")} == {"adv", "k1"}
+    assert {r["label"] for r in ff._apply_scope(rows, "conductors", "")} == {"adv", "peer"}
+    assert {r["label"] for r in ff._apply_scope(rows, "children", "")} == {"k1", "gk", "ok"}
+    assert {r["label"] for r in ff._apply_scope(rows, "all", "")} == {"adv", "k1", "gk", "peer", "ok"}
+
+
+def test_graph_scope_subtree_roots_at_caller_and_label():
+    ff = _ff()
+    rows = _scope_rows()
+    # graph mine = your whole SUBTREE (transitive), rooted at the caller
+    assert {r["label"] for r in ff._scope_subtree(rows, "mine", "adv")} == {"adv", "k1", "gk"}
+    assert {r["label"] for r in ff._scope_subtree(rows, "k1", "")} == {"k1", "gk"}      # a bare <label> root
+    assert {r["label"] for r in ff._scope_subtree(rows, "all", "")} == {"adv", "k1", "gk", "peer", "ok"}
+
+
+def test_graph_scope_unknown_label_exits():
+    ff = _ff()
+    import pytest as _pytest
+    with _pytest.raises(SystemExit):
+        ff._scope_subtree(_scope_rows(), "nosuch", "")
+
+
 def test_graph_html_is_balanced():
     ff = _ff()
     from html.parser import HTMLParser

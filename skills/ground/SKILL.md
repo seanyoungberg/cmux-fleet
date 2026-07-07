@@ -14,8 +14,14 @@ Before researching context, check what is already filed: past handovers (`./hand
 ## Conductors: dispatch
 To spawn, drive, or observe child agents, use the **`/cmux-fleet:cmux-fleet`** skill: launch, drive, completions arrive on their own, digest (`fleet launch` / `recycle` / `archive`). Do not re-derive dispatch.
 
+## The `--scope` model (your fleet by default)
+Every scope-aware verb takes **`--scope mine|all|conductors|children`** — one vocabulary, everywhere. The mental model: **your fleet by default.**
+- **Reads default to `mine`** — `fleet ls`, `fleet vitals`, `fleet inbox`, `fleet graph` show *you + your direct children* (for inbox, your own inbox). Add **`--scope all`** for the whole fleet; `conductors`/`children` filter by kind. When `mine` is just you, a one-line hint points at `--scope all` so you don't mistake your corner for an empty fleet.
+- **Acts require an explicit scope** — `fleet broadcast` **errors** without `--scope`; `fleet recycle` bare = just you, `fleet recycle --scope mine` = your children (gated bulk). No silent fan-out — you always say who.
+- A bare **`<label>`** works where single-target makes sense: `fleet inbox --scope <label>` peeks that agent's inbox, `fleet graph --scope <label>` roots its subtree.
+
 ## Conductors: catch up on boot (and after a recycle)
-Completions/peer-msgs/alerts arrive on their own **while you're live** — but a fresh instance (you, just now, especially after `fleet recycle`) never saw the wakes that queued while it was down. So at session start, pull the state the push path can't replay: run **`fleet inbox`** — your pending inbox on demand (child completions + auto-archive/health alerts + peer messages, oldest first). Ack what you handle with `fleet inbox-ack`. This is the catch-up read; don't hand-read the state file. (`fleet ls` / `fleet vitals` for the live fleet picture.)
+Completions/peer-msgs/alerts arrive on their own **while you're live** — but a fresh instance (you, just now, especially after `fleet recycle`) never saw the wakes that queued while it was down. So at session start, pull the state the push path can't replay: run **`fleet inbox`** — your pending inbox (child completions + auto-archive/health alerts + peer messages, oldest first). Ack what you handle with `fleet inbox-ack`. This is the catch-up read; don't hand-read the state file. Then **`fleet ls`** / **`fleet vitals`** (both default `--scope mine`) for your live fleet picture.
 
 ## Conductors: handover
 At session end, when context runs low, or before a relaunch, write a point-in-time handover with **`/cmux-fleet:cmux-handover`**. It is the file `fleet recycle --fresh` auto-primes the next instance to read (a bare `fleet recycle` now RESUMES — it does not prime).

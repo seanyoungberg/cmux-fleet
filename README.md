@@ -102,15 +102,16 @@ mode dial below).
 | Verb | What it does |
 | --- | --- |
 | `fleet launch <role\|--adhoc N>` | spawn an agent (`--place tab\|pane\|workspace`, `--dry-run`, `-- <tool flags>`) |
-| `fleet ls` | live fleet reconciled against cmux's hook store (flags STALE / pending / MUTED) |
-| `fleet recycle [label]` | restart in place, same surface and identity (default RESUME; `--fresh` sheds, `--session <id>`, `--force`; bulk `--all\|--conductors\|--children\|--my-children`) |
+| `fleet ls [--scope …]` | live fleet reconciled against cmux's hook store (flags STALE / pending / MUTED); defaults `--scope mine` (you + your children), `--scope all` for the world |
+| `fleet recycle [label]` | restart in place, same surface and identity (default RESUME; `--fresh` sheds, `--session <id>`, `--force`; bulk `--scope mine\|all\|conductors\|children`) |
 | `fleet sessions <label>` | list resumable prior sessions for the agent's surface (id, age, size, snippet) |
 | `fleet archive` / `revive` | park a live agent / bring a parked one back (`revive --fresh\|--session`) |
 | `fleet rm <label>` | close + archive a label (revivable; `--detach` drops the row only, `--force` overrides the mid-turn guard, `--with-group` dissolves its group) |
-| `fleet mute` / `unmute` | stop / resume pushing a child's completions to its parent |
-| `fleet vitals` / `find` / `graph` / `serve` / `paint` | read-only views (triage, lookup, tree, localhost, sidebar) |
+| `fleet mute` / `unmute` | stop / resume pushing a child's completions to its parent (`--scope mine` mutes all your children) |
+| `fleet inbox [--scope …]` | your pending inbox on demand (completions + alerts + peer msgs); the catch-up read after a recycle |
+| `fleet vitals` / `find` / `graph` / `serve` / `paint` | read-only views (triage, lookup, tree, localhost, sidebar); scope-aware verbs default `--scope mine` |
 | `fleet worktree ls` / `clean` | manage fleet-owned git worktrees (config-gated) |
-| `fleet broadcast "<msg>"` | input-safe heads-up to a target set of live agents |
+| `fleet broadcast "<msg>" --scope …` | input-safe heads-up to a scoped set of live agents (`--scope` required — an act) |
 | `fleet profile <name>` | pin all entrypoints at this build (multi-build isolation) |
 | `fleet daemon start\|stop\|status\|restart` | run the router as a detached daemon (survives shell exit + recycle); `start --foreground` for launchd; `--heartbeat` to nudge idle conductors |
 | `fleet peer-msg` / `fleet child-digest` / `fleet drive-child` / `fleet inbox-ack` | agent-facing helpers |
@@ -184,13 +185,19 @@ status. Status is inferred **without an LLM** (cmux's `agentLifecycle` is
 authoritative, refined by keyword tables); context-remaining % is read from each
 agent's transcript token usage.
 
+Every scope-aware verb takes `--scope mine|all|conductors|children` (one shared
+vocabulary). Reads default `--scope mine` — you + your direct children; add
+`--scope all` for the whole fleet.
+
 ```
-fleet vitals [--json] [--paint]     cheapest-first triage table: who needs you,
-                                    who's near-full (ctx %, ! marks <=30% left)
+fleet inbox [--scope …] [--json]    your pending inbox on demand (completions +
+                                    alerts + peer msgs) — the catch-up read after a recycle
+fleet vitals [--scope …] [--json]   cheapest-first triage table: who needs you,
+             [--paint]              who's near-full (ctx %, ! marks <=30% left)
 fleet find <query> [--turns N]      content-aware lookup: matches a label/role/cwd
                                     OR what an agent has been saying in its transcript
-fleet graph [--html] [--out FILE]   the fleet as a parentage tree (text, or a
-                                    self-contained dark HTML page)
+fleet graph [--scope …] [--html]    the fleet as a parentage tree (text, or a
+            [--out FILE]            self-contained dark HTML page); default = your subtree
 fleet serve [--port N]              thin read-only localhost view: GET / -> the graph
                                     HTML, GET /vitals.json -> the rows. No daemon.
 fleet paint                         sync fleet state onto the cmux sidebar (a status

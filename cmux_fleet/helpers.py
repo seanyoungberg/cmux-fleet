@@ -217,12 +217,13 @@ def cmd_child_digest(argv):
 
 
 # =================================================================================================
-# inbox — the on-demand READ of your pending inbox. The awareness/drain hooks push these same rows into
-# a conductor's context as they land; this is the PULL for when a conductor missed the live wakes — most
-# of all right after a recycle, where a fresh instance has no memory of completions/peer-msgs/alerts that
+# inbox — the on-demand READ of a pending inbox. The awareness/drain hooks push these same rows into a
+# conductor's context as they land; this is the PULL for when a conductor missed the live wakes — most of
+# all right after a recycle, where a fresh instance has no memory of completions/peer-msgs/alerts that
 # queued while it was down. Thin read-only wrapper over fs.inbox_pending() (ALL kinds, oldest→newest);
-# clear items with `fleet inbox-ack`. Self-IDs via $CMUX_SURFACE_ID; --surface reads another agent's
-# inbox (debug); --json emits the raw pending records.
+# clear items with `fleet inbox-ack`. Scoped like every read: default `--scope mine` (your own inbox);
+# `--scope <label|surfaceId>` peeks one agent's inbox (this REPLACES the old --surface, kept as a hidden
+# alias); `--scope all|conductors|children` = the multi-inbox triage view (every / by-kind member inbox).
 # =================================================================================================
 def _inbox_line(r):
     """One compact line for a pending row, uniform across kinds: seq · [kind] · who-it's-from · a
@@ -246,36 +247,87 @@ def _inbox_line(r):
     return f"seq {seq}  [{kind}]  {who}: {summary}"
 
 
-def cmd_inbox(argv):
-    args = list(argv)
-    as_json = "--json" in args
-    if as_json:
-        args.remove("--json")
-    surface = os.environ.get("CMUX_SURFACE_ID", "")
-    if "--surface" in args:
-        i = args.index("--surface"); surface = args[i + 1] if i + 1 < len(args) else ""; del args[i:i + 2]
-    if not surface:
-        sys.exit("inbox: no surface (set $CMUX_SURFACE_ID or pass --surface)")
-
-    pending = fs.inbox_pending(surface)                        # every kind addressed to me, oldest→newest
-    if as_json:
-        print(json.dumps(pending, indent=2))
-        return 0
-
-    label = fs.label_for_surface(surface) or surface[:8]
+def _print_inbox_block(label, surface, pending):
+    """Render one agent's pending inbox: header, one line per row, then the per-kind ack hint (each stream
+    has its own high-water, so you ack through the last seq shown per kind). Shared by the single-target
+    read and each member of the multi-target triage view."""
     if not pending:
         print(f"[inbox] {label} (surface {surface[:8]}): 0 pending")
-        return 0
-
+        return
     print(f"[inbox] {label} (surface {surface[:8]}): {len(pending)} pending (oldest first)")
     for r in pending:
         print("  " + _inbox_line(r))
-    # per-kind ack hint (each stream has its own high-water; ack through the last seq shown per kind)
     flag = {"completion": "", "peer": " --peer", "stale": " --stale", "doctor": " --doctor"}
     hints = [f"{fs.ACK} {fs.max_seq([r for r in pending if r.get('kind') == k])}{flag[k]}"
              for k in ("completion", "peer", "stale", "doctor")
              if any(r.get("kind") == k for r in pending)]
     print("  ack when handled: " + "   ".join(hints))
+
+
+def _inbox_targets(scope):
+    """Resolve a --scope value to the list of (label, surface) inboxes to read.
+      mine                      -> just you (self-ID via $CMUX_SURFACE_ID)
+      all / conductors / children -> every / by-kind LIVE member's inbox (triage)
+      <label> or <surfaceId>    -> that one agent (label resolved via the registry; a raw UUID used as-is)
+    Returns (targets, single) — `single` is True for the one-inbox reads (mine / a specific agent)."""
+    if scope == "mine":
+        surface = os.environ.get("CMUX_SURFACE_ID", "")
+        if not surface:
+            sys.exit("inbox: --scope mine needs $CMUX_SURFACE_ID (run inside a conductor); "
+                     "use --scope <label|surfaceId|all>")
+        return [(fs.label_for_surface(surface) or surface[:8], surface)], True
+    if scope in ("all", "conductors", "children"):
+        members = [(l, v.get("surface", "")) for l, v in fs.live_all().items()
+                   if scope == "all" or fs.scope_matches(scope, v, l, "", include_self=False)]
+        return [(l, s) for l, s in members if s], False
+    # a specific label or a raw surface UUID (the folded-in --surface path)
+    surf = fs.surface_for_label(scope)
+    if surf:
+        return [(scope, surf)], True
+    return [(fs.label_for_surface(scope) or scope[:8], scope)], True
+
+
+def cmd_inbox(argv):
+    scope_arg, args = fs.pop_scope(argv, default=None)
+    as_json = "--json" in args
+    if as_json:
+        args.remove("--json")
+    if "--surface" in args:                                    # deprecated alias -> --scope <surfaceId>
+        i = args.index("--surface"); surf = args[i + 1] if i + 1 < len(args) else ""; del args[i:i + 2]
+        sys.stderr.write("[fleet] inbox: --surface is deprecated — use --scope <label|surfaceId>\n")
+        if scope_arg is None:                                 # explicit --scope always wins over the alias
+            scope_arg = surf
+    # read_scope handles the default (mine), the graceful no-surface fallback (omitted -> all), and the
+    # explicit-mine-without-surface error; a bare <label>/surfaceId passes through (sets_only=False).
+    scope, _ = fs.read_scope(scope_arg, "inbox", sets_only=False)
+
+    targets, single = _inbox_targets(scope)
+
+    if as_json:
+        if single:
+            print(json.dumps(fs.inbox_pending(targets[0][1]), indent=2))   # raw rows (single-target shape)
+        else:
+            print(json.dumps({"scope": scope, "inboxes": [
+                {"label": l, "surface": s, "pending": fs.inbox_pending(s)} for l, s in sorted(targets)]},
+                indent=2))
+        return 0
+
+    if single:
+        label, surface = targets[0]
+        _print_inbox_block(label, surface, fs.inbox_pending(surface))
+        return 0
+
+    # multi-target triage: show only members WITH pending, then a summary so 'all clear' is unambiguous
+    shown = 0
+    for label, surface in sorted(targets):
+        pending = fs.inbox_pending(surface)
+        if pending:
+            _print_inbox_block(label, surface, pending)
+            shown += 1
+    if shown:
+        print(f"[inbox] scope {scope}: {shown} of {len(targets)} inbox(es) have pending items")
+    else:
+        print(f"[inbox] scope {scope}: all clear (0 pending across {len(targets)} inbox(es))")
     return 0
 
 

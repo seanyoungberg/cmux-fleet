@@ -369,14 +369,33 @@ def _vitals_fp(rows):
     return "\n".join(f"{r['label']}|{r['state']}|{r['ctx_pct_remaining']}|{r['last_text']}" for r in rows)
 
 
+def _apply_scope(rows, scope, caller):
+    """Filter vitals snapshot rows to a SET-valued --scope (rows carry kind+parent+label, so the shared
+    predicate applies directly). `all` is the whole board; `mine` is you + your direct children."""
+    if scope == "all":
+        return rows
+    return [r for r in rows if fs.scope_matches(scope, r, r["label"], caller, include_self=True)]
+
+
+def _mine_footer(scope, caller, rows, verb):
+    """The one-line 'only you — no children' hint, appended when `--scope mine` resolved to just you."""
+    if scope == "mine" and not any(r["label"] != caller for r in rows):
+        return "\n" + fs.only_self_hint(verb)
+    return ""
+
+
 def cmd_vitals(argv):
-    """fleet vitals [--json] [--paint] [--watch [--interval N]]   one-glance triage: who needs you, who's
-    near-full. Rows are most-urgent first (error/needs-input/review/working/done/idle). `ctx` is context-
-    REMAINING % from each agent's transcript token usage — a `!` marks <=30% left (recycle candidate).
-    `--watch` is the dock-pane mode: clears+reprints only on the fleet's change-fingerprint (no churn)."""
+    """fleet vitals [--scope mine|all|conductors|children] [--json] [--paint] [--watch [--interval N]]
+    one-glance triage: who needs you, who's near-full. Rows are most-urgent first (error/needs-input/
+    review/working/done/idle). `ctx` is context-REMAINING % from each agent's transcript token usage — a
+    `!` marks <=30% left (recycle candidate). Scoped like every read: defaults `--scope mine` (you + your
+    direct children); `--scope all` opens the whole fleet. `--watch` is the dock-pane mode: clears+reprints
+    only on the fleet's change-fingerprint (no churn)."""
     as_json = "--json" in argv
     paint = "--paint" in argv
     watch = "--watch" in argv
+    scope_arg, _ = fs.pop_scope(argv, default=None)
+    scope, caller = fs.read_scope(scope_arg, "vitals")
     interval = 2.0
     if "--interval" in argv:
         try:
@@ -384,24 +403,26 @@ def cmd_vitals(argv):
         except (ValueError, IndexError):
             interval = 2.0
     if watch and not as_json:
-        return _watch_vitals(paint, interval)
+        return _watch_vitals(paint, interval, scope, caller)
     rows = snapshot()
     if paint:
-        _paint(rows)
+        _paint(rows)                       # sidebar sync stays full-fleet — the view scope is display-only
+    rows = _apply_scope(rows, scope, caller)
     if as_json:
         print(json.dumps(rows, indent=2))
         return 0
     if not rows:
-        print("(no live agents)")
+        print("(no live agents)" + _mine_footer(scope, caller, rows, "vitals"))
         return 0
-    print(_render_vitals(rows))
+    print(_render_vitals(rows) + _mine_footer(scope, caller, rows, "vitals"))
     return 0
 
 
-def _watch_vitals(paint, interval):
+def _watch_vitals(paint, interval, scope="all", caller=""):
     """Dock-pane loop: poll `snapshot()` every `interval`s; repaint the terminal only when the board's
     change-fingerprint moves (or on a slow heartbeat, so idle ages don't freeze). Uses ANSI cursor-home
-    + clear-to-end instead of a full `clear` so the board sits still and readable instead of flashing."""
+    + clear-to-end instead of a full `clear` so the board sits still and readable instead of flashing.
+    Applies the same `--scope` filter each poll (paint stays full-fleet — the scope is display-only)."""
     HOME_CLEAR = "\x1b[H\x1b[J"            # cursor home, then erase from cursor to end of screen
     HEARTBEAT = 12.0                       # force a redraw at least this often (refresh idle ages)
     prev_fp, last_draw = None, 0.0
@@ -410,10 +431,11 @@ def _watch_vitals(paint, interval):
             rows = snapshot()
             if paint:
                 _paint(rows)
+            rows = _apply_scope(rows, scope, caller)
             fp = _vitals_fp(rows)
             now = time.time()
             if fp != prev_fp or (now - last_draw) >= HEARTBEAT:
-                body = _render_vitals(rows) if rows else "(no live agents)"
+                body = (_render_vitals(rows) if rows else "(no live agents)") + _mine_footer(scope, caller, rows, "vitals")
                 sys.stdout.write(HOME_CLEAR + body + "\n")
                 sys.stdout.flush()
                 prev_fp, last_draw = fp, now
@@ -641,12 +663,48 @@ li{{margin:6px 0}}
 </body></html>"""
 
 
+def _scope_subtree(rows, scope, caller):
+    """Restrict the parentage forest to a --scope. `all` = the whole tree (the old default). `mine` = the
+    subtree rooted at you (`caller`, resolved by read_scope). `conductors`/`children` = the union of
+    subtrees rooted at every member of that kind. A bare <label> = the subtree rooted at that label."""
+    if scope == "all":
+        return rows
+    _, children, _ = _tree(rows)
+    keep = set()
+
+    def dfs(x):
+        if x in keep:
+            return
+        keep.add(x)
+        for k in children.get(x, []):
+            dfs(k)
+
+    if scope == "mine":
+        if caller:
+            dfs(caller)
+    elif scope in ("conductors", "children"):
+        for r in rows:
+            if fs.scope_matches(scope, r, r["label"], "", include_self=False):
+                dfs(r["label"])
+    else:                                                    # a specific label
+        if scope not in {r["label"] for r in rows}:
+            sys.exit(f"[fleet] graph --scope {scope}: no live label '{scope}'")
+        dfs(scope)
+    return [r for r in rows if r["label"] in keep]
+
+
 def cmd_graph(argv):
-    """fleet graph [--html] [--out FILE]   the fleet as a parentage tree. Text by default; --html writes
-    a self-contained dark page (default $STATE/fleet-graph.html) and prints its path."""
-    rows = snapshot()
+    """fleet graph [--scope mine|all|conductors|children|<label>] [--html] [--out FILE]   the fleet as a
+    parentage tree. Text by default; --html writes a self-contained dark page (default
+    $STATE/fleet-graph.html) and prints its path. Scoped like every read: defaults `--scope mine` (your
+    subtree, rooted at you); `--scope all` is the full tree; a bare <label> roots the subtree there."""
+    scope_arg, argv = fs.pop_scope(argv, default=None)
+    scope, caller = fs.read_scope(scope_arg, "graph", sets_only=False)
+    rows = _scope_subtree(snapshot(), scope, caller)
     if "--html" not in argv:
         print(_graph_text(rows))
+        if scope == "mine" and len(rows) <= 1:
+            print(fs.only_self_hint("graph"))
         return 0
     out = os.path.join(STATE, "fleet-graph.html")
     if "--out" in argv:

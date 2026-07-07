@@ -18,17 +18,18 @@ fleet launch --adhoc <name> --tool claude -- --model opus
 fleet drive-child <surface> "<prompt>"
 fleet child-digest <session-frag> 5
 
-# inventory + lifecycle
-fleet ls                                    # live x hook store; flags STALE / pending / MUTED
-fleet recycle [label] [--fresh] [--session id] [--force] [-- <flags>]   # restart in place (default RESUME; --fresh sheds)
-fleet recycle --all|--conductors|--children|--my-children [--include-muted]  # bulk restart, sequential + gated
+# inventory + lifecycle   (scope-aware reads default --scope mine = you + your children; --scope all = the world)
+fleet ls [--scope mine|all|conductors|children]   # live x hook store; flags STALE / pending / MUTED
+fleet recycle [label] [--fresh] [--session id] [--force] [-- <flags>]   # restart in place (bare = self; default RESUME; --fresh sheds)
+fleet recycle --scope mine|all|conductors|children [--include-muted]   # bulk restart, sequential + gated (mine = your children)
 fleet sessions <label>                      # list resumable prior sessions (id, age, size, snippet)
 fleet archive <label>   / fleet revive <label> [--fresh] [--session id]     # park / bring back
 fleet rm <label> [--detach] [--force] [--with-group] [--wip-commit]   # close + archive (default); --detach drops row only
-fleet mute <label> / unmute <label>
+fleet mute <label> / unmute <label>   [| --scope mine]   # mute one child, or all your children at once
 
-# views (read-only, no LLM)
-fleet vitals [--json] [--paint]   fleet find <query> [--turns N]   fleet graph [--html]
+# views (read-only, no LLM; scope-aware, default --scope mine)
+fleet inbox [--scope mine|<label>|all] [--json]   # pending inbox on demand — the catch-up read after a recycle
+fleet vitals [--scope …] [--json] [--paint]   fleet find <query> [--turns N]   fleet graph [--scope …] [--html]
 fleet serve [--port N]            fleet paint
 
 # worktrees (config-gated) + multi-build
@@ -37,7 +38,7 @@ eval "$(/path/to/<build>/bin/fleet profile <name> --init)"   # pin a build (see 
 
 # comms
 fleet peer-msg <to-label> "<msg>" [--reply-to <id>] [--no-reply]
-fleet broadcast "<msg>" [--target all|all-conductors|all-children|my-children]
+fleet broadcast "<msg>" --scope mine|all|conductors|children   # an act: --scope REQUIRED
 fleet inbox-ack <seq> [--peer]
 ```
 
@@ -213,30 +214,54 @@ in the same step, tears down its (clean) worktree. Note that `rm --kill`,
 row, so after them `fleet worktree clean` can no longer find the tree: reclaim it
 manually with `git worktree remove <path>` (and `git branch -D fleet/<label>`).
 
+## The `--scope` model
+
+Every scope-aware verb takes one shared flag: **`--scope mine|all|conductors|children`**
+(a bare `<label>` works where a verb single-targets — `inbox`, `graph`). The only
+thing that varies per verb is the **default**:
+
+- **Reads** (`ls`, `vitals`, `inbox`, `graph`) default **`--scope mine`** — you +
+  your direct children (for `inbox`, your own inbox). `--scope all` opens the whole
+  fleet; `conductors`/`children` filter by kind. When `mine` is just you, a one-line
+  hint points at `--scope all`.
+- **Acts** (`recycle`, `broadcast`) take **no fan-out default** — you say who. A bare
+  `fleet recycle` is self; `fleet recycle --scope mine` is your children (gated bulk);
+  `fleet broadcast` **errors** without `--scope`. For acts, `mine` = your children.
+
+Back-compat: `broadcast --target all|all-conductors|all-children|my-children` and
+`recycle --all|--conductors|--children|--my-children` still work (hidden, deprecated;
+they map onto `--scope` with a one-line stderr note).
+
 ## Inspecting the fleet
 
 ```
-fleet ls
+fleet ls [--scope mine|all|conductors|children]
 ```
 
 Reconciles the live registry against cmux's hook store. It flags `STALE` (the
 registry says live but the surface has no live session, e.g. a closed tab or a
 crash) and `pending` (launched, awaiting its first turn to bind a session, which
-codex does lazily). It also lists archived, revivable agents.
+codex does lazily). It also lists archived, revivable agents. Defaults to your
+scope (you + your children); `--scope all` for every live member.
 
 ## Fleet views
 
 Read-only, derived from live state on every call (registry, hook stores,
 transcripts). No daemon, no stored status. Status is inferred without an LLM
-(cmux's `agentLifecycle` is authoritative, refined by keyword tables).
+(cmux's `agentLifecycle` is authoritative, refined by keyword tables). All are
+scope-aware and default `--scope mine`.
 
 ```
-fleet vitals [--json] [--paint]      triage table, most-urgent first
-                                     (error/needs-input/review/working/done/idle),
+fleet inbox [--scope mine|<label>|all] [--json]   your pending inbox on demand
+                                     (completions + alerts + peer msgs, oldest first);
+                                     the catch-up read after a recycle
+fleet vitals [--scope …] [--json]    triage table, most-urgent first
+             [--paint]               (error/needs-input/review/working/done/idle),
                                      each with context-remaining % (! flags <=30% left)
 fleet find <query> [--turns N]       find an agent by label/role/cwd, or by what it
                                      said in the last N transcript turns
-fleet graph [--html] [--out FILE]    the parentage tree (text, or a self-contained page)
+fleet graph [--scope …] [--html]     the parentage tree (text, or a self-contained page);
+            [--out FILE]             default = your subtree, --scope all = the full tree
 fleet serve [--port N]               localhost view: GET / -> graph HTML, /vitals.json -> rows
 fleet paint                          push status pill + context bar onto cmux's sidebar
 ```
@@ -258,9 +283,10 @@ writes.
   `--resume` is a no-op alias. It runs detached (so it can recycle the caller
   itself) behind a quiet-gate that waits for an idle prompt with an empty draft
   before respawning, never half-killing a mid-turn agent. `--force` skips the
-  draft guard. Bulk selectors restart many sequentially + gated, skipping self and
-  muted agents: `--all` / `--conductors` / `--children` / `--my-children`
-  (`--include-muted` to force).
+  draft guard. Bulk restarts many sequentially + gated, skipping self and muted
+  agents: `--scope mine|all|conductors|children` (`mine` = your children;
+  `--include-muted` to force). (Legacy `--all` / `--conductors` / `--children` /
+  `--my-children` still work, deprecated.)
 
   ```
   fleet recycle                 # recycle self, RESUME (preserve context) — the default
@@ -336,6 +362,7 @@ demand (`fleet ls` shows it `MUTED`; use `fleet child-digest` for the content).
 ```
 fleet mute worker
 fleet unmute worker
+fleet mute --scope mine        # mute all my children at once (bulk)
 ```
 
 ## Peer messaging
@@ -358,11 +385,29 @@ over the same input-safe path. It never restarts anything; each recipient
 decides what to do (often `fleet recycle` to pick up the change).
 
 ```
-fleet broadcast "roster updated, recycle to pick it up"
-fleet broadcast "heads up" --target all-children --no-wake
+fleet broadcast "roster updated, recycle to pick it up" --scope conductors
+fleet broadcast "heads up" --scope children --no-wake
 ```
 
-Targets: `all`, `all-conductors` (the default), `all-children`, `my-children`.
+Scope: `mine` (your children), `all`, `conductors`, `children`. It is an **act**,
+so `--scope` is **required** — there is no default fan-out; you always say who.
+(Legacy `--target all|all-conductors|all-children|my-children` still works,
+deprecated.)
+
+## Reading the inbox on demand
+
+Completions, auto-archive/health alerts, and peer messages are pushed into your
+context by the awareness/drain hooks while you're live — but a fresh instance
+(after a `recycle`) never saw the wakes that queued while it was down. `fleet
+inbox` is the pull for exactly that: your pending inbox, oldest first, each with
+its `inbox-ack` command. Run it at session start / after a recycle.
+
+```
+fleet inbox                    # your own inbox (default --scope mine)
+fleet inbox --scope <label>    # peek one agent's inbox (label or surface UUID)
+fleet inbox --scope all        # triage: every live member's inbox with pending
+fleet inbox --json             # raw pending records
+```
 
 ## Acking the inbox
 

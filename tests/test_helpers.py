@@ -184,10 +184,21 @@ def test_inbox_acked_rows_drop_out(fs, monkeypatch, capsys):
     assert rc == 0 and "0 pending" in capsys.readouterr().out
 
 
-def test_inbox_no_surface_exits(fs, monkeypatch):
+def test_inbox_explicit_mine_no_surface_exits(fs, monkeypatch):
+    # EXPLICIT --scope mine names identity-relative scope but there's no identity -> usage error
     monkeypatch.delenv("CMUX_SURFACE_ID", raising=False)
     with pytest.raises(SystemExit):
-        fh.cmd_inbox([])
+        fh.cmd_inbox(["--scope", "mine"])
+
+
+def test_inbox_bare_no_surface_falls_back_to_triage(fs, monkeypatch, capsys):
+    # a human at a plain shell (no surface) running bare `fleet inbox` gets the all-inbox triage, not an error
+    monkeypatch.delenv("CMUX_SURFACE_ID", raising=False)
+    fs.live_put("a", {"surface": "SA", "kind": "conductor", "role": "r"})
+    fs.inbox_put("completion", "SA", {"label": "b", "gist": "done"})
+    rc = fh.cmd_inbox([])
+    out = capsys.readouterr().out
+    assert rc == 0 and "scope all" in out and "done" in out
 
 
 def test_inbox_surface_override_reads_another_agent(fs, monkeypatch, capsys):

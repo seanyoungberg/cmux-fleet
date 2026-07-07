@@ -241,6 +241,85 @@ def entry_for_surface(surface):
     return None
 
 
+# --- unified --scope model (ratified 2026-07-07) -------------------------------------------------
+# ONE scoping vocabulary on every scope-aware verb. `mine|all|conductors|children` are the SET values
+# (a bare <label> is a single-target scope the verb resolves itself); the only thing that varies per
+# verb is the DEFAULT (reads default `mine`, acts require an explicit scope). scope_matches is the ONE
+# predicate behind every selector, so a read's view set and an act's target set can never drift.
+SCOPE_SETS = ("mine", "all", "conductors", "children")
+
+
+def is_my_child(entry, parent_label):
+    """The `mine` parent-match: a CHILD whose parent label == mine. `entry` is any dict carrying
+    `kind`+`parent` (a live registry entry, an archive row, or a vitals snapshot row)."""
+    return entry.get("kind") == "child" and entry.get("parent") == parent_label
+
+
+def scope_matches(scope, entry, label, caller_label, *, include_self):
+    """Does `entry` (registry key `label`) fall in a SET-valued --scope, relative to caller_label?
+      all         -> everyone
+      conductors  -> kind == conductor          children -> kind == child
+      mine        -> caller's direct children (+ caller itself iff include_self)
+    Reads pass include_self=True (show yourself in context); acts pass False (never fan out onto self).
+    A non-set scope (a specific label) returns False here — set-scope verbs validate the value first."""
+    kind = entry.get("kind")
+    if scope == "all":
+        return True
+    if scope == "conductors":
+        return kind == "conductor"
+    if scope == "children":
+        return kind == "child"
+    if scope == "mine":
+        return is_my_child(entry, caller_label) or (include_self and label == caller_label)
+    return False
+
+
+def scope_members(scope, caller_label, *, include_self):
+    """The live (label, entry) members a SET-valued --scope selects, relative to caller_label."""
+    return [(l, v) for l, v in live_all().items()
+            if scope_matches(scope, v, l, caller_label, include_self=include_self)]
+
+
+def pop_scope(argv, default=None):
+    """Pull `--scope <value>` out of a manually-parsed argv list. Returns (value_or_default, remaining).
+    Manual-parse verbs (ls/vitals/graph/inbox/broadcast) use this; recycle uses argparse instead."""
+    args = list(argv)
+    if "--scope" in args:
+        i = args.index("--scope")
+        val = args[i + 1] if i + 1 < len(args) else ""
+        del args[i:i + 2]
+        return val, args
+    return default, args
+
+
+def only_self_hint(verb):
+    """The one-line 'you have no children yet' nudge a read prints when `--scope mine` resolves to just
+    you, so nobody thinks the fleet is empty when it's only their corner of it that is."""
+    return f"(only you — no children. fleet {verb} --scope all for the whole fleet.)"
+
+
+def read_scope(scope_arg, verb, *, sets_only=True):
+    """Normalize + resolve a READ verb's --scope (None = the default `mine`) and its caller label.
+    Returns (scope, caller_label). Two rules make the default humane:
+      * The graceful no-surface fallback — an OMITTED scope with no $CMUX_SURFACE_ID falls back to `all`
+        (a human at a plain shell / CI just wants the fleet). An agent always carries a surface, so it
+        still gets its own scope; only an identity-less shell widens to the world.
+      * An EXPLICIT `--scope mine` with no surface is a usage error (you named identity-relative scope but
+        have no identity) — mirrors broadcast/recycle's message.
+    With sets_only (ls/vitals), a bare <label> is rejected; graph/inbox pass sets_only=False and resolve a
+    label themselves."""
+    explicit = scope_arg is not None
+    scope = scope_arg if explicit else "mine"
+    surface = os.environ.get("CMUX_SURFACE_ID", "")
+    if scope == "mine" and not surface:
+        if explicit:
+            sys.exit(f"[fleet] {verb} --scope mine needs $CMUX_SURFACE_ID (run inside a conductor); use --scope all")
+        scope = "all"                                          # identity-less shell -> show the world
+    if sets_only and scope not in SCOPE_SETS:
+        sys.exit(f"[fleet] {verb}: --scope must be one of {list(SCOPE_SETS)} (a bare label isn't a listing scope)")
+    return scope, (label_for_surface(surface) if surface else "")
+
+
 def reconcile_session(label, sid_bare, tool=None, event_tool=None):
     """Refresh a live member's stored `session` to the GROUND-TRUTH bound id `sid_bare` when it's either
     empty (lazy first-turn backfill: codex binds on its 1st turn) OR DIVERGED from what the surface

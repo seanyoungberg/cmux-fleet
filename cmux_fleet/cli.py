@@ -1512,10 +1512,19 @@ def _surface_pids(surface):
 
 def cmd_ls(argv):
     """Reconcile the live registry against cmux's hook store. Flags STALE = registry says live but the
-    surface has no live session (a closed tab / crash never fires an archive transition)."""
+    surface has no live session (a closed tab / crash never fires an archive transition). Scoped like
+    every read: defaults `--scope mine` (you + your direct children); `--scope all` opens the whole
+    fleet; `conductors`/`children` filter by kind. When `mine` is just you, a one-line hint points at
+    `--scope all` so nobody mistakes their corner for the empty fleet."""
     from . import state as fs
+    scope_arg, _ = fs.pop_scope(argv, default=None)
+    scope, caller = fs.read_scope(scope_arg, "ls")
     live, arch = fs.live_all(), fs.archive_all()
-    print(f"LIVE FLEET ({len(live)}):  {'label':<24}{'role':<16}{'kind':<11}{'status':<8}{'lifecycle':<11}surface")
+    if scope != "all":
+        live = {l: v for l, v in live.items() if fs.scope_matches(scope, v, l, caller, include_self=True)}
+        arch = {l: v for l, v in arch.items() if fs.scope_matches(scope, v, l, caller, include_self=True)}
+    scope_tag = "" if scope == "all" else f"{scope}: "
+    print(f"LIVE FLEET ({scope_tag}{len(live)}):  {'label':<24}{'role':<16}{'kind':<11}{'status':<8}{'lifecycle':<11}surface")
     for label, v in sorted(live.items()):
         surf = v.get("surface", "")
         life = fs.lifecycle(surf) or "-"
@@ -1535,6 +1544,8 @@ def cmd_ls(argv):
         print(f"\nARCHIVED ({len(arch)}, revivable):")
         for label, v in sorted(arch.items()):
             print(f"  {label:<24}{v.get('role','-'):<16}{v.get('kind','-'):<11}last_session={(v.get('last_session') or '')[:14]}")
+    if scope == "mine" and not any(l != caller for l in live):
+        print(fs.only_self_hint("ls"))
     print("\n(STALE = surface gone, `fleet rm`/`revive`.  pending = launched, awaiting first turn to bind.)")
     return 0
 
@@ -2819,8 +2830,9 @@ def _bulk_targets(target, from_surface, from_label, include_muted):
 
 
 def cmd_recycle(argv):
-    """Restart THIS (or a named) agent in place on the same surface, same identity. A bulk SELECTOR
-    (--all/--conductors/--children/--my-children) restarts many, sequentially + gated. See block comment."""
+    """Restart THIS (or a named) agent in place on the same surface, same identity. A bulk `--scope`
+    (mine|all|conductors|children) restarts many, sequentially + gated. Bare (no label, no scope) = self.
+    See block comment. (Legacy --all/--conductors/--children/--my-children still work, hidden.)"""
     from . import state as fs
     caller = []
     if "--" in argv:
@@ -2855,11 +2867,16 @@ def cmd_recycle(argv):
     ap.add_argument("--prime", help="override the post-fresh-boot priming prompt")
     ap.add_argument("--no-prime", action="store_true", help="don't send any priming prompt")
     ap.add_argument("--dry-run", action="store_true", help="resolve + print, do NOT recycle")
-    # bulk / cross-conductor selectors (mirror broadcast); sequential + gated, external-recycle is safe
-    ap.add_argument("--all", action="store_true", help="bulk: recycle every live agent (except self)")
-    ap.add_argument("--conductors", action="store_true", help="bulk: recycle live conductors")
-    ap.add_argument("--children", action="store_true", help="bulk: recycle live children")
-    ap.add_argument("--my-children", action="store_true", help="bulk: recycle live children whose parent is me")
+    # bulk / cross-conductor selector: one unified --scope (mirrors every verb); sequential + gated,
+    # external-recycle is safe. For an ACT, `mine` = your children (NOT self — a bare recycle is self).
+    ap.add_argument("--scope", default="", metavar="SET",
+                    help="bulk restart a SET: mine (your children) | all | conductors | children. "
+                         "Sequential + gated, skips self + muted. Omit for single-target (bare = self).")
+    # legacy bulk flags, kept working (hidden) for muscle-memory + old docs -> mapped onto --scope below.
+    ap.add_argument("--all", action="store_true", help=argparse.SUPPRESS)
+    ap.add_argument("--conductors", action="store_true", help=argparse.SUPPRESS)
+    ap.add_argument("--children", action="store_true", help=argparse.SUPPRESS)
+    ap.add_argument("--my-children", action="store_true", help=argparse.SUPPRESS)
     ap.add_argument("--include-muted", action="store_true",
                     help="bulk: also recycle muted/human-driven agents (skipped by default)")
     a = ap.parse_args(argv)
@@ -2878,14 +2895,28 @@ def cmd_recycle(argv):
         caller += ["--effort", a.effort]
     if a.model:
         caller += ["--model", a.model]
-    selectors = {"all": a.all, "conductors": a.conductors, "children": a.children, "my-children": a.my_children}
-    chosen = [k for k, on in selectors.items() if on]
-    if chosen:
-        if len(chosen) > 1:
-            sys.exit(f"[fleet] recycle: pick ONE bulk selector, got {chosen}")
+    # unify --scope + legacy flags into ONE internal bulk target vocab {all,conductors,children,my-children}.
+    # `mine` -> `my-children` (an act's `mine` is your children); the rest map name-for-name.
+    SCOPE_TO_TARGET = {"mine": "my-children", "all": "all", "conductors": "conductors", "children": "children"}
+    legacy = {"all": a.all, "conductors": a.conductors, "children": a.children, "my-children": a.my_children}
+    legacy_chosen = [k for k, on in legacy.items() if on]
+    target = None
+    if a.scope:
+        if a.scope not in SCOPE_TO_TARGET:
+            sys.exit(f"[fleet] recycle: --scope must be one of {list(SCOPE_TO_TARGET)}")
+        if legacy_chosen:
+            sys.exit("[fleet] recycle: --scope and the legacy bulk flags are mutually exclusive")
+        target = SCOPE_TO_TARGET[a.scope]
+    elif legacy_chosen:
+        if len(legacy_chosen) > 1:
+            sys.exit(f"[fleet] recycle: pick ONE bulk selector, got {legacy_chosen}")
+        target = legacy_chosen[0]
+        _scope_eq = {"my-children": "mine", "all": "all", "conductors": "conductors", "children": "children"}
+        sys.stderr.write(f"[fleet] recycle: --{target} is deprecated; use --scope {_scope_eq[target]}\n")
+    if target:
         if a.label or a.session:
-            sys.exit("[fleet] recycle: a bulk selector can't combine with a <label> or --session (per-target)")
-        return _recycle_bulk(chosen[0], mode, caller, a)
+            sys.exit("[fleet] recycle: a bulk scope can't combine with a <label> or --session (per-target)")
+        return _recycle_bulk(target, mode, caller, a)
 
     label = a.label or fs.label_for_surface(os.environ.get("CMUX_SURFACE_ID", ""))
     if not label:
@@ -3358,6 +3389,33 @@ def cmd_recycle_bulk_exec(argv):
     return 0
 
 
+def _mute_bulk(scope, mute, verb, fs):
+    """Bulk (un)mute a --scope. Mute governs child→parent completion delivery, so only CHILDREN in the
+    scope are touched (non-children skipped); `mine` = your children. Reuses the shared scope predicate."""
+    if scope not in fs.SCOPE_SETS:
+        sys.exit(f"[fleet] {verb}: --scope must be one of {list(fs.SCOPE_SETS)}")
+    caller = ""
+    if scope == "mine":
+        surface = os.environ.get("CMUX_SURFACE_ID", "")
+        if not surface:
+            sys.exit(f"[fleet] {verb} --scope mine needs $CMUX_SURFACE_ID (run inside a conductor)")
+        caller = fs.label_for_surface(surface) or ""
+    targets = [(l, v) for l, v in fs.scope_members(scope, caller, include_self=False)
+               if v.get("kind") == "child"]
+    if not targets:
+        print(f"[fleet] {verb} --scope {scope}: no live children in scope")
+        return 0
+    for label, e in sorted(targets):
+        if mute:
+            e["muted"] = True
+        else:
+            e.pop("muted", None)
+        fs.live_put(label, e)
+        fs.log_event(verb + "d", label=label, via="scope")
+    print(f"[fleet] {verb}d {len(targets)} child(ren) (scope {scope}): " + ", ".join(l for l, _ in sorted(targets)))
+    return 0
+
+
 def cmd_mute(argv, mute=True):
     """Mute/unmute a child's completion delivery. When muted, the router does NOT push the child's
     turn-completions to the parent's inbox (no inbox row, no `cmux notify`, no idle-wake); the parent
@@ -3365,13 +3423,16 @@ def cmd_mute(argv, mute=True):
     Berg drives a child directly (he is in the loop, so the conductor should not be spammed). The
     inverse of the notify-on-completion default. Mute is per-child runtime state on `fleet.json`.
 
-      fleet mute <label>     fleet unmute <label>
+      fleet mute <label>     fleet unmute <label>     fleet mute --scope mine   (all my children)
     """
     from . import state as fs
     verb = "mute" if mute else "unmute"
-    if not argv:
-        sys.exit(f"usage: fleet {verb} <label>")
-    label = argv[0]
+    scope, args = fs.pop_scope(argv, default=None)
+    if scope is not None:                                     # bulk (un)mute a --scope (children only)
+        return _mute_bulk(scope, mute, verb, fs)
+    if not args:
+        sys.exit(f"usage: fleet {verb} <label>  |  fleet {verb} --scope mine|children")
+    label = args[0]
     e = fs.live_get(label)
     if not e:
         sys.exit(f"fleet {verb}: no live label '{label}'")
@@ -3399,20 +3460,24 @@ def cmd_broadcast(argv):
     plus an idle-wake. Informational by default (no reply expected). It NEVER restarts anything — each
     recipient decides what to do (e.g. `fleet recycle` to pick up the new toml). Self is always excluded.
 
-      fleet broadcast "<msg>" [--target all|all-conductors|all-children|my-children]
-                              [--no-wake] [--expect-reply] [--dry-run]
+      fleet broadcast "<msg>" --scope mine|all|conductors|children [--no-wake] [--expect-reply] [--dry-run]
 
-    Default target: all-conductors (config-change broadcasts are a conductor concern — they refresh
-    their own fleets). `my-children` = live children whose parent label == mine.
+    An ACT: `--scope` is REQUIRED (no fan-out default — you say who). `mine` = live children whose parent
+    label == mine. (Legacy `--target all|all-conductors|all-children|my-children` still works, hidden.)
     """
     from . import state as fs; import secrets
-    target = "all-conductors"
+    # internal target vocab (unchanged selection logic below); --scope + legacy --target both funnel here.
+    SCOPE_TO_TARGET = {"mine": "my-children", "all": "all", "conductors": "all-conductors", "children": "all-children"}
+    TARGET_TO_SCOPE = {"my-children": "mine", "all": "all", "all-conductors": "conductors", "all-children": "children"}
+    scope = target_legacy = None
     no_wake = expect_reply = dry = False
     pos, i = [], 0
     while i < len(argv):
         a = argv[i]
-        if a == "--target":
-            target = argv[i + 1] if i + 1 < len(argv) else target; i += 2
+        if a == "--scope":
+            scope = argv[i + 1] if i + 1 < len(argv) else ""; i += 2
+        elif a == "--target":
+            target_legacy = argv[i + 1] if i + 1 < len(argv) else ""; i += 2
         elif a == "--no-wake":
             no_wake = True; i += 1
         elif a == "--expect-reply":
@@ -3422,17 +3487,25 @@ def cmd_broadcast(argv):
         else:
             pos.append(a); i += 1
     if not pos:
-        sys.exit('usage: fleet broadcast "<msg>" [--target all|all-conductors|all-children|my-children]'
+        sys.exit('usage: fleet broadcast "<msg>" --scope mine|all|conductors|children'
                  ' [--no-wake] [--expect-reply] [--dry-run]')
     body = " ".join(pos)
-    valid = {"all", "all-conductors", "all-children", "my-children"}
-    if target not in valid:
-        sys.exit(f"fleet broadcast: --target must be one of {sorted(valid)}")
+
+    if scope is None and target_legacy is not None:            # deprecated --target -> --scope alias
+        if target_legacy not in TARGET_TO_SCOPE:
+            sys.exit(f"fleet broadcast: --target must be one of {sorted(TARGET_TO_SCOPE)}")
+        scope = TARGET_TO_SCOPE[target_legacy]
+        sys.stderr.write(f"[fleet] broadcast: --target is deprecated; use --scope {scope}\n")
+    if scope is None:                                          # an ACT: no fan-out default (mirror recycle bulk)
+        sys.exit("fleet broadcast: --scope required (mine|all|conductors|children)")
+    if scope not in SCOPE_TO_TARGET:
+        sys.exit(f"fleet broadcast: --scope must be one of {list(SCOPE_TO_TARGET)}")
+    target = SCOPE_TO_TARGET[scope]
 
     from_surface = os.environ.get("CMUX_SURFACE_ID", "")
     from_label = fs.label_for_surface(from_surface) or (from_surface[:8] if from_surface else "fleet")
     if target == "my-children" and not from_surface:
-        sys.exit("fleet broadcast: --target my-children needs $CMUX_SURFACE_ID (run inside a conductor)")
+        sys.exit("fleet broadcast: --scope mine needs $CMUX_SURFACE_ID (run inside a conductor)")
 
     sel = []
     for label, v in fs.live_all().items():
@@ -3450,10 +3523,10 @@ def cmd_broadcast(argv):
     sel.sort()
 
     if not sel:
-        print(f"[broadcast] no live targets for --target {target}")
+        print(f"[broadcast] no live targets for --scope {scope}")
         return 0
     if dry:
-        print(f"[broadcast] (dry-run) from {from_label}, target {target} -> {len(sel)} agent(s):")
+        print(f"[broadcast] (dry-run) from {from_label}, scope {scope} -> {len(sel)} agent(s):")
         for label, v in sel:
             print(f"  {label:<24}{v.get('kind','-'):<11}{(v.get('surface') or '')[:8]}")
         print(f"  body: {body}")
@@ -3470,8 +3543,8 @@ def cmd_broadcast(argv):
         })
         if not no_wake and fs.idlewake_on() and fs.wake_if_idle(surf, "(broadcast-wake) a fleet broadcast is waiting in your context; handle it"):
             woke.append(label)                          # 'passive' mutes the wake fleet-wide; the inbox rows are still written
-    fs.log_event("broadcast", **{"from": from_label, "target": target, "count": len(sel), "msg_id": bid})
-    print(f"[broadcast] {from_label} -> {len(sel)} agent(s) (target {target}, msg {bid}, "
+    fs.log_event("broadcast", **{"from": from_label, "scope": scope, "count": len(sel), "msg_id": bid})
+    print(f"[broadcast] {from_label} -> {len(sel)} agent(s) (scope {scope}, msg {bid}, "
           f"reply: {'expected' if expect_reply else 'none'})")
     for label, v in sel:
         print(f"  {label:<24}{v.get('kind','-'):<11}{(v.get('surface') or '')[:8]}{'  (woke)' if label in woke else ''}")
@@ -3556,7 +3629,7 @@ def main():
         print("usage: fleet <launch|config|ls|plugins|archive|revive|register|recycle|rm|vitals|find|graph|serve|paint|worktree|profile|daemon> ...\n"
               "  launch <role|--adhoc NAME> [--tool t] [--place p] [--parent s] [--effort L] [--model M] [--use NAME] [--dry-run] [-- <tool flags>]\n"
               "  config <role|--adhoc NAME|--cwd DIR> [--tool t]   effective config (base settings + fleet adds)\n"
-              "  ls                                                live fleet x hook store; flags STALE + archived\n"
+              "  ls [--scope mine|all|conductors|children]         live fleet x hook store; flags STALE + archived (default mine = you + your children; --scope all = the world)\n"
               "  plugins <add|reconcile|ls|show|describe> ...      the plugin INDEX: add-from-URL (safe: never enables) + reconcile + on-demand discovery\n"
               "  archive <label>                                   park a live agent (revivable)\n"
               "  revive <label> [--fresh] [--session id] [--place p] [--parent s] [--add-plugin N] [-- <flags>]\n"
@@ -3565,18 +3638,18 @@ def main():
               "                                                    pull a LIVE-but-unregistered agent into the registry (recovery for a skipped auto-register)\n"
               "  recycle [label] [--fresh] [--session id] [--effort L] [--model M] [--force] [--add-plugin N] [--use NAME] [--prime T|--no-prime] [-- <flags>]\n"
               "                                                    restart in place, same surface/identity (default self+RESUME; --fresh sheds; --use = index-aware plugin add, reaches linked + enabled)\n"
-              "  recycle --all|--conductors|--children|--my-children [--include-muted] [--resume] [--dry-run]\n"
-              "                                                    BULK restart (sequential + gated, skips self + muted); cross-conductor = the safe topology\n"
+              "  recycle --scope mine|all|conductors|children [--include-muted] [--resume] [--dry-run]\n"
+              "                                                    BULK restart (sequential + gated, skips self + muted); mine = your children; cross-conductor = the safe topology\n"
               "  unstick [label] [--surface UUID] [--dry-run]      reap a frozen dead-pid hook-store ghost (SessionEnd-less death) so ls/recycle/doctor stop trusting a dead 'running'; never touches a LIVE record\n"
               "  sessions <label> [--all] [--json]                 list resumable prior sessions for the agent's surface (id, age, size, snippet)\n"
-              "  broadcast \"<msg>\" [--target all|all-conductors|all-children|my-children] [--no-wake] [--expect-reply] [--dry-run]\n"
-              "                                                    input-safe heads-up to live agents (e.g. after a toml/floor change); never restarts them\n"
-              "  mute <label> | unmute <label>                     stop/resume pushing a child's completions to its parent (parent reads on demand)\n"
+              "  broadcast \"<msg>\" --scope mine|all|conductors|children [--no-wake] [--expect-reply] [--dry-run]\n"
+              "                                                    input-safe heads-up to live agents (e.g. after a toml/floor change); never restarts them; --scope REQUIRED (an act)\n"
+              "  mute <label> | unmute <label> [| --scope mine]    stop/resume pushing a child's completions to its parent (parent reads on demand); --scope mine = all my children\n"
               "  rm <label> [--detach] [--force] [--kill] [--wip-commit] [--with-group]\n"
               "                                                    close + archive a label (revivable; refuses mid-turn, --force overrides); --detach drops the row only; --kill adds worktree teardown; --with-group dissolves its workspace-group\n"
-              "  vitals [--json] [--paint] [--watch [--interval N]] cheapest-first triage table + each agent's context-remaining %\n"
+              "  vitals [--scope mine|all|conductors|children] [--json] [--paint] [--watch [--interval N]] cheapest-first triage table + ctx-remaining % (default mine)\n"
               "  find <query> [--turns N] [--json]                 content-aware session lookup (label/role/cwd or transcript)\n"
-              "  graph [--html] [--out FILE]                       fleet parentage tree (text, or self-contained HTML)\n"
+              "  graph [--scope mine|all|<label>] [--html] [--out FILE]  fleet parentage tree (text/HTML); default mine = your subtree; --scope all = full tree\n"
               "  serve [--port N]                                  thin read-only localhost view (graph HTML + vitals.json); no daemon\n"
               "  paint                                             sync fleet state onto the cmux sidebar (status pills + ctx bars)\n"
               "  worktree <ls | clean <label> [--wip-commit]>      manage fleet-owned git worktrees (config-gated, default-off)\n"
@@ -3586,7 +3659,7 @@ def main():
               "  peer-msg <to-label> \"<body>\" [--no-reply] [--reply-to <id>] [--expect-reply] [--no-wake]\n"
               "                                                    input-safe A2A: message a live PEER conductor (into its context, never its input box)\n"
               "  child-digest <session-frag> [N]                   print a child's last N transcript turns (the reliable content source)\n"
-              "  inbox [--json] [--surface UUID]                   your pending inbox on demand (completions + stale + doctor + peer msgs, oldest first) — the catch-up read after a recycle\n"
+              "  inbox [--scope mine|<label>|all|conductors|children] [--json]  pending inbox on demand (default mine = yours; <label> peeks one; all = triage) — the catch-up read after a recycle\n"
               "  inbox-ack <seq> [--peer|--stale|--doctor] [--surface UUID]  mark shown completions/alerts/peer msgs handled so they stop re-surfacing")
         return 0
     sub, rest = sys.argv[1], sys.argv[2:]

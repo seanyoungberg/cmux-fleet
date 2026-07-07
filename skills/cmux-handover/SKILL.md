@@ -33,7 +33,7 @@ Hit what's relevant, skip what's empty, add what's yours. Write for a reader wit
 - **WIP pointers** — files, branches, commits, surfaces in flight; where to look.
 - **What went well / gotchas** — discoveries to reuse, traps to avoid.
 - **Fleet snapshot** *(conductors)* — paste `fleet ls` at handover + notes on children (who's parked/revivable, who's mid-task, who to clean up). Live truth is always `fleet ls` / `fleet.json`; this is just the picture at handover time, so the next instance isn't flying blind on boot. (No separate persistent state file — the registry already IS the live state.)
-- **Read on resume** — the 2-3 pointers (docs, memory, this file) to load first. For conductors, the boot ritual also includes **`fleet inbox`** — the pending completions/alerts/peer-msgs that queued while you were down, which the push path can't replay across a recycle.
+- **Read on resume** — the 2-3 pointers (docs, memory, this file) to load first. For conductors, the boot ritual also includes **`fleet inbox`** (pending completions/alerts/peer-msgs that queued while you were down — the push path can't replay them across a recycle) + **`fleet ls --scope mine`** (know your fleet: you + your children).
 
 ## Optional final step: recycle yourself
 The natural tail of a handover is a **`fleet recycle --fresh`** — restart yourself into a fresh session in the same seat, shedding bloated context, and let the next instance boot and read the handover you just wrote. At handover time you want **`--fresh`** (shedding is the whole point). **Only do this when you are actually ready to relaunch** (most handovers don't recycle — you write one and keep going, or hand back to a human). Never recycle with a draft you haven't finished.
