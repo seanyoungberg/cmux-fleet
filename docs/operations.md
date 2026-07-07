@@ -693,3 +693,29 @@ called "no recycle." If it fails, that agent needs strategy B (recycle).
 
 Until a staging run proves strategy A end-to-end, treat conductor **recycle**
 (strategy B) as the default for a production cutover.
+
+## Provider usage tracking + per-launch account selection (optional)
+
+The optional `[providers]` block (see `fleet.toml.example`) declares, per tool, the
+inference providers you can run under and how each is tracked. `fleet usage` shows the
+polled subscription windows; `fleet launch <role> --provider <name>` picks one for a
+launch.
+
+- **Types:** `subscription` (track 5h + 7-day windows), `api` (metered; budget stub),
+  `vertex` (env-file; nothing tracked).
+- **Read pollers** (daemon, ~every 3 min → `provider-usage.json`): claude hits
+  `GET /api/oauth/usage` with the account's OAuth token (keychain for the current acct,
+  or a `file:` token); codex reads the newest `~/.codex/**/rollout-*.jsonl` `rate_limits`
+  event (zero-auth). Vertex/api are not polled.
+- **Per-launch selection keeps logs in place:** a claude `file:` token is injected as
+  `CLAUDE_CODE_OAUTH_TOKEN` via a spawn-time `$(cat <path>)` — the config dir is never
+  swapped, so session JSONL stays in `~/.claude`, and the token value never appears in the
+  rendered/printed launch command. Tokens live at `~/.local/state/cmux-fleet/providers/<name>.token`
+  (0600). **Roadmap (not built):** fold these secrets into the SOPS env-var mechanism.
+- **Codex account switching is PROVISIONAL:** the codex READ poller is final, but the
+  account-SELECT mechanism (`CODEX_HOME`-per-profile vs an env-token path) is pending a
+  verdict — `--provider codex:<non-default>` warns and is a stub. Do not treat it as settled.
+- **Phase-1 limitations:** `recycle` does NOT re-inject a provider token (it rebuilds from
+  the roster), so an agent pinned to a non-default account must be **re-launched**, not
+  recycled, to keep that account (recycle-with-account is Phase 2). An invalid/expired
+  injected token silently falls back to the default keychain account.

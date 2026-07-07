@@ -37,6 +37,7 @@ DRAFTMARKS = os.path.join(STATE, "draft-marks.json")    # {surface: {text, since
 EXPECTED_CLOSE = os.path.join(STATE, "expected-close.json")  # short-lived CLI-close tombstones (list of {surface_id, ts})
 EXPECTED_CLOSE_S = 10   # a CLI-written close tombstone shields _archive_closed_surface from this surface this long
 DOCTOR_DEDUP = os.path.join(STATE, "doctor-dedup.json")
+PROVIDER_USAGE = os.path.join(STATE, "provider-usage.json")  # last usage poll snapshot (providers feature)
 
 # Agent-helper command hints emitted into conductor context by the awareness/drain hooks. Phase 2
 # folded the four standalone plugin scripts into `fleet <verb>` subcommands, so these are now the app
@@ -89,6 +90,17 @@ def _read_jsonl(path):
     except OSError:
         pass
     return out
+
+
+# --- provider usage snapshot (the providers feature; written by the daemon poller) ---------
+def provider_usage_write(data):
+    """Persist the latest usage poll (one atomic write; no secrets — utilization %/resets only)."""
+    _atomic_write(PROVIDER_USAGE, json.dumps(data, indent=2))
+
+
+def provider_usage_read():
+    """The last usage snapshot, or {} if the poller has never run."""
+    return _read_json(PROVIDER_USAGE, {})
 
 
 # --- the dial (DEMOTED to a mute switch — design 2.1) --------------------------------------

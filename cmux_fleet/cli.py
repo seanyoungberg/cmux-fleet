@@ -577,6 +577,8 @@ def register(surf, spec, parent_surface, session, ws):
         "session": f"claude-{session}" if spec["tool"] == "claude" else session,
         # carried so archive->revive can rebuild the launch without re-resolving the roster
         "plugins": spec["plugins"], "flags": spec["flags"], "settings": spec["settings"],
+        # provider attribution (providers feature): "tool:name" the agent launched under, for `fleet usage`
+        "provider": spec.get("provider", ""),
         # group is only ever REAL cmux-side membership when place=="workspace" -- that's the one branch
         # of create_surface() that touches workspace-group at all (join/bootstrap). A role's toml (or a
         # caller --group) can carry a `group` value alongside place="tab"/"pane" (e.g. a --place override
@@ -608,10 +610,15 @@ def _link_floor_claudemd(abs_cwd):
         print(f"[fleet] warn: could not link floor CLAUDE.md into {abs_cwd}: {e}")
 
 
-def render_send_cmd(bin_name, args, env, abs_cwd):
+def render_send_cmd(bin_name, args, env, abs_cwd, raw_env=None):
     parts = [f"cd {shlex.quote(abs_cwd)} &&"]
     for k, v in env.items():
         parts.append(f"{k}={shlex.quote(str(v))}")
+    # raw_env values are emitted VERBATIM (NOT shlex-quoted): the caller guarantees shell-safety. This is
+    # how a secret is injected as a spawn-time `$(cat 'path')` so the token itself never appears in the
+    # rendered/printed command (the providers feature; only the path shows). Empty -> byte-identical output.
+    for k, v in (raw_env or {}).items():
+        parts.append(f"{k}={v}")
     parts.append(bin_name)
     # shlex.quote every arg: it's a no-op for safe tokens (flags, paths) but is REQUIRED for inline
     # JSON values like --settings '{"enabledPlugins":...}' — compact JSON has no spaces yet is full of
@@ -749,6 +756,10 @@ def cmd_launch(argv):
     ap.add_argument("--force", action="store_true",
                     help="overwrite an already-LIVE label's registry row (only when you KNOW its old "
                          "surface is already dead by other means)")
+    ap.add_argument("--provider", metavar="NAME", help="select an inference provider from "
+                    "[providers.<tool>] for THIS launch (accepts NAME or tool:NAME). A subscription "
+                    "token is injected per-launch so session logs stay in the tool's DEFAULT dir; no "
+                    "config-dir swap. Omit to use the tool's configured default.")
     ap.add_argument("--dry-run", action="store_true", help="resolve + print, do NOT spawn")
     a = ap.parse_args(argv)
     if not a.role and not a.adhoc:
@@ -832,7 +843,35 @@ def cmd_launch(argv):
         print(f"[fleet] worktree: {path} on branch {branch}")
 
     bin_name, args, env = adapter_compile(spec["tool"], spec, caller)
-    send_cmd = render_send_cmd(bin_name, args, env, spec["abs_cwd"])
+    # --- provider selection (the optional providers feature) -----------------------------------
+    # Resolve the inference provider for THIS launch and merge its auth into the spawn env. A claude
+    # subscription token is injected via raw_env ($(cat path) at spawn) so the secret is never printed;
+    # the config dir is untouched, so logs stay in the tool's default place. When [providers] is
+    # unconfigured, default_provider() returns "" and this whole block is inert (attribution stays empty).
+    from . import providers as pv
+    raw_env = {}
+    if a.provider:
+        pname = a.provider
+        if ":" in pname:
+            ptool, pname = pname.split(":", 1)
+            if ptool != spec["tool"]:
+                sys.exit(f"[fleet] --provider tool '{ptool}' != this launch's tool '{spec['tool']}'")
+        try:
+            pr = pv.resolve_launch(spec["tool"], pname)
+        except pv.ProviderError as e:
+            sys.exit(f"[fleet] --provider: {e}")
+        env.update(pr["env"])
+        raw_env.update(pr["raw_env"])
+        spec["provider"] = pr["label"]
+        print(f"[fleet] provider: {pr['label']}" + (f"  ({pr['note']})" if pr.get("note") else ""))
+        if pr.get("provisional"):
+            print(f"[fleet] WARN: {pr['label']} account selection is PROVISIONAL (codex mechanism "
+                  f"verdict pending; not yet final)")
+    else:
+        dflt = pv.default_provider(spec["tool"])         # attribute default-account agents too
+        if dflt:
+            spec["provider"] = f"{spec['tool']}:{dflt}"
+    send_cmd = render_send_cmd(bin_name, args, env, spec["abs_cwd"], raw_env)
 
     print(f"[fleet] tool={spec['tool']} role/label={spec['label']} kind={spec['kind']} place={spec['place']}"
           + (f" group={spec['group']}" if spec['place'] == 'workspace' else ""))
@@ -3613,8 +3652,8 @@ def cmd_profile(argv):
 
 def main():
     if len(sys.argv) < 2 or sys.argv[1] in ("-h", "--help"):
-        print("usage: fleet <launch|config|ls|plugins|archive|revive|register|recycle|unstick|sessions|broadcast|mute|unmute|rm|vitals|find|graph|serve|paint|worktree|profile|daemon|drive-child|peer-msg|child-digest|inbox|inbox-ack> ...\n"
-              "  launch <role|--adhoc NAME> [--tool t] [--place p] [--parent s] [--effort L] [--model M] [--use NAME] [--dry-run] [-- <tool flags>]\n"
+        print("usage: fleet <launch|config|ls|plugins|archive|revive|register|recycle|unstick|sessions|broadcast|mute|unmute|rm|vitals|usage|find|graph|serve|paint|worktree|profile|daemon|drive-child|peer-msg|child-digest|inbox|inbox-ack> ...\n"
+              "  launch <role|--adhoc NAME> [--tool t] [--place p] [--parent s] [--effort L] [--model M] [--use NAME] [--provider NAME] [--dry-run] [-- <tool flags>]\n"
               "  config <role|--adhoc NAME|--cwd DIR> [--tool t]   effective config (base settings + fleet adds)\n"
               "  ls [--scope mine|all|conductors|children] [--json] live fleet x hook store; flags STALE + archived (default mine = you + your children; --scope all = the world)\n"
               "  plugins <add|reconcile|ls|show|describe> ...      the plugin INDEX: add-from-URL (safe: never enables) + reconcile + on-demand discovery\n"
@@ -3635,6 +3674,7 @@ def main():
               "  rm <label> [--detach] [--force] [--kill] [--wip-commit] [--with-group]\n"
               "                                                    close + archive a label (revivable; refuses mid-turn, --force overrides); --detach drops the row only; --kill adds worktree teardown; --with-group dissolves its workspace-group\n"
               "  vitals [--scope mine|all|conductors|children] [--json] [--paint] [--watch [--interval N]] cheapest-first triage table + ctx-remaining % (default mine)\n"
+              "  usage [--json]                                    per-provider subscription windows (5h + weekly bars, reset countdowns, metered/Fable flags, live attribution) from the daemon poller\n"
               "  find <query> [--turns N] [--json]                 content-aware session lookup (label/role/cwd or transcript)\n"
               "  graph [--scope mine|all|<label>] [--json] [--html] [--out FILE]  fleet parentage tree (text/JSON/HTML); default mine = your subtree; --scope all = full tree\n"
               "  serve [--port N]                                  thin read-only localhost view (graph HTML + vitals.json); no daemon\n"
@@ -3665,7 +3705,7 @@ def main():
            "broadcast": cmd_broadcast,
            "mute": lambda a: cmd_mute(a, mute=True), "unmute": lambda a: cmd_mute(a, mute=False),
            "rm": cmd_rm, "worktree": cmd_worktree, "profile": cmd_profile, "daemon": fd.cmd_daemon,
-           "vitals": ff.cmd_vitals, "find": ff.cmd_find, "graph": ff.cmd_graph,
+           "vitals": ff.cmd_vitals, "usage": ff.cmd_usage, "find": ff.cmd_find, "graph": ff.cmd_graph,
            "serve": ff.cmd_serve, "paint": ff.cmd_paint,
            "drive-child": fh.cmd_drive_child, "peer-msg": fh.cmd_peer_msg,
            "child-digest": fh.cmd_child_digest, "inbox": fh.cmd_inbox, "inbox-ack": fh.cmd_inbox_ack}

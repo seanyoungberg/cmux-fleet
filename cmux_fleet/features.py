@@ -444,6 +444,81 @@ def _watch_vitals(paint, interval, scope="all", caller=""):
         return 0
 
 
+# ─── usage: per-provider subscription windows (the providers feature) ───────────────────────────
+def _bar(pct, width=10):
+    """A |####------| utilization bar. None/unparseable → an empty rail."""
+    try:
+        f = max(0.0, min(1.0, float(pct) / 100.0))
+    except (TypeError, ValueError):
+        return "|" + "-" * width + "|  ?"
+    n = int(round(f * width))
+    return "|" + "#" * n + "-" * (width - n) + f"| {float(pct):.0f}%"
+
+
+def _countdown(epoch):
+    """'resets in 3h16m' from a unix-epoch reset time; '' if absent/past."""
+    if not epoch:
+        return ""
+    d = int(epoch) - int(time.time())
+    if d <= 0:
+        return "resets now"
+    h, m = d // 3600, (d % 3600) // 60
+    return f"resets in {h}h{m:02d}m" if h else f"resets in {m}m"
+
+
+def _age(epoch):
+    if not epoch:
+        return "never"
+    d = int(time.time()) - int(epoch)
+    return f"{d}s ago" if d < 90 else (f"{d // 60}m ago" if d < 5400 else f"{d // 3600}h ago")
+
+
+def cmd_usage(argv):
+    """fleet usage [--json]   per-provider subscription windows (5h + weekly), reset countdowns, the
+    metered-overage/Fable flags, which accounts are live-attributed, and the last poll age. Read-only;
+    data comes from the daemon usage poller (provider-usage.json). Sibling to `fleet vitals`."""
+    as_json = "--json" in argv
+    snap = fs.provider_usage_read()
+    # attribution: which live agents launched under each provider (recorded on the registry row)
+    attrib = {}
+    for label, e in fs.live_all().items():
+        p = e.get("provider")
+        if p:
+            attrib.setdefault(p, []).append(label)
+    if as_json:
+        print(json.dumps({"providers": snap, "attribution": attrib}, indent=2))
+        return 0
+    if not snap:
+        print("(no usage snapshot yet — the daemon poller writes provider-usage.json; "
+              "start it with `fleet daemon start` or configure [providers] in fleet.toml)")
+        return 0
+    lines = ["USAGE (subscription windows; source: usage poller)"]
+    for key in sorted(snap):
+        r = snap[key]
+        star = " *default" if r.get("is_default") else ""
+        who = attrib.get(key) or []
+        whom = f"  [{len(who)} live: {', '.join(who[:3])}{'…' if len(who) > 3 else ''}]" if who else ""
+        lines.append(f"\n{key}{star}  ({r.get('type', '?')}, checked {_age(r.get('checked_at'))}){whom}")
+        if not r.get("ok"):
+            lines.append(f"    !! not readable: {r.get('error', 'unknown')}")
+            continue
+        w = r.get("windows") or {}
+        fh, sd = w.get("five_hour") or {}, w.get("seven_day") or {}
+        act5 = " <" if r.get("active_limit") == "session" else ""
+        actw = " <" if str(r.get("active_limit", "")).startswith("weekly") else ""
+        lines.append(f"    5h    {_bar(fh.get('pct'))}  {_countdown(fh.get('resets_at'))}{act5}")
+        lines.append(f"    7day  {_bar(sd.get('pct'))}  {_countdown(sd.get('resets_at'))}{actw}")
+        for sc in (r.get("scoped") or []):
+            lines.append(f"    {sc.get('label', 'scoped'):<5} {_bar(sc.get('pct'))}  {_countdown(sc.get('resets_at'))} (scoped)")
+        xu = r.get("extra_usage") or {}
+        if xu.get("enabled"):
+            lines.append(f"    metered $  enabled  util {xu.get('pct')}")
+        if r.get("stale"):
+            lines.append("    (stale: newest rollout is old; % reflects this account's last activity)")
+    print("\n".join(lines))
+    return 0
+
+
 # ─── find: content-aware session lookup ────────────────────────────────────────────────────────
 def cmd_find(argv):
     """fleet find <query> [--turns N] [--json]   find an agent by label/role/cwd OR by what it has been

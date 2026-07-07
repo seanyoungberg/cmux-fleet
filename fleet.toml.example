@@ -77,3 +77,49 @@ worktree = true                    # opt in. default false. CLI: --worktree / --
 # worktree_base          = "main"  # base ref for a NEW branch (default: repo default branch)
 # worktree_dir           = ".worktrees"   # where trees live under the repo (gitignored automatically)
 # worktree_branch_prefix = "fleet/"       # branch = <prefix><label>
+
+# ----------------------------------------------------------------------------------------------
+# [providers] OPTIONAL inference-provider config (usage tracking + per-launch account selection).
+# A TOOL has N named providers; each has a TYPE that decides handling:
+#   subscription  track the 5h + 7-day windows (%, reset); auth = an OAuth token injected PER LAUNCH
+#                 (never a config-dir swap → session logs stay in the tool's default dir).
+#   api           metered; windows N/A. track="budget" is a stub (leave room; not built).
+#   vertex        just env vars (an env-file); nothing to track.
+# `fleet launch <role> --provider <name>` selects one for a launch (omit → the tool's `default`).
+# `fleet usage` shows the polled windows. The daemon poll writes ~/.local/state/cmux-fleet/provider-usage.json.
+#
+# auth = "<method>:<arg>":
+#   keychain:<service>  read the tool's OAuth blob from the macOS keychain (the CURRENT logged-in acct;
+#                       no launch injection — the tool uses the keychain natively). claude default acct.
+#   file:<path>         a long-lived token from `claude setup-token`; relative → under the state dir
+#                       (e.g. providers/<name>.token, chmod 0600). Injected at launch as
+#                       CLAUDE_CODE_OAUTH_TOKEN via a spawn-time $(cat …) so the secret is never printed.
+#   codex-home:<path>   CODEX_HOME for a codex account. NOTE: codex account SELECTION is PROVISIONAL — a
+#                       verdict (CODEX_HOME-per-profile vs an env-token path) is pending; the READ poller
+#                       is final, the switch mechanism is a stub. Do not treat as settled.
+#   env-file:<path>     source KEY=VALUE lines (vertex: CLAUDE_CODE_USE_VERTEX, project, region).
+#
+# SECRETS ROADMAP (not built): the file: tokens are a prototype stopgap stored as plain 0600 files.
+# Long-term these fold into Berg's SOPS env-var mechanism; the auth DSL leaves room for a `sops:` method.
+
+# [providers.claude]
+# default = "berg-max"
+# [providers.claude.berg-max]                       # the current logged-in account (no injection)
+# type = "subscription"
+# auth = "keychain:Claude Code-credentials"
+# track = "windows"
+# [providers.claude.throwaway]                       # a 2nd account, token minted via `claude setup-token`
+# type = "subscription"
+# auth = "file:providers/throwaway.token"           # -> ~/.local/state/cmux-fleet/providers/throwaway.token (0600)
+# track = "windows"
+# [providers.claude.vertex]
+# type = "vertex"
+# auth = "env-file:~/.claude-vertex.env"
+# track = "none"
+
+# [providers.codex]
+# default = "berg-team"
+# [providers.codex.berg-team]                        # current CODEX_HOME (~/.codex); READ poller is live
+# type = "subscription"
+# auth = "codex-home:~/.codex"
+# track = "windows"

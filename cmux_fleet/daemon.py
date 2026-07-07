@@ -42,6 +42,7 @@ ROUTER_LOCK = os.path.join(STATE, "router.live.lock")   # the router's bus-level
 ROUTER_HEALTH = os.path.join(STATE, "router.health")    # the router's bus-consumption liveness stamp
 MANAGER_LOCK = os.path.join(STATE, "router.daemon.lock")  # the daemon MANAGER lock (start/ownership)
 DEFAULT_HEARTBEAT = 540                              # 9 min, within the spec's 8-10 min window
+USAGE_POLL_S = 180                                   # providers feature: refresh subscription-usage snapshot ~every 3 min
 HEALTH_STALE_S = 60          # a live router silent on the bus longer than this (bus HB ~15s) is WEDGED
 HEALTH_CHECK_S = 30          # how often the supervisor re-checks the router is still consuming the bus
 
@@ -294,6 +295,7 @@ def _run_daemon(heartbeat_secs):
 
     next_tick = time.time() + heartbeat_secs if heartbeat_secs else None
     next_health = time.time() + HEALTH_CHECK_S        # router-wedge check runs regardless of --heartbeat
+    next_usage = time.time() + 5                       # first usage poll shortly after boot, then every USAGE_POLL_S
     while proc.poll() is None and not stopping["v"]:
         time.sleep(1)
         now = time.time()
@@ -303,6 +305,15 @@ def _run_daemon(heartbeat_secs):
             except Exception as e:                   # a bad tick must never kill the daemon
                 print(f"[heartbeat] tick error: {e}", flush=True)
             next_tick = now + heartbeat_secs
+        if now >= next_usage:                         # providers feature: refresh the subscription-usage snapshot
+            try:
+                from . import providers as pv
+                snap = pv.poll_all()                  # writes provider-usage.json; no-op/{} if [providers] unset
+                if snap:
+                    print(f"[usage] polled {len(snap)} provider(s)", flush=True)
+            except Exception as e:                    # a bad poll must never kill the daemon
+                print(f"[usage] poll error: {e}", flush=True)
+            next_usage = now + USAGE_POLL_S
         if now >= next_health:
             try:
                 _check_router_health(proc.pid)       # surface an alive-but-wedged router (silent-loss class)
