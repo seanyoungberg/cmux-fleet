@@ -942,7 +942,7 @@ def _fleet_blob(rows):
     return ";".join(recs)
 
 
-def _paint(rows):
+def _paint(rows, sidebar_blob=False):
     """Push the live fleet onto the cmux BUILT-IN sidebar as native widgets:
       • one status PILL PER AGENT, keyed by the agent's label — so children that SHARE a conductor's
         workspace STACK into a per-agent pill strip instead of overwriting one 'fleet' pill (the old bug);
@@ -956,10 +956,14 @@ def _paint(rows):
         prev = {}
     cur, painted = {}, 0
     # worst-case ctx per workspace: lowest remaining % among the agents sharing it (+ who it is).
-    worst = {}
+    # how many agents share each workspace? per-agent workspaces -> 1; a conductor's tab-children -> N.
+    worst, ws_count = {}, {}
     for r in rows:
         ws, pct = r["ws"], r["ctx_pct_remaining"]
-        if ws and pct is not None and (ws not in worst or pct < worst[ws][0]):
+        if not ws:
+            continue
+        ws_count[ws] = ws_count.get(ws, 0) + 1
+        if pct is not None and (ws not in worst or pct < worst[ws][0]):
             worst[ws] = (pct, r["label"])
     # per-agent status pills — unique key per (workspace, label) so they coexist instead of clobbering.
     for r in rows:
@@ -968,10 +972,14 @@ def _paint(rows):
             continue
         color, icon, rank = STATE_STYLE.get(r["state"], ("#8B8D98", "circle", 9))
         pct = r["ctx_pct_remaining"]
-        # the pill's VALUE is what renders — lead with the agent's LABEL (identity, otherwise invisible)
-        # and carry its own ctx% as text, since only ONE progress BAR exists per workspace. State is the
-        # icon+color. Key stays the bare label so pills stack per-agent and clear cleanly.
-        val = f"{r['label']} · {pct}%" if pct is not None else r["label"]
+        # The pill VALUE is what renders. On a SHARED workspace (tab-children) pills stack, so lead with the
+        # agent's LABEL (otherwise invisible) + its ctx%. On its OWN workspace (per-agent) the workspace TITLE
+        # already shows the label, so the pill carries the STATE word instead (icon+color reinforce it; the
+        # per-agent ctx BAR carries the %). Key stays the bare label so pills stack per-agent and clear cleanly.
+        if ws_count.get(ws, 1) > 1:
+            val = f"{r['label']} · {pct}%" if pct is not None else r["label"]
+        else:
+            val = r["state"]
         key = f"pill{_SEP}{ws}{_SEP}{r['label']}"
         fp = f"{val}|{color}|{icon}"
         cur[key] = fp
@@ -998,7 +1006,7 @@ def _paint(rows):
     marker_ws = (next((r["ws"] for r in rows if r.get("kind") == "conductor" and r["ws"]), "")
                  or next((r["ws"] for r in rows if r["ws"]), ""))
     old_mark = prev.get(f"blob{_SEP}mark")
-    if os.environ.get("FLEET_SIDEBAR_BLOB") and marker_ws:
+    if (sidebar_blob or os.environ.get("FLEET_SIDEBAR_BLOB")) and marker_ws:
         cur[f"blob{_SEP}mark"] = marker_ws
         cur[f"blob{_SEP}val"] = blob
         if prev.get(f"blob{_SEP}val") != blob or old_mark != marker_ws:
@@ -1027,9 +1035,13 @@ def _paint(rows):
 
 
 def cmd_paint(argv):
-    """fleet paint   sync the live fleet onto the cmux sidebar (status pills + context progress bars),
-    once. Cheapest visualization — runs off live state, on-change-only. Re-run (or `vitals --paint`) to
-    refresh; pair with the custom sidebar `fleet.swift` for the native tree-view."""
-    n = _paint(snapshot())
-    print(f"[fleet paint] synced sidebar ({n} workspace(s) updated)")
+    """fleet paint [--sidebar]   sync the live fleet onto the cmux sidebar (status pills + context progress
+    bars), once. Cheapest visualization — runs off live state, on-change-only. Re-run (or `vitals --paint`)
+    to refresh. `--sidebar` ALSO pushes the full board as a blob into a marker workspace's description for
+    the custom `fleet.swift` sidebar to render — OFF by default because that blob shows as the workspace's
+    subtitle in the BUILT-IN sidebar (only enable it when you're actually using fleet.swift)."""
+    sidebar = "--sidebar" in argv
+    n = _paint(snapshot(), sidebar_blob=sidebar)
+    extra = " + custom-sidebar blob" if sidebar else ""
+    print(f"[fleet paint] synced sidebar{extra} ({n} update(s))")
     return 0

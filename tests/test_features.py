@@ -461,6 +461,19 @@ def test_paint_stacks_one_pill_per_child_not_a_single_fleet_pill(monkeypatch):
     assert vals["loom-dev"] == "loom-dev · 38%"
 
 
+def test_paint_solo_workspace_pill_is_state_not_label(monkeypatch):
+    ff = _ff()
+    calls = _capture_cmux(ff, monkeypatch)
+    # ONE agent alone on its own workspace (workspace-per-agent) -> pill VALUE is the state word, because
+    # the workspace TITLE already shows the label and the per-agent bar carries the ctx%.
+    rows = [dict(_row("usage-ops", state="working", ctx_pct_remaining=68), ws="workspace:7", kind="child")]
+    ff._paint(rows)
+    pills = [c for c in calls if c[0] == "set-status"]
+    assert len(pills) == 1
+    assert pills[0][1] == "usage-ops"                        # key stays the label (clears cleanly)
+    assert pills[0][2] == "working"                          # value is the STATE word, not "usage-ops · 68%"
+
+
 def test_paint_progress_bar_is_the_worst_agent_on_the_workspace(monkeypatch):
     ff = _ff()
     calls = _capture_cmux(ff, monkeypatch)
@@ -476,15 +489,17 @@ def test_paint_progress_bar_is_the_worst_agent_on_the_workspace(monkeypatch):
 def test_paint_on_change_only_and_retires_vanished_pills(monkeypatch):
     ff = _ff()
     calls = _capture_cmux(ff, monkeypatch)
+    # keep 'a' and 'b' on SEPARATE workspaces so removing 'b' doesn't flip 'a' shared->solo (which would
+    # legitimately change 'a's pill value) — this isolates the on-change/vanish behavior.
     rows = [dict(_row("a", state="working", ctx_pct_remaining=50), ws="workspace:1"),
-            dict(_row("b", state="idle", ctx_pct_remaining=80), ws="workspace:1")]
+            dict(_row("b", state="idle", ctx_pct_remaining=80), ws="workspace:2")]
     ff._paint(rows)                                           # first paint: both pills land
     calls.clear()
     # 'a' unchanged, 'b' gone -> no repaint of 'a', a clear-status for 'b'
     ff._paint([dict(_row("a", state="working", ctx_pct_remaining=50), ws="workspace:1")])
     assert not [c for c in calls if c[0] == "set-status" and c[1] == "a"]   # unchanged -> not repainted
     clears = [c for c in calls if c[0] == "clear-status"]
-    assert ("clear-status", "b", "--workspace", "workspace:1") in clears
+    assert ("clear-status", "b", "--workspace", "workspace:2") in clears
 
 
 def test_fleet_blob_serializes_and_sanitizes():
