@@ -902,32 +902,118 @@ def cmd_serve(argv):
 
 
 # ─── paint: native cmux sidebar telemetry (set-status / set-progress) ──────────────────────────
+_SEP = "\x1f"                                                 # key delimiter (never appears in a label)
+
+
+def _fleet_blob(rows):
+    """Serialize the whole fleet board into ONE delimited string for the custom sidebar (fleet.swift),
+    which can read only cmux workspace fields — so the board rides in a workspace DESCRIPTION and the
+    .swift splits it. Format (11 fields):
+      'FLEET3;label~state~ctx~parent~kind~surface~tool~model~effort~cwd~last;...'
+    The ~ and ; delimiters are stripped from free text so a stray char can't break the parse. Rows are
+    emitted in a STABLE order (conductors by label, each followed by its children by label) so the sidebar
+    doesn't reshuffle every repaint."""
+    def clean(s, n):
+        return str(s or "").replace("~", "-").replace(";", ",").replace("\n", " ").strip()[:n]
+    def cwd_tail(p):                                            # last 3 path segments (repo/…/worktree) so the repo shows
+        segs = [x for x in str(p or "").split("/") if x]
+        return "/".join(segs[-3:])
+    def rec(r):
+        pct = r["ctx_pct_remaining"]
+        return "~".join([
+            clean(r["label"], 24), r["state"], (str(pct) if pct is not None else "-"),
+            clean(r.get("parent"), 24), r.get("kind", "child"), r.get("surface", ""),
+            clean(r.get("tool"), 8), clean(_short_model(r.get("model") or ""), 16),
+            clean(r.get("effort"), 6), clean(cwd_tail(r.get("cwd")), 40),
+            clean(r.get("last_text"), 160),
+        ])
+    by_label = sorted(rows, key=lambda r: r["label"])
+    conductors = [r for r in by_label if r.get("kind") == "conductor"]
+    recs = ["FLEET3"]
+    seen = set()
+    for c in conductors:                                       # each conductor, then its children (stable)
+        recs.append(rec(c)); seen.add(c["label"])
+        for r in by_label:
+            if r.get("parent") == c["label"] and r.get("kind") != "conductor" and r["label"] not in seen:
+                recs.append(rec(r)); seen.add(r["label"])
+    for r in by_label:                                          # any orphans (parent not a conductor)
+        if r["label"] not in seen:
+            recs.append(rec(r)); seen.add(r["label"])
+    return ";".join(recs)
+
+
 def _paint(rows):
-    """Push each live agent's state onto its cmux workspace as a sidebar pill (`set-status`) + a context
-    progress bar (`set-progress`). On-change-only via a fingerprint file so we never repaint-churn. Key
-    'fleet' so we own exactly one pill per workspace. The custom sidebar (sidebars/fleet.swift) then
-    renders these natively. Returns the count painted."""
+    """Push the live fleet onto the cmux BUILT-IN sidebar as native widgets:
+      • one status PILL PER AGENT, keyed by the agent's label — so children that SHARE a conductor's
+        workspace STACK into a per-agent pill strip instead of overwriting one 'fleet' pill (the old bug);
+      • one context PROGRESS BAR per workspace, showing the WORST (lowest-remaining) agent on it — the
+        recycle-first signal — since set-progress is per-workspace (only one bar exists to give).
+    On-change-only via a per-key fingerprint file (no repaint churn), and agents that vanish get their
+    pill CLEARED (`clear-status`) so the strip doesn't accumulate ghosts. Returns pills+bars (re)painted."""
     try:
         prev = json.load(open(PAINT_STATE))
     except Exception:
         prev = {}
     cur, painted = {}, 0
+    # worst-case ctx per workspace: lowest remaining % among the agents sharing it (+ who it is).
+    worst = {}
+    for r in rows:
+        ws, pct = r["ws"], r["ctx_pct_remaining"]
+        if ws and pct is not None and (ws not in worst or pct < worst[ws][0]):
+            worst[ws] = (pct, r["label"])
+    # per-agent status pills — unique key per (workspace, label) so they coexist instead of clobbering.
     for r in rows:
         ws = r["ws"]
         if not ws:
             continue
         color, icon, rank = STATE_STYLE.get(r["state"], ("#8B8D98", "circle", 9))
         pct = r["ctx_pct_remaining"]
-        prog = "" if pct is None else f"{(100 - pct) / 100:.2f}"
-        fp = f"{r['state']}|{color}|{prog}"
-        cur[ws] = fp
-        if prev.get(ws) == fp:
+        # the pill's VALUE is what renders — lead with the agent's LABEL (identity, otherwise invisible)
+        # and carry its own ctx% as text, since only ONE progress BAR exists per workspace. State is the
+        # icon+color. Key stays the bare label so pills stack per-agent and clear cleanly.
+        val = f"{r['label']} · {pct}%" if pct is not None else r["label"]
+        key = f"pill{_SEP}{ws}{_SEP}{r['label']}"
+        fp = f"{val}|{color}|{icon}"
+        cur[key] = fp
+        if prev.get(key) == fp:
             continue                                          # unchanged -> skip (no churn)
-        _cmux("set-status", "fleet", r["state"], "--icon", icon, "--color", color,
+        _cmux("set-status", r["label"], val, "--icon", icon, "--color", color,
               "--priority", str(100 - rank), "--workspace", ws)
-        if prog:
-            _cmux("set-progress", prog, "--label", f"ctx {pct}% left", "--workspace", ws)
         painted += 1
+    # one ctx bar per workspace = its worst agent (paint once per ws, keyed apart from pills).
+    for ws, (pct, lbl) in worst.items():
+        key = f"prog{_SEP}{ws}"
+        prog = f"{(100 - pct) / 100:.2f}"
+        cur[key] = prog
+        if prev.get(key) == prog:
+            continue
+        _cmux("set-progress", prog, "--label", f"{lbl} {pct}% left", "--workspace", ws)
+        painted += 1
+    # emit the whole fleet board as one delimited blob into a MARKER workspace's description, for the
+    # custom sidebar (fleet.swift) — it can't read pills, only workspace fields. Marker = the first
+    # conductor's workspace (deterministic); on-change only; the sidebar finds it by the 'FLEET2;' prefix.
+    blob = _fleet_blob(rows)
+    marker_ws = (next((r["ws"] for r in rows if r.get("kind") == "conductor" and r["ws"]), "")
+                 or next((r["ws"] for r in rows if r["ws"]), ""))
+    if marker_ws:
+        cur[f"blob{_SEP}mark"] = marker_ws
+        cur[f"blob{_SEP}val"] = blob
+        if prev.get(f"blob{_SEP}val") != blob or prev.get(f"blob{_SEP}mark") != marker_ws:
+            _cmux("workspace-action", "--action", "set-description", "--description", blob,
+                  "--workspace", marker_ws)
+            painted += 1
+        old_mark = prev.get(f"blob{_SEP}mark")
+        if old_mark and old_mark != marker_ws:                 # marker moved -> clear the stale blob
+            _cmux("workspace-action", "--action", "clear-description", "--workspace", old_mark)
+    # retire pills for agents (and legacy single-'fleet' pills) that are no longer present.
+    for stale in set(prev) - set(cur):
+        parts = stale.split(_SEP)
+        if parts[0] == "pill" and len(parts) == 3:
+            _cmux("clear-status", parts[2], "--workspace", parts[1])
+        elif parts[0] == "blob":
+            continue                                           # blob marker handled above, not a pill
+        elif _SEP not in stale:                                # old format: bare ws -> the 'fleet' pill
+            _cmux("clear-status", "fleet", "--workspace", stale)
     try:
         os.makedirs(STATE, exist_ok=True)
         json.dump(cur, open(PAINT_STATE, "w"))

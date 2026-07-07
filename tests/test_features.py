@@ -436,3 +436,85 @@ def test_vitals_fp_excludes_age_but_tracks_meaning():
     assert ff._vitals_fp([base]) != ff._vitals_fp([dict(base, state="needs-input")])
     assert ff._vitals_fp([base]) != ff._vitals_fp([dict(base, ctx_pct_remaining=49)])
     assert ff._vitals_fp([base]) != ff._vitals_fp([dict(base, last_text="bye")])
+
+
+# ── paint: native built-in-sidebar pills (per-agent stack) + worst-case ctx bar ───────────────
+def _capture_cmux(ff, monkeypatch):
+    calls = []
+    monkeypatch.setattr(ff, "_cmux", lambda *a: calls.append(a) or "")
+    return calls
+
+
+def test_paint_stacks_one_pill_per_child_not_a_single_fleet_pill(monkeypatch):
+    ff = _ff()
+    calls = _capture_cmux(ff, monkeypatch)
+    # two children SHARING one conductor workspace — the old code keyed both 'fleet' -> they clobbered.
+    rows = [dict(_row("book-keeper", state="needs-input", ctx_pct_remaining=49), ws="workspace:1"),
+            dict(_row("loom-dev", state="working", ctx_pct_remaining=38), ws="workspace:1")]
+    ff._paint(rows)
+    pills = [c for c in calls if c[0] == "set-status"]
+    keys = {c[1] for c in pills}
+    assert keys == {"book-keeper", "loom-dev"}                # keyed per AGENT, never the constant 'fleet'
+    assert "fleet" not in keys
+    vals = {c[1]: c[2] for c in pills}                        # the VALUE renders — must identify the agent
+    assert vals["book-keeper"] == "book-keeper · 49%"         # label + its OWN ctx% (not the shared bar)
+    assert vals["loom-dev"] == "loom-dev · 38%"
+
+
+def test_paint_progress_bar_is_the_worst_agent_on_the_workspace(monkeypatch):
+    ff = _ff()
+    calls = _capture_cmux(ff, monkeypatch)
+    rows = [dict(_row("a", state="working", ctx_pct_remaining=50), ws="workspace:1"),
+            dict(_row("b", state="working", ctx_pct_remaining=12), ws="workspace:1")]
+    ff._paint(rows)
+    progs = [c for c in calls if c[0] == "set-progress"]
+    assert len(progs) == 1                                    # ONE bar per workspace, not one per agent
+    assert progs[0][1] == "0.88"                              # (100-12)/100 -> the WORST agent's usage
+    assert "b 12% left" in progs[0]                           # labelled with who's tightest
+
+
+def test_paint_on_change_only_and_retires_vanished_pills(monkeypatch):
+    ff = _ff()
+    calls = _capture_cmux(ff, monkeypatch)
+    rows = [dict(_row("a", state="working", ctx_pct_remaining=50), ws="workspace:1"),
+            dict(_row("b", state="idle", ctx_pct_remaining=80), ws="workspace:1")]
+    ff._paint(rows)                                           # first paint: both pills land
+    calls.clear()
+    # 'a' unchanged, 'b' gone -> no repaint of 'a', a clear-status for 'b'
+    ff._paint([dict(_row("a", state="working", ctx_pct_remaining=50), ws="workspace:1")])
+    assert not [c for c in calls if c[0] == "set-status" and c[1] == "a"]   # unchanged -> not repainted
+    clears = [c for c in calls if c[0] == "clear-status"]
+    assert ("clear-status", "b", "--workspace", "workspace:1") in clears
+
+
+def test_fleet_blob_serializes_and_sanitizes():
+    ff = _ff()
+    rows = [dict(_row("lead", state="working", ctx_pct_remaining=41), kind="conductor", surface="s1"),
+            dict(_row("w~one;x", state="idle", ctx_pct_remaining=None), kind="child", parent="lead",
+                 surface="s2", last_text="did a ~thing; ok")]
+    blob = ff._fleet_blob(rows)
+    assert blob.startswith("FLEET3;")
+    recs = blob.split(";")
+    assert recs[0] == "FLEET3"
+    lead = recs[1].split("~")                                 # conductor emitted first (stable order)
+    assert lead[0] == "lead" and lead[1] == "working" and lead[2] == "41"
+    assert lead[4] == "conductor" and lead[5] == "s1" and lead[6] == "claude"
+    child = recs[2].split("~")                                # its child next
+    assert child[0] == "w-one,x"                              # ~ and ; stripped from the label
+    assert child[2] == "-"                                    # no ctx -> '-'
+    assert child[4] == "child" and child[3] == "lead"
+    assert child[10] == "did a -thing, ok"                   # last-text (field 10) delimiters neutralized
+
+
+def test_paint_emits_blob_to_first_conductor_workspace(monkeypatch):
+    ff = _ff()
+    calls = _capture_cmux(ff, monkeypatch)
+    rows = [dict(_row("worker", state="working", ctx_pct_remaining=50), ws="workspace:9", kind="child"),
+            dict(_row("boss", state="working", ctx_pct_remaining=40), ws="workspace:1", kind="conductor")]
+    ff._paint(rows)
+    desc = [c for c in calls if c[0] == "workspace-action" and "set-description" in c]
+    assert len(desc) == 1
+    assert desc[0][-1] == "workspace:1"                       # marker = the conductor's ws
+    assert "--description" in desc[0]
+    blob = desc[0][desc[0].index("--description") + 1]
+    assert blob.startswith("FLEET3;") and "boss~working~40" in blob and "worker~working~50" in blob
