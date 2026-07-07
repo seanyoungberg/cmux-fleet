@@ -95,7 +95,6 @@ def _default_cmux():
 ROOT        = _resolve_path("CMUX_FLEET_ROOT",        "root",           os.path.expanduser("~"))
 STATE       = _resolve_path("CMUX_STATE_DIR",         "state_dir",      os.path.join(_xdg("XDG_STATE_HOME", "~/.local/state"), "cmux-fleet"))
 CMUX        = _resolve("CMUX_BIN",                    "cmux_bin",       _default_cmux())                # bare command name OK -> NOT anchored
-MARKETPLACE = _resolve_path("CMUX_FLEET_MARKETPLACE", "marketplace",    "")          # "" -> internal --plugin-dir resolution disabled
 FLOOR       = _resolve_path("CMUX_FLEET_FLOOR",       "floor_claudemd", "")          # "" -> no ad-hoc CLAUDE.md symlink
 HOOKSTORE   = _resolve_path("CMUX_HOOKSTORE_DIR",     "hookstore_dir",  os.path.expanduser("~/.cmuxterm"))   # cmux-owned, $HOME-relative
 ADHOC_SUBDIR = _resolve("CMUX_FLEET_ADHOC_SUBDIR",   "adhoc_subdir",   "_meta/agents/ad-hoc")          # relative to ROOT (intentionally not anchored)
@@ -117,13 +116,12 @@ def load_plugin_index(path=None):
       plugins[<name>]      = {"type": "linked"|"enabled", "source", "tools": [...], "description",
                               "install", "origin", "tool_overrides": {<tool>: {...}}}  # [plugin.<n>.<tool>]
 
-    Back-compat: a configured [fleet].marketplace / $CMUX_FLEET_MARKETPLACE synthesizes
-    marketplaces["default"] so bare unindexed names (and source="default") resolve under it, exactly as
-    the single-marketplace path does today. Named [marketplace.<x>] entries are purely additive."""
+    Marketplaces come ONLY from explicit [marketplace.<name>] blocks — the index self-documents where
+    plugins come from (a plugin's `source` names its marketplace). There is no implicit "default"
+    marketplace and no $CMUX_FLEET_MARKETPLACE env shim: a linked plugin resolves via its declared
+    marketplace or an absolute path (cli._linked_dir), nothing else."""
     path = path or PLUGIN_INDEX
     marketplaces, plugins = {}, {}
-    if MARKETPLACE:                                          # synthesize the legacy single marketplace
-        marketplaces["default"] = {"kind": "local", "path": MARKETPLACE}
     if tomllib and os.path.exists(path):
         anchor = os.path.dirname(os.path.abspath(path))     # relative marketplace paths anchor to plugins.toml's dir
         try:

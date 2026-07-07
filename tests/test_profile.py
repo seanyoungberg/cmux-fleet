@@ -9,7 +9,7 @@ from cmux_fleet import cli as fleet
 def test_profile_emits_all_entrypoint_pins(capsys):
     fleet.cmd_profile(["myprof"])
     out = capsys.readouterr().out
-    for key in ("CMUX_FLEET_ROOT", "CMUX_STATE_DIR", "CMUX_FLEET_TOML", "CMUX_FLEET_MARKETPLACE", "CMUX_BIN"):
+    for key in ("CMUX_FLEET_ROOT", "CMUX_STATE_DIR", "CMUX_FLEET_TOML", "CMUX_FLEET_PLUGIN_INDEX", "CMUX_BIN"):
         assert f"export {key}=" in out
     assert "export PATH=" in out
     # PATH pins THIS build's fleet dir — resolved via _fleet_bin_dir(), NOT blindly PLUGIN_ROOT/bin
@@ -25,16 +25,16 @@ def test_profile_base_keeps_state_and_toml_together(capsys):
     assert "/tmp/cf-x/fleet.toml" in out
 
 
-def test_profile_marketplace_resolves_this_build(capsys):
-    # CMUX_FLEET_MARKETPLACE must be the pin from _marketplace_pin(): explicit config, or a REAL
-    # checkout's parent (so plugins=["<build-dirname>"] -> this build) — never a wheel's site-packages.
-    fleet.cmd_profile(["p"])
+def test_profile_pins_the_plugin_index_next_to_the_toml(capsys):
+    # Marketplaces live in the index now, so the profile pins CMUX_FLEET_PLUGIN_INDEX (next to its toml) —
+    # THAT is what keeps the profile's plugin loadout on its own declared [marketplace.*] blocks.
+    fleet.cmd_profile(["p", "--base", "/tmp/cf-prof-x"])
     out = capsys.readouterr().out
-    assert f"export CMUX_FLEET_MARKETPLACE={fleet._marketplace_pin()}" in out
+    assert "export CMUX_FLEET_PLUGIN_INDEX=/tmp/cf-prof-x/plugins.toml" in out
 
 
 def test_profile_env_injection_is_absolute_and_complete():
     e = fleet._profile_env()
-    assert {"CMUX_STATE_DIR", "CMUX_FLEET_TOML", "CMUX_FLEET_ROOT", "CMUX_BIN"} <= set(e)
-    for k in ("CMUX_STATE_DIR", "CMUX_FLEET_TOML", "CMUX_FLEET_ROOT"):
+    assert {"CMUX_STATE_DIR", "CMUX_FLEET_TOML", "CMUX_FLEET_ROOT", "CMUX_BIN", "CMUX_FLEET_PLUGIN_INDEX"} <= set(e)
+    for k in ("CMUX_STATE_DIR", "CMUX_FLEET_TOML", "CMUX_FLEET_ROOT", "CMUX_FLEET_PLUGIN_INDEX"):
         assert os.path.isabs(e[k])                             # hermetic: never a relative/ambiguous path

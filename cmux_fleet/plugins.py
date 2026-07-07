@@ -122,6 +122,55 @@ def _plugin_json_desc(plugin_dir):
     return ""
 
 
+def _manifest_path_for_write(mkt_path):
+    """Locate the marketplace.json to WRITE for a local marketplace at `mkt_path`, mirroring how
+    `_marketplace_meta` READS it: an existing manifest at <mkt_path>/.claude-plugin/ or its parent wins
+    (so read + write stay on the same file); absent, a new one is created at
+    <mkt_path>/.claude-plugin/marketplace.json."""
+    for root in (mkt_path, os.path.dirname(mkt_path.rstrip(os.sep))):
+        mj = os.path.join(root, ".claude-plugin", "marketplace.json")
+        if os.path.exists(mj):
+            return mj
+    return os.path.join(mkt_path, ".claude-plugin", "marketplace.json")
+
+
+def register_in_marketplace(mkt_path, mkt_name, plugin_name, dest_dir, ref, kind, description=""):
+    """Record `plugin_name` in the target LOCAL marketplace's marketplace.json so the NEXT reconcile
+    derives an HONEST `origin` for it: a git-url add records a `{"source":"url","url":ref}` object
+    (-> origin=url), a local-path add records a "./"-relative string source (-> origin=path). Creates
+    the manifest if the marketplace has none. Additive + idempotent: an existing entry for the same name
+    is replaced in place, every other entry preserved (only JSON whitespace is normalized). Returns the
+    manifest path written."""
+    mj = _manifest_path_for_write(mkt_path)
+    try:
+        with open(mj, encoding="utf-8") as f:
+            doc = json.load(f)
+        if not isinstance(doc, dict):
+            doc = {}
+    except (OSError, ValueError):
+        doc = {}
+    doc.setdefault("name", mkt_name)
+    existing = doc.get("plugins")
+    plugins = [e for e in existing if not (isinstance(e, dict) and e.get("name") == plugin_name)] \
+        if isinstance(existing, list) else []
+    if kind == "git-url":
+        source = {"source": "url", "url": ref}                # dict source -> reconcile derives origin=url
+    else:
+        root = os.path.dirname(os.path.dirname(mj))           # the dir that HOLDS .claude-plugin
+        rel = os.path.relpath(dest_dir, root)
+        source = rel if rel.startswith((".", "/")) else "./" + rel   # string source -> origin=path
+    entry = {"name": plugin_name, "source": source}
+    if description:
+        entry["description"] = description
+    plugins.append(entry)
+    doc["plugins"] = plugins
+    os.makedirs(os.path.dirname(mj), exist_ok=True)
+    with open(mj, "w", encoding="utf-8") as f:
+        json.dump(doc, f, indent=2)
+        f.write("\n")
+    return mj
+
+
 def derive_entries(marketplaces, settings_paths):
     """Scan sources -> {name: derived_entry}. Two source kinds (design §6):
       (a) every LOCAL [marketplace.<name>] (a resolved {"kind","path"} from config.load_plugin_index) —

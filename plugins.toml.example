@@ -1,7 +1,7 @@
 # plugins.toml — the plugin INDEX. Copy next to fleet.toml (default <toml-dir>/plugins.toml) or point
-# $CMUX_FLEET_PLUGIN_INDEX / [fleet].plugin_index at it. Entirely optional: no file = empty index (no
-# error), and a roster whose `plugins` names are all bare/absolute (resolved under [fleet].marketplace)
-# never needs it.
+# $CMUX_FLEET_PLUGIN_INDEX / [fleet].plugin_index at it. Optional only if every roster `plugins` name is
+# an ABSOLUTE path (a bare name resolves ONLY through a [marketplace.<name>] block declared here — there
+# is no implicit default marketplace).
 #
 # The index defines each plugin ONCE; rosters reference it by name via `plugins = [...]` and the index
 # decides the load MECHANISM (linked -> --plugin-dir, enabled -> enabledPlugins). This is a separate
@@ -14,23 +14,42 @@
 # (freeform comments are not round-tripped); a second reconcile right after the first is a no-op.
 #
 # ---------------------------------------------------------------------------------------------------
-# [marketplace.<name>]  — where plugins come from. Several are allowed.
-#   path = "<dir>"       a LOCAL marketplace dir; bare plugin names resolve to <path>/<name>.
-#                        relative paths anchor to THIS file's dir. env [fleet].marketplace synthesizes
-#                        a [marketplace.default] automatically (back-compat with bare `plugins=` names).
+# [marketplace.<name>]  — where plugins come from. Declare each EXPLICITLY (several are allowed); the
+# `source` of every plugin below names one of these, so the config self-documents where code comes from.
+#   path = "<dir>"       a LOCAL marketplace dir holding plugin subdirs; a plugin resolves to <path>/<name>.
+#                        Relative paths anchor to THIS file's dir; absolute paths are used as-is.
+#                        `reconcile` scans the dir and pulls in EVERY subdir that carries a plugin manifest
+#                        (.claude-plugin/plugin.json). A marketplace.json (at <path>/.claude-plugin/ or its
+#                        PARENT) adds each plugin's description + origin; with NO marketplace.json the dir
+#                        is still scanned — descriptions fall back to each plugin.json, origin defaults to
+#                        "path". So "just point at a dir of plugins" works, manifest or not.
 #   kind = "global"      a user-installed Claude Code marketplace; its plugins load via enabledPlugins.
 # ---------------------------------------------------------------------------------------------------
 [marketplace.berg-plugins]
 path = "~/code/claude-marketplace/plugins"
 
+# a SECOND local marketplace is just another block — multi-source is first-class:
+# [marketplace.team-tools]
+# path = "~/work/team-plugins/plugins"
+
 [marketplace.obsidian-skills]
 kind = "global"
+
+# ---------------------------------------------------------------------------------------------------
+# Adding a PUBLIC plugin from a git repo (an alternative to the `enabled` global-install dance): clone it
+# INTO a local marketplace and index it `linked`. `fleet plugins add` does this safely — it clones + wires
+# the index but NEVER enables it, edits a role, or runs its hooks:
+#     fleet plugins add https://github.com/org/cool-plugin --as linked --marketplace berg-plugins
+#     # -> cloned into berg-plugins, recorded in its marketplace.json as a url source (origin=url),
+#     #    indexed type=linked, DISABLED. Enable for one agent:  fleet recycle <agent> --plugin cool-plugin
+# A basename collision with an already-indexed plugin STOPs; pass --name <other> to index it separately.
+# ---------------------------------------------------------------------------------------------------
 
 # ---------------------------------------------------------------------------------------------------
 # [plugin.<name>]  — one entry per plugin.
 #   type        "linked" (loads via --plugin-dir; our authored/forked tools) or
 #               "enabled" (loads via enabledPlugins; public plugins installed globally-as-disabled).
-#   source      a [marketplace.<name>] ref (or "default").
+#   source      the [marketplace.<name>] this plugin comes from (DERIVED by reconcile).
 #   tools       supported tools, e.g. ["claude"] or ["claude","codex"]. DERIVED from which manifests the
 #               plugin dir carries (.claude-plugin -> claude, .codex-plugin -> codex).
 #   origin      source-kind, DERIVED from the marketplace.json: "path" (local) or "url" (git entry).

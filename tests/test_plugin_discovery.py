@@ -38,13 +38,9 @@ def _mkmarketplace(root, plugins, *, mjson=None):
     return plugins_dir
 
 
-def _env(cli_env, tmp_path, *, index=None, marketplace=None, settings=None):
+def _env(cli_env, tmp_path, *, index=None, settings=None):
     e = {**cli_env, "CMUX_FLEET_TOML": str(tmp_path / "fleet.toml")}
     e["CMUX_FLEET_PLUGIN_INDEX"] = str(index) if index is not None else str(tmp_path / "__no_index__.toml")
-    if marketplace is not None:
-        e["CMUX_FLEET_MARKETPLACE"] = str(marketplace)
-    else:
-        e.pop("CMUX_FLEET_MARKETPLACE", None)
     if settings is not None:
         e["CMUX_FLEET_CLAUDE_SETTINGS"] = str(settings)
     return e
@@ -160,12 +156,14 @@ def test_plugins_reconcile_cli_dry_run_then_idempotent(cli_env, tmp_path):
     ])
     settings = tmp_path / "settings.json"
     settings.write_text('{"enabledPlugins": {"obsidian@obs": false}}')
-    index = tmp_path / "plugins.toml"                          # absent to start
-    env = _env(cli_env, tmp_path, index=index, marketplace=plugins_dir, settings=settings)
+    index = tmp_path / "plugins.toml"                          # declares the marketplace, no plugins yet
+    index.write_text(f'[marketplace.local]\npath = "{plugins_dir}"\n')
+    before = index.read_text()
+    env = _env(cli_env, tmp_path, index=index, settings=settings)
 
     dry = run_fleet(env, "plugins", "reconcile", "--dry-run")
     assert "add" in dry.stdout and "[dry-run]" in dry.stdout
-    assert not index.exists()                                  # --dry-run wrote NOTHING
+    assert index.read_text() == before                         # --dry-run wrote NOTHING (marketplace-only)
 
     wrote = run_fleet(env, "plugins", "reconcile")
     assert index.exists() and "wrote" in wrote.stdout

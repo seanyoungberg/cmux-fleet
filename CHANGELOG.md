@@ -14,6 +14,24 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   (`plugins.toml`) still decides linked (`--plugin-dir`) vs enabled (`enabledPlugins`) per plugin, so the
   type distinction stays index-internal. A name not in the index loads as a linked `--plugin-dir` (default
   marketplace / absolute path), exactly as before.
+- **Marketplaces are declared explicitly; the config self-documents sources.** The `[fleet].marketplace` /
+  `$CMUX_FLEET_MARKETPLACE` shim is **removed** — there is no implicit `default` marketplace. Marketplaces
+  come only from `[marketplace.<name>]` blocks in `plugins.toml`, so every plugin's `source` names a real,
+  visible marketplace. A linked plugin resolves via its declared marketplace or an absolute path — a bare
+  *unindexed* name no longer resolves under a hidden env-var dir. Build hermeticity is now carried by pinning
+  the plugin INDEX (`CMUX_FLEET_PLUGIN_INDEX`) into child launches + `fleet profile` (children resolve the
+  same declared marketplaces), replacing the old `CMUX_FLEET_MARKETPLACE` pin. A local marketplace with no
+  `marketplace.json` is still fully scanned (descriptions from each plugin.json, `origin=path`).
+- **`fleet plugins add <ref> --as linked` now records the plugin in the marketplace's `marketplace.json`,**
+  so a reconcile derives an honest `origin`: a git URL → `origin=url`, a local path → `origin=path` (the
+  manifest is created if the marketplace has none). Added `--name <n>` to index/clone under a chosen name.
+
+### Fixed
+
+- **`fleet plugins add` reports a basename collision instead of a misleading no-op.** When the ref's derived
+  name is already indexed from a *different* marketplace (e.g. `orgB/tools` vs an existing `tools`), `add`
+  now STOPs and points at `--name <other>` rather than printing "already indexed; nothing to do" and aiming
+  the user at the wrong plugin.
 
 ### Removed
 

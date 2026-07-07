@@ -27,14 +27,14 @@
 # [defaults] (orchestration) -> [role] scalars -> tool config [tool.<t>] -> [role.<t>] -> caller `--`.
 import argparse, json, os, shlex, subprocess, sys, tempfile, time
 
-from .config import ROOT, STATE, CMUX, MARKETPLACE, FLOOR, FLEET_TOML, ADHOC_SUBDIR, PLUGIN_INDEX, load_plugin_index  # path resolver
+from .config import ROOT, STATE, CMUX, FLOOR, FLEET_TOML, ADHOC_SUBDIR, PLUGIN_INDEX, load_plugin_index  # path resolver
 
 # The checkout/build root: the dir that holds bin/, .claude-plugin/, fleet.toml.example next to the
 # cmux_fleet package. In a repo/editable install this is the repo root (unchanged from the flat layout,
 # where it was dirname(dirname(scripts/fleet.py))). In a WHEEL/venv install it is site-packages — which
 # holds NONE of bin/, .claude-plugin/, or a repo-root fleet.toml.example — so `fleet profile` must NOT
-# derive its pins from it there (see _fleet_bin_dir / _marketplace_pin / _seed_example_text below, and
-# the codex P1.1 fix). PLUGIN_ROOT stays only as the checkout-detection anchor + editable-install seed
+# derive its pins from it there (see _fleet_bin_dir / _seed_example_text below, and the codex P1.1 fix).
+# PLUGIN_ROOT stays only as the checkout-detection anchor + editable-install seed
 # path; it is never emitted as a marketplace or bin dir unless it is provably a real plugin checkout.
 PLUGIN_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 REGISTRY = os.path.join(STATE, "fleet-registry.json")
@@ -72,18 +72,6 @@ def _fleet_bin_dir():
     return os.path.dirname(exe) if exe else ""
 
 
-def _marketplace_pin():
-    """The dir to emit as $CMUX_FLEET_MARKETPLACE (so a roster's plugins=["<build-name>"] resolves to
-    THIS build's plugin). EXPLICIT config wins; else inferred ONLY from a real checkout — NEVER from a
-    wheel's site-packages (codex P1.1). Returns "" -> caller omits the pin (internal --plugin-dir
-    resolution stays disabled, which is correct for a wheel install with no bundled plugin)."""
-    if MARKETPLACE:                                   # env CMUX_FLEET_MARKETPLACE / [fleet].marketplace
-        return MARKETPLACE
-    if _is_plugin_checkout():
-        return os.path.dirname(PLUGIN_ROOT)           # parent holds the build dir; plugins=["<name>"] -> it
-    return ""
-
-
 def _seed_example_text():
     """The bundled fleet.toml.example seed roster text, or None. Read via importlib.resources for a
     WHEEL install (force-included at cmux_fleet/fleet.toml.example), falling back to the repo-root
@@ -108,9 +96,12 @@ def _profile_env():
     whatever its ambient shell happens to carry. This is what makes a profile HERMETIC across the
     parent->child boundary (the core multi-build-isolation requirement): without it a child could inherit
     a different build's CMUX_STATE_DIR and split-brain the registry/inbox."""
-    e = {"CMUX_STATE_DIR": STATE, "CMUX_FLEET_TOML": FLEET_TOML, "CMUX_FLEET_ROOT": ROOT, "CMUX_BIN": CMUX}
-    if MARKETPLACE:
-        e["CMUX_FLEET_MARKETPLACE"] = MARKETPLACE
+    e = {"CMUX_STATE_DIR": STATE, "CMUX_FLEET_TOML": FLEET_TOML, "CMUX_FLEET_ROOT": ROOT, "CMUX_BIN": CMUX,
+         # pin the plugin INDEX too: a child resolves its marketplaces from plugins.toml, so pinning the
+         # index location is what keeps its plugin loadout on THIS build's marketplaces (the marketplace
+         # dirs themselves are absolute paths declared IN the index) — the successor to the old
+         # $CMUX_FLEET_MARKETPLACE pin now that marketplaces live in the index, not an env var.
+         "CMUX_FLEET_PLUGIN_INDEX": PLUGIN_INDEX}
     return e
 
 try:
@@ -273,33 +264,20 @@ def _claude_settings_args(spec, enabled_refs=()):
     return ["--settings", base, "--settings", json.dumps({"enabledPlugins": ep})]
 
 
-def _plugin_dir(name):
-    """Resolve an INTERNAL plugin name to a --plugin-dir path, or None. An absolute/~ path is used
-    as-is (if it exists); a bare name is looked up under MARKETPLACE. With no marketplace configured,
-    bare names resolve to None (the caller warns + skips) — so the engine needs no marketplace to run."""
-    expanded = os.path.expanduser(name)
-    if os.path.isabs(expanded):
-        return expanded if os.path.exists(expanded) else None
-    if not MARKETPLACE:
-        return None
-    pd = os.path.join(MARKETPLACE, name)
-    return pd if os.path.exists(pd) else None
-
-
 def _linked_dir(name, source, index):
-    """Resolve a `type=linked` plugin name to a --plugin-dir path (or None to warn+skip). Generalizes
-    `_plugin_dir` to a NAMED marketplace: an absolute/~ path is used as-is; else join the plugin under
-    `[marketplace.<source>].path`. Falls back to `_plugin_dir` (the single default marketplace) when the
-    source has no path (kind=global, unknown, or absent) — which keeps default-marketplace resolution
-    byte-identical to today."""
+    """Resolve a `type=linked` plugin name to a --plugin-dir path (or None to warn+skip). An absolute/~
+    path is used as-is (if it exists); else the plugin is joined under its `[marketplace.<source>].path`.
+    A name with no resolvable marketplace (unknown/absent/global source, and not an absolute path) returns
+    None — the caller warns + skips. There is NO implicit default marketplace: a linked plugin resolves
+    ONLY via its declared marketplace or an absolute path."""
     expanded = os.path.expanduser(name)
-    if os.path.isabs(expanded):                              # abs/~ bypasses the marketplace (as today)
+    if os.path.isabs(expanded):                              # abs/~ bypasses the marketplace
         return expanded if os.path.exists(expanded) else None
-    mk = index["marketplaces"].get(source or "default")
+    mk = index["marketplaces"].get(source) if source else None
     if mk and mk.get("path"):
         pd = os.path.join(mk["path"], name)
         return pd if os.path.exists(pd) else None
-    return _plugin_dir(name)                                 # default marketplace / no source -> today's path
+    return None
 
 
 def _resolve_plugins(plugin_names, index):
@@ -307,10 +285,10 @@ def _resolve_plugins(plugin_names, index):
     Returns (linked_dirs, enabled_refs, unresolved):
       - in index & type=enabled -> "<name>@<source>" accumulated for enabledPlugins (via --settings).
       - in index & type=linked  -> a --plugin-dir path via the entry's source marketplace.
-      - NOT in index            -> a linked --plugin-dir: an abs/~ path used as-is, else a bare name under
-                                   the default marketplace (`_plugin_dir`). So bare/absolute names still
-                                   load without an index entry.
-    A name that should resolve to a dir but doesn't (missing marketplace/dir) lands in `unresolved`
+      - NOT in index            -> a linked --plugin-dir IF it's an abs/~ path (used as-is); a bare name
+                                   with no index entry has no marketplace to resolve under, so it is
+                                   UNRESOLVED (there is no implicit default marketplace).
+    A name that should resolve to a dir but doesn't (missing marketplace/dir/abs) lands in `unresolved`
     (caller warns + skips)."""
     linked, enabled, unresolved = [], [], []
     for name in plugin_names:
@@ -1487,11 +1465,17 @@ def _add_linked(a, name, note, marketplaces):
         print(f"[fleet] plugins add: a LINKED add needs a git URL or a local path to clone/copy "
               f"(ref '{a.ref}' is neither); pass one, or use --as enabled.", file=sys.stderr)
         return 2
+    try:                                                     # a malformed index aborts FIRST (before we even
+        fp.assert_index_parseable(PLUGIN_INDEX)              # resolve a marketplace — the tolerant read that
+    except fp.IndexParseError as e:                          # feeds resolution would silently see an EMPTY
+        print(f"[fleet] plugins add: existing index {e.path} is malformed ({e.cause}); refusing to "  # index,
+              f"overwrite it — fix or delete it, then re-run. (Nothing cloned.)", file=sys.stderr)     # so the
+        return 2                                             # real reason must win over "no LOCAL marketplace")
     target = a.marketplace or "default"
     mk = marketplaces.get(target)
     if not mk or mk.get("kind") == "global" or not mk.get("path"):
         print(f"[fleet] plugins add: no LOCAL marketplace '{target}' to clone into — declare "
-              f"[marketplace.{target}] path=... in {PLUGIN_INDEX}, or set $CMUX_FLEET_MARKETPLACE.",
+              f"[marketplace.{target}] path=... in {PLUGIN_INDEX} (and pass --marketplace {target}).",
               file=sys.stderr)
         return 2
     dest = os.path.join(mk["path"], name)
@@ -1502,12 +1486,6 @@ def _add_linked(a, name, note, marketplaces):
     if a.dry_run:
         print(f"[dry-run] {plan}\n[dry-run] nothing cloned or written")
         return 0
-    try:                                                     # bail BEFORE cloning if the index won't parse
-        fp.assert_index_parseable(PLUGIN_INDEX)
-    except fp.IndexParseError as e:
-        print(f"[fleet] plugins add: existing index {e.path} is malformed ({e.cause}); refusing to "
-              f"overwrite it — fix or delete it, then re-run. (Nothing cloned.)", file=sys.stderr)
-        return 2
     if os.path.exists(dest):
         print(f"[fleet] plugins add: destination already exists ({dest}); skipping clone, reconciling.")
     else:
@@ -1525,6 +1503,10 @@ def _add_linked(a, name, note, marketplaces):
             detail = (getattr(e, "stderr", "") or "").strip() or str(e)
             print(f"[fleet] plugins add: clone/copy failed: {detail}", file=sys.stderr)
             return 1
+    # register the plugin in the marketplace's manifest so the reconcile below derives an HONEST origin:
+    # a git-url add records a url source (origin=url), a local-path add a path source (origin=path). The
+    # manifest is created if the marketplace has none; the write is additive (other entries preserved).
+    manifest = fp.register_in_marketplace(mk["path"], target, name, dest, a.ref, kind, fp._plugin_json_desc(dest))
     # reconcile the LINKED channel ONLY (settings_paths=[]): the enabled channel is never scanned or
     # written by an `add linked`, and existing enabled index entries are preserved untouched. (The index
     # was already checked parseable above, before the clone, so this cannot raise IndexParseError.)
@@ -1534,7 +1516,8 @@ def _add_linked(a, name, note, marketplaces):
         with open(PLUGIN_INDEX, "w", encoding="utf-8") as f:
             f.write(new_text)
     print(f"[fleet] plugins add: wired '{name}' as LINKED into the index ({PLUGIN_INDEX}).")
-    print(f"  cloned into: {dest}")
+    print(f"  cloned into:  {dest}")
+    print(f"  registered:   {manifest}  (origin={'url' if kind == 'git-url' else 'path'})")
     print(f"  NOT enabled — no role loads it and no hook has run. Enable it for ONE agent when ready:")
     print(f"      fleet recycle <agent> --plugin {name}")
     return 0
@@ -1585,18 +1568,32 @@ def _cmd_plugins_add(rest):
     ap.add_argument("--as", dest="as_", choices=["linked", "enabled"],
                     help="force the technique (default: inferred from the ref)")
     ap.add_argument("--marketplace", help="target (linked) / source (enabled) marketplace; default 'default'")
+    ap.add_argument("--name", help="index name + clone-dir name for the plugin (default: the ref's basename). "
+                                   "Pass this to resolve a basename collision with an already-indexed plugin.")
     ap.add_argument("--dry-run", action="store_true",
                     help="infer + print the plan; clone/install/write NOTHING")
     a = ap.parse_args(rest)
 
     index = load_plugin_index()
-    name = fp.plugin_name_from_ref(a.ref)
+    name = a.name or fp.plugin_name_from_ref(a.ref)
 
-    # 1. already indexed? -> a no-op that points at the enable one-liner (idempotent; never re-clones).
+    # 1. already indexed? The idempotency check keys on the derived NAME, and two different repos can share
+    #    a basename (orgA/tools vs orgB/tools). So distinguish a genuine re-add of the SAME plugin (a safe
+    #    no-op) from a COLLISION where a different source would land on a taken name (STOP + tell the human
+    #    to pass --name). Signal: an explicit target marketplace that differs from the indexed entry's source.
     if name in index["plugins"]:
         cur = index["plugins"][name]
-        print(f"plugin '{name}' is already indexed (type={cur['type']}); nothing to do.")
-        print(f"  enable it per-agent with:  fleet recycle <agent> --plugin {name}")
+        target = a.marketplace or (a.ref.partition("@")[2] if "@" in a.ref else "")
+        if target and cur.get("source") and target != cur.get("source"):
+            print(f"[fleet] plugins add: STOP — the index name '{name}' is already taken by marketplace "
+                  f"'{cur.get('source')}' (type={cur['type']}), but this add targets '{target}'. Two "
+                  f"different plugins would collide on one index name.\n"
+                  f"  Re-run with --name <other> to index it under a different name.", file=sys.stderr)
+            return 2
+        print(f"plugin '{name}' is already indexed (type={cur['type']}, source={cur.get('source', '') or '?'}); "
+              f"nothing to do.")
+        print(f"  if you meant a DIFFERENT plugin, its basename collides — re-run with --name <other>.")
+        print(f"  enable this one per-agent with:  fleet recycle <agent> --plugin {name}")
         return 0
 
     # 2. infer the technique — an ambiguous or invalid call STOPs (never defaults a security-relevant choice).
@@ -3969,7 +3966,7 @@ def cmd_profile(argv):
       CMUX_STATE_DIR          <base>/state    (default $XDG_STATE_HOME/cmux-fleet-<name>)
       CMUX_FLEET_TOML         <base>/fleet.toml (default $XDG_CONFIG_HOME/cmux-fleet-<name>/fleet.toml)
       CMUX_FLEET_ROOT         --root or $HOME
-      CMUX_FLEET_MARKETPLACE  the build's parent dir (so a roster plugins=["<build-name>"] -> this build)
+      CMUX_FLEET_PLUGIN_INDEX <base>/plugins.toml (so the profile's plugins resolve from ITS index)
       CMUX_BIN                the resolved cmux
     --init also creates the state dir and seeds the toml from fleet.toml.example if it's missing.
     The launcher injects these same paths into every child it spawns (see _profile_env), so a conductor
@@ -3990,7 +3987,7 @@ def cmd_profile(argv):
         state = os.path.join(xdg_state, f"cmux-fleet-{a.name}")
         toml = os.path.join(xdg_cfg, f"cmux-fleet-{a.name}", "fleet.toml")
     root = os.path.abspath(os.path.expanduser(a.root)) if a.root else os.path.expanduser("~")
-    mkt = _marketplace_pin()                      # explicit config, or a real checkout's parent; "" -> omit
+    index = os.path.join(os.path.dirname(toml), "plugins.toml")   # the profile's index sits next to its toml
     binp = _fleet_bin_dir()                        # THIS build's fleet dir (checkout bin/ or installed script)
 
     if a.init:
@@ -4011,11 +4008,10 @@ def cmd_profile(argv):
     print(f'export CMUX_FLEET_ROOT={shlex.quote(root)}')
     print(f'export CMUX_STATE_DIR={shlex.quote(state)}')
     print(f'export CMUX_FLEET_TOML={shlex.quote(toml)}')
-    if mkt:
-        print(f'export CMUX_FLEET_MARKETPLACE={shlex.quote(mkt)}')
-    else:
-        sys.stderr.write("[fleet profile] note: no plugin marketplace pinned (wheel install / no explicit "
-                         "$CMUX_FLEET_MARKETPLACE); install the plugin separately and set it if you use plugins=[...]\n")
+    print(f'export CMUX_FLEET_PLUGIN_INDEX={shlex.quote(index)}')
+    if not os.path.exists(index):
+        sys.stderr.write(f"[fleet profile] note: no plugin index at {index} yet — declare "
+                         f"[marketplace.<name>] there (see plugins.toml.example) if you use plugins=[...]\n")
     print(f'export CMUX_BIN={shlex.quote(CMUX)}')
     if binp:
         print(f'export PATH={shlex.quote(binp)}:"$PATH"')

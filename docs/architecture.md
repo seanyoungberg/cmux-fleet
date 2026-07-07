@@ -363,7 +363,7 @@ A build is a checkout directory; a profile pins every entrypoint at one build so
 independent builds run side by side with no shared config, state, or daemons.
 `fleet profile <name>` emits a sourceable env block (PATH to the build's `bin`,
 plus `CMUX_STATE_DIR`, `CMUX_FLEET_TOML`, `CMUX_FLEET_ROOT`,
-`CMUX_FLEET_MARKETPLACE`, `CMUX_BIN`). The launcher also injects those same paths
+`CMUX_FLEET_PLUGIN_INDEX`, `CMUX_BIN`). The launcher also injects those same paths
 into every child it spawns (`_profile_env`), so a conductor and all its
 descendants, including their hooks, stay on one build regardless of a child
 shell's ambient env. See `docs/profiles.md`.

@@ -13,7 +13,7 @@ one prod app (see the marketplace caveat below).
 | Wiring point | How it resolves | Pinned by |
 | --- | --- | --- |
 | `fleet` CLI | `fleet profile` emits the dir of THIS build's `fleet` onto `PATH` — the installed console-script dir, or a checkout's `bin/fleet` shim (which runs `python -m cmux_fleet`) | `$CMUX_FLEET_BIN` › the invoked `fleet` › checkout `bin/` |
-| hooks + skills | the `--plugin-dir` baked into each agent's launch command | `CMUX_FLEET_MARKETPLACE` + the roster's `plugins` (checkout-inferred or explicit; **omitted for a bare installed app**) |
+| hooks + skills | the `--plugin-dir` / `enabledPlugins` baked into each agent's launch command | `CMUX_FLEET_PLUGIN_INDEX` + the roster's `plugins` (the index's `[marketplace.*]` blocks resolve each name) |
 | router daemon | reads `CMUX_STATE_DIR` from the env it was started in | `CMUX_STATE_DIR` |
 | state (registry/inbox/archive) | `config.py` resolves it at import | `CMUX_STATE_DIR` |
 | roster | `config.py` resolves it at import | `CMUX_FLEET_TOML` |
@@ -39,10 +39,10 @@ roster from the bundled `fleet.toml.example`, read via `importlib.resources` in 
 - `CMUX_STATE_DIR`  -> `$XDG_STATE_HOME/cmux-fleet-<name>`
 - `CMUX_FLEET_TOML` -> `$XDG_CONFIG_HOME/cmux-fleet-<name>/fleet.toml`
 - `CMUX_FLEET_ROOT` -> `$HOME` (override with `--root DIR`)
-- `CMUX_FLEET_MARKETPLACE` -> a real **checkout's** parent dir, so a roster `plugins = ["<build-dirname>"]`
-  loads that checkout's plugin. **A bare wheel/tool install OMITS this** (there is no plugin dir next to
-  the app) — set `CMUX_FLEET_MARKETPLACE` / `[fleet].marketplace` explicitly if you use `plugins = [...]`
-  with an installed app, or install the plugin the normal Claude Code way and reference it by name.
+- `CMUX_FLEET_PLUGIN_INDEX` -> `<config-dir>/plugins.toml`, the profile's plugin index. Declare your
+  `[marketplace.<name>]` blocks there (a local dir of plugins, or a `kind="global"` Claude marketplace)
+  and the roster's `plugins = [...]` names resolve through it — the index says linked (`--plugin-dir`) vs
+  enabled. See `plugins.toml.example`. A roster name that isn't indexed must be an absolute path.
 - `PATH` -> THIS build's `fleet` dir first (installed console-script dir, or the checkout `bin/`)
 
 Use `--base DIR` to keep one profile's state and toml together under a single dir instead of the XDG
@@ -157,5 +157,6 @@ So a second build's sandbox conductor lands in its own separate group, and teari
   build's router. `fleet daemon status` shows which state dir it routes; `ps aux | grep 'cmux_fleet.router
   --live'` should show one router per active profile, no more.
 - `eval` runs the env block in the **current** shell. A subshell or a new terminal needs its own `eval`.
-- The build's directory basename is the plugin name the roster's `plugins = [...]` resolves to under
-  `CMUX_FLEET_MARKETPLACE`. If you rename the dir, update the roster or use an absolute plugin path.
+- The roster's `plugins = [...]` names resolve through the profile's `plugins.toml` index (its
+  `[marketplace.*]` blocks). If a marketplace dir moves, update its `[marketplace.<n>].path` (or use an
+  absolute plugin path).

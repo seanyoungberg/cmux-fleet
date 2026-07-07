@@ -13,9 +13,6 @@
 #                                   #   env: CMUX_FLEET_ROOT
 # state_dir    = ""                 # "" -> $XDG_STATE_HOME/cmux-fleet (~/.local/state/cmux-fleet).  env: CMUX_STATE_DIR
 # cmux_bin     = ""                 # "" -> `which cmux`, then the macOS app bundle.  env: CMUX_BIN
-# marketplace  = ""                 # dir of internal plugins for bare `plugins=` names; "" disables it
-#                                   #   (use absolute plugin paths instead, or omit plugins).  env: CMUX_FLEET_MARKETPLACE
-#                                   #   (also synthesizes [marketplace.default] for the plugin index below.)
 # plugin_index = ""                 # path to the plugins.toml INDEX (see plugins.toml.example); "" ->
 #                                   #   <this-file's-dir>/plugins.toml. Absent file = empty index, no error.
 #                                   #   The index powers the `plugins = [...]` roster key.  env: CMUX_FLEET_PLUGIN_INDEX
@@ -31,7 +28,7 @@
 #   [role.<name>.<t>]   that role's config for tool <t>
 # Native flags go RAW in `flags` (e.g. "--model opus --effort high"); the launcher forwards them
 # without knowing them. `cwd` is relative to [fleet].root (or absolute). AGENT_ROLE/AGENT_LABEL are
-# auto-set. `plugins` names resolve under [fleet].marketplace (or use absolute paths).
+# auto-set. `plugins` names resolve through the plugins.toml index (or an absolute path).
 # ----------------------------------------------------------------------------------------------
 [defaults]
 tool  = "claude"
@@ -42,8 +39,8 @@ place = "tab"
 # plugins = ["cmux-fleet"]          # give every claude agent the conductor toolkit. Names resolve through
 #                                   #   the INDEX (plugins.toml) — the index says linked (--plugin-dir) vs
 #                                   #   enabled (enabledPlugins), so you don't pick the mechanism here. A
-#                                   #   name not in the index loads as a linked --plugin-dir (under
-#                                   #   [fleet].marketplace, or an absolute path). Unioned floor ∪ role.
+#                                   #   name must be in the index (via a [marketplace.<n>] block) or be an
+#                                   #   absolute path. Unioned floor ∪ role.
 flags   = "--effort high"
 
 [tool.codex]

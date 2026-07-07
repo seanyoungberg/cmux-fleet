@@ -446,9 +446,9 @@ fleet launch sandbox-conductor                            # auto-anchors its own
 
 `--init` creates the state dir and seeds the roster from the bundled
 `fleet.toml.example`. The `PATH` pin is THIS build's `fleet` dir (a checkout's
-`bin/` or the installed console-script dir); `CMUX_FLEET_MARKETPLACE` is emitted
-only for a real **checkout** — a bare installed app **omits** it, so set it (or
-`[fleet].marketplace`) explicitly if a roster uses `plugins = [...]`. `fleet
+`bin/` or the installed console-script dir); `CMUX_FLEET_PLUGIN_INDEX` is pinned
+next to the profile's toml — declare your `[marketplace.<name>]` blocks there if a
+roster uses `plugins = [...]` (see `plugins.toml.example`). `fleet
 daemon` is per-state, so started inside the activated shell it manages that
 profile's router against that profile's `CMUX_STATE_DIR`, separate from prod's
 daemon. Full model and the Nth-build workflow are in `docs/profiles.md`.
@@ -661,9 +661,9 @@ and `CMUX_STATE_DIR`. These decide whether a symlink/app swap reaches it.
    - **`profile --init` caveats (F2/F3):** `fleet profile <name> --init` without
      `--base` writes to the XDG-default state `~/.local/state/cmux-fleet-<name>` (with
      `name=staging` that IS the live checkout-staging state — use `--base <dir>` or a
-     distinct name to avoid a collision); and its emitted `marketplace` pin inherits
-     whatever `fleet.toml` `config.py` resolves (prod's, if `CMUX_FLEET_TOML` is
-     unset), so set `CMUX_FLEET_TOML` first for a true wheel-only pin.
+     distinct name to avoid a collision); and its emitted plugin-index pin sits next
+     to that toml (prod's, if `CMUX_FLEET_TOML` is unset), so set `CMUX_FLEET_TOML`
+     first for a true wheel-only pin.
 4. Apply the chosen agent strategy (A: flip the `CMUX_FLEET_BIN` symlink; B:
    `fleet recycle` each conductor).
 

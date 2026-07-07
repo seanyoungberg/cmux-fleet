@@ -144,7 +144,7 @@ no vault assumption, marketplace and floor disabled.
 | `CMUX_FLEET_ROOT` | `root` | `$HOME` (set `root = "."` for the toml's own directory) |
 | `CMUX_STATE_DIR` | `state_dir` | `$XDG_STATE_HOME/cmux-fleet` (`~/.local/state/cmux-fleet`) |
 | `CMUX_BIN` | `cmux_bin` | `which cmux`, else `/Applications/cmux.app/Contents/Resources/bin/cmux` |
-| `CMUX_FLEET_MARKETPLACE` | `marketplace` | `""` (internal `--plugin-dir` name resolution disabled) |
+| `CMUX_FLEET_PLUGIN_INDEX` | `plugin_index` | `<toml-dir>/plugins.toml` (the plugin index; declares `[marketplace.*]`) |
 | `CMUX_FLEET_FLOOR` | `floor_claudemd` | `""` (no ad-hoc `CLAUDE.md` symlink) |
 | `CMUX_HOOKSTORE_DIR` | `hookstore_dir` | `~/.cmuxterm` (cmux-owned) |
 | `CMUX_FLEET_ADHOC_SUBDIR` | `adhoc_subdir` | `agents/ad-hoc` (relative to root) |

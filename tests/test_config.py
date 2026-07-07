@@ -16,7 +16,7 @@ from conftest import REPO
 _DUMP = textwrap.dedent("""
     import json
     from cmux_fleet import config
-    keys = ["ROOT","STATE","CMUX","MARKETPLACE","FLOOR","HOOKSTORE","ADHOC_SUBDIR","FLEET_TOML","TOML_DIR"]
+    keys = ["ROOT","STATE","CMUX","FLOOR","HOOKSTORE","ADHOC_SUBDIR","FLEET_TOML","TOML_DIR"]
     print(json.dumps({k: getattr(config, k) for k in keys}))
 """)
 
@@ -68,9 +68,8 @@ def test_root_default_is_home(tmp_path):
     assert c["ROOT"] == str(tmp_path)
 
 
-def test_marketplace_and_floor_default_empty():
+def test_floor_default_empty():
     c, _ = _resolve()
-    assert c["MARKETPLACE"] == ""
     assert c["FLOOR"] == ""
 
 

@@ -44,10 +44,14 @@ def test_launch_plugin_unions_on_a_role(cli_env, tmp_path):
     # --adhoc one (the contract is "pass any valid flag at launch/recycle and it takes"). Assert `--plugin`
     # unions onto a ROLE's composed loadout, with a control proving it is absent when not passed.
     mkt = tmp_path / "mkt"
-    (mkt / "extrap").mkdir(parents=True)               # a resolvable bare name under the default marketplace
+    (mkt / "extrap" / ".claude-plugin").mkdir(parents=True)
+    (mkt / "extrap" / ".claude-plugin" / "plugin.json").write_text('{"name":"extrap"}')
+    index = tmp_path / "plugins.toml"
+    index.write_text(f'[marketplace.local]\npath = "{mkt}"\n'
+                     '[plugin.extrap]\ntype = "linked"\nsource = "local"\n')
     toml = tmp_path / "fleet.toml"
     toml.write_text('[role.worker]\nkind = "child"\ncwd = "workers/w"\n[role.worker.claude]\n')
-    env = {**cli_env, "CMUX_FLEET_TOML": str(toml), "CMUX_FLEET_MARKETPLACE": str(mkt)}
+    env = {**cli_env, "CMUX_FLEET_TOML": str(toml), "CMUX_FLEET_PLUGIN_INDEX": str(index)}
     with_flag = run_fleet(env, "launch", "worker", "--label", "w1", "--parent", "FAKE",
                           "--plugin", "extrap", "--dry-run")
     assert f"--plugin-dir {mkt / 'extrap'}" in with_flag.stdout   # unioned onto the ROLE launch (the fix)

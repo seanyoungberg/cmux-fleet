@@ -59,15 +59,11 @@ def _mkgitrepo(root, name):
     return repo
 
 
-def _env(cli_env, tmp_path, *, index, marketplace=None, settings=None):
-    """CLI env pinned at tmp_path: the roster, the plugin index, an optional local marketplace, and an
-    optional REDIRECTED claude-settings file (so nothing reads/writes the host's real ~/.claude)."""
+def _env(cli_env, tmp_path, *, index, settings=None):
+    """CLI env pinned at tmp_path: the roster, the plugin index, and an optional REDIRECTED
+    claude-settings file (so nothing reads/writes the host's real ~/.claude)."""
     e = {**cli_env, "CMUX_FLEET_TOML": str(tmp_path / "fleet.toml"),
          "CMUX_FLEET_PLUGIN_INDEX": str(index)}
-    if marketplace is not None:
-        e["CMUX_FLEET_MARKETPLACE"] = str(marketplace)
-    else:
-        e.pop("CMUX_FLEET_MARKETPLACE", None)
     if settings is not None:
         e["CMUX_FLEET_CLAUDE_SETTINGS"] = str(settings)
     return e
@@ -153,23 +149,26 @@ def test_add_linked_local_path_never_enables(cli_env, tmp_path):
     src = _mkplugin_src(tmp_path / "src", "newplug", sentinel=sentinel)
     mkt = tmp_path / "mkt" / "plugins"
     mkt.mkdir(parents=True)
-    index = tmp_path / "plugins.toml"                        # absent to start
+    index = tmp_path / "plugins.toml"                        # declares the target marketplace, no plugins yet
+    index.write_text(f'[marketplace.local]\npath = "{mkt}"\n')
     settings = tmp_path / "settings.json"
     settings.write_text('{"enabledPlugins": {"unrelated@x": false}}')
     fleet = tmp_path / "fleet.toml"
     fleet.write_text('[tool.claude]\n'
                      '[role.worker]\nkind = "child"\ncwd = "workers/w"\n[role.worker.claude]\n')
-    env = _env(cli_env, tmp_path, index=index, marketplace=mkt, settings=settings)
+    env = _env(cli_env, tmp_path, index=index, settings=settings)
 
     settings_before, fleet_before = settings.read_text(), fleet.read_text()
-    p = run_fleet(env, "plugins", "add", str(src))
+    p = run_fleet(env, "plugins", "add", str(src), "--marketplace", "local")
     assert "LINKED" in p.stdout
     assert "recycle <agent> --plugin newplug" in p.stdout       # told the human how to enable (didn't do it)
 
-    # the index gained a type=linked entry; linked never records an `install`; no enable map anywhere
+    # the index gained a type=linked entry under the declared marketplace; a local-path add -> origin=path;
+    # linked never records an `install`; no enable map anywhere
     doc = tomllib.loads(index.read_text())
     assert doc["plugin"]["newplug"]["type"] == "linked"
-    assert doc["plugin"]["newplug"]["source"] == "default"
+    assert doc["plugin"]["newplug"]["source"] == "local"
+    assert doc["plugin"]["newplug"]["origin"] == "path"        # a local-path add is recorded path-origin
     assert "install" not in doc["plugin"]["newplug"]
     assert "enabledPlugins" not in index.read_text()
     # NEVER enabled: the claude settings file is byte-identical (no {newplug@...: true} was ever written)
@@ -196,15 +195,18 @@ def test_add_linked_from_git_repo_never_enables(cli_env, tmp_path):
     mkt = tmp_path / "mkt" / "plugins"
     mkt.mkdir(parents=True)
     index = tmp_path / "plugins.toml"
+    index.write_text(f'[marketplace.local]\npath = "{mkt}"\n')
     settings = tmp_path / "settings.json"
     settings.write_text('{"enabledPlugins": {}}')
-    env = _env(cli_env, tmp_path, index=index, marketplace=mkt, settings=settings)
+    env = _env(cli_env, tmp_path, index=index, settings=settings)
 
     before = settings.read_text()
-    p = run_fleet(env, "plugins", "add", f"file://{repo}")
+    p = run_fleet(env, "plugins", "add", f"file://{repo}", "--marketplace", "local")
     assert "LINKED" in p.stdout
     assert (mkt / "gitplug" / ".claude-plugin" / "plugin.json").exists()   # clone landed
-    assert tomllib.loads(index.read_text())["plugin"]["gitplug"]["type"] == "linked"
+    entry = tomllib.loads(index.read_text())["plugin"]["gitplug"]
+    assert entry["type"] == "linked"
+    assert entry["origin"] == "url"                                        # Q2: a git-url add records origin=url
     assert "enabledPlugins" not in index.read_text()
     assert settings.read_text() == before                                  # never touched claude settings
 
@@ -259,6 +261,33 @@ def test_add_already_indexed_is_noop_pointer(cli_env, tmp_path):
     assert index.read_text() == before                       # byte-identical: no write, no clone attempted
 
 
+def test_add_name_collision_across_marketplaces_stops(cli_env, tmp_path):
+    """Issue #1: a derived name already indexed from a DIFFERENT marketplace is a COLLISION, not a bland
+    no-op — add STOPs and tells the human to pass --name (which then resolves it)."""
+    mkt = tmp_path / "mkt" / "plugins"
+    mkt.mkdir(parents=True)
+    src = _mkplugin_src(tmp_path / "src", "tools")           # basename 'tools' collides with the entry below
+    index = tmp_path / "plugins.toml"
+    index.write_text(f'[marketplace.local]\npath = "{mkt}"\n'
+                     '[plugin.tools]\ntype = "linked"\nsource = "other-mkt"\ntools = ["claude"]\n')
+    before = index.read_text()
+    env = _env(cli_env, tmp_path, index=index)
+
+    # adding a DIFFERENT 'tools' into marketplace 'local' collides with the indexed 'tools' from 'other-mkt'
+    p = run_fleet(env, "plugins", "add", str(src), "--marketplace", "local", expect=2)
+    assert "STOP" in (p.stdout + p.stderr) and "--name" in (p.stdout + p.stderr)
+    assert index.read_text() == before                       # refused; wrote nothing, cloned nothing
+    assert not (mkt / "tools").exists()
+
+    # --name resolves it: index + clone under a different name
+    p2 = run_fleet(env, "plugins", "add", str(src), "--marketplace", "local", "--name", "org-tools")
+    assert "LINKED" in p2.stdout
+    doc = tomllib.loads(index.read_text())
+    assert doc["plugin"]["org-tools"]["source"] == "local"   # indexed under the new name
+    assert doc["plugin"]["tools"]["source"] == "other-mkt"   # the original entry untouched
+    assert (mkt / "org-tools" / ".claude-plugin" / "plugin.json").exists()   # cloned into the renamed dir
+
+
 def test_add_bare_ref_stops_writes_nothing(cli_env, tmp_path):
     """A bare, un-inferable ref STOPs (rc 2) and writes nothing — it refuses to guess a security call."""
     index = tmp_path / "plugins.toml"                        # absent
@@ -273,11 +302,14 @@ def test_add_linked_dry_run_writes_nothing(cli_env, tmp_path):
     mkt = tmp_path / "mkt" / "plugins"
     mkt.mkdir(parents=True)
     index = tmp_path / "plugins.toml"
-    env = _env(cli_env, tmp_path, index=index, marketplace=mkt)
-    p = run_fleet(env, "plugins", "add", str(src), "--dry-run")
+    index.write_text(f'[marketplace.local]\npath = "{mkt}"\n')
+    before = index.read_text()
+    env = _env(cli_env, tmp_path, index=index)
+    p = run_fleet(env, "plugins", "add", str(src), "--marketplace", "local", "--dry-run")
     assert "[dry-run]" in p.stdout and "LINKED" in p.stdout
-    assert not index.exists()                                # no index write
+    assert index.read_text() == before                       # no index write (marketplace-only, unchanged)
     assert not (mkt / "dryplug").exists()                    # no clone/copy
+    assert not (mkt / ".claude-plugin").exists()             # no manifest write either
 
 
 def test_add_enabled_dry_run_writes_nothing(cli_env, tmp_path):
@@ -290,10 +322,8 @@ def test_add_enabled_dry_run_writes_nothing(cli_env, tmp_path):
 
 def test_add_as_linked_on_name_at_marketplace_stops(cli_env, tmp_path):
     """`--as linked` on a name@marketplace ref STOPs — a linked add needs something to clone/copy."""
-    mkt = tmp_path / "mkt" / "plugins"
-    mkt.mkdir(parents=True)
     index = tmp_path / "plugins.toml"
-    env = _env(cli_env, tmp_path, index=index, marketplace=mkt)
+    env = _env(cli_env, tmp_path, index=index)
     p = run_fleet(env, "plugins", "add", "obsidian@obs", "--as", "linked", expect=2)
     assert "needs a git URL or a local path" in (p.stdout + p.stderr)
     assert not index.exists()
@@ -333,11 +363,9 @@ _MALFORMED = ('[marketplace.berg]\npath = "mkt/plugins"\n'
 def test_reconcile_aborts_on_malformed_index_file_unchanged(cli_env, tmp_path):
     """`fleet plugins reconcile` on a malformed populated index -> rc 2, message names the file, and the
     file is BYTE-UNCHANGED (the pre-fix behavior regenerated it from sources, losing the curated data)."""
-    mkt = tmp_path / "mkt" / "plugins"
-    mkt.mkdir(parents=True)
     index = tmp_path / "plugins.toml"
     index.write_text(_MALFORMED)
-    env = _env(cli_env, tmp_path, index=index, marketplace=mkt)
+    env = _env(cli_env, tmp_path, index=index)
     p = run_fleet(env, "plugins", "reconcile", expect=2)
     assert "malformed" in (p.stdout + p.stderr) and str(index) in (p.stdout + p.stderr)
     assert index.read_text() == _MALFORMED                   # curated data untouched
@@ -351,8 +379,9 @@ def test_add_linked_aborts_on_malformed_index_nothing_cloned(cli_env, tmp_path):
     mkt.mkdir(parents=True)
     index = tmp_path / "plugins.toml"
     index.write_text(_MALFORMED)
-    env = _env(cli_env, tmp_path, index=index, marketplace=mkt)
-    p = run_fleet(env, "plugins", "add", str(src), "--as", "linked", expect=2)
+    env = _env(cli_env, tmp_path, index=index)
+    # a valid --marketplace can't rescue a malformed index (it won't parse) — the malformed abort wins FIRST
+    p = run_fleet(env, "plugins", "add", str(src), "--as", "linked", "--marketplace", "berg", expect=2)
     assert "malformed" in (p.stdout + p.stderr) and str(index) in (p.stdout + p.stderr)
     assert index.read_text() == _MALFORMED                   # curated data untouched
     assert not (mkt / "newplug").exists()                    # bailed BEFORE cloning

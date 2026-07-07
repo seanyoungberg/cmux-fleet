@@ -32,15 +32,11 @@ def _launch_argv(stdout):
     return line[line.index(" claude ") + 1:]
 
 
-def _env(cli_env, tmp_path, *, index=None, marketplace=None):
+def _env(cli_env, tmp_path, *, index=None):
     e = {**cli_env, "CMUX_FLEET_TOML": str(tmp_path / "fleet.toml")}
     # Keep the index pointer explicit + hermetic (never fall back to the default <toml-dir>/plugins.toml
     # unless a test wants that). Point at an absent path when a test wants NO index.
     e["CMUX_FLEET_PLUGIN_INDEX"] = str(index) if index is not None else str(tmp_path / "__no_index__.toml")
-    if marketplace is not None:
-        e["CMUX_FLEET_MARKETPLACE"] = str(marketplace)
-    else:
-        e.pop("CMUX_FLEET_MARKETPLACE", None)
     return e
 
 
@@ -112,22 +108,21 @@ def test_per_tool_block_parses_and_is_stored(cli_env, tmp_path):
     assert ms["tool_overrides"]["codex"]["hook"] == "codex-hooks.json"
 
 
-# --- (d) an unindexed `plugins` name falls back to a linked --plugin-dir (fall-through) -----------
-def test_unindexed_plugins_falls_back_to_abspath_and_default_marketplace(cli_env, tmp_path):
-    mkt = tmp_path / "default-mkt"
-    bare_dir = _mkplugin(mkt, "bareplug")            # a bare name resolvable under the default marketplace
+# --- (d) an unindexed name: an absolute path still loads; a bare name has no marketplace -> skip ---
+def test_unindexed_plugins_abspath_resolves_bare_skips(cli_env, tmp_path):
     abs_dir = tmp_path / "loose" / "abs-plug"
     abs_dir.mkdir(parents=True)
-    # plugins.toml exists but does NOT list these names -> they take the not-in-index fall-through
+    # plugins.toml exists but lists neither name -> the not-in-index path: abs used as-is, bare unresolvable
     (tmp_path / "plugins.toml").write_text('[plugin.somethingelse]\ntype = "linked"\nsource = "x"\n')
     (tmp_path / "fleet.toml").write_text(
         '[role.w]\nkind = "child"\ncwd = "w"\n'
-        f'[role.w.claude]\nplugins = ["bareplug", "{abs_dir}"]\n')
-    env = _env(cli_env, tmp_path, index=tmp_path / "plugins.toml", marketplace=mkt)
+        f'[role.w.claude]\nplugins = ["bareghost", "{abs_dir}"]\n')
+    env = _env(cli_env, tmp_path, index=tmp_path / "plugins.toml")
     p = run_fleet(env, "launch", "w", "--label", "w1", "--parent", "FAKE", "--dry-run")
     argv = _launch_argv(p.stdout)
-    assert f"--plugin-dir {bare_dir}" in argv          # bare name -> default marketplace (fall-through)
-    assert f"--plugin-dir {abs_dir}" in argv           # abs path -> used as-is (fall-through bypass)
+    assert f"--plugin-dir {abs_dir}" in argv           # abs path -> used as-is
+    assert "bareghost" not in argv                     # bare unindexed name has no marketplace -> skipped
+    assert "not resolvable" in p.stdout                # ...with a warning
 
 
 def test_absent_index_is_empty_not_error(cli_env, tmp_path):
@@ -172,29 +167,27 @@ def test_default_index_location_next_to_fleet_toml(cli_env, tmp_path):
     assert f"--plugin-dir {d}" in _launch_argv(p.stdout)
 
 
-# --- an unrelated index never perturbs fall-through composition ----------------------------------
-def test_unindexed_composition_unchanged_by_index(cli_env, tmp_path):
-    """A roster of UNINDEXED plugin names (resolved via $MARKETPLACE fall-through) must compose the same
-    claude argv whether or not an UNRELATED plugins.toml exists. Proves the index only ever ADDS routing
-    for names it actually lists — it never moves the composition of names it doesn't."""
-    mkt = tmp_path / "mkt"
-    _mkplugin(mkt, "someplug")
-    # a roster referencing a plugin the index does NOT list -> pure fall-through under $MARKETPLACE
+# --- an unrelated index never perturbs an absolute-path plugin's composition ---------------------
+def test_abspath_composition_unchanged_by_index(cli_env, tmp_path):
+    """A roster referencing a plugin by ABSOLUTE PATH must compose the same claude argv whether or not an
+    UNRELATED plugins.toml exists. Proves the index only ever ADDS routing for names it lists — it never
+    moves the composition of an absolute-path plugin it doesn't."""
+    abs_plug = tmp_path / "loose" / "someplug"
+    abs_plug.mkdir(parents=True)
     (tmp_path / "fleet.toml").write_text(
-        '[tool.claude]\nplugins = ["someplug"]\n'
+        '[tool.claude]\n'
         '[role.worker]\nkind = "child"\ncwd = "workers/w"\n'
-        '[role.worker.claude]\nplugins = ["someplug"]\nsetting_sources = "user,local"\n')
+        f'[role.worker.claude]\nplugins = ["{abs_plug}"]\nsetting_sources = "user,local"\n')
     # an unrelated index that the roster never references
     (tmp_path / "plugins.toml").write_text(
         '[marketplace.berg]\npath = "elsewhere"\n'
         '[plugin.unused]\ntype = "linked"\nsource = "berg"\ntools = ["claude"]\n')
 
-    with_index = _env(cli_env, tmp_path, index=tmp_path / "plugins.toml", marketplace=mkt)
-    without_index = _env(cli_env, tmp_path, marketplace=mkt)   # index -> absent path
+    with_index = _env(cli_env, tmp_path, index=tmp_path / "plugins.toml")
+    without_index = _env(cli_env, tmp_path)                    # index -> absent path
 
     a = _launch_argv(run_fleet(with_index, "launch", "worker", "--label", "w1", "--parent", "FAKE", "--dry-run").stdout)
     b = _launch_argv(run_fleet(without_index, "launch", "worker", "--label", "w1", "--parent", "FAKE", "--dry-run").stdout)
-    assert a == b, f"index presence changed unindexed composition:\n WITH: {a}\n WITHOUT: {b}"
-    # and the fall-through channel is exactly the default-marketplace --plugin-dir
-    assert f"--plugin-dir {os.path.join(str(mkt), 'someplug')}" in a
+    assert a == b, f"index presence changed abspath composition:\n WITH: {a}\n WITHOUT: {b}"
+    assert f"--plugin-dir {abs_plug}" in a
     assert "--setting-sources user,local" in a

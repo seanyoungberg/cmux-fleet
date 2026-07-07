@@ -87,9 +87,10 @@ def test_wheel_profile_init_pins_installed_bin_and_seeds(installed, tmp_path):
     # 2. The seed roster was actually written (importlib.resources read the force-included data).
     assert os.path.exists(os.path.join(base, "fleet.toml")), "profile --init did not seed fleet.toml"
 
-    # 3. NOTHING emitted points a bare plugin name at a Python lib dir. In a wheel install with no
-    #    explicit $CMUX_FLEET_MARKETPLACE the marketplace pin is correctly OMITTED (not site-packages).
-    assert "CMUX_FLEET_MARKETPLACE" not in out, "wheel install must not emit an inferred marketplace pin"
+    # 3. The profile pins the plugin INDEX (marketplaces live there now); NOTHING emitted points at a
+    #    Python lib dir (a wheel's site-packages must never leak into any pin).
+    assert "export CMUX_FLEET_PLUGIN_INDEX=" in out, "profile must pin the plugin index"
+    assert "CMUX_FLEET_MARKETPLACE" not in out, "the retired marketplace shim must not be emitted"
     assert "site-packages" not in out and "/lib/python" not in out, out
 
 
