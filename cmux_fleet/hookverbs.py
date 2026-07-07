@@ -42,6 +42,11 @@ def _doctor_line(r):
                   f"runs out mid-task")
     elif reason == "needs-input":
         detail = "NEEDS INPUT — waiting at a question/permission gate; answer or drive it"
+    elif reason == "never-bound":
+        mins = int(r.get("pending_s") or 0) // 60
+        err = (r.get("pane_error") or "").strip()
+        detail = (f"NEVER BOUND — launched ~{mins}m ago, no session; the process died on spawn"
+                  + (f" ({err})" if err else "") + f". `fleet rm {label} --kill` + relaunch (fix the flags)")
     else:
         detail = f"needs attention ({reason})"
     return f"seq {r.get('seq')}  {label} (surface {surf}): {detail}"

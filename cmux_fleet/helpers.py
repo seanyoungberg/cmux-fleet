@@ -237,7 +237,10 @@ def _inbox_line(r):
         summary = (f"surface {(r.get('child_surface') or '')[:8]} closed ({r.get('origin','?')}); "
                    f"revive: fleet revive {r.get('label','?')}")
     elif kind == "doctor":
-        summary = f"{r.get('reason','?')} — still LIVE, needs attention (inspect/drive/recycle)"
+        if r.get("reason") == "never-bound":
+            summary = f"never-bound — launched but died on spawn, no session; rm --kill + relaunch (fix flags)"
+        else:
+            summary = f"{r.get('reason','?')} — still LIVE, needs attention (inspect/drive/recycle)"
     elif kind == "peer":
         body = (r.get("body") or "").strip().replace("\n", " ")[:100]
         rexp = " · REPLY EXPECTED" if r.get("reply_expected") else ""

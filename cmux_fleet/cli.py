@@ -331,6 +331,49 @@ def _resolve_use(use_names, index):
     return linked, enabled, unresolved
 
 
+# claude->codex launch-flag translation (P0-3). The fleet's first-class launch flags (--effort/--model)
+# funnel into the caller-token layer in CLAUDE syntax regardless of tool (cmd_launch), and a caller's `--`
+# passthrough is often copy-pasted from a claude launch. Forwarding those verbatim to codex can KILL it:
+# codex aborts on `--effort` ("unexpected argument '--effort' found", 2026-07-07). The codex adapter is
+# the ONE place that owns the mapping (the adapter boundary): TRANSLATE what has a codex equivalent,
+# DROP+warn what's claude-only, PASS the rest (incl. --model, a real codex flag) through untouched.
+_CODEX_DROP = ("--setting-sources", "--permission-mode", "--plugin-dir")  # claude-only; no codex analog
+
+
+def _codex_flags(tokens):
+    """Map claude-flavored launcher tokens to codex's CLI (P0-3). Value-consuming flags use the repo's
+    heuristic (the next token is the value iff it doesn't start with '-'), matching _drop_keys.
+      --effort <lvl>                 -> -c model_reasoning_effort=<lvl>   (codex reads effort via -c; the
+                                        LEVEL passes through verbatim -- codex's tiers overlap the fleet's,
+                                        incl. xhigh (its own TUI shows `gpt-5.5 xhigh`), so we do NOT clamp
+                                        and silently downgrade; a value codex rejects now fails LOUD via the
+                                        P0-4a launch verify, not silently)
+      --dangerously-skip-permissions -> --dangerously-bypass-approvals-and-sandbox
+      --setting-sources|--permission-mode|--plugin-dir -> DROP (+warn): codex rejects them
+      everything else                -> passthrough (a codex floor's own flags, --model, `--` extras)"""
+    out, i, n = [], 0, len(tokens)
+    while i < n:
+        t = tokens[i]
+        key, eq, inline = t.partition("=")
+        has_next_val = (not eq) and i + 1 < n and not tokens[i + 1].startswith("-")
+        val = inline if eq else (tokens[i + 1] if has_next_val else "")
+        if key == "--effort":
+            if val:
+                out += ["-c", f"model_reasoning_effort={val}"]
+            i += 2 if has_next_val else 1
+        elif key == "--dangerously-skip-permissions":
+            out.append("--dangerously-bypass-approvals-and-sandbox")
+            i += 1
+        elif key in _CODEX_DROP:
+            print(f"[fleet] warn: dropping claude-only flag '{key}"
+                  + (f" {val}" if (val and not eq) else "") + "' for codex (no codex equivalent)")
+            i += 2 if has_next_val else 1
+        else:
+            out.append(t)
+            i += 1
+    return out
+
+
 def adapter_compile(tool, spec, caller_tokens):
     """Compile {plugins, flags, env, settings} + caller passthrough -> (bin, arg_tokens, env_map)
     for the given tool. Adding a tool = adding a branch here + a [tool.<t>] block."""
@@ -371,7 +414,7 @@ def adapter_compile(tool, spec, caller_tokens):
         # provision CODEX_HOME (deferred) -> plugins/settings/use are still no-ops for codex, so warn.
         if spec["plugins"] or spec["settings"] or spec.get("use"):
             print("[fleet] warn: 'plugins'/'settings'/'use' are not yet provisioned for codex; ignored")
-        return "codex", merged, env
+        return "codex", _codex_flags(merged), env
 
     sys.exit(f"fleet: unknown tool '{tool}' (no adapter)")
 
@@ -611,6 +654,12 @@ def register(surf, spec, parent_surface, session, ws):
         "cwd": spec["abs_cwd"], "parent": parent_label, "place": spec["place"], "status": "live",
         "surface": surf, "workspace": ws,
         "session": f"claude-{session}" if spec["tool"] == "claude" else session,
+        # when this row was written -> the age gate for the fleet-doctor never-bound sweep (P0-4): a LAZY
+        # child (codex) registers unbound and BACKFILLS its session on its first turn; a dead-on-arrival
+        # one never binds. launchedAt lets the daemon tell "just launched, still booting" from "pending
+        # for 10m -> dead/stuck" without a false alarm on a fresh boot. A revive/recycle re-stamps it (it
+        # IS a fresh launch); absent on legacy rows -> the sweep treats age as 0 (never false-fires).
+        "launchedAt": time.time(),
         # carried so archive->revive can rebuild the launch without re-resolving the roster
         "plugins": spec["plugins"], "flags": spec["flags"], "settings": spec["settings"],
         # provider attribution (providers feature): "tool:name" the agent launched under, for `fleet usage`
@@ -675,6 +724,33 @@ def _agent_surfaced(surf):
     is still at the shell — an injected command that hasn't started, i.e. the enter-race symptom."""
     pane = cmuxq("capture-pane", "--surface", surf) or ""
     return any(m in pane for m in _TUI_MARKERS)
+
+
+# startup-error signatures on a pane -> a launch that DIED on spawn (a bad flag, a missing binary, an
+# early crash), not a healthy agent (P0-4). Curated to catch the CLI-arg-death class the brief names
+# (--effort/--model/--permission-mode forwarded to the wrong tool) without matching a live TUI's chrome.
+_LAUNCH_ERROR_MARKERS = (
+    "unexpected argument", "unrecognized argument", "unrecognized option", "invalid value",
+    "error: unexpected", "USAGE:", "Usage: ", "command not found", "No such file or directory",
+    "panic:", "thread 'main' panicked", "Traceback (most recent call last)",
+)
+
+
+def launch_error_line(pane_text):
+    """First startup-error line in a captured pane (a bad flag / missing binary / early crash), or ''.
+    PURE (no shell-out) so the launch-time verify (cli._launch_failure_line) and the fleet-doctor
+    never-bound sweep (router._surface_error_line) share ONE scanner and both stay unit-testable without
+    a live cmux -- the same shape as surface_ws_from_tree."""
+    for line in (pane_text or "").splitlines():
+        low = line.lower()
+        if any(m.lower() in low for m in _LAUNCH_ERROR_MARKERS):
+            return line.strip()[:200]
+    return ""
+
+
+def _launch_failure_line(surf):
+    """launch_error_line applied to `surf`'s live pane (captured via cmuxq)."""
+    return launch_error_line(cmuxq("capture-pane", "--surface", surf) or "")
 
 
 def _resume_menu_visible(surf):
@@ -993,6 +1069,26 @@ def cmd_launch(argv):
             print(f"[fleet]       (if the tree shows changes, rm --kill refuses it; reclaim manually: "
                   f"git -C {wm.get('repo', '<repo>')} worktree remove {wm.get('path', spec['abs_cwd'])})")
             print(f"[fleet]     fleet launch {a.role or ('--adhoc ' + a.adhoc)} ...")
+            return 2
+    # launch verification (P0-4a): a LAZY tool that never bound is EITHER healthy (binds on its 1st turn)
+    # OR dead-on-arrival -- e.g. codex rejecting a claude-ism like --effort (2026-07-07): it exited on
+    # spawn yet launch still printed DONE while the surface sat empty. `not sid` alone can't tell the two
+    # apart (a bound claude already sys.exited above on a failed bind, so this only guards the lazy path).
+    # POSITIVELY scan the pane for a startup-error signature before reporting DONE: a match = the process
+    # died -> FAIL LOUD with the cleanup + retry, never pretend it's a pending backfill. No match = trust
+    # the normal lazy path (the row is already registered, so a silent death still shows PENDING in
+    # `fleet ls` and the daemon never-bound sweep is the backstop).
+    if lazy and not sid:
+        errline = _launch_failure_line(surf)
+        if errline:
+            print(f"\n[fleet] !!! LAUNCH FAILED for {spec['label']} (tool {spec['tool']}): the process "
+                  f"exited on spawn -- it never came up.")
+            print(f"[fleet]   pane error : {errline}")
+            print(f"[fleet]   likely a tool/flag mismatch (a claude-ism forwarded to {spec['tool']}?); "
+                  f"inspect: cmux capture-pane --surface {surf}")
+            print(f"[fleet]   clean up + retry:")
+            print(f"[fleet]     fleet rm {spec['label']} --kill")
+            print(f"[fleet]     fleet launch {a.role or ('--adhoc ' + a.adhoc)} ...   # fix the flags first")
             return 2
     if sid:
         print(f"[fleet] DONE: {spec['label']} = surface {surf} (session {sid}, place {spec['place']}, tool {spec['tool']})")

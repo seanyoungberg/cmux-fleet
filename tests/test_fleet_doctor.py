@@ -365,6 +365,87 @@ def test_recycle_new_session_realerts(fs, monkeypatch, wake):
     assert len(router._doctor_fired) == 1                       # old key pruned (set didn't grow)
 
 
+# ── #4 never-bound (P0-4: a LAZY child launched, no session bound past NEVER_BOUND_S) ───────────────
+AGED_LAUNCH = NOW - (router.NEVER_BOUND_S + 60)      # registered long enough ago to be past the grace window
+FRESH_LAUNCH = NOW - 10                               # just launched, still inside the boot/drive grace
+
+
+def _seed_never_bound(launched_at, tool="codex"):
+    """A parent + a lazily-registered child with NO session bound (the pending state)."""
+    fs.live_put("parent", {"surface": "PARENT", "kind": "conductor", "role": "c", "session": "claude-parent"})
+    fs.live_put("child", {"surface": "CHILD", "kind": "child", "role": "w", "parent": "parent",
+                          "tool": tool, "session": "", "launchedAt": launched_at})
+    # the top-level st read still happens; give it an empty store (the never-bound branch never resolves a record).
+    return {"sessions": {}, "activeSessionsBySurface": {}}
+
+
+def test_never_bound_fires_when_aged_and_pane_shows_error(fs, monkeypatch, wake):
+    """The incident (2026-07-07): codex died on a bad flag, sat 'pending' unnoticed. Past the grace
+    window with a startup ERROR on the pane, the sweep alerts the parent — deduped, wake-routed."""
+    store = _seed_never_bound(AGED_LAUNCH)
+    monkeypatch.setattr(fs, "read_hook_store", lambda: store)
+    monkeypatch.setattr(router, "_surface_error_line",
+                        lambda surf: "error: unexpected argument '--effort' found")
+    n = router.fleet_doctor_sweep(now=NOW)
+    assert n == 1
+    a = fs.inbox_pending("PARENT", kind="doctor")[0]
+    assert a["reason"] == "never-bound" and a["label"] == "child" and a["child_surface"] == "CHILD"
+    assert "unexpected argument" in a["pane_error"] and a["pending_s"] >= router.NEVER_BOUND_S
+    assert wake == ["PARENT"]
+
+
+def test_never_bound_does_not_fire_without_a_pane_error(fs, monkeypatch, wake):
+    """THE false-positive case: a healthy child launched in a batch and NOT YET DRIVEN is also pending
+    with no session. It shows its TUI, not an error, so the sweep must NOT alert (log-only)."""
+    store = _seed_never_bound(AGED_LAUNCH)
+    monkeypatch.setattr(fs, "read_hook_store", lambda: store)
+    monkeypatch.setattr(router, "_surface_error_line", lambda surf: "")   # healthy TUI, no error
+    assert router.fleet_doctor_sweep(now=NOW) == 0
+    assert fs.inbox_pending("PARENT", kind="doctor") == []
+    assert wake == []
+
+
+def test_never_bound_does_not_fire_within_grace_window(fs, monkeypatch, wake):
+    """A just-launched child mid-cold-boot is legitimately unbound; even a transient error line on the
+    pane must not fire before the grace window — the sweep never even reads the pane inside it."""
+    store = _seed_never_bound(FRESH_LAUNCH)
+    monkeypatch.setattr(fs, "read_hook_store", lambda: store)
+    monkeypatch.setattr(router, "_surface_error_line",
+                        lambda surf: pytest.fail("must not scan the pane inside the grace window"))
+    assert router.fleet_doctor_sweep(now=NOW) == 0
+    assert fs.inbox_pending("PARENT", kind="doctor") == []
+
+
+def test_never_bound_skips_claude(fs, monkeypatch, wake):
+    """claude binds at boot (a failed bind sys.exits BEFORE register), so a no-session live row is never
+    a claude — the branch skips it defensively rather than scanning the pane for one."""
+    store = _seed_never_bound(AGED_LAUNCH, tool="claude")
+    monkeypatch.setattr(fs, "read_hook_store", lambda: store)
+    monkeypatch.setattr(router, "_surface_error_line",
+                        lambda surf: pytest.fail("must not scan the pane for a claude row"))
+    assert router.fleet_doctor_sweep(now=NOW) == 0
+    assert fs.inbox_pending("PARENT", kind="doctor") == []
+
+
+def test_never_bound_dedups_then_rearms_on_bind(fs, monkeypatch, wake):
+    """Fires once, silent on the next tick (no storm); when the child finally BINDS a session the pending
+    key leaves live_keys and the dedup prunes, so a future never-bound would re-fire fresh."""
+    store = _seed_never_bound(AGED_LAUNCH)
+    monkeypatch.setattr(fs, "read_hook_store", lambda: store)
+    monkeypatch.setattr(router, "_surface_error_line", lambda surf: "error: unexpected argument")
+    assert router.fleet_doctor_sweep(now=NOW) == 1
+    assert router.fleet_doctor_sweep(now=NOW + 120) == 0             # same pending state -> silent
+    assert len(fs.inbox_pending("PARENT", kind="doctor")) == 1
+    # child binds on its first turn: session backfills -> the ("never-bound","child","") key prunes.
+    fs.live_put("child", {"surface": "CHILD", "kind": "child", "role": "w", "parent": "parent",
+                          "tool": "codex", "session": "codex-boundnow", "launchedAt": AGED_LAUNCH})
+    monkeypatch.setattr(fs, "surface_has_live_agent", lambda surf: True)
+    monkeypatch.setattr(fs, "read_hook_store",
+                        lambda: _store("idle", FRESH_UA, sid="boundnow"))
+    router.fleet_doctor_sweep(now=NOW + 240)
+    assert ("never-bound", "child", "") not in router._doctor_fired  # re-armed
+
+
 def test_orphan_record_on_surface_does_not_mask_bound(fs, monkeypatch, wake):
     """resolve_bound_record picks the fleet-BOUND session's record, not max-updatedAt: a fresher ORPHAN
     record squatting on the same surface must not hide the bound record's real state (or vice versa)."""

@@ -66,6 +66,10 @@ STALL_WINDOW = 1800     # ...but ONLY fire while the stall is RECENT (age in (ST
                         # that a bare `age > STALL_S` would false-flag as "stalled." The upper bound
                         # excludes them (30m >> any fresh-caught stall) without missing a real one.
 LOW_CTX_PCT = 30        # context-remaining % at/under which to alert once (matches vitals' near-full flag)
+NEVER_BOUND_S = 600     # a LAZY child (codex) registered but with NO session bound this long = launched
+                        # but never came up (dead-on-arrival on a bad flag) OR never driven. 10m clears any
+                        # cold boot; the sweep only ALERTS when the pane ALSO shows a startup error (so a
+                        # healthy batch-launched-not-yet-driven child never false-fires) -- see condition #4.
 NEEDS_INPUT_COMPLETION_SUPPRESS_S = 120      # only the immediate post-Stop idle duplicate; not later gates
 NEEDS_INPUT_COMPLETION_SKEW_S = 2.0          # row write can lag the hook-store lifecycle stamp slightly
 _doctor_fired = set()   # {(reason, label, session)} — parent-alert/seen-state dedup across ticks/restarts
@@ -265,6 +269,14 @@ def _surface_ws_now(surface):
     return cli.surface_ws_from_tree(cmux("tree", "--all", "--id-format", "both"), surface)
 
 
+def _surface_error_line(surface):
+    """First startup-error line on `surface`'s live pane (a bad flag / missing binary / early crash), or
+    ''. The never-bound sweep's discriminator: a DEAD lazy launch shows the error; a merely-undriven one
+    shows its TUI (no error) -> no false alarm. Shares cli's PURE scanner so the marker list lives once."""
+    from . import cli                                    # lazy: shared marker list + pure scanner
+    return cli.launch_error_line(cmux("capture-pane", "--surface", surface) or "")
+
+
 def _archive_closed_surface(ev):
     """surface.closed -> registry hygiene. The event IS the ground truth that a tracked member's surface
     just died (no lifecycle re-derivation needed): if the close came through `fleet rm`/`fleet archive`,
@@ -396,6 +408,31 @@ def fleet_doctor_sweep(now=None):
             if fs.expected_close_recent(surface, now=now):
                 log(f"[fleet-doctor] skip {label}: expected CLI close (surface {surface[:8]})")
                 continue
+
+            # #4 never-bound — a LAZY child registered with NO session bound past NEVER_BOUND_S. claude
+            # binds at boot (a failed bind sys.exits BEFORE register), so a no-session live row is always a
+            # lazy tool that either died-on-arrival (bad flag) or was launched-and-never-driven. Handled
+            # HERE, before the session-based conditions (they all assume a bound record). We ONLY alert on
+            # a CONFIRMED pane startup-error -> a healthy child queued for later driving (no error) never
+            # false-fires; a silent exit with no error is LOG-only (the launch-time verify P0-4a is the
+            # primary catch). live_keys keeps this member's dedup key across the end-of-sweep prune.
+            if not session:
+                live_keys.add((label, ""))
+                if entry.get("tool") == "claude":
+                    continue                               # defensive: claude never registers unbound
+                age = now - (entry.get("launchedAt") or now)
+                if age < NEVER_BOUND_S:
+                    continue                               # still inside the boot/drive grace window
+                errline = _surface_error_line(surface)
+                if errline:
+                    _emit("never-bound", label, entry, surface,
+                          {"pane_error": errline, "pending_s": int(age)})
+                else:
+                    _doctor_fired.discard(("never-bound", label, ""))   # re-arm; undriven or silent exit
+                    log(f"[fleet-doctor] {label}: pending {int(age)}s (no session, no pane error) "
+                        f"— undriven or silent exit; not alerting")
+                continue
+
             if session and not fs.surface_has_live_agent(surface):
                 log(f"[fleet-doctor] skip {label}: surface {surface[:8]} has no live agent")
                 continue

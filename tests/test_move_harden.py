@@ -176,3 +176,88 @@ def test_move_noop_when_already_in_target(fs, monkeypatch):
     assert fleet.cmd_move(["kid", "--to-workspace", "11111111-1111-1111-1111-111111111111"]) == 0
     assert not [c for c in calls if c[0] == "move-surface"]              # nothing moved
     assert not fs.expected_close_recent("KID-S")                        # and no tombstone stamped
+
+
+# ================= P0-3: tool-aware launch flags (claude-isms must not kill codex) ==================
+# The 2026-07-07 incident: `--effort` (a claude flag) was forwarded VERBATIM to codex, which aborted on
+# "unexpected argument '--effort' found". _codex_flags is the ONE place that owns claude->codex flag
+# translation at the adapter boundary. These are pure units on the token mapping + adapter wiring.
+
+def test_codex_flags_translates_effort_to_config_override():
+    assert fleet._codex_flags(["--effort", "high"]) == ["-c", "model_reasoning_effort=high"]
+    assert fleet._codex_flags(["--effort", "low"]) == ["-c", "model_reasoning_effort=low"]
+
+
+def test_codex_flags_passes_the_effort_LEVEL_through_verbatim():
+    # The LEVEL is passed through, not clamped: codex's tiers overlap the fleet's (its TUI shows xhigh),
+    # so clamping would SILENTLY DOWNGRADE reasoning. A value codex rejects fails LOUD via the P0-4a
+    # launch verify instead. Inline (--effort=X) and separate (--effort X) forms both work.
+    assert fleet._codex_flags(["--effort", "xhigh"]) == ["-c", "model_reasoning_effort=xhigh"]
+    assert fleet._codex_flags(["--effort=max"]) == ["-c", "model_reasoning_effort=max"]
+
+
+def test_codex_flags_translates_dangerous_bypass():
+    assert fleet._codex_flags(["--dangerously-skip-permissions"]) \
+        == ["--dangerously-bypass-approvals-and-sandbox"]
+
+
+def test_codex_flags_drops_claude_only_flags_with_values():
+    # --setting-sources / --permission-mode / --plugin-dir have no codex analog -> drop (consume value).
+    assert fleet._codex_flags(["--setting-sources", "user,project", "--model", "gpt-5-codex"]) \
+        == ["--model", "gpt-5-codex"]                                    # setting-sources gone, model kept
+    assert fleet._codex_flags(["--permission-mode", "plan"]) == []
+    assert fleet._codex_flags(["--plugin-dir", "/x/p"]) == []
+
+
+def test_codex_flags_passes_codex_native_flags_through():
+    # a codex floor's own flags (and any -- passthrough that's already codex-shaped) are untouched.
+    assert fleet._codex_flags(["--effort", "high", "-c", "sandbox=danger", "--search"]) \
+        == ["-c", "model_reasoning_effort=high", "-c", "sandbox=danger", "--search"]
+
+
+def test_codex_flags_effort_as_last_bare_token_is_dropped_not_crashed():
+    assert fleet._codex_flags(["--effort"]) == []                       # no value -> emit nothing, no IndexError
+
+
+def test_adapter_compile_codex_translates_effort_and_claude_stays_verbatim():
+    spec = {"tool": "codex", "role": "w", "label": "w", "flags": [], "env": {},
+            "plugins": [], "settings": "", "use": [], "enable_plugins": [], "setting_sources": ""}
+    binn, args, _ = fleet.adapter_compile("codex", spec, ["--effort", "high"])
+    assert binn == "codex"
+    assert "--effort" not in args and "-c" in args and "model_reasoning_effort=high" in args
+    # the SAME caller tokens on a claude spec are forwarded AS-IS (claude owns --effort natively).
+    cspec = dict(spec, tool="claude")
+    _, cargs, _ = fleet.adapter_compile("claude", cspec, ["--effort", "high"])
+    assert "--effort" in cargs and "high" in cargs                      # claude path unchanged (regression guard)
+
+
+# ================= P0-4a: launch verification (a dead-on-arrival lazy child != DONE) ================
+# launch_error_line is the PURE scanner (shared with the router never-bound sweep) that tells a launch
+# that DIED on spawn (a bad flag / missing binary / crash) from a healthy agent TUI. _launch_failure_line
+# wires it to a live pane via cmuxq. cmd_launch uses these to FAIL LOUD instead of a false "DONE".
+
+def test_launch_error_line_catches_the_bad_flag_death():
+    pane = ("user@host cmux $ codex --effort high\n"
+            "error: unexpected argument '--effort' found\n"
+            "\n  tip: a similar argument exists: '--config'\n"
+            "user@host cmux $ ")
+    assert "unexpected argument" in fleet.launch_error_line(pane)
+
+
+def test_launch_error_line_catches_missing_binary():
+    assert "command not found" in fleet.launch_error_line("bash: codex: command not found")
+
+
+def test_launch_error_line_is_quiet_on_a_healthy_tui():
+    # a booted agent shows its chrome, NOT a CLI error -> no false failure verdict.
+    healthy = "  Context Remaining: 100%   ? for shortcuts   esc to interrupt\n> \n"
+    assert fleet.launch_error_line(healthy) == ""
+    assert fleet.launch_error_line("") == ""
+
+
+def test_launch_failure_line_reads_the_pane_via_cmuxq(monkeypatch):
+    monkeypatch.setattr(fleet, "cmuxq",
+                        lambda *a: "error: unexpected argument '--effort' found" if a[:1] == ("capture-pane",) else "")
+    assert "unexpected argument" in fleet._launch_failure_line("SURF")
+    monkeypatch.setattr(fleet, "cmuxq", lambda *a: "> healthy prompt")
+    assert fleet._launch_failure_line("SURF") == ""
