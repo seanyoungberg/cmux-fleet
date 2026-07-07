@@ -6,61 +6,142 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
-### Fixed
-
-- **Pid-aware liveness everywhere — a dead-pid ghost now reads gone at EVERY "is-it-live"
-  site, not just recycle (round 2).** Round 1 made `fleet recycle`'s verify + quiet-gate
-  pid-aware, but the other liveness checks still trusted the raw `agentLifecycle` string, so
-  a frozen `running`+dead-pid record kept lying to them. All such sites now route through a
-  shared `state.surface_has_live_agent()` predicate (non-terminal lifecycle **AND** a live
-  pid), so the pid — not the string — is the universal authority: **`fleet ls`** flags a
-  dead-pid `running` ghost as `STALE` (the original "ls lies" symptom) instead of a false
-  `live`; **`fleet rm`** no longer refuses a plain remove on a dead ghost (only a genuinely
-  mid-turn agent — `running` + live pid — is protected); **`fleet launch`**'s overwrite-guard
-  and **`fleet worktree clean`**'s refuse-if-live treat a dead ghost as gone; **bulk
-  recycle** skips a dead-pid ghost as stale (consistent with `ls`, and reported so the
-  operator recovers it explicitly); **`fleet register`**'s live gate (`_live_session_for`)
-  refuses to bind onto a dead-pid record cmux's active pointer still references; the recycle
-  **resume re-bind poll** won't false-confirm on a leftover dead-pid ghost; and the wake
-  gate (`surface_busy`) never treats a dead pid as mid-turn. **Codex** carries a live `pid`
-  in its hook store exactly like claude and fires no SessionEnd at all (its record *always*
-  lingers non-terminal after death), so this pid-authority is what makes codex `ls`/recycle/
-  reap honest — verified end-to-end against a throwaway codex agent.
-
-- **Dead-agent recycle brick — `fleet recycle` is now pid-aware (root cause: the
-  SessionEnd freeze).** A self-recycle that left its seat DEAD with a hook-store record
-  frozen at a non-terminal `agentLifecycle` (`running`) and a dead/`None` pid could never
-  be recovered: `_respawn_and_verify` confirmed "old agent gone" ONLY via a terminal
-  lifecycle string, which is **SessionEnd-driven** — and an abrupt death (SIGKILL) fires
-  no SessionEnd, while even a SessionEnd that *does* fire can be clobbered by a cmux
-  store-write race under load (the live 2026-07-05 berg-sandbox incident), leaving the
-  string frozen. Every recycle (even `--force`) then aborted forever ("old session still
-  ALIVE"). The confirm is now **pid-authoritative**: a terminal lifecycle is still the
-  happy signal, but a dead/`None` old pid is conclusive proof the agent is gone (a dead
-  pid cannot host a TUI). A pre-respawn snapshot of the surface's live pids is the safety
-  floor — if the original claude *survives* the respawn (wedged cmux), its pid is still
-  alive and the verify correctly refuses, never typing into a live TUI. The quiet-gate is
-  likewise pid-aware, so a frozen `running` ghost recovers on a plain `fleet recycle`
-  (no `--force`). Empirically grounded by a sandbox kill-mechanism matrix (SIGKILL freezes
-  the record; SIGTERM/SIGINT×2/respawn-pane fire SessionEnd and clear it).
+## [0.4.0] - 2026-07-07
 
 ### Added
 
-- **Graceful session-close before respawn (`fleet recycle`).** Recycle now sends a bounded
-  SIGINT×2 to the old agent before `respawn-pane`, giving claude a moment to fire its
-  SessionEnd hook so cmux's lifecycle reaches a clean terminal state and every consumer
-  (`fleet ls`, the fleet-doctor, vitals) sees honest state instead of a frozen `running`
-  ghost. Best-effort and bounded — it always falls through to the respawn, and the
-  pid-aware verify (not this) authorizes the relaunch.
-- **`fleet unstick [label] [--surface UUID] [--dry-run]`.** Reaps a frozen dead-pid
-  hook-store ghost (the SessionEnd-less death) from cmux's `~/.cmuxterm/*-hook-sessions.json`
-  without hand-editing, so `ls`/`recycle`/the doctor stop trusting a dead `running`. Refuses
-  to touch a record whose pid is alive; a surface holding both a live record and a dead ghost
-  keeps the live one.
-- **fleet-doctor dead-pid guard.** The heartbeat sweep now suppresses health alerts for a
-  bound record whose process is dead (a down member reading as live) — chiefly the frozen
-  `needsInput` ghost, which has no freshness gate and would otherwise nudge the parent every
-  tick forever. Pid-gated: a live pid still alerts normally.
+- **Plugin index system (`plugins.toml` + `use`).** cmux-fleet now carries a
+  first-class plugin index: a `plugins.toml` spine that catalogs each plugin's
+  type (linked `--plugin-dir` vs enabled `enabledPlugins`), source marketplace,
+  tools, and description, resolved through a new `use = [...]` roster key
+  (unioned floor∪role like `plugins`) so a single name reaches BOTH plugin
+  channels. It layers additively over the legacy `plugins`/`enable_plugins`/
+  `marketplace` keys — a config with no `use` composes byte-identically. Adds
+  discovery verbs (`fleet plugins ls|show|describe`), a `fleet plugins reconcile`
+  that derives the index from local marketplaces + `~/.claude` settings while
+  preserving hand-authored fields (and reporting drift rather than clobbering
+  curated ones), a dynamic `--use NAME` on launch and recycle (the index-aware
+  successor to `--plugins`/`--add-plugin`, and the first CLI add-surface that
+  reaches an *enabled* plugin at launch or recycle), and `fleet plugins add
+  <ref>` to clone/wire a new plugin from a git URL or local path at a
+  deliberately SAFE default — the verb writes ONLY the index; it never enables
+  the plugin, edits a role's `use`, or runs its hooks (a human flips it on later
+  via `fleet recycle <agent> --use`). Every write path aborts rather than clobber
+  a malformed-but-populated index (a hand-authored-data-loss guard) and surfaces
+  cross-marketplace name collisions instead of resolving them silently.
+
+- **`fleet vitals --watch` — a live, non-flickering fleet board.** A dock-pane
+  watch mode that repaints only on a real change (ANSI home-clear, not a full
+  clear; a 12s heartbeat refreshes ages), sharing one pure renderer with the
+  one-shot table so the painted output stays byte-identical to `fleet vitals`.
+
+- **Fleet-doctor: proactive parent alerts on an unhealthy child.** The router now
+  watches for children that go bad and alerts the parent conductor on the same
+  inbox + wake rail completions ride, via two mechanisms. Event-driven
+  **stale-surface reconciliation**: on a tracked child's `surface.closed` (an
+  accidental tab close or workspace teardown — anything outside `fleet
+  rm`/`archive`) the registry row is immediately archived and the parent gets a
+  `kind=stale` "revive?" alert (registry-integrity signal, quieter than a
+  completion — no desktop banner). And a heartbeat **sweep** that once per tick
+  emits a deduped `kind=doctor` alert on each **stall** (a bound `running` record
+  frozen past a fresh window — a dead stream that fired no Stop), **low-context**
+  (≤30% remaining), or **needs-input** child. Edge-triggered dedup plus healthy /
+  conductor / muted skips prevent an alarm storm, and a deliberate `fleet
+  rm`/`archive` writes a short-lived expected-close tombstone so an intentional
+  retirement never reads as an accidental external close.
+
+### Changed
+
+- **`fleet rm` default flips to close + archive; launch refuses to overwrite a
+  live label.** Bare `fleet rm <label>` now closes the surface and force-archives
+  (SIGINT ladder + close-surface + force-archive) so removing a label can no
+  longer silently abandon a still-live pane (the root of the ~40h book-keeper
+  zombie). `--detach` is the explicit opt-in for the old drop-the-row-only
+  behavior; `--kill` stays as an alias whose remaining job is worktree teardown;
+  and a mid-turn (`running`) surface refuses without `--force`. Same failure
+  family, other entry point: `fleet launch` now refuses to overwrite an
+  already-live label (a clearly-stale row still relaunches freely; anything else
+  fails closed, `--force` overrides). Recycled/revived ledger events now carry the
+  same `effective` {model, effort, plugins} field that `launched` already did.
+
+- **`fleet vitals` reports a real per-agent context window.** The
+  context-remaining column is now derived per agent from its effective launched
+  model's window (precedence: explicit `[1m]`/`[Nk]` flavor > fleet-declared
+  window > keyword guess > 200k) instead of one static global — killing the false
+  "over-full, recycle now" alarms a mixed-window fleet produced. The table also
+  surfaces model / effort / cwd, and a transcript with no real usage record
+  renders `—` instead of a garbage `0k 100%`.
+
+### Fixed
+
+- **Dead-agent recycle brick: `fleet recycle` is now pid-authoritative.** A self-recycle that
+  left its seat DEAD with a hook-store record frozen at a non-terminal `agentLifecycle`
+  (`running`) and a dead/`None` pid could never be recovered: the respawn-verify confirmed "old
+  agent gone" ONLY via a terminal lifecycle string, which is SessionEnd-driven. But an abrupt
+  death (SIGKILL) fires no SessionEnd, and even one that *does* fire can be clobbered by a cmux
+  store-write race under load (the live 2026-07-05 incident), leaving the string frozen. Every
+  recycle (even `--force`) then aborted forever ("old session still ALIVE"). The confirm is now
+  **pid-authoritative**: a dead/`None` old pid is conclusive proof the agent is gone (a dead pid
+  cannot host a TUI), with a pre-respawn live-pid snapshot as the safety floor, so if the original
+  claude survives the respawn (wedged cmux) its pid is still alive and the verify correctly
+  refuses, never typing into a live TUI. The quiet-gate is likewise pid-aware, so a frozen
+  `running` ghost recovers on a plain `fleet recycle` (no `--force`). Grounded by a sandbox
+  kill-mechanism matrix (SIGKILL freezes the record; SIGTERM/SIGINT×2/respawn-pane fire SessionEnd
+  and clear it), so `recycle` now does a bounded graceful SIGINT×2 close before respawn to keep
+  cmux state honest.
+
+- **Pid-aware liveness at every "is-it-live" site.** A dead-pid ghost now reads gone everywhere,
+  not just in recycle: all such checks route through a shared `state.surface_has_live_agent()`
+  predicate (non-terminal lifecycle AND a live pid), so the pid, not the string, is the authority.
+  `fleet ls` flags a dead-pid `running` ghost as `STALE` (was a false `live`); `fleet rm` no longer
+  refuses a plain remove on a dead ghost (only a genuinely mid-turn agent is protected); `launch`'s
+  overwrite-guard and `worktree clean` treat a dead ghost as gone; bulk-recycle skips it as stale;
+  `register` won't bind onto it; and the wake gate never reads it busy. Adds `fleet unstick
+  [label]` to reap a frozen dead-pid record without hand-editing cmux's hook store. Codex fires no
+  SessionEnd at all (its record *always* lingers non-terminal after death), so this pid authority
+  is what makes codex `ls`/recycle/reap honest — verified end-to-end against a live codex agent.
+
+- **Recycle reliability — no more silent self-recycle failures.** Three gaps
+  behind the ~9h-undetected-down incidents are closed: recycle now verifies the
+  launch ENTER actually submitted the paste (re-kicking a bare Enter, never
+  resending the text — resending on top of an unsubmitted draft was the
+  doubled/tripled-draft failure) and verifies a fresh shell surfaced before
+  firing the launch, falling back to a cmux-independent SIGINTx2 kill when an
+  async respawn hangs past the settle; a "launch sent but no session bound" tail
+  now ESCALATES (cmux notify + logged `recycle_abort`) instead of warning into
+  the void; `--force` short-circuits the entire quiet-gate (a desynced/stale
+  surface no longer burns the full 180s to an abort); and a roster role with no
+  `--model` pinned anywhere now warns that it is riding the ambient default (the
+  Sonnet-instead-of-Opus surprise). Bulk recycle prints the same per-agent
+  resolved effort/model + warning as the single-target path.
+
+- **Destructive-op + recovery-path safety.** Root-cause fixes for the
+  workspace-group cascade-close incident: `fleet launch --resume <id>` no longer
+  blind-kicks Enter into claude's resume-summary menu (it dismisses to "full
+  session as-is" the same way `recycle` does, and aborts without registering on a
+  resume-gate timeout rather than binding the lossy "resume from summary"
+  default); `fleet rm --with-group` cross-checks the registry's belief about a
+  group's membership against cmux's real membership and refuses on any
+  disagreement (and lists what is about to die before deleting); `--kill`
+  force-archives before teardown so a killed agent leaves a recovery trace; and
+  every logged event now stamps an `invoker` so a destructive op's origin is
+  reconstructable.
+
+- **Cross-tool `Stop` no longer re-queues a stale completion.** A codex `Stop`
+  resolving to a claude-typed registry entry (or vice versa) already refused to
+  write the mismatched session id, but the router still fell through and
+  re-delivered that entry's last-known completion on every such Stop — the ~80s
+  ack-loop that hammered a conductor while Berg typed in the codex session. A
+  tool mismatch now stops routing entirely.
+
+- **`--plugins` unions onto a role launch.** `fleet launch <role> --plugins <p>`
+  was gated behind `--adhoc` and silently dropped on a roster-role launch; it now
+  unions unconditionally, aligning launch with recycle's `--add-plugin`.
+
+- **Worktree base prefers local `main` over a stale `origin/main`.** In a
+  local-merge dev flow (merges held local, never pushed) `origin/<default>` sits
+  frozen for days, so a new fleet worktree silently branched off stale code; base
+  resolution is now explicit > `<default>` > `origin/<default>` > HEAD.
 
 ## [0.3.1] - 2026-07-01
 
@@ -361,5 +442,6 @@ vault or machine.
   session" instead of false success), the launch self-heals by re-firing once if
   no fresh session binds, and the post-respawn settle is 2s -> 3s.
 
-[Unreleased]: https://github.com/seanyoungberg/cmux-fleet/compare/v0.1.0...HEAD
+[Unreleased]: https://github.com/seanyoungberg/cmux-fleet/compare/v0.4.0...HEAD
+[0.4.0]: https://github.com/seanyoungberg/cmux-fleet/compare/v0.3.1...v0.4.0
 [0.1.0]: https://github.com/seanyoungberg/cmux-fleet/releases/tag/v0.1.0
