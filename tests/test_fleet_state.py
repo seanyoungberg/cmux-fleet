@@ -231,10 +231,13 @@ def test_atomic_write_creates_dirs(fs, state_dir):
 # an idle surface (the cmux-advisor stall), the fleet's BOUND session outranks an orphaned
 # max-updatedAt record, and the SCREEN is the final arbiter — empty/garbage reads never wake, and a
 # wake never fires when no clean prompt is visible.
-def _rec(surface, sid, life, age_s=0.0):
-    """A synthetic cmux hook-store session record (updatedAt is float epoch seconds, aged back)."""
+def _rec(surface, sid, life, age_s=0.0, pid="__live__"):
+    """A synthetic cmux hook-store session record (updatedAt is float epoch seconds, aged back). `pid`
+    defaults to THIS test process's pid (os.getpid() -- guaranteed alive) so a record models a REAL
+    live agent, which always carries a live pid; pass pid=None (or a dead pid) to model the frozen
+    SessionEnd-less brick that the pid-aware wake gate must read as not-busy."""
     return {"surfaceId": surface, "sessionId": sid, "agentLifecycle": life,
-            "updatedAt": time.time() - age_s}
+            "updatedAt": time.time() - age_s, "pid": os.getpid() if pid == "__live__" else pid}
 
 
 def _store(*records):
@@ -254,6 +257,31 @@ def _fake_cmux(screen, sink):
 def test_surface_busy_fresh_running_is_busy(fs, monkeypatch):
     monkeypatch.setattr(fs, "read_hook_store", lambda: _store(_rec("S", "u1", "running", age_s=1)))
     assert fs.surface_busy("S") is True
+
+
+def test_surface_has_live_agent_predicate(fs, monkeypatch):
+    # the shared 'is this seat genuinely live?' authority behind ls STALE, bulk stale-skip, launch's
+    # overwrite-guard, worktree-clean's refuse, and recycle's re-bind poll: non-terminal lifecycle AND a
+    # live pid. All four sites read a dead-pid ghost as gone BECAUSE they route through this one predicate.
+    monkeypatch.setattr(fs, "read_hook_store", lambda: _store(_rec("S", "u1", "running", age_s=1)))
+    assert fs.surface_has_live_agent("S") is True             # non-terminal + live pid -> genuinely live
+    monkeypatch.setattr(fs, "read_hook_store", lambda: _store(_rec("S", "u1", "running", age_s=1, pid=None)))
+    assert fs.surface_has_live_agent("S") is False            # frozen 'running' on a DEAD pid -> gone (brick)
+    monkeypatch.setattr(fs, "read_hook_store", lambda: _store(_rec("S", "u1", "idle", age_s=1, pid=None)))
+    assert fs.surface_has_live_agent("S") is False            # frozen 'idle' on a dead pid -> gone too
+    monkeypatch.setattr(fs, "read_hook_store", lambda: _store(_rec("S", "u1", "ended", age_s=1)))
+    assert fs.surface_has_live_agent("S") is False            # terminal string (live pid mid-drop) -> gone
+    monkeypatch.setattr(fs, "read_hook_store", lambda: _store())
+    assert fs.surface_has_live_agent("S") is False            # nothing on the surface -> gone
+
+
+def test_surface_busy_dead_pid_running_not_busy(fs, monkeypatch):
+    # pid-aware wake gate (round 2, 2026-07-06): a FRESH 'running' record (age 1, well within the
+    # staleness window) but on a DEAD pid is the SessionEnd-less brick, NOT a live turn -- must read
+    # not-busy so the gate can still wake the (dead/idle) seat instead of being silenced by the frozen
+    # string. The staleness guard alone would NOT catch this (the record is fresh); the pid does.
+    monkeypatch.setattr(fs, "read_hook_store", lambda: _store(_rec("S", "u1", "running", age_s=1, pid=None)))
+    assert fs.surface_busy("S") is False
 
 
 def test_surface_busy_stale_running_not_busy(fs, monkeypatch):

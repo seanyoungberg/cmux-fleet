@@ -30,11 +30,13 @@ def test_fresh_confirms_a_genuinely_new_sid(monkeypatch):
 
 def test_resume_ignores_exclude_and_uses_lifecycle(monkeypatch):
     # resume keeps the SAME sid; confirmation is the surface going live again, not a new sid. So a sid
-    # that is IN exclude still confirms in resume mode (exclude is a fresh-mode-only guard).
+    # that is IN exclude still confirms in resume mode (exclude is a fresh-mode-only guard). Confirm =
+    # surface_has_live_agent: a live lifecycle AND a live pid (pid-aware, round 2).
     from cmux_fleet import state as fleet_state
     monkeypatch.setattr(fleet.time, "sleep", lambda *_: None)
     monkeypatch.setattr(fleet, "poll_session", lambda surf, timeout=1: "old")
     monkeypatch.setattr(fleet_state, "lifecycle", lambda surf: "idle")
+    monkeypatch.setattr(fleet_state, "surface_has_live_pid", lambda surf: True)   # resumed agent is live
     got = fleet._poll_session_back("S", "old", "resume", timeout=5, exclude={"old"})
     assert got == "old"
 
@@ -45,6 +47,19 @@ def test_resume_waits_while_lifecycle_dead(monkeypatch):
     monkeypatch.setattr(fleet.time, "sleep", lambda *_: None)
     monkeypatch.setattr(fleet, "poll_session", lambda surf, timeout=1: "old")
     monkeypatch.setattr(fleet_state, "lifecycle", lambda surf: "ended")
+    got = fleet._poll_session_back("S", "old", "resume", timeout=0.05, exclude={"old"})
+    assert got == ""
+
+
+def test_resume_does_not_falseconfirm_on_dead_pid_ghost(monkeypatch):
+    # round-2 gap (2026-07-06): a leftover FROZEN 'running' record on a DEAD pid must NOT false-confirm the
+    # re-bind before the resumed agent has actually booted. Lifecycle reads live but the pid is dead ->
+    # surface_has_live_agent is False -> keep waiting -> "" within the (tiny) timeout.
+    from cmux_fleet import state as fleet_state
+    monkeypatch.setattr(fleet.time, "sleep", lambda *_: None)
+    monkeypatch.setattr(fleet, "poll_session", lambda surf, timeout=1: "old")
+    monkeypatch.setattr(fleet_state, "lifecycle", lambda surf: "running")         # frozen non-terminal...
+    monkeypatch.setattr(fleet_state, "surface_has_live_pid", lambda surf: False)  # ...but the pid is DEAD
     got = fleet._poll_session_back("S", "old", "resume", timeout=0.05, exclude={"old"})
     assert got == ""
 

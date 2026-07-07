@@ -94,16 +94,20 @@ def test_register_refuses_stale_ended_surface(fs, monkeypatch):
 
 
 def test_live_session_for_refuses_ended_record(fs, monkeypatch):
-    # the gate itself: a sessions[] record on the surface but agentLifecycle 'ended' -> not live.
+    # the gate itself: a sessions[] record on the surface but agentLifecycle 'ended' -> not live (terminal
+    # string, no active pointer -> the fallback filters it out regardless of pid).
     store = {"activeSessionsBySurface": {},
              "sessions": {"s1": {"surfaceId": "SURF-E", "sessionId": "S1",
-                                 "agentLifecycle": "ended", "updatedAt": 5}}}
+                                 "agentLifecycle": "ended", "updatedAt": 5, "pid": os.getpid()}}}
     monkeypatch.setattr(fleet, "_store", lambda: store)
     assert fleet._live_session_for("SURF-E") is None
-    # active-index entry -> live (cmux says bound right now), resolved to the full record
+    # active-index entry -> resolved to the full record, but ONLY when a LIVE pid backs it (pid-aware gate,
+    # round 2, 2026-07-06): cmux's 'bound right now' pointer can still reference a frozen dead-pid ghost.
     store["activeSessionsBySurface"] = {"SURF-E": {"sessionId": "S1"}}
     got = fleet._live_session_for("SURF-E")
-    assert got and got.get("sessionId") == "S1"
+    assert got and got.get("sessionId") == "S1"                # live pid -> returned
+    store["sessions"]["s1"]["pid"] = None                      # same pointer, but the process is DEAD
+    assert fleet._live_session_for("SURF-E") is None           # -> refuse (never bind onto a ghost)
 
 
 def test_register_ambiguous_cwd_asks_for_surface(fs, monkeypatch):
@@ -130,6 +134,7 @@ def test_register_typeerror_repro_dict_launchcommand(fs, monkeypatch):
     store = {"activeSessionsBySurface": {"SURF-KG": {"sessionId": "SESS-KG"}},
              "sessions": {"s": {"surfaceId": "SURF-KG", "sessionId": "SESS-KG",
                                 "agentLifecycle": "idle", "cwd": "/x", "workspaceId": "WS-KG",
+                                "pid": os.getpid(),   # a genuinely-live agent (the register live gate is pid-aware)
                                 "launchCommand": {"argv": ["claude"], "env": {"AGENT_ROLE": "kg"}}}}}
     monkeypatch.setattr(fleet, "_store", lambda: store)
     monkeypatch.setattr(fleet, "_tool_for_surface", lambda surf: "claude")

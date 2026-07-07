@@ -13,13 +13,17 @@ import pytest
 from cmux_fleet import cli as fleet
 
 
-def _stub_cmux(monkeypatch, fs, lifecycle="idle", binding=None, calls=None):
-    """The standard cmd_rm stub set: no real cmux, a pinned lifecycle, an optional call recorder."""
+def _stub_cmux(monkeypatch, fs, lifecycle="idle", binding=None, calls=None, has_pid=True):
+    """The standard cmd_rm stub set: no real cmux, a pinned lifecycle, an optional call recorder.
+    `has_pid` models whether a LIVE process backs the surface (default True -- a real live agent always
+    does); the mid-turn refuse is now pid-aware ('running' AND a live pid), so pass has_pid=False to
+    model the frozen dead-pid 'running' ghost that must NOT block a plain `rm`."""
     monkeypatch.setattr(fleet, "cmuxq",
                         (lambda *a: (calls.append(a) or "")) if calls is not None else (lambda *a: ""))
     monkeypatch.setattr(fleet, "_pid_for_surface", lambda s: None)
     monkeypatch.setattr(fleet, "_resume_binding", lambda surf: binding or {})
     monkeypatch.setattr(fs, "lifecycle", lambda s: lifecycle)
+    monkeypatch.setattr(fs, "surface_has_live_pid", lambda s: has_pid)
 
 
 def _seed(fs, label, surf, session="claude-OLD", **extra):
@@ -89,6 +93,19 @@ def test_rm_refuses_running_surface_without_force(fs, monkeypatch):
     assert fs.live_get("w5") is not None                          # nothing removed
     assert fs.archive_get("w5") is None                           # nothing archived
     assert ("close-surface", "--surface", "S5") not in calls      # surface untouched
+
+
+def test_rm_dead_pid_running_ghost_not_refused(fs, monkeypatch):
+    # round-2 gap (2026-07-06): a FROZEN 'running' record on a DEAD pid (SessionEnd-less brick) is NOT
+    # mid-turn -- there's no live work to interrupt -- so a plain `rm` must proceed (close + archive),
+    # NOT refuse. Before this, the dead ghost matched lifecycle=='running' and forced a needless --force.
+    _seed(fs, "w5b", "S5B")
+    calls = []
+    _stub_cmux(monkeypatch, fs, lifecycle="running", calls=calls, has_pid=False)  # frozen string, dead pid
+    fleet.cmd_rm(["w5b"])                                          # no --force needed
+    assert fs.live_get("w5b") is None                             # removed
+    assert fs.archive_get("w5b") is not None                      # archived for recovery
+    assert ("close-surface", "--surface", "S5B") in calls         # surface actually closed
 
 
 def test_rm_force_closes_running_surface(fs, monkeypatch):

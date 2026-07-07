@@ -29,7 +29,8 @@ def _hermetic(monkeypatch):
 
 def test_launch_refuses_live_label(fs, monkeypatch, tmp_path):
     _seed_live(fs, "dup-x")
-    monkeypatch.setattr(fs, "lifecycle", lambda s: "idle")      # old surface genuinely live
+    monkeypatch.setattr(fs, "lifecycle", lambda s: "idle")      # old surface genuinely live:
+    monkeypatch.setattr(fs, "surface_has_live_pid", lambda s: True)  # ...non-terminal AND a live pid
     spawned = []
     monkeypatch.setattr(fleet, "create_surface", lambda *a: (spawned.append(a) or (None, None)))
     with pytest.raises(SystemExit) as ei:
@@ -53,6 +54,7 @@ def test_launch_refuses_pending_label_fail_closed(fs, monkeypatch, tmp_path):
 def test_launch_force_overrides_live_label(fs, monkeypatch, tmp_path):
     _seed_live(fs, "dup-x")
     monkeypatch.setattr(fs, "lifecycle", lambda s: "idle")
+    monkeypatch.setattr(fs, "surface_has_live_pid", lambda s: True)  # genuinely live -> --force is the override
     spawned = []
     monkeypatch.setattr(fleet, "create_surface", lambda *a: (spawned.append(a) or (None, None)))
     with pytest.raises(SystemExit) as ei:
@@ -71,4 +73,20 @@ def test_launch_proceeds_over_stale_label(fs, monkeypatch, tmp_path):
     with pytest.raises(SystemExit) as ei:
         _launch(tmp_path)
     assert ei.value.code == 1                                   # past the guard, died at the stubbed spawn
+    assert spawned
+
+
+def test_launch_proceeds_over_dead_pid_running_ghost(fs, monkeypatch, tmp_path):
+    # round-2 gap (2026-07-06): a prior row FROZEN 'running' on a DEAD pid (SessionEnd-less brick) must
+    # read STALE here too -- via the shared surface_has_live_agent, a dead pid means no live surface to
+    # orphan, so relaunch overwrites the ghost row with NO --force (before this it hit a bogus
+    # "already LIVE" and forced a manual `fleet rm` first).
+    _seed_live(fs, "dup-x")
+    monkeypatch.setattr(fs, "lifecycle", lambda s: "running")   # frozen non-terminal string...
+    monkeypatch.setattr(fs, "surface_has_live_pid", lambda s: False)  # ...but the process is DEAD
+    spawned = []
+    monkeypatch.setattr(fleet, "create_surface", lambda *a: (spawned.append(a) or (None, None)))
+    with pytest.raises(SystemExit) as ei:
+        _launch(tmp_path)
+    assert ei.value.code == 1                                   # past the guard (read stale), died at stub
     assert spawned

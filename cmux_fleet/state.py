@@ -494,6 +494,19 @@ def surface_has_live_pid(surface):
     return False
 
 
+def surface_has_live_agent(surface):
+    """True iff a GENUINELY-live agent occupies `surface`: cmux's lifecycle is non-terminal AND a real
+    process is still attached (a live pid). This is the SHARED 'is this seat actually live?' authority —
+    the negation ('gone/stale') is the single answer that `fleet ls` STALE-detection, bulk-recycle's
+    stale-skip, `launch`'s overwrite-guard, `worktree clean`'s refuse-if-live, and recycle's re-bind
+    poll must ALL agree on, so a SessionEnd-less brick (frozen 'running'/'idle'/'unknown' on a dead/None
+    pid — root-caused 2026-07-06) reads as gone EVERYWHERE, never as a false 'live' at whichever site
+    still trusts the lifecycle string alone. Stricter than surface_has_live_pid (pid only): this ALSO
+    requires the lifecycle to be non-terminal, so a surface mid-drop (terminal string, pid briefly
+    lingering) reads as gone too — the two conditions together are 'a live agent is actually here'."""
+    return lifecycle(surface) not in ("", "-", "ended") and surface_has_live_pid(surface)
+
+
 def reap_dead_surface_records(surface, dry_run=False):
     """Remove FROZEN, provably-dead session records for `surface` from cmux's per-tool hook stores
     (~/.cmuxterm/<tool>-hook-sessions.json) — the ghost a SessionEnd-less death leaves behind. SAFETY:
@@ -603,6 +616,11 @@ def surface_busy(surface, now=None):
         rec = resolve_bound_record(surface)
         if not rec or rec.get("agentLifecycle") != "running":
             return False
+        if not pid_alive(rec.get("pid")):
+            return False                        # a DEAD pid cannot be mid-turn: a frozen 'running' brick
+                                                # (SessionEnd-less death, root-caused 2026-07-06), not a
+                                                # live turn. Same not-busy lean as the staleness guard
+                                                # below -- the pid is the shared liveness authority.
         return (now - (rec.get("updatedAt") or 0)) <= LIFECYCLE_STALE_S
     except Exception:
         return False                            # fail-open to not-busy; the screen read is the arbiter

@@ -863,7 +863,12 @@ def cmd_launch(argv):
     prior = fs.live_get(spec["label"])
     if prior and prior.get("surface"):
         prior_surf = prior["surface"]
-        stale = fs.lifecycle(prior_surf) in ("", "-", "ended") and bool(prior.get("session"))
+        # stale = the prior row's surface holds NO genuinely-live agent (lifecycle terminal, OR frozen
+        # non-terminal on a DEAD pid -- the SessionEnd-less brick, 2026-07-06) AND it once bound a session.
+        # Via surface_has_live_agent a dead-pid ghost now reads stale -> we overwrite the row (no bogus
+        # "already LIVE" refusal); a genuinely-live surface (live pid) still refuses (fail-closed: the
+        # orphan-a-live-surface guard this exists for). A pending row (no session) refuses as before.
+        stale = not fs.surface_has_live_agent(prior_surf) and bool(prior.get("session"))
         if stale:
             print(f"[fleet] note: label '{spec['label']}' had a STALE registry row (surface "
                   f"{prior_surf[:8]} gone); overwriting it")
@@ -1514,8 +1519,12 @@ def cmd_ls(argv):
     for label, v in sorted(live.items()):
         surf = v.get("surface", "")
         life = fs.lifecycle(surf) or "-"
-        if life in ("", "-", "ended"):
-            # no live session on the surface: PENDING = lazily-registered, not bound yet (codex binds
+        # STALE if NO genuinely-live agent holds the surface: lifecycle terminal, OR frozen non-terminal
+        # on a DEAD pid (the SessionEnd-less brick, root-caused 2026-07-06). Routed through the shared
+        # surface_has_live_agent predicate so the pid -- not the lifecycle string -- is the authority: a
+        # dead 'running' ghost now reads STALE here (the "ls lies" symptom), consistent with bulk-recycle.
+        if not fs.surface_has_live_agent(surf):
+            # no live agent on the surface: PENDING = lazily-registered, not bound yet (codex binds
             # on its 1st turn -> drive it); STALE = had a session but the tab/process is gone.
             status = "pending" if not v.get("session") else "STALE"
         else:
@@ -1582,7 +1591,12 @@ def cmd_rm(argv):
     # label). idle/needsInput/unknown proceed as already-safe (_quiet_gate's own vocabulary of quiet).
     surf = (e_live or {}).get("surface", "")
     closing = not detach and bool(surf)
-    if closing and not force and fs.lifecycle(surf) == "running":
+    # refuse only a GENUINELY mid-turn agent: lifecycle 'running' AND a live pid. A frozen 'running' ghost
+    # on a DEAD pid (the SessionEnd-less brick, root-caused 2026-07-06) is not mid-turn -- there's no live
+    # work to interrupt -- so it must NOT block a plain `rm` (Berg's gap: a dead ghost forced --force). The
+    # string==running specificity is kept (idle/needsInput/unknown already proceed as safe per _quiet_gate's
+    # vocabulary); surface_has_live_pid just strips the dead-ghost false-positive.
+    if closing and not force and fs.lifecycle(surf) == "running" and fs.surface_has_live_pid(surf):
         sys.exit(f"[fleet] rm: '{label}' is mid-turn (lifecycle=running on surface {surf[:8]}). "
                  f"Use --force to close it anyway, or --detach to drop the registry row and leave "
                  f"the surface running.")
@@ -1745,7 +1759,10 @@ def cmd_worktree(argv):
             sys.exit(f"fleet worktree clean: no registered worktree for '{a.label}' (see `fleet worktree ls`)")
         from . import state as fs
         live = fs.live_get(a.label)
-        if info["where"] == "live" and live and fs.lifecycle(live.get("surface", "")) not in ("", "-", "ended", None):
+        # refuse only if a GENUINELY-live agent holds the surface (non-terminal lifecycle AND a live pid).
+        # A dead-pid frozen 'running' ghost (the SessionEnd-less brick, 2026-07-06) must NOT block worktree
+        # teardown -- there is no live work to protect. surface_has_live_agent is the shared authority.
+        if info["where"] == "live" and live and fs.surface_has_live_agent(live.get("surface", "")):
             sys.exit(f"fleet worktree clean: '{a.label}' is still LIVE. Either `fleet archive {a.label}` "
                      f"then `fleet worktree clean {a.label}`, or `fleet rm {a.label} --kill` (which itself "
                      f"tears the worktree down).")
@@ -2004,16 +2021,25 @@ def _live_session_for(surf):
          sessions[] record by sessionId for tool/cwd/role; the index entry itself is the fallback);
       2. else the freshest sessions[] record for the surface whose agentLifecycle is not in
          ('','-','ended') AND whose surface still resolves live in the tree (surface_loc()[0] present)."""
+    from . import state as fs
     d = _store()
     active = d.get("activeSessionsBySurface") or {}
     ae = active.get(surf) or active.get((surf or "").upper()) or {}
     if ae.get("sessionId"):
         for s in (d.get("sessions") or {}).values():
             if (s.get("sessionId") or "") == ae["sessionId"]:
-                return s
-        return ae
+                # pid-aware live gate: cmux's active pointer can resolve to a FROZEN dead-pid record
+                # (the SessionEnd-less brick, 2026-07-06). A dead pid == not live -> return None so
+                # `register` refuses a dead surface instead of binding onto a ghost; a live pid returns
+                # the record as before.
+                return s if fs.pid_alive(s.get("pid")) else None
+        return ae            # bare active pointer, no full record to pid-check: keep cmux's word (rare
+                             # degenerate state, NOT the freeze class -- the freeze RETAINS the full
+                             # record, caught above; over-restricting here would break a just-bound seat)
+    # freshest non-terminal record whose pid is ALSO alive -- the lifecycle string alone can be a frozen
+    # dead-pid ghost (the "ls lies" class); the pid is the authority for "genuinely live" here too.
     live_recs = [s for s in _sessions_on_surface(d, surf)
-                 if (s.get("agentLifecycle") or "") not in ("", "-", "ended")]
+                 if (s.get("agentLifecycle") or "") not in ("", "-", "ended") and fs.pid_alive(s.get("pid"))]
     if live_recs and surface_loc(surf)[0]:
         return live_recs[0]
     return None
@@ -2477,8 +2503,12 @@ def _poll_session_back(surf, old_sid, mode, timeout=90, exclude=None):
     end = time.time() + timeout
     while time.time() < end:
         sid = poll_session(surf, timeout=1)
+        # RESUME confirm waits for the surface to carry a live lifecycle again (resume reuses old_sid, so
+        # 'a different sid' never comes). Require surface_has_live_agent -- non-terminal AND a LIVE pid --
+        # not just the string: a leftover frozen dead-pid 'running' ghost (SessionEnd-less brick,
+        # 2026-07-06) would else false-confirm the re-bind before the resumed agent has actually booted.
         if sid and (sid not in exclude if mode == "fresh"
-                    else fs.lifecycle(surf) not in ("", "-", "ended")):
+                    else fs.surface_has_live_agent(surf)):
             return sid
         time.sleep(1)
     return ""
@@ -2775,10 +2805,13 @@ def _bulk_targets(target, from_surface, from_label, include_muted):
             continue
         if v.get("muted") and not include_muted:
             skipped.append((label, "muted/human-driven")); continue
-        # STALE/non-live (same signal `fleet ls` shows): surface has no live session -> respawn-pane would
-        # target a gone UUID, or the quiet-gate would burn its timeout on a dead surface. Skip it (revive
-        # it explicitly instead). Matches cmd_ls: STALE = a recorded session but lifecycle ''/'-'/'ended'.
-        if fs.lifecycle(surf) in ("", "-", "ended") and v.get("session"):
+        # STALE/non-live (same signal `fleet ls` shows): NO genuinely-live agent on the surface -> skip in
+        # a bulk sweep (respawn-pane would target a gone seat / the quiet-gate would burn its timeout).
+        # Routed through surface_has_live_agent so a frozen dead-pid 'running' ghost (SessionEnd-less brick,
+        # 2026-07-06) reads STALE here too, CONSISTENT with cmd_ls (both now pid-aware). The skip is
+        # REPORTED, so the brick surfaces to the operator for an explicit `fleet recycle <label>` (itself
+        # now pid-aware and able to recover it) rather than being silently retried inside the sweep.
+        if not fs.surface_has_live_agent(surf) and v.get("session"):
             skipped.append((label, "stale/non-live")); continue
         sel.append((label, v))
     sel.sort()

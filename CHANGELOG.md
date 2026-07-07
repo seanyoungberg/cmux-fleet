@@ -8,6 +8,25 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Fixed
 
+- **Pid-aware liveness everywhere — a dead-pid ghost now reads gone at EVERY "is-it-live"
+  site, not just recycle (round 2).** Round 1 made `fleet recycle`'s verify + quiet-gate
+  pid-aware, but the other liveness checks still trusted the raw `agentLifecycle` string, so
+  a frozen `running`+dead-pid record kept lying to them. All such sites now route through a
+  shared `state.surface_has_live_agent()` predicate (non-terminal lifecycle **AND** a live
+  pid), so the pid — not the string — is the universal authority: **`fleet ls`** flags a
+  dead-pid `running` ghost as `STALE` (the original "ls lies" symptom) instead of a false
+  `live`; **`fleet rm`** no longer refuses a plain remove on a dead ghost (only a genuinely
+  mid-turn agent — `running` + live pid — is protected); **`fleet launch`**'s overwrite-guard
+  and **`fleet worktree clean`**'s refuse-if-live treat a dead ghost as gone; **bulk
+  recycle** skips a dead-pid ghost as stale (consistent with `ls`, and reported so the
+  operator recovers it explicitly); **`fleet register`**'s live gate (`_live_session_for`)
+  refuses to bind onto a dead-pid record cmux's active pointer still references; the recycle
+  **resume re-bind poll** won't false-confirm on a leftover dead-pid ghost; and the wake
+  gate (`surface_busy`) never treats a dead pid as mid-turn. **Codex** carries a live `pid`
+  in its hook store exactly like claude and fires no SessionEnd at all (its record *always*
+  lingers non-terminal after death), so this pid-authority is what makes codex `ls`/recycle/
+  reap honest — verified end-to-end against a throwaway codex agent.
+
 - **Dead-agent recycle brick — `fleet recycle` is now pid-aware (root cause: the
   SessionEnd freeze).** A self-recycle that left its seat DEAD with a hook-store record
   frozen at a non-terminal `agentLifecycle` (`running`) and a dead/`None` pid could never
