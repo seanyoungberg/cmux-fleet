@@ -1050,8 +1050,13 @@ def cmd_launch(argv):
     ws, surf, sid = _bind_launched_session(ws, surf, send_cmd, spec["tool"], spec["label"], spec["abs_cwd"],
                                            caller, lazy, timeout=8 if lazy else 60)
     if not sid and not lazy:
-        sys.exit(f"[fleet] timed out waiting for session binding; the injected command may not have "
-                 f"started. Inspect the surface: cmux capture-pane --surface {surf}")
+        # the surface is LIVE but no session bound in the window — likely still booting (heavy loadout), or
+        # the injected command never started. It is NOT torn down, so it is adoptable once it binds
+        # (recovery-safety #9): signpost the register-after escape hatch alongside the inspect command.
+        sys.exit(f"[fleet] timed out waiting for session binding on surface {surf}; the injected command "
+                 f"may still be booting (heavy loadout) or never started. The surface is NOT torn down. "
+                 f"If it comes up, adopt it:\n[fleet]     fleet register {spec['label']} --surface {surf}\n"
+                 f"[fleet]   (inspect first: cmux capture-pane --surface {surf})")
     register(surf, spec, a.parent, sid or "", ws)
     log_launch(spec, a.parent, surf, sid or "", send_cmd)
     # post-launch placement reconciliation: confirm the surface actually came up IN the worktree (a
@@ -1754,7 +1759,11 @@ def cmd_rm(argv):
     --with-group cross-checks the registry's belief about that group's membership against cmux's REAL
     membership (`workspace-group list --json`) and REFUSES (no dissolve, no sweep) on any disagreement --
     a registry `group` field can desync from cmux's actual visual group (root cause of the 2026-07-02
-    incident: dissolving a group the target only THOUGHT it belonged to swept 3 unrelated live agents). A
+    incident: dissolving a group the target only THOUGHT it belonged to swept 3 unrelated live agents).
+    Once membership agrees, a CONFIRM GATE stops a mass-close: if the dissolve would take down LIVE
+    collateral (any live agent besides the named target), it PREVIEWS the blast radius and REFUSES until
+    --yes (alias --confirm) is passed -- a preview-then-confirm, not an interactive prompt, so it is safe in
+    a non-interactive agent turn. A solo/target-only or all-dead group needs no --yes. A
     swept member's worktree dir and branch are left UNMANAGED: their registry rows are gone, so `fleet
     worktree clean` (which discovers from the registry) cannot find them. Reclaim manually with `git
     worktree list` + `git worktree remove <path>` (and `git branch -D fleet/<label>` if you want the
@@ -1766,9 +1775,11 @@ def cmd_rm(argv):
     force = "--force" in argv
     wipc = "--wip-commit" in argv
     with_group = "--with-group" in argv
-    args = [a for a in argv if a not in ("--kill", "--detach", "--force", "--wip-commit", "--with-group")]
+    yes = "--yes" in argv or "--confirm" in argv          # confirm gate override for a mass-close dissolve
+    args = [a for a in argv if a not in ("--kill", "--detach", "--force", "--wip-commit",
+                                         "--with-group", "--yes", "--confirm")]
     if not args:
-        sys.exit("usage: fleet rm <label> [--detach] [--force] [--kill] [--wip-commit] [--with-group]")
+        sys.exit("usage: fleet rm <label> [--detach] [--force] [--kill] [--wip-commit] [--with-group [--yes]]")
     label = args[0]
     if detach and kill:
         sys.exit("[fleet] rm: --detach and --kill are contradictory (leave the surface running vs "
@@ -1796,12 +1807,13 @@ def cmd_rm(argv):
         sys.exit(f"[fleet] rm: '{label}' is mid-turn (lifecycle=running on surface {surf[:8]}). "
                  f"Use --force to close it anyway, or --detach to drop the registry row and leave "
                  f"the surface running.")
-    if closing:
-        fs.expected_close_put(surf)                     # tombstone BEFORE any close: mark this a DELIBERATE
-                                                        # retirement so the router won't mis-read the
-                                                        # surface.closed frame as an accidental external
-                                                        # close and fire a spurious stale "revive?" alert
-    group_note = ""
+    # --with-group PREFLIGHT (recovery-safety #3): registry-vs-cmux membership cross-check, then a
+    # list-what-dies CONFIRM GATE -- BOTH on pure reads, BEFORE any mutation (no tombstone, no close, no
+    # sweep yet). A dissolve that would close LIVE collateral (any live agent besides the named target)
+    # REFUSES without --yes: it prints the blast radius + the exact re-run and returns, touching nothing.
+    # The cross-check (registry group can diverge from cmux's real group -- the 2026-07-02 root cause) still
+    # ABORTS on any disagreement. Only after this passes do we tombstone + dissolve (below).
+    grp = None
     if with_group and e.get("group"):
         gname = e["group"]
         gref = _group_ref(gname)
@@ -1830,11 +1842,44 @@ def cmd_rm(argv):
                     f"[fleet]   cmux reports group '{gref}' member workspaces = {real_display}\n"
                     f"[fleet] no dissolve, no sweep happened. Investigate before retrying "
                     f"(`fleet ls`, `cmux workspace-group list --json`).")
-            # AGREEMENT confirmed -> observability BEFORE the irreversible act (not just an after-the-fact
-            # report): print what's about to die, THEN dissolve. wt_kept only needs `members` (already
-            # known), so it's computable up front too.
+            # AGREEMENT confirmed. CONFIRM GATE: a dissolve is a mass-close. Refuse (preview only) whenever
+            # it would take down LIVE collateral -- any live agent OTHER than the named target -- unless
+            # --yes. A solo/target-only or all-dead group proceeds with no gate (no surprise to confirm).
+            def _live(v):
+                return fs.surface_has_live_agent(v.get("surface", ""))
+            live_collateral = sorted(lbl for lbl, v in members.items() if _live(v))
+            if live_collateral and not yes:
+                print(f"[fleet] CONFIRM --with-group: dissolving '{gname}' ({gref}) is a MASS-CLOSE -- it "
+                      f"closes {1 + len(members)} surface(s), incl. {len(live_collateral)} LIVE agent(s) "
+                      f"besides '{label}'. What dies:")
+                for lbl in sorted(registry_all):
+                    v = registry_all[lbl]
+                    tags = (["CONDUCTOR"] if v.get("kind") == "conductor" else []) \
+                        + (["live"] if _live(v) else ["stale"]) \
+                        + (["<- named target"] if lbl == label else [])
+                    print(f"[fleet]     {lbl:26} {(v.get('role') or '?'):20} [{', '.join(tags)}]")
+                rerun = "fleet rm " + " ".join(
+                    [label] + [f for f in ("--with-group", "--kill", "--force", "--wip-commit") if f in argv]
+                    + ["--yes"])
+                print(f"[fleet] NOTHING closed. This op needs explicit confirmation -- re-run with --yes:\n"
+                      f"[fleet]     {rerun}")
+                return 3
             wt_kept = sorted([lbl for lbl, v in members.items() if v.get("worktree")]
                              + ([label] if e.get("worktree") and not kill else []))
+            grp = {"gname": gname, "gref": gref, "members": members,
+                   "registry_all": registry_all, "wt_kept": wt_kept}
+        else:
+            grp = {"gname": gname, "gref": "", "members": {}}
+    if closing:
+        fs.expected_close_put(surf)                     # tombstone BEFORE any close: mark this a DELIBERATE
+                                                        # retirement so the router won't mis-read the
+                                                        # surface.closed frame as an accidental external
+                                                        # close and fire a spurious stale "revive?" alert
+    group_note = ""
+    if grp is not None:
+        gname, gref = grp["gname"], grp["gref"]
+        if gref:
+            members, registry_all, wt_kept = grp["members"], grp["registry_all"], grp["wt_kept"]
             group_note = f"\n[fleet] group '{gname}' dissolved ({gref}); closed + cleared {1 + len(members)} member(s)"
             if members:
                 group_note += f" (also removed: {', '.join(sorted(members))})"
@@ -2161,9 +2206,19 @@ def cmd_revive(argv):
     if not _resume_and_gate(surf, send_cmd, tool, sess, lambda m: print(f"[fleet] {m}")):
         sys.exit(f"[fleet] ABORT: resume-summary menu never resolved for {a.label} (surface still "
                  f"booting or wedged at the menu); NOT registering. Re-run `fleet revive {a.label}`.")
-    sid = poll_session(surf)
+    # scale the post-menu bind poll by loadout (recovery-safety #9): after the menu clears, a heavy boot
+    # (5 plugins + memsearch onnx embedding load — the ~100s+ tail that made revive time out) can run past
+    # a flat 60s. Same plugin-count heuristic the menu ceiling uses, with a higher bind ceiling.
+    _pc = _count_plugin_dirs(send_cmd)
+    sid = poll_session(surf, timeout=_resume_menu_timeout(_pc, base=60, per_plugin=8, ceiling=180))
     if not sid:
-        sys.exit("[fleet] timed out waiting for session binding")
+        # the menu cleared but the session hasn't bound within the (loadout-scaled) ceiling. The surface is
+        # LIVE and still booting — NEVER torn down — so it is adoptable the instant it binds. Signpost the
+        # register-after escape hatch (the label stays PARKED: archive_del hasn't run, so it's re-runnable).
+        sys.exit(f"[fleet] timed out waiting for session binding on surface {surf} (plugin_count={_pc}); the "
+                 f"agent is likely still booting. It is NOT torn down and '{a.label}' stays parked. Adopt it "
+                 f"once it binds:\n[fleet]     fleet register {a.label} --surface {surf}\n"
+                 f"[fleet]   (inspect: cmux capture-pane --surface {surf})")
     sid = _resume_binding(surf).get("checkpoint_id", "") or sid   # ground-truth session over a bridge poll id
     register(surf, spec, a.parent, sid, ws)
     fs.archive_del(a.label)
@@ -3064,6 +3119,20 @@ def _compose_recycle_cmd(label, entry, caller_tokens, add_plugins, mode, explici
     # cmux-checkpoint surgery); else cmux's checkpoint if it has one; else the registry's recorded session.
     resume_session = ((explicit_session or checkpoint or (entry.get("session") or "").replace("claude-", ""))
                       if mode == "resume" else None)
+    # LOUD HEAL-LOG (recovery-safety #11): when we resume from cmux's checkpoint BECAUSE the registry
+    # session is stale/absent, say so — the whole point of preferring the checkpoint is to heal a STALE
+    # registry binding (the desync that the router's Stop-only reconcile structurally can't reach), and a
+    # silent heal is invisible to the operator confirming the fix. cmux's checkpoint is the ground truth
+    # (empirically survives the hook-store desync); the post-recycle re-bind writes it back to the registry.
+    if mode == "resume" and not explicit_session:
+        _reg = (entry.get("session") or "").replace("claude-", "")
+        if checkpoint and _reg and checkpoint != _reg:
+            print(f"[fleet] heal: registry session {_reg[:12]} != cmux checkpoint {checkpoint[:12]} for "
+                  f"'{label}' — resuming from the CHECKPOINT (cmux ground truth); the re-bind refreshes the "
+                  f"stale registry binding.")
+        elif checkpoint and not _reg:
+            print(f"[fleet] note: registry has no session for '{label}'; resuming from cmux checkpoint "
+                  f"{checkpoint[:12]} (ground truth).")
     if _is_roster(role):                                          # ROSTER -> re-resolve the toml (truth)
         # RESUME pins the session's original cwd (registry) so a moved-role / worktree agent resumes where
         # its session actually lives; FRESH adopts the current toml cwd (picks up an intentional move).
@@ -3301,6 +3370,17 @@ def cmd_recycle(argv):
         sys.exit(f"[fleet] recycle: could not verify session '{a.session}' under {label}'s projects dir "
                  f"(bad id, or the dir couldn't be resolved/enumerated). `fleet sessions {label}` to list "
                  f"resumable ids; add --force-session to skip this check if you're sure the id is valid.")
+    # FAIL-LOUD on a RESUME with nothing to resume (recovery-safety #11): if cmux holds NO checkpoint for
+    # the surface AND the registry has no recorded session, a resume would compose an empty `--resume` and
+    # dead-end at runtime ('No conversation found'). Refuse up front with the recovery options instead.
+    if mode == "resume" and not a.session:
+        _ckpt = _resume_binding(surf).get("checkpoint_id", "")
+        _reg = (entry.get("session") or "").replace("claude-", "")
+        if not _ckpt and not _reg:
+            sys.exit(f"[fleet] recycle: RESUME but '{label}' has NO resumable session — cmux holds no "
+                     f"checkpoint for surface {surf[:8]} and the registry has no recorded session. Nothing "
+                     f"to resume. Shed into a fresh one: `fleet recycle {label} --fresh`; or pick a prior "
+                     f"id: `fleet sessions {label}` then `fleet recycle {label} --session <id>`.")
     payload = _recycle_plan(label, entry, caller, a.add_plugin, mode, a.session, a.force, a.prime, a.no_prime,
                             add_use=_flatten_csv(a.use))
     provline, provwarn = _session_pref_provenance(entry.get("role"), entry.get("tool", "claude"),

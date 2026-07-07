@@ -183,3 +183,90 @@ def test_rm_without_group_leaves_group_intact(monkeypatch):
     fleet.cmd_rm(["cond2"])
     assert not [c for c in calls if c[:2] == ("workspace-group", "delete")]  # group untouched
     assert fs.live_get("cond2") is None
+
+
+# --- --with-group CONFIRM GATE (recovery-safety #3) --------------------------------------------------
+# After the membership cross-check AGREES, a dissolve that would close LIVE collateral (any live agent
+# besides the named target) is a mass-close: it PREVIEWS the blast radius and REFUSES (return 3, nothing
+# mutated) until --yes. A solo/target-only or all-stale group needs no --yes. These stub surface_has_live_
+# agent (the liveness authority) so the fixture doesn't depend on the machine's real cmux hook store.
+def _dissolve_stubs(monkeypatch, live_surfaces, member_refs, gref="workspace_group:7"):
+    from cmux_fleet import state as fs
+    calls = []
+
+    def fake_cmuxq(*a):
+        calls.append(a)
+        if a[:2] == ("workspace-group", "list"):
+            refs = ",".join(f'"{r}"' for r in member_refs)
+            return '{"groups":[{"ref":"%s","member_workspace_refs":[%s]}]}' % (gref, refs)
+        return ""
+
+    monkeypatch.setattr(fleet, "cmuxq", fake_cmuxq)
+    monkeypatch.setattr(fleet, "_group_ref", lambda g: gref)
+    monkeypatch.setattr(fleet, "_ref_to_uuid", lambda kind, ref: member_refs[ref])
+    monkeypatch.setattr(fleet, "_pid_for_surface", lambda s: None)
+    monkeypatch.setattr(fleet, "_resume_binding", lambda s: {})
+    monkeypatch.setattr(fs, "surface_has_live_agent", lambda s: s in live_surfaces)
+    return calls
+
+
+def _seed_cond_child(fs):
+    fs.live_put("cond", {"role": "c", "kind": "conductor", "tool": "claude", "group": "g",
+                         "surface": "SC", "workspace": "WS-C", "status": "live"})
+    fs.live_put("child", {"role": "w", "kind": "child", "tool": "claude", "group": "g", "parent": "cond",
+                          "surface": "SW", "workspace": "WS-W", "status": "live"})
+
+
+def test_rm_with_group_confirm_gate_blocks_live_collateral(monkeypatch, capsys):
+    from cmux_fleet import state as fs
+    _seed_cond_child(fs)
+    calls = _dissolve_stubs(monkeypatch, live_surfaces={"SC", "SW"},
+                            member_refs={"workspace:c": "WS-C", "workspace:w": "WS-W"})
+    rc = fleet.cmd_rm(["cond", "--with-group"])                     # NO --yes -> gated
+    assert rc == 3                                                  # distinct 'confirmation needed' code
+    assert not [c for c in calls if c[:2] == ("workspace-group", "delete")]  # NOTHING dissolved
+    assert fs.live_get("cond") is not None and fs.live_get("child") is not None  # both rows intact
+    out = capsys.readouterr().out
+    assert "MASS-CLOSE" in out and "--yes" in out and "child" in out  # list-what-dies + how to confirm
+
+
+def test_rm_with_group_yes_bypasses_gate(monkeypatch):
+    from cmux_fleet import state as fs
+    _seed_cond_child(fs)
+    calls = _dissolve_stubs(monkeypatch, live_surfaces={"SC", "SW"},
+                            member_refs={"workspace:c": "WS-C", "workspace:w": "WS-W"})
+    fleet.cmd_rm(["cond", "--with-group", "--yes"])                 # explicit confirmation
+    assert ("workspace-group", "delete", "workspace_group:7") in calls   # dissolved
+    assert fs.live_get("cond") is None and fs.live_get("child") is None  # swept
+
+
+def test_rm_with_group_no_gate_when_collateral_is_stale(monkeypatch):
+    # a member whose surface is NOT live is not surprise collateral -> proceed without --yes.
+    from cmux_fleet import state as fs
+    _seed_cond_child(fs)
+    calls = _dissolve_stubs(monkeypatch, live_surfaces={"SC"},       # child (SW) is stale
+                            member_refs={"workspace:c": "WS-C", "workspace:w": "WS-W"})
+    fleet.cmd_rm(["cond", "--with-group"])                          # no --yes needed
+    assert ("workspace-group", "delete", "workspace_group:7") in calls
+    assert fs.live_get("cond") is None and fs.live_get("child") is None
+
+
+def test_rm_with_group_solo_target_no_gate(monkeypatch):
+    # a group with only the named target (no members) is no surprise -> no --yes needed.
+    from cmux_fleet import state as fs
+    fs.live_put("cond", {"role": "c", "kind": "conductor", "tool": "claude", "group": "g",
+                         "surface": "SC", "workspace": "WS-C", "status": "live"})
+    calls = _dissolve_stubs(monkeypatch, live_surfaces={"SC"}, member_refs={"workspace:c": "WS-C"})
+    fleet.cmd_rm(["cond", "--with-group"])
+    assert ("workspace-group", "delete", "workspace_group:7") in calls
+    assert fs.live_get("cond") is None
+
+
+def test_rm_with_group_confirm_alias_also_bypasses(monkeypatch):
+    from cmux_fleet import state as fs
+    _seed_cond_child(fs)
+    calls = _dissolve_stubs(monkeypatch, live_surfaces={"SC", "SW"},
+                            member_refs={"workspace:c": "WS-C", "workspace:w": "WS-W"})
+    fleet.cmd_rm(["cond", "--with-group", "--confirm"])             # --confirm is the --yes alias
+    assert ("workspace-group", "delete", "workspace_group:7") in calls
+    assert fs.live_get("cond") is None and fs.live_get("child") is None

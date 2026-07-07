@@ -536,3 +536,31 @@ def test_provenance_model_gap_does_not_overwrite_effort_floor_warn(monkeypatch):
     _line, warn = fleet._session_pref_provenance("r", "claude", "cd /x && claude --effort high", None, None)
     assert "floor" in warn and "effort" in warn                # effort floor-warning won
     assert "no --model anywhere" not in warn                   # model gap did NOT overwrite it
+
+
+# --- recovery-safety #11: fail-loud when a RESUME has nothing to resume -----------------------------
+def test_recycle_resume_fails_loud_when_no_checkpoint_and_no_registry_session(monkeypatch):
+    # both sources empty: cmux holds no checkpoint AND the registry has no recorded session -> a resume
+    # would compose an empty `--resume` and dead-end at runtime. Refuse up front with the recovery options.
+    from cmux_fleet import state as fs
+    fs.live_put("w", {"role": "r", "kind": "child", "tool": "claude", "cwd": "/x", "place": "tab",
+                      "group": "", "surface": "S1", "session": "", "plugins": [], "flags": [],
+                      "settings": "", "status": "live"})
+    monkeypatch.setattr(fleet, "_resume_binding", lambda surf: {})          # cmux has no checkpoint
+    with __import__("pytest").raises(SystemExit) as ei:
+        fleet.cmd_recycle(["w"])                                            # default = resume
+    msg = str(ei.value)
+    assert "NO resumable session" in msg and "--fresh" in msg               # signposts the recovery paths
+
+
+def test_recycle_resume_ok_when_checkpoint_present(monkeypatch):
+    # a checkpoint alone (empty registry session) is enough to resume -> no fail-loud; it schedules.
+    from cmux_fleet import state as fs
+    fs.live_put("w", {"role": "r", "kind": "child", "tool": "claude", "cwd": "/x", "place": "tab",
+                      "group": "", "surface": "S1", "session": "", "plugins": [], "flags": [],
+                      "settings": "", "status": "live"})
+    monkeypatch.setattr(fleet, "_resume_binding", lambda surf: {"checkpoint_id": "CKPT-1"})
+    monkeypatch.setattr(fleet, "_is_roster", lambda role: False)            # registry-fallback compose
+    monkeypatch.setattr(fleet.subprocess, "Popen", lambda *a, **k: None)    # don't actually spawn
+    rc = fleet.cmd_recycle(["w"])                                           # must NOT fail-loud
+    assert rc == 0
