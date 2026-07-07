@@ -50,8 +50,9 @@ _retry_lock = threading.Lock()
 # Driven once per heartbeat tick (daemon._heartbeat_tick), the sweep walks every LIVE child and emits a
 # DEDUPED parent alert on each bad condition. Dedup is edge-triggered per (reason, label, session): fire
 # once when a condition turns bad, re-arm when it clears; the session component resets the alarm on a
-# recycle/rebind. The set persists across ticks in the long-lived daemon process (a restart re-alerts
-# once — never a storm). See docs/backlog.md 'NOTIFY-LAYER FAILURE CONDITIONS'.
+# recycle/rebind. The set is mirrored to fs.DOCTOR_DEDUP so a daemon restart does not re-alert a
+# steady-state condition that was already seen in a prior process. See docs/backlog.md
+# 'NOTIFY-LAYER FAILURE CONDITIONS'.
 STALL_S = 600           # a fleet-bound 'running' record frozen longer than this = a dead/stalled turn
                         # (the INVERSE of surface_busy's live-turn check). A live turn re-stamps updatedAt
                         # every ~1-35s, so 10m never clips a legit slow turn EXCEPT one blocked on a single
@@ -65,7 +66,9 @@ STALL_WINDOW = 1800     # ...but ONLY fire while the stall is RECENT (age in (ST
                         # that a bare `age > STALL_S` would false-flag as "stalled." The upper bound
                         # excludes them (30m >> any fresh-caught stall) without missing a real one.
 LOW_CTX_PCT = 30        # context-remaining % at/under which to alert once (matches vitals' near-full flag)
-_doctor_fired = set()   # {(reason, label, session)} — parent-alert dedup across heartbeat ticks
+NEEDS_INPUT_COMPLETION_SUPPRESS_S = 120      # only the immediate post-Stop idle duplicate; not later gates
+NEEDS_INPUT_COMPLETION_SKEW_S = 2.0          # row write can lag the hook-store lifecycle stamp slightly
+_doctor_fired = set()   # {(reason, label, session)} — parent-alert/seen-state dedup across ticks/restarts
 
 
 def cmux(*args, timeout=10):
@@ -204,6 +207,36 @@ def _idle_wake_retry_loop(surface, label):
             _retrying.discard(surface)
 
 
+def _recent_completion_for(label, session, now, rec=None):
+    """True iff this child/session recently produced a completion row.
+
+    Completion rows remain in inbox.jsonl after ack, so this catches both still-pending and already-acked
+    completions. Suppress only the immediate post-completion idle duplicate: if the hook-store record has
+    a later lifecycle transition than the completion row, a new turn happened after that Stop and a
+    needsInput state is a real gate.
+    """
+    sid = fs.bare_uuid(session or "")
+    try:
+        rec_updated = float((rec or {}).get("updatedAt") or 0)
+    except (TypeError, ValueError):
+        rec_updated = 0
+    for r in fs.inbox_read():
+        if r.get("kind") != "completion" or r.get("label") != label:
+            continue
+        try:
+            ts = float(r.get("ts") or 0)
+        except (TypeError, ValueError):
+            continue
+        if now - ts > NEEDS_INPUT_COMPLETION_SUPPRESS_S:
+            continue
+        if sid and fs.bare_uuid(r.get("child_session") or "") != sid:
+            continue
+        if rec_updated and rec_updated > ts + NEEDS_INPUT_COMPLETION_SKEW_S:
+            continue
+        return True
+    return False
+
+
 def deliver(parent_surface, parent_label, child_entry, child_surface):
     time.sleep(0.5)                                    # let the final assistant line flush to disk
     gist = last_assistant_text(transcript_of(store(), child_surface))
@@ -295,6 +328,9 @@ def fleet_doctor_sweep(now=None):
     st = fs.read_hook_store()
     live_keys, woke = set(), set()
     fired = 0
+    persisted = fs.doctor_dedup_load()
+    if persisted:
+        _doctor_fired.update(persisted)
 
     def _emit(reason, label, entry, surface, payload):
         nonlocal fired
@@ -323,6 +359,12 @@ def fleet_doctor_sweep(now=None):
                 continue                               # conductors: no parent; muted: manual concern
             surface, session = entry.get("surface") or "", entry.get("session") or ""
             if not surface:
+                continue
+            if fs.expected_close_recent(surface, now=now):
+                log(f"[fleet-doctor] skip {label}: expected CLI close (surface {surface[:8]})")
+                continue
+            if session and not fs.surface_has_live_agent(surface):
+                log(f"[fleet-doctor] skip {label}: surface {surface[:8]} has no live agent")
                 continue
             live_keys.add((label, session))
             rec = fs.resolve_bound_record(surface, st=st, bound=fs.bare_uuid(session))
@@ -357,6 +399,10 @@ def fleet_doctor_sweep(now=None):
             # 'fresh updatedAt' would MISS exactly what #3 exists to catch. Orphan needsInput records are
             # excluded by resolving the BOUND record of a LIVE member — not by age (see resolve_bound_record).
             if life == "needsInput":
+                if _recent_completion_for(label, session, now, rec=rec):
+                    _doctor_fired.add(("needs-input", label, session))
+                    log(f"[fleet-doctor] {label}: needs-input suppressed after recent completion")
+                    continue
                 _emit("needs-input", label, entry, surface, {})
             else:
                 _doctor_fired.discard(("needs-input", label, session))  # re-arm on leaving needsInput
@@ -380,6 +426,11 @@ def fleet_doctor_sweep(now=None):
     # bounds the set AND lets a recycled-while-still-bad member re-alert fresh under its new session.
     for k in [k for k in _doctor_fired if (k[1], k[2]) not in live_keys]:
         _doctor_fired.discard(k)
+    if _doctor_fired != persisted:
+        try:
+            fs.doctor_dedup_save(_doctor_fired, now=now)
+        except Exception as e:
+            log(f"[fleet-doctor] dedup persistence error: {e}")
     return fired
 
 

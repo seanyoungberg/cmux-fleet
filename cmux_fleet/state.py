@@ -3,12 +3,14 @@
 # peer-messages into a single inbox. CODE lives in the `fleet` APP (the plugin ships only thin hook
 # wiring that shells into it); STATE under $CMUX_STATE_DIR (default $XDG_STATE_HOME/cmux-fleet).
 #
-# Stores (9 files, down from 12; one inbox mechanism instead of two):
+# Stores (10 files, down from 12; one inbox mechanism instead of two):
 #   inbox.jsonl        unified append-only message stream. One line: {seq, ts, kind, to, **payload}.
 #                      kind = "completion" (child finished) | "peer" (deliberate conductor->peer send).
 #   inbox.seq          atomic monotonic counter behind `seq` (router AND peer-msg both append).
 #   inbox-cursors.json {surface: {acked, blocked}} — ONE high-water ack + drain-guard per surface,
 #                      across both kinds (seq is global). Replaces 4 old files.
+#   doctor-dedup.json  durable fleet-doctor condition keys, so daemon restarts do not re-alert
+#                      steady-state conditions already seen in a prior process.
 #   fleet.json         the LIVE fleet, label-keyed: label -> {role,kind,tool,cwd,parent,place,
 #                      status:"live",surface,session}. Only running agents.
 #   archive.json       PARKED agents, label-keyed: {role,kind,tool,cwd,last_session,parent,archived_at}.
@@ -34,6 +36,7 @@ DRAFTMODE = os.path.join(STATE, "draft-through")        # policy override: 'clob
 DRAFTMARKS = os.path.join(STATE, "draft-marks.json")    # {surface: {text, since}} — stale-draft-gate age tracking
 EXPECTED_CLOSE = os.path.join(STATE, "expected-close.json")  # short-lived CLI-close tombstones (list of {surface_id, ts})
 EXPECTED_CLOSE_S = 10   # a CLI-written close tombstone shields _archive_closed_surface from this surface this long
+DOCTOR_DEDUP = os.path.join(STATE, "doctor-dedup.json")
 
 # Agent-helper command hints emitted into conductor context by the awareness/drain hooks. Phase 2
 # folded the four standalone plugin scripts into `fleet <verb>` subcommands, so these are now the app
@@ -185,6 +188,38 @@ def inbox_ack(surface, kind, seq):
     e[kind] = max(int(e.get(kind, 0)), int(seq))
     _atomic_write(CURSORS, json.dumps(m, indent=2))
     return e[kind]
+
+
+# --- DURABLE fleet-doctor condition dedup --------------------------------------------------
+def doctor_dedup_load():
+    """Return the persisted fleet-doctor condition keys as {(reason, label, session)}.
+
+    This is condition state, not ack state: it records bad conditions the sweep has already seen so a
+    daemon restart does not produce a new doctor row for the same steady-state member. The router prunes
+    it when a condition clears, a member leaves live state, or the member's bound session changes.
+    """
+    rows = _read_json(DOCTOR_DEDUP, [])
+    out = set()
+    if not isinstance(rows, list):
+        return out
+    for r in rows:
+        if not isinstance(r, dict):
+            continue
+        reason = str(r.get("reason") or "")
+        label = str(r.get("label") or "")
+        session = str(r.get("session") or "")
+        if reason and label:
+            out.add((reason, label, session))
+    return out
+
+
+def doctor_dedup_save(keys, now=None):
+    """Persist fleet-doctor condition keys. `now` stamps the write for operator inspection only."""
+    now = time.time() if now is None else now
+    norm = sorted({(str(r or ""), str(l or ""), str(s or "")) for r, l, s in keys
+                   if str(r or "") and str(l or "")})
+    rows = [{"reason": r, "label": l, "session": s, "ts": now} for r, l, s in norm]
+    _atomic_write(DOCTOR_DEDUP, json.dumps(rows, indent=2))
 
 
 # --- EPHEMERAL drain loop-guard (blocks; per-kind, separate nukeable file) ------------------

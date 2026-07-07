@@ -194,6 +194,57 @@ def test_needs_input_does_not_fire_for_working_child(fs, monkeypatch, wake):
     assert fs.inbox_pending("PARENT", kind="doctor") == []
 
 
+def test_needs_input_dedup_persists_across_daemon_restart_after_ack(fs, monkeypatch, wake):
+    """Ack clears the row, not the underlying condition. The condition dedup must survive a daemon
+    restart so a steady-state needsInput child does not produce a fresh doctor seq after every restart."""
+    _seed_parent_child()
+    monkeypatch.setattr(fs, "read_hook_store", lambda: _store("needsInput", NOW - 100))
+    assert router.fleet_doctor_sweep(now=NOW) == 1
+    alert = fs.inbox_pending("PARENT", kind="doctor")[0]
+    fs.inbox_ack("PARENT", "doctor", alert["seq"])
+
+    router._doctor_fired.clear()                         # simulate a fresh daemon process
+    assert fs.inbox_pending("PARENT", kind="doctor") == []
+    assert router.fleet_doctor_sweep(now=NOW + 120) == 0
+    assert len([r for r in fs.inbox_read() if r.get("kind") == "doctor"]) == 1
+
+
+def test_recent_completion_suppresses_copending_needs_input(fs, monkeypatch, wake):
+    """A just-finished child commonly idles at needsInput. The completion row is the real alert; the
+    doctor sweep should mark that condition as seen without writing a second doctor row."""
+    session = _seed_parent_child()
+    fs.inbox_put("completion", "PARENT", {"label": "child", "child_session": session, "gist": "done"})
+    completion_ts = fs.inbox_read()[-1]["ts"]
+    now = completion_ts + 60
+    monkeypatch.setattr(fs, "read_hook_store", lambda: _store("needsInput", completion_ts - 1))
+
+    assert router.fleet_doctor_sweep(now=now) == 0
+    assert fs.inbox_pending("PARENT", kind="doctor") == []
+    assert wake == []
+    assert ("needs-input", "child", session) in fs.doctor_dedup_load()
+
+    router._doctor_fired.clear()                         # restart should keep the suppressed state quiet
+    assert router.fleet_doctor_sweep(now=now + 120) == 0
+    assert fs.inbox_pending("PARENT", kind="doctor") == []
+
+
+def test_later_same_session_needs_input_after_new_turn_still_alerts(fs, monkeypatch, wake):
+    """A prior turn's completion must not silence a genuine gate in a later turn on the same session.
+    The updatedAt stamp after the completion is the available transition proof; this should alert even
+    if the coincidence window is accidentally widened again."""
+    session = _seed_parent_child()
+    fs.inbox_put("completion", "PARENT", {"label": "child", "child_session": session, "gist": "turn 1 done"})
+    completion_ts = fs.inbox_read()[-1]["ts"]
+    now = completion_ts + 12 * 60
+    monkeypatch.setattr(router, "NEEDS_INPUT_COMPLETION_SUPPRESS_S", 30 * 60)
+    monkeypatch.setattr(fs, "read_hook_store", lambda: _store("needsInput", completion_ts + 11 * 60))
+
+    assert router.fleet_doctor_sweep(now=now) == 1
+    alert = fs.inbox_pending("PARENT", kind="doctor")[0]
+    assert alert["reason"] == "needs-input" and alert["label"] == "child"
+    assert wake == ["PARENT"]
+
+
 # ── #0 dead-pid guard (the SessionEnd-freeze class, 2026-07-06) ────────────────────────────────────
 def test_dead_pid_ghost_suppresses_false_alerts(fs, monkeypatch, wake):
     """A bound record frozen at 'needsInput' on a DEAD process is a SessionEnd-less ghost (an abrupt
@@ -242,6 +293,30 @@ def test_muted_child_is_skipped(fs, monkeypatch, wake):
     receipt: 3 of 4 live needsInput members were muted human-driven agents; alerting them = a storm."""
     _seed_parent_child(child_extra={"muted": True})
     monkeypatch.setattr(fs, "read_hook_store", lambda: _store("needsInput", NOW - 100))
+    assert router.fleet_doctor_sweep(now=NOW) == 0
+    assert fs.inbox_pending("PARENT", kind="doctor") == []
+    assert wake == []
+
+
+def test_expected_close_surface_is_skipped_by_doctor_sweep(fs, monkeypatch, wake):
+    """A CLI-close tombstone means the surface is being deliberately archived/removed. The doctor sweep
+    must share the stale-alert guard and not flag the same surface during that close race."""
+    _seed_parent_child()
+    fs.expected_close_put("CHILD", now=NOW)
+    monkeypatch.setattr(fs, "read_hook_store", lambda: _store("needsInput", NOW - 100))
+
+    assert router.fleet_doctor_sweep(now=NOW) == 0
+    assert fs.inbox_pending("PARENT", kind="doctor") == []
+    assert wake == []
+
+
+def test_non_live_session_bound_surface_is_skipped_by_doctor_sweep(fs, monkeypatch, wake):
+    """A session-bound registry row whose surface no longer has a live agent is stale by the same
+    predicate used by ls/bulk-recycle, so the doctor sweep should not produce health alerts for it."""
+    _seed_parent_child()
+    monkeypatch.setattr(fs, "surface_has_live_agent", lambda surf: False)
+    monkeypatch.setattr(fs, "read_hook_store", lambda: _store("needsInput", NOW - 100))
+
     assert router.fleet_doctor_sweep(now=NOW) == 0
     assert fs.inbox_pending("PARENT", kind="doctor") == []
     assert wake == []
