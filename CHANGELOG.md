@@ -6,6 +6,21 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [0.5.1] - 2026-07-07
+
+### Fixed
+
+- **Fleet-doctor sweep no longer over-fires** — three `needs-input`/doctor false-positive classes fixed:
+  - **Restart no longer replays handled alerts.** The doctor's condition dedup is now persisted
+    (`doctor-dedup.json`, keyed by `(reason,label,session)`), so a daemon restart stops re-alerting
+    steady-state conditions already seen in a prior process.
+  - **Completion + needs-input double-fire suppressed.** A just-finished child no longer produces both a
+    completion and a redundant `needs-input` doctor alert (suppressed within a 120s co-incidence window,
+    with an `updatedAt`-transition guard so a genuine later gate still alerts).
+  - **Archived/closing surfaces skipped.** The sweep now honors the expected-close tombstone and the
+    `surface_has_live_agent` live-truth boundary (parity with bulk-recycle/ls), fixing the archived-surface
+    race.
+
 ## [0.5.0] - 2026-07-07
 
 ### Added
