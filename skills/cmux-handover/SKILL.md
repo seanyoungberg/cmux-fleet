@@ -32,11 +32,11 @@ Hit what's relevant, skip what's empty, add what's yours. Write for a reader wit
 - **Open / dropped threads** — anything deferred, half-done, or that fell off. **Scan the whole session for these, don't just recall** — a long session drops threads silently, and this is the one place they get caught. Honest loose ends beat a tidy summary.
 - **WIP pointers** — files, branches, commits, surfaces in flight; where to look.
 - **What went well / gotchas** — discoveries to reuse, traps to avoid.
-- **Fleet snapshot** *(conductors)* — paste `fleet ls` at handover + notes on children (who's parked/revivable, who's mid-task, who to clean up). Live truth is always `fleet ls` / `fleet.json`; this is just the picture at handover time, so the next instance isn't flying blind on boot. (No separate persistent state file — the registry already IS the live state.)
+- **Fleet snapshot** *(conductors)* — paste `fleet ls` at handover + notes on children (who's archived/revivable, who's mid-task, who to clean up). Live truth is always `fleet ls` / `fleet.json`; this is just the picture at handover time, so the next instance isn't flying blind on boot. (No separate persistent state file — the registry already IS the live state.)
 - **Read on resume** — the 2-3 pointers (docs, memory, this file) to load first. For conductors, the boot ritual also includes **`fleet inbox`** (pending completions/alerts/peer-msgs that queued while you were down — the push path can't replay them across a recycle) + **`fleet ls --scope mine`** (know your fleet: you + your children).
 
 ## Optional final step: recycle yourself
-The natural tail of a handover is a **`fleet recycle --fresh`** — restart yourself into a fresh session in the same seat, shedding bloated context, and let the next instance boot and read the handover you just wrote. At handover time you want **`--fresh`** (shedding is the whole point). **Only do this when you are actually ready to relaunch** (most handovers don't recycle — you write one and keep going, or hand back to a human). Never recycle with a draft you haven't finished.
+The natural tail of a handover is a **`fleet recycle --fresh`** — restart yourself into a fresh session in the same surface, shedding bloated context, and let the next instance boot and read the handover you just wrote. At handover time you want **`--fresh`** (shedding is the whole point). **Only do this when you are actually ready to relaunch** (most handovers don't recycle — you write one and keep going, or hand back to a human). Never recycle with a draft you haven't finished.
 
 > NOTE (2026-07-01): `fleet recycle` now DEFAULTS to **RESUME** (preserve context — the least-disruptive default). A handover recycle must pass **`--fresh`** to get a clean session; a bare `fleet recycle` would just continue the same session (no shed, no handover prime).
 
@@ -44,13 +44,13 @@ The natural tail of a handover is a **`fleet recycle --fresh`** — restart your
 
 ```
 fleet recycle --fresh --dry-run    # STEP 1 — preview; verify the `session-prefs:` model/effort line
-fleet recycle --fresh              # STEP 2 — only after the dry-run looks right: self, FRESH session, same seat
+fleet recycle --fresh              # STEP 2 — only after the dry-run looks right: self, FRESH session, same surface
 fleet recycle --fresh -- --effort xhigh --add-plugin <name>   # a one-off launch-param change (also dry-run it first)
 ```
 
-What it does (see the `cmux-fleet` SKILL → recycle, and `docs/operations.md`): a **detached** worker waits until you go quiet (idle + empty input draft; `--force` to override), then uses cmux's native `respawn-pane` to tear you down and relaunch a fresh session **in the same surface** — so your label and all parent/child routing stay valid (only the session id changes). The launch is recomposed from cmux's own resume binding (accurate even if the registry is sparse), then it auto-primes the fresh instance to read this handover. A bare `fleet recycle` (no `--fresh`) instead RESUMES the same session — not what you want at handover time. You can recycle a **child** the same way: have it write its handover first, then `fleet recycle <label> --fresh`.
+What it does (see the `cmux-fleet` SKILL → recycle, and `docs/operations.md`): a **detached** helper waits until you go quiet (idle + empty input draft; `--force` to override), then uses cmux's native `respawn-pane` to tear you down and relaunch a fresh session **in the same surface** — so your label and all parent/child routing stay valid (only the session id changes). The launch is recomposed from cmux's own resume binding (accurate even if the registry is sparse), then it auto-primes the fresh instance to read this handover. A bare `fleet recycle` (no `--fresh`) instead RESUMES the same session — not what you want at handover time. You can recycle a **child** the same way: have it write its handover first, then `fleet recycle <label> --fresh`.
 
-Because the worker is detached and waits for idle, the clean pattern is: write the handover → call `fleet recycle --fresh` → **end your turn**. It fires once you're quiet.
+Because the helper is detached and waits for idle, the clean pattern is: write the handover → call `fleet recycle --fresh` → **end your turn**. It fires once you're quiet.
 
 ## Principles
 - **Cold-read first.** Assume the reader knows nothing of this session.

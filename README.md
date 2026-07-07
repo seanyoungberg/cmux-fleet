@@ -2,7 +2,7 @@
 
 Native parent/child agent orchestration for [cmux](https://cmux.io).
 
-A conductor agent spawns child agents (workers or sub-conductors) as real cmux
+A conductor agent spawns child agents (children or sub-conductors) as real cmux
 surfaces, places them in panes, tabs, or workspaces, and gets told when they
 finish. The notify path is **input-safe**: a child's completion and a peer's
 message reach a conductor through its context, never by typing into its input
@@ -105,7 +105,7 @@ mode dial below).
 | `fleet ls [--scope …]` | live fleet reconciled against cmux's hook store (flags STALE / pending / MUTED); defaults `--scope mine` (you + your children), `--scope all` for the world |
 | `fleet recycle [label]` | restart in place, same surface and identity (default RESUME; `--fresh` sheds, `--session <id>`, `--force`; bulk `--scope mine\|all\|conductors\|children`) |
 | `fleet sessions <label>` | list resumable prior sessions for the agent's surface (id, age, size, snippet) |
-| `fleet archive` / `revive` | park a live agent / bring a parked one back (`revive --fresh\|--session`) |
+| `fleet archive` / `revive` | archive a live agent / bring an archived one back (`revive --fresh\|--session`) |
 | `fleet rm <label>` | close + archive a label (revivable; `--detach` drops the row only, `--force` overrides the mid-turn guard, `--with-group` dissolves its group) |
 | `fleet mute` / `unmute` | stop / resume pushing a child's completions to its parent (`--scope mine` mutes all your children) |
 | `fleet inbox [--scope …]` | your pending inbox on demand (completions + alerts + peer msgs); the catch-up read after a recycle |
@@ -173,8 +173,7 @@ Wake-now is the **default**; the dial exists only to opt out:
   surface via context on the conductor's next turn; nothing is auto-driven or
   woken — for a "leave me alone, I'll drain on my own" or debugging conductor.
 
-(The old `autodrain` mode is retired — with wake-now default the one override is
-`passive`. Peer messages still drain at Stop regardless, and `peer-msg --no-wake`
+(Peer messages still drain at Stop regardless, and `peer-msg --no-wake`
 is the per-message opt-out for acks/FYIs.)
 
 ## Fleet views

@@ -1515,19 +1515,22 @@ def cmd_ls(argv):
     surface has no live session (a closed tab / crash never fires an archive transition). Scoped like
     every read: defaults `--scope mine` (you + your direct children); `--scope all` opens the whole
     fleet; `conductors`/`children` filter by kind. When `mine` is just you, a one-line hint points at
-    `--scope all` so nobody mistakes their corner for the empty fleet."""
+    `--scope all` so nobody mistakes their corner for the empty fleet. `--json` emits the reconciled
+    rows (live + archived, with the computed status/lifecycle) as machine output."""
     from . import state as fs
+    as_json = "--json" in argv
+    argv = [a for a in argv if a != "--json"]
     scope_arg, _ = fs.pop_scope(argv, default=None)
     scope, caller = fs.read_scope(scope_arg, "ls")
     live, arch = fs.live_all(), fs.archive_all()
     if scope != "all":
         live = {l: v for l, v in live.items() if fs.scope_matches(scope, v, l, caller, include_self=True)}
         arch = {l: v for l, v in arch.items() if fs.scope_matches(scope, v, l, caller, include_self=True)}
-    scope_tag = "" if scope == "all" else f"{scope}: "
-    print(f"LIVE FLEET ({scope_tag}{len(live)}):  {'label':<24}{'role':<16}{'kind':<11}{'status':<8}{'lifecycle':<11}surface")
+    # reconcile ONCE -> render as JSON or the text table (identical status/lifecycle either way).
+    live_rows = []
     for label, v in sorted(live.items()):
         surf = v.get("surface", "")
-        life = fs.lifecycle(surf) or "-"
+        life = fs.lifecycle(surf)
         # STALE if NO genuinely-live agent holds the surface: lifecycle terminal, OR frozen non-terminal
         # on a DEAD pid (the SessionEnd-less brick, root-caused 2026-07-06). Routed through the shared
         # surface_has_live_agent predicate so the pid -- not the lifecycle string -- is the authority: a
@@ -1538,8 +1541,19 @@ def cmd_ls(argv):
             status = "pending" if not v.get("session") else "STALE"
         else:
             status = v.get("status", "live")
-        muted = "  MUTED" if v.get("muted") else ""
-        print(f"  {label:<24}{v.get('role','-'):<16}{v.get('kind','-'):<11}{status:<8}{life:<11}{surf[:8]}{muted}")
+        live_rows.append({"label": label, "role": v.get("role"), "kind": v.get("kind"),
+                          "status": status, "lifecycle": life or None, "surface": surf,
+                          "muted": bool(v.get("muted"))})
+    if as_json:
+        arch_rows = [{"label": label, "role": v.get("role"), "kind": v.get("kind"),
+                      "last_session": v.get("last_session") or None} for label, v in sorted(arch.items())]
+        print(json.dumps({"scope": scope, "live": live_rows, "archived": arch_rows}, indent=2))
+        return 0
+    scope_tag = "" if scope == "all" else f"{scope}: "
+    print(f"LIVE FLEET ({scope_tag}{len(live)}):  {'label':<24}{'role':<16}{'kind':<11}{'status':<8}{'lifecycle':<11}surface")
+    for r in live_rows:
+        muted = "  MUTED" if r["muted"] else ""
+        print(f"  {r['label']:<24}{(r['role'] or '-'):<16}{(r['kind'] or '-'):<11}{r['status']:<8}{(r['lifecycle'] or '-'):<11}{r['surface'][:8]}{muted}")
     if arch:
         print(f"\nARCHIVED ({len(arch)}, revivable):")
         for label, v in sorted(arch.items()):
@@ -1559,8 +1573,8 @@ def cmd_rm(argv):
     --detach is the explicit opt-in for the OLD soft behavior: drop the registry row ONLY, never touch
     the surface -- for handing a pane to a human to drive directly without killing in-progress work.
     NOTE detach != mute: `fleet mute` is a notification-ROUTING concept (the child stays tracked,
-    completions just aren't pushed); a detached label is fully untracked. --kill is kept as an accepted
-    alias for the close+archive default (same precedent as recycle's kept --resume alias); the one
+    completions just aren't pushed); a detached label is fully untracked. --kill is accepted as an
+    alias for the close+archive default; the one
     thing it still adds is worktree teardown for a worktree-isolated agent (refuse-if-dirty;
     --wip-commit to snapshot; branch always kept) -- `fleet worktree clean <label>` is the dedicated
     verb for that otherwise. --with-group also dissolves the agent's workspace-group: deleting the group by ref
@@ -2385,7 +2399,7 @@ def _known_session(entry, surf, sid):
 
 def cmd_sessions(argv):
     """List resumable prior claude sessions for an agent's surface (freshest first) so an operator can
-    pick an id for `fleet recycle --resume --session <id>` / `fleet revive --session <id>` without
+    pick an id for `fleet recycle --session <id>` / `fleet revive --session <id>` without
     hand-hunting under ~/.claude/projects. Marks the CURRENTLY-bound session with '*'. Works for a live
     OR archived label."""
     from . import state as fs
@@ -2420,17 +2434,17 @@ def cmd_sessions(argv):
         print(f" {mark} {s:<38}{ff._age(now - mt):>7} ago {_human_size(sz):>8}  {_session_snippet(p)}")
     if any(fs.bare_uuid(s) == cur for s, *_ in shown):
         print(" (* = currently bound)")
-    print(f" resume: fleet recycle {a.label} --resume --session <id>   |   fleet revive {a.label} --session <id>")
+    print(f" resume: fleet recycle {a.label} --session <id>   |   fleet revive {a.label} --session <id>")
     return 0
 
 
 # ---------------------------------------------------------------- recycle (live->live, same surface)
 # Restart an agent IN PLACE on its OWN surface via cmux's native `respawn-pane` (the tmux-compat
 # kill+restart: cmux tears down the surface's current process and runs a fresh command in the SAME
-# seat). Default = RESUME (preserves context — the least-disruptive action, ratified 2026-07-01); --fresh
+# surface). Default = RESUME (preserves context — the least-disruptive action, ratified 2026-07-01); --fresh
 # sheds context into a brand-new session and auto-primes from the latest handover. Same surfaceId -> the
 # registry entry (label, parent/child pointers) stays valid with ZERO churn; only `session` changes. Runs
-# DETACHED so it can recycle the CALLER itself. (--resume kept as a no-op alias for back-compat.)
+# DETACHED so it can recycle the CALLER itself.
 #
 # Why this is NOT the old kill-pid-then-type-the-launch-into-a-prompt dance: respawn-pane does the
 # teardown+restart atomically and natively, so 3 of berg-sandbox's 6 lab guards are obsolete (the
@@ -2832,7 +2846,7 @@ def _bulk_targets(target, from_surface, from_label, include_muted):
 def cmd_recycle(argv):
     """Restart THIS (or a named) agent in place on the same surface, same identity. A bulk `--scope`
     (mine|all|conductors|children) restarts many, sequentially + gated. Bare (no label, no scope) = self.
-    See block comment. (Legacy --all/--conductors/--children/--my-children still work, hidden.)"""
+    See block comment."""
     from . import state as fs
     caller = []
     if "--" in argv:
@@ -2842,8 +2856,6 @@ def cmd_recycle(argv):
     ap.add_argument("--fresh", action="store_true",
                     help="SHED context: recycle into a brand-new session, auto-primed from the latest "
                          "handover. Default is RESUME (preserve context) — --fresh is the explicit opt-in.")
-    ap.add_argument("--resume", action="store_true",
-                    help="(now the DEFAULT; kept as a no-op alias for back-compat) continue the session")
     ap.add_argument("--session", default="", metavar="ID",
                     help="resume an ARBITRARY prior session id directly (list with `fleet sessions "
                          "<label>`) — no cmux-checkpoint surgery; single-target only")
@@ -2872,22 +2884,14 @@ def cmd_recycle(argv):
     ap.add_argument("--scope", default="", metavar="SET",
                     help="bulk restart a SET: mine (your children) | all | conductors | children. "
                          "Sequential + gated, skips self + muted. Omit for single-target (bare = self).")
-    # legacy bulk flags, kept working (hidden) for muscle-memory + old docs -> mapped onto --scope below.
-    ap.add_argument("--all", action="store_true", help=argparse.SUPPRESS)
-    ap.add_argument("--conductors", action="store_true", help=argparse.SUPPRESS)
-    ap.add_argument("--children", action="store_true", help=argparse.SUPPRESS)
-    ap.add_argument("--my-children", action="store_true", help=argparse.SUPPRESS)
     ap.add_argument("--include-muted", action="store_true",
                     help="bulk: also recycle muted/human-driven agents (skipped by default)")
     a = ap.parse_args(argv)
 
     # DEFAULT FLIPPED (ratified 2026-07-01): recycle now RESUMES (preserves context) by default; --fresh is
-    # the explicit context-shedding opt-in (was the silent default that dropped berg-sandbox's session). The
-    # old --resume is kept as an accepted no-op alias so muscle-memory/scripts don't break.
+    # the explicit context-shedding opt-in (was the silent default that dropped berg-sandbox's session).
     if a.fresh and a.session:
         sys.exit("[fleet] recycle: --fresh and --session are contradictory (fresh sheds context; --session resumes one)")
-    if a.fresh and a.resume:
-        sys.exit("[fleet] recycle: --fresh and --resume are contradictory (shed vs preserve context) — pick one")
     mode = "fresh" if a.fresh else "resume"
     # session-preference overrides funnel into the caller-token layer (highest precedence over the composed
     # floor/role loadout) — applies to the single AND bulk paths.
@@ -2895,24 +2899,14 @@ def cmd_recycle(argv):
         caller += ["--effort", a.effort]
     if a.model:
         caller += ["--model", a.model]
-    # unify --scope + legacy flags into ONE internal bulk target vocab {all,conductors,children,my-children}.
+    # --scope maps onto ONE internal bulk target vocab {all,conductors,children,my-children}.
     # `mine` -> `my-children` (an act's `mine` is your children); the rest map name-for-name.
     SCOPE_TO_TARGET = {"mine": "my-children", "all": "all", "conductors": "conductors", "children": "children"}
-    legacy = {"all": a.all, "conductors": a.conductors, "children": a.children, "my-children": a.my_children}
-    legacy_chosen = [k for k, on in legacy.items() if on]
     target = None
     if a.scope:
         if a.scope not in SCOPE_TO_TARGET:
             sys.exit(f"[fleet] recycle: --scope must be one of {list(SCOPE_TO_TARGET)}")
-        if legacy_chosen:
-            sys.exit("[fleet] recycle: --scope and the legacy bulk flags are mutually exclusive")
         target = SCOPE_TO_TARGET[a.scope]
-    elif legacy_chosen:
-        if len(legacy_chosen) > 1:
-            sys.exit(f"[fleet] recycle: pick ONE bulk selector, got {legacy_chosen}")
-        target = legacy_chosen[0]
-        _scope_eq = {"my-children": "mine", "all": "all", "conductors": "conductors", "children": "children"}
-        sys.stderr.write(f"[fleet] recycle: --{target} is deprecated; use --scope {_scope_eq[target]}\n")
     if target:
         if a.label or a.session:
             sys.exit("[fleet] recycle: a bulk scope can't combine with a <label> or --session (per-target)")
@@ -2972,17 +2966,18 @@ def _recycle_bulk(target, mode, caller, a):
     independently quiet-gated. Self is always excluded (external recycle avoids the can't-respawn-own-
     surface footgun); muted/human-driven agents skipped unless --include-muted. --dry-run prints the plan."""
     from . import state as fs
+    scope = "mine" if target == "my-children" else target     # display the --scope value the caller typed
     from_surface = os.environ.get("CMUX_SURFACE_ID", "")
     from_label = fs.label_for_surface(from_surface) or (from_surface[:8] if from_surface else "fleet")
     if target == "my-children" and not from_surface:
-        sys.exit("[fleet] recycle --my-children needs $CMUX_SURFACE_ID (run inside a conductor)")
+        sys.exit("[fleet] recycle --scope mine needs $CMUX_SURFACE_ID (run inside a conductor)")
     sel, skipped = _bulk_targets(target, from_surface, from_label, a.include_muted)
     if not sel:
-        print(f"[fleet] recycle --{target}: no live targets"
+        print(f"[fleet] recycle --scope {scope}: no live targets"
               + (f" ({len(skipped)} skipped: {', '.join(l for l, _ in skipped)})" if skipped else ""))
         return 0
     ov = (f", effort={a.effort}" if a.effort else "") + (f", model={a.model}" if a.model else "")
-    print(f"[fleet] recycle --{target} (mode={mode}{ov}) from {from_label}: {len(sel)} target(s), sequential + gated")
+    print(f"[fleet] recycle --scope {scope} (mode={mode}{ov}) from {from_label}: {len(sel)} target(s), sequential + gated")
     payloads = []
     for label, entry in sel:
         payload = _recycle_plan(label, entry, caller, a.add_plugin, mode, "", a.force, a.prime, a.no_prime,
@@ -3306,7 +3301,7 @@ def _recycle_exec_one(p):
             # that fleet no longer tracks. Abort instead so the caller re-runs when the surface settles.
             if not _resume_and_gate(surf, send_cmd, p.get("tool"), old_sid, log):
                 log("ABORT: resume-summary menu never resolved within ceiling; NOT binding/registering "
-                    "(surface still booting or wedged at the menu). Re-run `fleet recycle --resume` later.")
+                    "(surface still booting or wedged at the menu). Re-run `fleet recycle` later.")
                 return 1
         # exclude pre_sid (the stale store entry snapshotted post-respawn) so a crashed launch can't
         # false-confirm on it; fresh requires a sid that is neither old_sid nor pre_sid.
@@ -3463,21 +3458,18 @@ def cmd_broadcast(argv):
       fleet broadcast "<msg>" --scope mine|all|conductors|children [--no-wake] [--expect-reply] [--dry-run]
 
     An ACT: `--scope` is REQUIRED (no fan-out default — you say who). `mine` = live children whose parent
-    label == mine. (Legacy `--target all|all-conductors|all-children|my-children` still works, hidden.)
+    label == mine.
     """
     from . import state as fs; import secrets
-    # internal target vocab (unchanged selection logic below); --scope + legacy --target both funnel here.
+    # --scope maps onto the internal target vocab (unchanged selection logic below).
     SCOPE_TO_TARGET = {"mine": "my-children", "all": "all", "conductors": "all-conductors", "children": "all-children"}
-    TARGET_TO_SCOPE = {"my-children": "mine", "all": "all", "all-conductors": "conductors", "all-children": "children"}
-    scope = target_legacy = None
+    scope = None
     no_wake = expect_reply = dry = False
     pos, i = [], 0
     while i < len(argv):
         a = argv[i]
         if a == "--scope":
             scope = argv[i + 1] if i + 1 < len(argv) else ""; i += 2
-        elif a == "--target":
-            target_legacy = argv[i + 1] if i + 1 < len(argv) else ""; i += 2
         elif a == "--no-wake":
             no_wake = True; i += 1
         elif a == "--expect-reply":
@@ -3491,11 +3483,6 @@ def cmd_broadcast(argv):
                  ' [--no-wake] [--expect-reply] [--dry-run]')
     body = " ".join(pos)
 
-    if scope is None and target_legacy is not None:            # deprecated --target -> --scope alias
-        if target_legacy not in TARGET_TO_SCOPE:
-            sys.exit(f"fleet broadcast: --target must be one of {sorted(TARGET_TO_SCOPE)}")
-        scope = TARGET_TO_SCOPE[target_legacy]
-        sys.stderr.write(f"[fleet] broadcast: --target is deprecated; use --scope {scope}\n")
     if scope is None:                                          # an ACT: no fan-out default (mirror recycle bulk)
         sys.exit("fleet broadcast: --scope required (mine|all|conductors|children)")
     if scope not in SCOPE_TO_TARGET:
@@ -3626,10 +3613,10 @@ def cmd_profile(argv):
 
 def main():
     if len(sys.argv) < 2 or sys.argv[1] in ("-h", "--help"):
-        print("usage: fleet <launch|config|ls|plugins|archive|revive|register|recycle|rm|vitals|find|graph|serve|paint|worktree|profile|daemon> ...\n"
+        print("usage: fleet <launch|config|ls|plugins|archive|revive|register|recycle|unstick|sessions|broadcast|mute|unmute|rm|vitals|find|graph|serve|paint|worktree|profile|daemon|drive-child|peer-msg|child-digest|inbox|inbox-ack> ...\n"
               "  launch <role|--adhoc NAME> [--tool t] [--place p] [--parent s] [--effort L] [--model M] [--use NAME] [--dry-run] [-- <tool flags>]\n"
               "  config <role|--adhoc NAME|--cwd DIR> [--tool t]   effective config (base settings + fleet adds)\n"
-              "  ls [--scope mine|all|conductors|children]         live fleet x hook store; flags STALE + archived (default mine = you + your children; --scope all = the world)\n"
+              "  ls [--scope mine|all|conductors|children] [--json] live fleet x hook store; flags STALE + archived (default mine = you + your children; --scope all = the world)\n"
               "  plugins <add|reconcile|ls|show|describe> ...      the plugin INDEX: add-from-URL (safe: never enables) + reconcile + on-demand discovery\n"
               "  archive <label>                                   park a live agent (revivable)\n"
               "  revive <label> [--fresh] [--session id] [--place p] [--parent s] [--add-plugin N] [-- <flags>]\n"
@@ -3638,7 +3625,7 @@ def main():
               "                                                    pull a LIVE-but-unregistered agent into the registry (recovery for a skipped auto-register)\n"
               "  recycle [label] [--fresh] [--session id] [--effort L] [--model M] [--force] [--add-plugin N] [--use NAME] [--prime T|--no-prime] [-- <flags>]\n"
               "                                                    restart in place, same surface/identity (default self+RESUME; --fresh sheds; --use = index-aware plugin add, reaches linked + enabled)\n"
-              "  recycle --scope mine|all|conductors|children [--include-muted] [--resume] [--dry-run]\n"
+              "  recycle --scope mine|all|conductors|children [--include-muted] [--dry-run]\n"
               "                                                    BULK restart (sequential + gated, skips self + muted); mine = your children; cross-conductor = the safe topology\n"
               "  unstick [label] [--surface UUID] [--dry-run]      reap a frozen dead-pid hook-store ghost (SessionEnd-less death) so ls/recycle/doctor stop trusting a dead 'running'; never touches a LIVE record\n"
               "  sessions <label> [--all] [--json]                 list resumable prior sessions for the agent's surface (id, age, size, snippet)\n"
@@ -3649,7 +3636,7 @@ def main():
               "                                                    close + archive a label (revivable; refuses mid-turn, --force overrides); --detach drops the row only; --kill adds worktree teardown; --with-group dissolves its workspace-group\n"
               "  vitals [--scope mine|all|conductors|children] [--json] [--paint] [--watch [--interval N]] cheapest-first triage table + ctx-remaining % (default mine)\n"
               "  find <query> [--turns N] [--json]                 content-aware session lookup (label/role/cwd or transcript)\n"
-              "  graph [--scope mine|all|<label>] [--html] [--out FILE]  fleet parentage tree (text/HTML); default mine = your subtree; --scope all = full tree\n"
+              "  graph [--scope mine|all|<label>] [--json] [--html] [--out FILE]  fleet parentage tree (text/JSON/HTML); default mine = your subtree; --scope all = full tree\n"
               "  serve [--port N]                                  thin read-only localhost view (graph HTML + vitals.json); no daemon\n"
               "  paint                                             sync fleet state onto the cmux sidebar (status pills + ctx bars)\n"
               "  worktree <ls | clean <label> [--wip-commit]>      manage fleet-owned git worktrees (config-gated, default-off)\n"

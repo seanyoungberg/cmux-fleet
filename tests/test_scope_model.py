@@ -3,8 +3,8 @@
 One scoping vocabulary on every scope-aware verb; the only thing that varies is the DEFAULT — reads
 (ls/vitals/inbox/graph) default `mine`, acts (recycle/broadcast) require an explicit scope. Here we cover
 the shared predicate + resolver in `state`, the read default + empty-mine hint (via `ls`), and the act
-verbs' scope routing + legacy-alias back-compat (recycle/broadcast) + the bulk mute. vitals/graph scope
-filtering lives in test_features (pure row helpers).
+verbs' scope routing (recycle/broadcast) + that the dropped legacy aliases are gone + the bulk mute.
+vitals/graph scope filtering lives in test_features (pure row helpers).
 """
 import sys
 
@@ -111,7 +111,7 @@ def test_ls_bad_scope_exits(fs, monkeypatch):
         fleet.cmd_ls(["--scope", "bogus"])
 
 
-# ── act verb: recycle (bare = self; --scope = gated bulk; legacy flags map) ────────────────────
+# ── act verb: recycle (bare = self; --scope = gated bulk; dropped legacy flags error) ──────────
 def test_recycle_scope_maps_to_bulk_target(fs, monkeypatch):
     monkeypatch.setenv("CMUX_SURFACE_ID", "SA")
     calls = []
@@ -122,19 +122,13 @@ def test_recycle_scope_maps_to_bulk_target(fs, monkeypatch):
         assert calls[-1] == target                            # act's mine -> your children
 
 
-def test_recycle_legacy_flags_route_with_deprecation(fs, monkeypatch, capsys):
-    calls = []
-    monkeypatch.setattr(fleet, "_recycle_bulk", lambda target, mode, caller, a: calls.append(target) or 0)
-    fleet.cmd_recycle(["--my-children"])
-    fleet.cmd_recycle(["--all"])
-    assert calls == ["my-children", "all"]
-    assert "deprecated" in capsys.readouterr().err            # a one-line stderr nudge, still routes
-
-
-def test_recycle_scope_and_legacy_mutually_exclusive(fs, monkeypatch):
+@pytest.mark.parametrize("flag", ["--all", "--conductors", "--children", "--my-children"])
+def test_recycle_legacy_bulk_flags_removed(fs, monkeypatch, flag):
+    # the v0.5.0 hidden bulk aliases are GONE (dropped 2026-07-07, no external users): --scope is the
+    # only bulk selector, so a bare legacy flag is now an unrecognized argument.
     monkeypatch.setattr(fleet, "_recycle_bulk", lambda *a, **k: 0)
     with pytest.raises(SystemExit):
-        fleet.cmd_recycle(["--scope", "all", "--all"])
+        fleet.cmd_recycle([flag])
 
 
 def test_recycle_bad_scope_exits(fs):
@@ -142,7 +136,7 @@ def test_recycle_bad_scope_exits(fs):
         fleet.cmd_recycle(["--scope", "bogus"])
 
 
-# ── act verb: broadcast (--scope REQUIRED; --target legacy alias) ──────────────────────────────
+# ── act verb: broadcast (--scope REQUIRED; dropped --target alias errors) ──────────────────────
 def test_broadcast_requires_scope(fs, monkeypatch):
     monkeypatch.setenv("CMUX_SURFACE_ID", "SA")
     with pytest.raises(SystemExit):
@@ -159,12 +153,13 @@ def test_broadcast_scope_mine_selects_children(fs, monkeypatch, capsys):
     assert "k1" in labels and "k2" in labels and "peer" not in labels and "otherkid" not in labels
 
 
-def test_broadcast_legacy_target_alias_maps_to_scope(fs, monkeypatch, capsys):
+def test_broadcast_legacy_target_flag_removed(fs, monkeypatch):
+    # `--target` (the v0.5.0 hidden alias) is GONE: --scope is the only selector, so --target no longer
+    # picks a scope and the act's required-scope guard fires.
     _seed(fs)
     monkeypatch.setenv("CMUX_SURFACE_ID", "SA")
-    fleet.cmd_broadcast(["msg", "--target", "my-children", "--dry-run"])
-    cap = capsys.readouterr()
-    assert "scope mine" in cap.out and "deprecated" in cap.err
+    with pytest.raises(SystemExit):
+        fleet.cmd_broadcast(["msg", "--target", "my-children", "--dry-run"])
 
 
 # ── mute --scope mine (bulk, children only) ───────────────────────────────────────────────────

@@ -97,7 +97,7 @@ def test_broadcast_muted_by_passive(fs, monkeypatch, capsys):
         f.write("passive")
     called = []
     monkeypatch.setattr(fs, "wake_if_idle", lambda surf, msg: called.append(surf) or True)
-    rc = fleet.cmd_broadcast(["heads up", "--target", "all-conductors"])
+    rc = fleet.cmd_broadcast(["heads up", "--scope", "conductors"])
     assert rc == 0
     assert called == []                                         # muted -> no wake attempted
     assert len(fs.inbox_pending("C1", kind="peer")) == 1        # the row IS queued

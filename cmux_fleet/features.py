@@ -694,13 +694,18 @@ def _scope_subtree(rows, scope, caller):
 
 
 def cmd_graph(argv):
-    """fleet graph [--scope mine|all|conductors|children|<label>] [--html] [--out FILE]   the fleet as a
-    parentage tree. Text by default; --html writes a self-contained dark page (default
-    $STATE/fleet-graph.html) and prints its path. Scoped like every read: defaults `--scope mine` (your
-    subtree, rooted at you); `--scope all` is the full tree; a bare <label> roots the subtree there."""
+    """fleet graph [--scope mine|all|conductors|children|<label>] [--json] [--html] [--out FILE]   the fleet
+    as a parentage tree. Text by default; --json emits the scoped node rows (label + parent + kind/state)
+    as machine output; --html writes a self-contained dark page (default $STATE/fleet-graph.html) and
+    prints its path. Scoped like every read: defaults `--scope mine` (your subtree, rooted at you);
+    `--scope all` is the full tree; a bare <label> roots the subtree there."""
+    as_json = "--json" in argv
     scope_arg, argv = fs.pop_scope(argv, default=None)
     scope, caller = fs.read_scope(scope_arg, "graph", sets_only=False)
     rows = _scope_subtree(snapshot(), scope, caller)
+    if as_json:
+        print(json.dumps(rows, indent=2))
+        return 0
     if "--html" not in argv:
         print(_graph_text(rows))
         if scope == "mine" and len(rows) <= 1:

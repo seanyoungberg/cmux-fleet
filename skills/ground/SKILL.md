@@ -1,6 +1,6 @@
 ---
 name: ground
-description: Orient a cmux-fleet agent at session start. Run FIRST in any cmux fleet session (conductor or worker) to learn where you are, how to dispatch, and the working conventions. The optional floor CLAUDE.md can point new agents here.
+description: Orient a cmux-fleet agent at session start. Run FIRST in any cmux fleet session (conductor or child) to learn where you are, how to dispatch, and the working conventions. The optional floor CLAUDE.md can point new agents here.
 ---
 
 # ground

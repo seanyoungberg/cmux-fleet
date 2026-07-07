@@ -303,6 +303,15 @@ def test_graph_scope_unknown_label_exits():
         ff._scope_subtree(_scope_rows(), "nosuch", "")
 
 
+def test_graph_json_emits_scoped_node_rows(monkeypatch, capsys):
+    ff = _ff()
+    monkeypatch.setattr(ff, "snapshot", lambda: _scope_rows())
+    ff.cmd_graph(["--json", "--scope", "all"])
+    data = json.loads(capsys.readouterr().out)                   # --json is machine output, no text table
+    assert {r["label"] for r in data} == {"adv", "k1", "gk", "peer", "ok"}
+    assert {r["label"]: r["parent"] for r in data}["k1"] == "adv"  # parent pointers preserved in JSON
+
+
 def test_graph_html_is_balanced():
     ff = _ff()
     from html.parser import HTMLParser

@@ -23,7 +23,7 @@ fleet ls [--scope mine|all|conductors|children]   # live x hook store; flags STA
 fleet recycle [label] [--fresh] [--session id] [--force] [-- <flags>]   # restart in place (bare = self; default RESUME; --fresh sheds)
 fleet recycle --scope mine|all|conductors|children [--include-muted]   # bulk restart, sequential + gated (mine = your children)
 fleet sessions <label>                      # list resumable prior sessions (id, age, size, snippet)
-fleet archive <label>   / fleet revive <label> [--fresh] [--session id]     # park / bring back
+fleet archive <label>   / fleet revive <label> [--fresh] [--session id]     # archive / bring back
 fleet rm <label> [--detach] [--force] [--with-group] [--wip-commit]   # close + archive (default); --detach drops row only
 fleet mute <label> / unmute <label>   [| --scope mine]   # mute one child, or all your children at once
 
@@ -41,6 +41,22 @@ fleet peer-msg <to-label> "<msg>" [--reply-to <id>] [--no-reply]
 fleet broadcast "<msg>" --scope mine|all|conductors|children   # an act: --scope REQUIRED
 fleet inbox-ack <seq> [--peer]
 ```
+
+## Vocabulary — two footguns
+
+Two words carry more than one meaning; misreading either is expensive.
+
+- **session vs transcript.** `session` is the **cmux/tool session id** — the surface's
+  bound conversation handle. The claude/codex **conversation itself** (its content) is the
+  **transcript**. `fleet sessions`, `--session <id>`, and `child-digest <session-frag>` all
+  take *transcript ids*. An agent's stable identity is its **surfaceId**, never the session —
+  a recycle/revive gives the same surface a new session id. (See `architecture.md`:
+  "Transcript = content".)
+- **`--force` means four different things** and does NOT transfer between verbs:
+  - `launch --force` — register even though the old surface is already dead.
+  - `recycle --force` — skip the empty-draft quiet-gate (a deliberate go-live).
+  - `rm --force` — close a mid-turn (`running`) surface anyway.
+  - `worktree clean --force` — force the git worktree removal.
 
 ## The router daemon
 
@@ -114,8 +130,8 @@ echo auto    > "$CMUX_STATE_DIR/notify-mode" # explicit wake-now (same as absent
 - **passive**: the single mute — suppresses idle-wake AND auto-drain fleet-wide;
   pending work waits in the inbox and surfaces via context on the next turn.
 
-The retired `autodrain` value normalizes to `auto`. Peer messages drain at Stop in
-every mode; `peer-msg --no-wake` is the per-message opt-out for acks/FYIs.
+Peer messages drain at Stop in every mode; `peer-msg --no-wake` is the per-message
+opt-out for acks/FYIs.
 
 ## Draft-through — waking through a human draft
 
@@ -184,7 +200,7 @@ fleet launch coder --worktree feat # ad-hoc: name the branch (else fleet/<label>
 fleet launch coder --worktree-base release/2.0
 fleet launch coder --no-worktree   # force-disable for a worktree=true role
 fleet worktree ls                  # branch / state (clean|dirty|GONE) / path per agent
-fleet archive coder                # park it (keeps the registry row + worktree record)
+fleet archive coder                # archive it (keeps the registry row + worktree record)
 fleet worktree clean coder         # then tear the tree down (refuse-if-dirty; --wip-commit to override)
 ```
 
@@ -227,10 +243,6 @@ thing that varies per verb is the **default**:
 - **Acts** (`recycle`, `broadcast`) take **no fan-out default** — you say who. A bare
   `fleet recycle` is self; `fleet recycle --scope mine` is your children (gated bulk);
   `fleet broadcast` **errors** without `--scope`. For acts, `mine` = your children.
-
-Back-compat: `broadcast --target all|all-conductors|all-children|my-children` and
-`recycle --all|--conductors|--children|--my-children` still work (hidden, deprecated;
-they map onto `--scope` with a one-line stderr note).
 
 ## Inspecting the fleet
 
@@ -279,14 +291,12 @@ writes.
   cmux's native `respawn-pane`. Default is **RESUME** (it preserves context — the
   least-disruptive default, ratified 2026-07-01); **`--fresh`** sheds context into
   a new session and auto-primes from the latest `handover/*.md`. `--session <id>`
-  resumes an arbitrary prior session (`fleet sessions <label>` lists them);
-  `--resume` is a no-op alias. It runs detached (so it can recycle the caller
-  itself) behind a quiet-gate that waits for an idle prompt with an empty draft
-  before respawning, never half-killing a mid-turn agent. `--force` skips the
-  draft guard. Bulk restarts many sequentially + gated, skipping self and muted
-  agents: `--scope mine|all|conductors|children` (`mine` = your children;
-  `--include-muted` to force). (Legacy `--all` / `--conductors` / `--children` /
-  `--my-children` still work, deprecated.)
+  resumes an arbitrary prior session (`fleet sessions <label>` lists them). It runs
+  detached (so it can recycle the caller itself) behind a quiet-gate that waits for
+  an idle prompt with an empty draft before respawning, never half-killing a mid-turn
+  agent. `--force` skips the draft guard. Bulk restarts many sequentially + gated,
+  skipping self and muted agents: `--scope mine|all|conductors|children` (`mine` =
+  your children; `--include-muted` to force).
 
   ```
   fleet recycle                 # recycle self, RESUME (preserve context) — the default
@@ -305,7 +315,7 @@ writes.
   fleet archive worker
   ```
 
-- **revive** brings a parked agent back into a fresh surface, resuming its last
+- **revive** brings an archived agent back into a fresh surface, resuming its last
   session by default. It replays the captured launch binding (with `--resume`
   swapped in), falling back to the registry spec for older entries. `--fresh`
   sheds into a new session (auto-primed from the handover); `--session <id>`
@@ -391,8 +401,6 @@ fleet broadcast "heads up" --scope children --no-wake
 
 Scope: `mine` (your children), `all`, `conductors`, `children`. It is an **act**,
 so `--scope` is **required** — there is no default fan-out; you always say who.
-(Legacy `--target all|all-conductors|all-children|my-children` still works,
-deprecated.)
 
 ## Reading the inbox on demand
 

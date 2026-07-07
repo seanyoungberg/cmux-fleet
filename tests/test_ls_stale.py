@@ -2,6 +2,8 @@
 # 'running' record on a DEAD pid (the SessionEnd-less brick) must render STALE, not a false 'live' --
 # the "ls lies" symptom Berg hit at the very start of the incident. Pure unit: the surface's lifecycle
 # and pid-liveness are stubbed so nothing touches the host's ~/.cmuxterm store.
+import json
+
 from cmux_fleet import cli as fleet
 
 
@@ -40,3 +42,19 @@ def test_ls_pending_row_unbound_shows_pending_not_stale(fs, monkeypatch, capsys)
     fleet.cmd_ls([])
     rows = _rows(capsys.readouterr().out)
     assert "pending" in rows["pendingkid"] and "STALE" not in rows["pendingkid"]
+
+
+def test_ls_json_emits_reconciled_rows(fs, monkeypatch, capsys):
+    # --json carries the SAME reconciliation as the text table: a dead-pid 'running' ghost reads STALE,
+    # a genuinely-live agent reads live, and cmux's raw lifecycle string is preserved honestly.
+    _seed(fs, "livekid", "S-LIVE")
+    _seed(fs, "ghostkid", "S-GHOST")
+    monkeypatch.setattr(fs, "lifecycle", lambda s: {"S-LIVE": "idle", "S-GHOST": "running"}.get(s, ""))
+    monkeypatch.setattr(fs, "surface_has_live_pid", lambda s: {"S-LIVE": True, "S-GHOST": False}.get(s, False))
+    fleet.cmd_ls(["--json", "--scope", "all"])
+    data = json.loads(capsys.readouterr().out)                   # --json is machine output, no text table
+    by = {r["label"]: r for r in data["live"]}
+    assert by["ghostkid"]["status"] == "STALE"
+    assert by["ghostkid"]["lifecycle"] == "running"              # honest cmux string, not masked
+    assert by["livekid"]["status"] == "live"
+    assert data["scope"] == "all"

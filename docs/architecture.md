@@ -66,7 +66,7 @@ Three wrapper behaviors shape the orchestration built on it:
   running a `claude` inside a cmux terminal *without* it touching cmux state.
 - **It assigns a fresh `--session-id`** unless you already pass
   `--resume`/`--session-id`/`--continue`. So a relaunch with `--resume <id>` keeps
-  the seat's session; a bare launch gets a new one. The surface id is the stable
+  the surface's session; a bare launch gets a new one. The surface id is the stable
   identity, not the session.
 - **It injects for `claude -p` too.** This is the footgun: a nested `claude -p`
   (or a Claude Code Task-tool subagent, which runs in-process on the parent's
@@ -129,11 +129,11 @@ small adapter branch plus the resume form. Two substrate differences shape the
 orchestration:
 
 - **codex registers lazily and never ends.** claude binds a session at boot;
-  codex binds on its **first turn**. So a freshly launched codex worker has no
+  codex binds on its **first turn**. So a freshly launched codex child has no
   session yet — `fleet ls` shows it `pending`, and the router backfills the
   session on its first `Stop`. codex also fires **no `SessionEnd`**, so its
   hook-store entry lingers after the process exits and re-binds on the next turn.
-  The practical rule: **drive a `pending` codex worker to bind it.**
+  The practical rule: **drive a `pending` codex child to bind it.**
 - **The resume form differs.** claude resumes with a `--resume <id>` flag; codex
   resumes with a `resume <id>` subcommand. Both continue the *same* session id;
   recycle and revive carry both shapes.
@@ -145,7 +145,7 @@ hook-declaration file**: claude reads `.claude-plugin/plugin.json` +
 names a *separate* codex hooks file; and an adapter absorbs the I/O deltas (codex
 has no `SessionEnd`, carries an `apply_patch` tool, and hands hooks a different
 stdin shape). cmux-fleet's own conductor hooks are claude-side today: codex runs
-as a first-class **worker**, but the adapter does not yet map claude's
+as a first-class **agent**, but the adapter does not yet map claude's
 `plugins`/`settings` vocabulary onto codex (it warns and ignores those keys), so
 a codex agent does not load the plugin's conductor hooks.
 
@@ -158,7 +158,7 @@ throwaway state dir gives you a clean run.
 - `fleet.json`: the **live** fleet, keyed by label:
   `{role, kind, tool, cwd, parent, place, status, surface, session, ...}`. Only
   running agents.
-- `archive.json`: **parked** agents, keyed by label, with enough to revive
+- `archive.json`: **archived** agents, keyed by label, with enough to revive
   them (last session, cwd, place, the captured launch binding).
 - `inbox.jsonl`: the unified append-only message stream. One line per message:
   `{seq, ts, kind, to, ...payload}`, where `kind` is `completion` (a child
@@ -187,7 +187,7 @@ Every agent carries four identity fields:
   directory in the roster.
 - **label**: the unique instance (set as `AGENT_LABEL`); the registry key,
   durable across recycles. Defaults to the role for a single instance.
-- **surfaceId**: the agent's current cmux seat. Mutable: recycle and revive
+- **surfaceId**: the agent's current cmux surface. Mutable: recycle and revive
   move an agent to a fresh surface while the label stays put.
 
 A conductor self-identifies via `$CMUX_SURFACE_ID`, which the hooks and the CLI
@@ -244,7 +244,7 @@ both run). Both self-identify via `$CMUX_SURFACE_ID`, read and write under
   the awareness hook).
 
 The only action that ever injects into an input box is the idle-wake, and it is
-gated: `fleet_state.wake_if_idle` submits a wake only when the surface is at the
+gated: `state.wake_if_idle` submits a wake only when the surface is at the
 prompt with an empty draft, and never when the agent is running or has a human
 draft pending.
 
@@ -290,7 +290,7 @@ same mechanism fanned out to a target set (`all`, `all-conductors`,
 - **archive** parks a live agent: SIGINT for a clean TUI exit, close the tab,
   move the entry to `archive.json` with the captured launch binding. `last_session`
   is captured from cmux's checkpoint (ground truth) so revive resumes the real id.
-- **revive** brings a parked agent back on a fresh surface, resuming its last
+- **revive** brings an archived agent back on a fresh surface, resuming its last
   session by replaying that binding (with `--resume` swapped in); `--fresh` sheds,
   `--session <id>` targets an arbitrary prior session.
 
