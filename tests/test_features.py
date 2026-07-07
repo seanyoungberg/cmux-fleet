@@ -508,6 +508,7 @@ def test_fleet_blob_serializes_and_sanitizes():
 
 def test_paint_emits_blob_to_first_conductor_workspace(monkeypatch):
     ff = _ff()
+    monkeypatch.setenv("FLEET_SIDEBAR_BLOB", "1")             # blob is opt-in (off by default)
     calls = _capture_cmux(ff, monkeypatch)
     rows = [dict(_row("worker", state="working", ctx_pct_remaining=50), ws="workspace:9", kind="child"),
             dict(_row("boss", state="working", ctx_pct_remaining=40), ws="workspace:1", kind="conductor")]

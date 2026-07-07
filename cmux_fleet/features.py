@@ -990,21 +990,25 @@ def _paint(rows):
         _cmux("set-progress", prog, "--label", f"{lbl} {pct}% left", "--workspace", ws)
         painted += 1
     # emit the whole fleet board as one delimited blob into a MARKER workspace's description, for the
-    # custom sidebar (fleet.swift) — it can't read pills, only workspace fields. Marker = the first
-    # conductor's workspace (deterministic); on-change only; the sidebar finds it by the 'FLEET2;' prefix.
+    # custom sidebar (fleet.swift) — it can't read pills, only workspace fields. OFF by default: the blob
+    # is visible as the workspace's SUBTITLE in the built-in sidebar (ugly), so plain `fleet paint` /
+    # `vitals --paint` never write it. Opt in with FLEET_SIDEBAR_BLOB=1 when the custom sidebar is active.
+    # Marker = the first conductor's workspace (deterministic); on-change only; sidebar finds it by prefix.
     blob = _fleet_blob(rows)
     marker_ws = (next((r["ws"] for r in rows if r.get("kind") == "conductor" and r["ws"]), "")
                  or next((r["ws"] for r in rows if r["ws"]), ""))
-    if marker_ws:
+    old_mark = prev.get(f"blob{_SEP}mark")
+    if os.environ.get("FLEET_SIDEBAR_BLOB") and marker_ws:
         cur[f"blob{_SEP}mark"] = marker_ws
         cur[f"blob{_SEP}val"] = blob
-        if prev.get(f"blob{_SEP}val") != blob or prev.get(f"blob{_SEP}mark") != marker_ws:
+        if prev.get(f"blob{_SEP}val") != blob or old_mark != marker_ws:
             _cmux("workspace-action", "--action", "set-description", "--description", blob,
                   "--workspace", marker_ws)
             painted += 1
-        old_mark = prev.get(f"blob{_SEP}mark")
         if old_mark and old_mark != marker_ws:                 # marker moved -> clear the stale blob
             _cmux("workspace-action", "--action", "clear-description", "--workspace", old_mark)
+    elif old_mark:                                             # blob just disabled -> wipe the lingering one
+        _cmux("workspace-action", "--action", "clear-description", "--workspace", old_mark)
     # retire pills for agents (and legacy single-'fleet' pills) that are no longer present.
     for stale in set(prev) - set(cur):
         parts = stale.split(_SEP)
