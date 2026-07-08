@@ -65,4 +65,4 @@ Note the topology split: the original hand-swept husks (issue #6) lived in a **s
 - It CANNOT reap dedicated-workspace husks — that needs an upstream cmux verb (see the `forget-surface` / `close-workspace` draft) OR a workaround (move the husk into a scratch workspace with other surfaces, then close-surface — hacky, mutates layout; not recommended).
 - Clearing the restore record is a second, still-open cmux gap folded into the same upstream ask.
 
-Upstream draft: `_meta/agents/ad-hoc/doctor-reliability/daemon-robustness/UPSTREAM-cmux-forget-surface.md`.
+Upstream draft: [`docs/upstream-cmux-forget-surface.md`](upstream-cmux-forget-surface.md) (DRAFT; the submit is Berg's button).
