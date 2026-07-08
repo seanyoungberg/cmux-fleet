@@ -322,6 +322,40 @@ def test_stop_reaps_orphaned_router(monkeypatch, capsys):
     assert "reaped stray live router" in capsys.readouterr().out
 
 
+def test_start_reaps_orphan_router_and_proceeds(monkeypatch, capsys):
+    """FIX 3 at the START path — the #7 self-heal acceptance. The supervisor is DEAD (no validated
+    supervisor, so the manager lock is free), but its `router.py --live` child survives holding the bus
+    lock. `_acquire_for_start` (the shared preamble for both `start` and launchd's `start --foreground`)
+    must REAP+REPLACE the orphan — the same self-heal `restart` does — and RETURN a held lock so start
+    proceeds, NOT bail with 'already running' / 'another start in progress' and leave the orphan wedging
+    the bus. (Structurally, the router is Popen'd with CLOEXEC, so it never holds the MANAGER lock; a dead
+    supervisor therefore frees the manager lock and this path is reachable.)"""
+    try:
+        os.remove(fd.PIDFILE)                            # no supervisor pidfile
+    except OSError:
+        pass
+    monkeypatch.setattr(fd, "_running_pid", lambda: 0)   # no validated supervisor is up
+    stray = 60123
+    monkeypatch.setattr(fd, "_lock_holder_pid", lambda: stray)   # an orphaned --live router holds the bus
+    monkeypatch.setattr(fd, "_is_live_router", lambda pid: True)  # ...and ps confirms it is a router
+    state = {"alive": True}
+    sent = []
+    def fake_kill(pid, sig):
+        sent.append((pid, sig))
+        state["alive"] = False                           # SIGTERM takes it down
+    monkeypatch.setattr(fd.os, "kill", fake_kill)
+    monkeypatch.setattr(fd, "_alive", lambda pid: state["alive"])
+    monkeypatch.setattr(fd.time, "sleep", lambda *_: None)
+    lock_fd = fd._acquire_for_start()
+    try:
+        assert lock_fd is not None                       # did NOT bail -> start proceeds to spawn a fresh daemon
+        assert sent and sent[0] == (stray, signal.SIGTERM)   # reaped the orphan bus-holder first
+        assert "reaping stray live router" in capsys.readouterr().out
+    finally:
+        if lock_fd is not None:
+            fd._release_manager_lock(lock_fd)
+
+
 def test_stop_not_running_when_no_supervisor_and_no_router(monkeypatch, capsys):
     """No supervisor AND no stray router -> a clean not-running, no signals sent."""
     try:
