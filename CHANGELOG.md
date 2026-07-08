@@ -6,6 +6,30 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [0.8.0] - 2026-07-08
+
+### Added
+
+- **Mass-close confirm-gate** — `fleet rm --with-group` on a consequential group (a live conductor or bound
+  children) now previews the full list-what-dies and requires `--yes` before acting (agent-safe: a preview +
+  `--yes` re-run, never an interactive prompt that would hang a conductor mid-turn). Prevents the group-dissolve
+  mass-close accident class.
+- **Conductor-down detection** — the fleet-doctor sweep no longer skips conductors: a stalled conductor turn, a
+  registry-live conductor sitting as a bare-shell husk (a failed self-recycle), or a closed conductor surface now
+  alerts every live peer conductor plus a surfaceless desktop banner. Guarded by transition-only firing
+  (process-local, defuses the reboot storm) and a 600s grace window (a legit recycle rebinding within it never
+  fires).
+
+### Fixed
+
+- **needs-input false-positives eliminated** — the doctor's needs-input predicate flagged ~100% false (cmux
+  stamps `needsInput` ~60s after ANY turn ends, indistinguishable from a real gate at the lifecycle level).
+  Replaced with a transcript discriminator: alert only on an actually-unanswered `AskUserQuestion`/`ExitPlanMode`;
+  suppress done-idle / survey / anything-else (fail-safe). Also guards the stall predicate against false-firing on
+  a live tool-less extended-think.
+- **Recovery-primitive residuals** — signposted the `fleet register`-after path on a bind-timeout, scaled the
+  post-menu poll for heavy loadouts, and made the checkpoint-heal loud + fail-loud when no resumable id exists.
+
 ## [0.7.0] - 2026-07-07
 
 ### Added
