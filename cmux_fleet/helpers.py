@@ -137,7 +137,7 @@ def cmd_peer_msg(argv):
         "ptype": "peer-reply" if is_reply else "peer-msg",
         "to_label": to_label, "from_surface": from_surface, "from_label": from_label,
         "msg_id": msg_id, "reply_to": flags["reply_to"], "reply_expected": reply_expected, "body": body,
-    })
+    }, event_key=f"peer:{msg_id}")
     rt = f", re {flags['reply_to']}" if is_reply else ""
     print(f"[peer-msg] {from_label} -> {to_label} (msg {msg_id}{rt}, reply: {'expected' if reply_expected else 'none'})")
 
@@ -337,19 +337,24 @@ def cmd_inbox(argv):
 # =================================================================================================
 # inbox-ack — a conductor runs this after handling the items it was shown, to mark them done so they
 # stop re-surfacing. Acks an EXACT seq (race-safe: later arrivals have a higher seq and survive).
-# Default kind is `completion`; --peer acks the peer stream, --stale the stale-member alerts.
+# EVENT-KEY ack: the seq names a ROW, and the row knows its own kind + event key — so a bare
+# `inbox-ack <seq>` acks what you actually pointed at (no more advancing the completion cursor because
+# a --doctor flag was forgotten). The kind flags stay as compat fallbacks for a seq that no longer
+# resolves to a row. Recording the cleared rows' event keys is what makes ONE ack clear every
+# presentation path (awareness/drain/heartbeat/wake/`fleet inbox`) and refuse a producer replay of the
+# same event (state.inbox_put) — the per-kind cursor alone can't stop a re-put under a new seq.
 # Self-IDs via $CMUX_SURFACE_ID.
 # =================================================================================================
 def cmd_inbox_ack(argv):
     args = list(argv)
     surface = os.environ.get("CMUX_SURFACE_ID", "")
-    kind = "completion"
+    kind_flag = None
     if "--peer" in args:
-        args.remove("--peer"); kind = "peer"
+        args.remove("--peer"); kind_flag = "peer"
     if "--stale" in args:
-        args.remove("--stale"); kind = "stale"
+        args.remove("--stale"); kind_flag = "stale"
     if "--doctor" in args:
-        args.remove("--doctor"); kind = "doctor"
+        args.remove("--doctor"); kind_flag = "doctor"
     if "--surface" in args:
         i = args.index("--surface"); surface = args[i + 1]; del args[i:i + 2]
 
@@ -357,7 +362,16 @@ def cmd_inbox_ack(argv):
         sys.exit("usage: fleet inbox-ack <seq> [--peer | --stale | --doctor] [--surface <surfaceId>]")
     if not surface:
         sys.exit("inbox-ack: no surface (set $CMUX_SURFACE_ID or pass --surface)")
+    seq = int(args[0])
 
-    now = fs.inbox_ack(surface, kind, int(args[0]))
-    print(f"[inbox-ack] surface {surface[:8]} {kind} -> {now} (acked through seq {args[0]})")
+    row = next((r for r in fs.inbox_read()
+                if int(r.get("seq", 0)) == seq and r.get("to") == surface), None)
+    kind = row.get("kind") if row else (kind_flag or "completion")
+    if row and kind_flag and kind_flag != kind:
+        print(f"[inbox-ack] note: seq {seq} is a {kind} row, not {kind_flag} — acking the {kind} stream")
+    cleared = [r for r in fs.inbox_pending(surface, kind=kind) if int(r.get("seq", 0)) <= seq]
+    fs.ack_events(surface, cleared)                    # event-level: clears every path, refuses replays
+    now = fs.inbox_ack(surface, kind, seq)             # per-kind cursor: the batch high-water (compat)
+    print(f"[inbox-ack] surface {surface[:8]} {kind} -> {now} "
+          f"(acked through seq {seq}; {len(cleared)} event(s) cleared on every path)")
     return 0

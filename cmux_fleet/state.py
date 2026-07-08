@@ -3,12 +3,15 @@
 # peer-messages into a single inbox. CODE lives in the `fleet` APP (the plugin ships only thin hook
 # wiring that shells into it); STATE under $CMUX_STATE_DIR (default $XDG_STATE_HOME/cmux-fleet).
 #
-# Stores (10 files, down from 12; one inbox mechanism instead of two):
-#   inbox.jsonl        unified append-only message stream. One line: {seq, ts, kind, to, **payload}.
-#                      kind = "completion" (child finished) | "peer" (deliberate conductor->peer send).
+# Stores (one inbox mechanism):
+#   inbox.jsonl        unified append-only message stream. One line: {seq, ts, kind, to, event_key,
+#                      **payload}. kind = "completion" | "peer" | "stale" | "doctor".
 #   inbox.seq          atomic monotonic counter behind `seq` (router AND peer-msg both append).
-#   inbox-cursors.json {surface: {acked, blocked}} — ONE high-water ack + drain-guard per surface,
-#                      across both kinds (seq is global). Replaces 4 old files.
+#   inbox-cursors.json {surface: {kind: seq}} — per-(surface,kind) ack high-water (batch clears).
+#   inbox-acked.json   {surface: {event_key: ts}} — EVENT-level ack ledger: one ack clears that event
+#                      on every presentation path AND refuses a producer re-put of the same event.
+#   inbox-presented.json {surface: {event_key: {ts,via}}} — presentation cooldown (shown-recently
+#                      state, distinct from ack): the heartbeat reminds instead of re-nudging.
 #   doctor-dedup.json  durable fleet-doctor condition keys, so daemon restarts do not re-alert
 #                      steady-state conditions already seen in a prior process.
 #   fleet.json         the LIVE fleet, label-keyed: label -> {role,kind,tool,cwd,parent,place,
@@ -37,6 +40,9 @@ DRAFTMARKS = os.path.join(STATE, "draft-marks.json")    # {surface: {text, since
 EXPECTED_CLOSE = os.path.join(STATE, "expected-close.json")  # short-lived CLI-close tombstones (list of {surface_id, ts})
 EXPECTED_CLOSE_S = 10   # a CLI-written close tombstone shields _archive_closed_surface from this surface this long
 DOCTOR_DEDUP = os.path.join(STATE, "doctor-dedup.json")
+ACKED = os.path.join(STATE, "inbox-acked.json")          # DURABLE {surface: {event_key: ts}} event-ack ledger
+PRESENTED = os.path.join(STATE, "inbox-presented.json")  # {surface: {event_key: {ts,via}}} presentation cooldown
+LEDGER_TTL_S = 14 * 86400   # acked/presented entries older than this are pruned on write (bounded files)
 PROVIDER_USAGE = os.path.join(STATE, "provider-usage.json")  # last usage poll snapshot (providers feature)
 
 # Agent-helper command hints emitted into conductor context by the awareness/drain hooks. Phase 2
@@ -152,14 +158,33 @@ def inbox_next_seq():
         os.close(fd)
 
 
-def inbox_put(kind, to_surface, payload):
-    """Append one message addressed to a surface. kind: 'completion' | 'peer' | 'stale'. ALL carry a single `to`
-    field (normalized, critic issue #7) so one reader selects 'for me'. Returns the seq."""
+def inbox_put(kind, to_surface, payload, event_key=None):
+    """Append one message addressed to a surface. kind: 'completion' | 'peer' | 'stale' | 'doctor'. ALL
+    carry a single `to` field (normalized, critic issue #7) so one reader selects 'for me'.
+
+    `event_key` is the row's durable EVENT identity (see row_event_key). A put whose key `to_surface`
+    already ACKED is REFUSED (returns 0, no row): the agent handled that event, so a producer replaying
+    it — a re-swept doctor condition after dedup-state loss, a re-delivered bus frame — must not
+    resurrect it on any presentation path. Only stable keys can pre-exist; the per-row fallback never
+    collides. Returns the seq (0 = refused)."""
+    if event_key and event_acked(to_surface, event_key):
+        return 0
     seq = inbox_next_seq()
     rec = {"seq": seq, "ts": time.time(), "kind": kind, "to": to_surface}
     rec.update(payload)
+    rec["event_key"] = event_key or f"{kind}:seq-{seq}"
     _append(INBOX, rec)
     return seq
+
+
+def row_event_key(r):
+    """The durable event identity of an inbox row — 'what happened', independent of which path presents
+    it (awareness / drain / wake / heartbeat / `fleet inbox`) and of the row's seq. Producers with a
+    stable cross-row identity pass event_key at put time (doctor: reason+label+session; peer: msg_id;
+    stale: label+surface; completion: label+session+occurred_at); anything else — including legacy rows
+    written before event keys — degrades to a per-row key, which still gives every presentation path ONE
+    shared identity to ack/cool-down against, it just can't dedup a re-put."""
+    return r.get("event_key") or f"{r.get('kind')}:seq-{r.get('seq')}"
 
 
 def inbox_read():
@@ -167,10 +192,14 @@ def inbox_read():
 
 
 def inbox_pending(surface, kind=None):
-    """Unacked messages to this surface, oldest first. Ack high-water is PER-KIND (critic issue #3):
-    a conductor can handle completions and acked them without swallowing an unread peer. Pass `kind`
-    to select one stream for display grouping; omit it for the full inbox view."""
+    """Unacked messages to this surface, oldest first. TWO ack layers filter here: the per-(surface,kind)
+    high-water cursor (critic issue #3: a conductor can ack completions without swallowing an unread
+    peer) and the EVENT-key ledger (an acked event stays cleared even if a producer re-put it under a
+    new seq the cursor hasn't reached). Every presentation path — awareness, drain, heartbeat, router
+    wake gate, `fleet inbox` — reads pending through here, so one ack clears them all at once. Pass
+    `kind` to select one stream for display grouping; omit it for the full inbox view."""
     cur = _cursors().get(surface, {})
+    acked = acked_events(surface)
     rows = []
     for r in inbox_read():
         if r.get("to") != surface:
@@ -178,8 +207,11 @@ def inbox_pending(surface, kind=None):
         k = r.get("kind")
         if kind is not None and k != kind:
             continue
-        if int(r.get("seq", 0)) > int(cur.get(k, 0)):
-            rows.append(r)
+        if int(r.get("seq", 0)) <= int(cur.get(k, 0)):
+            continue
+        if row_event_key(r) in acked:
+            continue
+        rows.append(r)
     return sorted(rows, key=lambda r: int(r.get("seq", 0)))
 
 
@@ -200,6 +232,47 @@ def inbox_ack(surface, kind, seq):
     e[kind] = max(int(e.get(kind, 0)), int(seq))
     _atomic_write(CURSORS, json.dumps(m, indent=2))
     return e[kind]
+
+
+# --- DURABLE event-level ack (one ack clears every presentation path) ------------------------
+def acked_events(surface):
+    """{event_key: ts_acked} for `surface` — the event-level ack ledger."""
+    return _read_json(ACKED, {}).get(surface, {})
+
+
+def event_acked(surface, event_key):
+    """Has `surface` already acked this event? Producers consult this via inbox_put's refusal."""
+    return event_key in acked_events(surface)
+
+
+def ack_events(surface, rows, now=None):
+    """Record `rows`' event keys as HANDLED by `surface`. THE event-level ack: inbox_pending drops an
+    acked key from every reader (awareness, drain, heartbeat, router wake gate, `fleet inbox`) and
+    inbox_put refuses a producer re-put of it — one ack clears every presentation of that event,
+    current AND future, where the per-kind cursor only clears rows the seq high-water has reached.
+    Entries older than LEDGER_TTL_S are pruned on write so the file stays bounded (the doctor dedup set
+    still blocks steady-state re-emission long after the ledger forgets)."""
+    if not rows:
+        return
+    now = time.time() if now is None else now
+    m = _read_json(ACKED, {})
+    m.setdefault(surface, {}).update({row_event_key(r): now for r in rows})
+    m = {s: {k: t for k, t in ev.items() if now - float(t or 0) < LEDGER_TTL_S} for s, ev in m.items()}
+    _atomic_write(ACKED, json.dumps({s: ev for s, ev in m.items() if ev}, indent=2))
+
+
+def inbox_event_rearm(event_key):
+    """Forget `event_key` in every surface's acked AND presented ledgers. For condition-keyed events
+    (fleet-doctor): the sweep observed the condition CLEAR, so its next occurrence is a NEW event that
+    must alert again — without this, the acked key would suppress a genuine re-alert forever. One-shot
+    keys (peer msg ids, stale closes, completions) never re-arm; they age out via LEDGER_TTL_S."""
+    for path in (ACKED, PRESENTED):
+        m = _read_json(path, {})
+        if not any(event_key in ev for ev in m.values()):
+            continue
+        for ev in m.values():
+            ev.pop(event_key, None)
+        _atomic_write(path, json.dumps({s: ev for s, ev in m.items() if ev}, indent=2))
 
 
 # --- DURABLE fleet-doctor condition dedup --------------------------------------------------

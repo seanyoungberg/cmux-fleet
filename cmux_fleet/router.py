@@ -85,6 +85,28 @@ NEEDS_INPUT_COMPLETION_SKEW_S = 2.0          # row write can lag the hook-store 
 CONDUCTOR_DOWN_GRACE_S = 600   # unbound past this = down, not mid-recycle (2026-07-08: a real recovery that
                                # day took several minutes of retries; 300s would false-fire mid-recovery)
 _doctor_fired = set()   # {(reason, label, session)} — parent-alert/seen-state dedup across ticks/restarts
+
+
+def _doctor_event_key(reason, label, session):
+    """The doctor row's durable EVENT identity — one occurrence of one condition on one bound session.
+    Deliberately the string form of the _doctor_fired dedup key: the two must move together (fire
+    together, re-arm together) or an acked event and a re-armed alarm could disagree."""
+    return f"doctor:{reason}:{label}:{session}"
+
+
+def _rearm(reason, label, session):
+    """The sweep observed condition (reason,label,session) CLEAR -> re-arm its alarm AND forget its
+    event-level ack (fs.inbox_event_rearm): the next time it goes bad is a NEW occurrence that must
+    alert again — an acked key left behind would suppress that genuine re-alert at the producer.
+    No-op unless the alarm was actually armed, so healthy members cost nothing per tick."""
+    key = (reason, label, session)
+    if key not in _doctor_fired:
+        return
+    _doctor_fired.discard(key)
+    try:
+        fs.inbox_event_rearm(_doctor_event_key(reason, label, session))
+    except Exception as e:
+        log(f"[fleet-doctor] {label}: event-ack rearm error {e}")
 # {label: last_ts_seen_LIVE} — PROCESS-LOCAL (never persisted): the transition guard for conductor-down.
 # Deliberately reset on restart so a fresh daemon never fires DOWN on a conductor it never observed live
 # (the reboot/resume-menu storm guard). Persisting it would reintroduce that storm.
@@ -257,14 +279,21 @@ def _recent_completion_for(label, session, now, rec=None):
     return False
 
 
-def deliver(parent_surface, parent_label, child_entry, child_surface):
+def deliver(parent_surface, parent_label, child_entry, child_surface, occurred_at=""):
     time.sleep(0.5)                                    # let the final assistant line flush to disk
     gist = last_assistant_text(transcript_of(store(), child_surface))
     label = child_entry.get("label", child_surface[:8])
+    # Event identity: label+session+the Stop's bus timestamp — one key per REAL completion (distinct
+    # completions of the same child differ in occurred_at), stable across re-delivery of the same frame.
+    sid = fs.bare_uuid(child_entry.get("session", ""))
+    ekey = f"completion:{label}:{sid}:{occurred_at}" if occurred_at else None
     if LIVE:
         seq = fs.inbox_put("completion", parent_surface, {
             "child_surface": child_surface, "child_session": child_entry.get("session", ""),
-            "label": label, "gist": gist})
+            "label": label, "gist": gist}, event_key=ekey)
+        if not seq:
+            log(f"[skip] {label}: completion event already acked (replayed frame) -> no row, no push")
+            return
         cmux("notify", "--surface", parent_surface, "--title",
              f"child {label} finished", "--body", (gist[:120] or "(done)"))
         log(f"[QUEUE seq={seq}] {label} -> {parent_label} | {gist[:60]}")
@@ -305,11 +334,16 @@ def _alert_conductor_peers(reason, down_label, down_entry, surface, payload, now
     woke = set() if woke is None else woke
     peers = [(lbl, e) for lbl, e in members.items()
              if e.get("kind") == "conductor" and lbl != down_label and e.get("surface")]
+    ekey = _doctor_event_key(reason, down_label, down_entry.get("session") or "")
     seq = None
     for pl, pe in peers:                                # write the inbox row regardless of the --live
         ps = pe.get("surface")                          # global (like _emit; the sweep runs from the daemon
-        seq = fs.inbox_put("doctor", ps, {"reason": reason, "label": down_label,   # and _archive_closed_surface
-                                          "child_surface": surface, **payload})     # already LIVE-gates upstream)
+        s = fs.inbox_put("doctor", ps, {"reason": reason, "label": down_label,     # and _archive_closed_surface
+                                        "child_surface": surface, **payload},       # already LIVE-gates upstream)
+                         event_key=ekey)
+        if not s:
+            continue                                    # THIS peer already acked this condition -> no row/wake
+        seq = s
         if fs.idlewake_on() and ps not in woke:
             woke.add(ps)
             fs.wake_if_idle(ps, f"(fleet-doctor) conductor {down_label} appears DOWN ({reason}); "
@@ -397,7 +431,8 @@ def _archive_closed_surface(ev):
         log(f"[stale] {label}: unresolved parent '{parent}' -> archived without alert")
         return
     seq = fs.inbox_put("stale", parent_surface, {
-        "label": label, "child_surface": surface, "via": "surface-closed", "origin": origin})
+        "label": label, "child_surface": surface, "via": "surface-closed", "origin": origin},
+        event_key=f"stale:{label}:{surface}")          # a surface closes once; stable per close event
     log(f"[STALE-ALERT seq={seq}] {label} -> {parent} (surface closed; archived)")
     maybe_idle_wake(parent_surface, parent)
 
@@ -431,7 +466,8 @@ def fleet_doctor_sweep(now=None):
 
     def _emit(reason, label, entry, surface, payload):
         nonlocal fired
-        key = (reason, label, entry.get("session") or "")
+        session = entry.get("session") or ""
+        key = (reason, label, session)
         if key in _doctor_fired:
             return                                     # already alerted this occurrence -> dedup (no storm)
         parent = entry.get("parent")                   # parent LABEL (durable); resolve like deliver()'s path
@@ -441,7 +477,15 @@ def fleet_doctor_sweep(now=None):
             log(f"[fleet-doctor] {label}: unresolved parent '{parent}' -> {reason} not alerted")
             return
         seq = fs.inbox_put("doctor", parent_surface, {
-            "reason": reason, "label": label, "child_surface": surface, **payload})
+            "reason": reason, "label": label, "child_surface": surface, **payload},
+            event_key=_doctor_event_key(reason, label, session))
+        if not seq:
+            # The parent already ACKED this very occurrence (event-key ledger) but the dedup set lost
+            # it (nuked file, pruned-then-revived member). Handled is handled: arm the alarm so we stop
+            # re-attempting, count nothing, wake nobody. A REAL re-occurrence re-arms via _rearm first.
+            _doctor_fired.add(key)
+            log(f"[fleet-doctor] {label} {reason}: suppressed — event already acked by {parent}")
+            return
         _doctor_fired.add(key)
         fired += 1
         log(f"[DOCTOR-ALERT seq={seq}] {label} {reason} -> {parent}")
@@ -466,7 +510,7 @@ def fleet_doctor_sweep(now=None):
         live_keys.add((label, session))
         if fs.surface_has_live_agent(surface):
             _conductor_live_seen[label] = now                  # transition-guard clock: last seen alive
-            _doctor_fired.discard(("conductor-down", label, session))   # recovered -> re-arm DOWN
+            _rearm("conductor-down", label, session)           # recovered -> re-arm DOWN (+ its event ack)
             rec = fs.resolve_bound_record(surface, st=st, bound=fs.bare_uuid(session))
             life = (rec.get("agentLifecycle") or "") if rec else ""
             ua = (rec.get("updatedAt") or 0) if rec else 0
@@ -475,7 +519,7 @@ def fleet_doctor_sweep(now=None):
             if life == "running" and ua and STALL_S < (now - ua) < STALL_WINDOW:
                 _emit_conductor("stall", label, entry, surface, {"stalled_s": int(now - ua)})
             else:
-                _doctor_fired.discard(("stall", label, session))
+                _rearm("stall", label, session)
             return
         # B. DOWN — a registry-live conductor whose surface holds NO live agent (a bare-shell husk a
         # failed recycle left; also the dead-pid brick, which surface_has_live_agent already reads as
@@ -521,7 +565,7 @@ def fleet_doctor_sweep(now=None):
                     _emit("never-bound", label, entry, surface,
                           {"pane_error": errline, "pending_s": int(age)})
                 else:
-                    _doctor_fired.discard(("never-bound", label, ""))   # re-arm; undriven or silent exit
+                    _rearm("never-bound", label, "")   # re-arm; undriven or silent exit
                     log(f"[fleet-doctor] {label}: pending {int(age)}s (no session, no pane error) "
                         f"— undriven or silent exit; not alerting")
                 continue
@@ -544,7 +588,7 @@ def fleet_doctor_sweep(now=None):
             # READS cmux's store, so it deliberately does not rewrite it here.
             if rec and life not in ("", "-", "ended") and not fs.pid_alive(rec.get("pid")):
                 for r in ("stall", "needs-input", "low-ctx"):
-                    _doctor_fired.discard((r, label, session))
+                    _rearm(r, label, session)
                 log(f"[fleet-doctor] {label}: bound record {life!r} on a DEAD pid {rec.get('pid')} "
                     f"(surface {surface[:8]}) — down; suppressing health alerts. `fleet unstick {label}` to clear")
                 continue
@@ -555,7 +599,7 @@ def fleet_doctor_sweep(now=None):
             if life == "running" and ua and STALL_S < (now - ua) < STALL_WINDOW:
                 _emit("stall", label, entry, surface, {"stalled_s": int(now - ua)})
             else:
-                _doctor_fired.discard(("stall", label, session))       # re-arm when it clears/ages out
+                _rearm("stall", label, session)                        # re-arm when it clears/ages out
 
             # #3 needs-input — bound record at needsInput. NO freshness gate: a genuine wait freezes
             # updatedAt for DAYS (loom-dev sat 46h; the live store holds a 46.3h needsInput record), so
@@ -578,7 +622,7 @@ def fleet_doctor_sweep(now=None):
                     continue
                 _emit("needs-input", label, entry, surface, {})
             else:
-                _doctor_fired.discard(("needs-input", label, session))  # re-arm on leaving needsInput
+                _rearm("needs-input", label, session)                   # re-arm on leaving needsInput
 
             # #2 low-ctx — context-remaining <= LOW_CTX_PCT (vitals' exact math). used=None
             # (codex/unparseable transcript) -> skip: no false alarm on an unknowable window.
@@ -591,14 +635,16 @@ def fleet_doctor_sweep(now=None):
             if pct is not None and pct <= LOW_CTX_PCT:
                 _emit("low-ctx", label, entry, surface, {"ctx_pct_remaining": pct})
             else:
-                _doctor_fired.discard(("low-ctx", label, session))     # re-arm above threshold / unknown
+                _rearm("low-ctx", label, session)                      # re-arm above threshold / unknown
         except Exception as e:
             log(f"[fleet-doctor] {label}: sweep error {e}")
 
     # prune dedup keys for members no longer live (removed) or whose session changed (recycle/rebind) —
     # bounds the set AND lets a recycled-while-still-bad member re-alert fresh under its new session.
+    # _rearm (not bare discard) so the event-level ack goes too: once we can no longer observe the
+    # condition, all its state is forgotten — a future observation starts fresh.
     for k in [k for k in _doctor_fired if (k[1], k[2]) not in live_keys]:
-        _doctor_fired.discard(k)
+        _rearm(*k)
     # prune the conductor seen-live clock for conductors no longer in the registry, so a removed label
     # can't carry a stale 'seen live' timestamp into a later reuse and false-fire DOWN on a fresh husk.
     for lbl in [l for l in _conductor_live_seen
@@ -692,7 +738,7 @@ def handle(ev):
         if not parent_surface:
             log(f"[skip] child {label}: unresolved parent '{parent}'")
             return
-        deliver(parent_surface, parent, entry, surface)
+        deliver(parent_surface, parent, entry, surface, ev.get("occurred_at") or "")
     elif kind == "conductor":
         maybe_idle_wake(surface, label)
 
