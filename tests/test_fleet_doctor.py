@@ -7,6 +7,7 @@
 # Hermetic: the hook store is mocked (fs.read_hook_store), the wake is captured (fs.wake_if_idle) so
 # nothing shells out to cmux, and ctx is controlled via features._context_used. Inbox assertions read
 # the file-backed inbox, robust to module reloads.
+import json
 import os
 
 import pytest
@@ -40,8 +41,10 @@ def _sync(monkeypatch):
     fs, features = _state, _features
     monkeypatch.setattr(router, "fs", _state)   # the sweep reads router.fs -> make it the module we patch
     router._doctor_fired.clear()
+    router._conductor_live_seen.clear()         # process-local transition guard; reset per test like _doctor_fired
     yield
     router._doctor_fired.clear()
+    router._conductor_live_seen.clear()
 
 
 def _seed_parent_child(child_extra=None, session="claude-cccccccc-1111-2222-3333-444444444444"):
@@ -180,6 +183,7 @@ def test_needs_input_fires_even_when_updatedat_is_days_old(fs, monkeypatch, wake
     _seed_parent_child()
     ancient = NOW - 46 * 3600                                   # 46 hours frozen, like loom-dev
     monkeypatch.setattr(fs, "read_hook_store", lambda: _store("needsInput", ancient))
+    monkeypatch.setattr(features, "pending_interactive_gate", lambda p: True)   # a genuine gate on the transcript
     n = router.fleet_doctor_sweep(now=NOW)
     assert n == 1
     a = fs.inbox_pending("PARENT", kind="doctor")[0]
@@ -199,6 +203,7 @@ def test_needs_input_dedup_persists_across_daemon_restart_after_ack(fs, monkeypa
     restart so a steady-state needsInput child does not produce a fresh doctor seq after every restart."""
     _seed_parent_child()
     monkeypatch.setattr(fs, "read_hook_store", lambda: _store("needsInput", NOW - 100))
+    monkeypatch.setattr(features, "pending_interactive_gate", lambda p: True)   # a genuine gate on the transcript
     assert router.fleet_doctor_sweep(now=NOW) == 1
     alert = fs.inbox_pending("PARENT", kind="doctor")[0]
     fs.inbox_ack("PARENT", "doctor", alert["seq"])
@@ -238,11 +243,70 @@ def test_later_same_session_needs_input_after_new_turn_still_alerts(fs, monkeypa
     now = completion_ts + 12 * 60
     monkeypatch.setattr(router, "NEEDS_INPUT_COMPLETION_SUPPRESS_S", 30 * 60)
     monkeypatch.setattr(fs, "read_hook_store", lambda: _store("needsInput", completion_ts + 11 * 60))
+    monkeypatch.setattr(features, "pending_interactive_gate", lambda p: True)   # a genuine gate on the transcript
 
     assert router.fleet_doctor_sweep(now=now) == 1
     alert = fs.inbox_pending("PARENT", kind="doctor")[0]
     assert alert["reason"] == "needs-input" and alert["label"] == "child"
     assert wake == ["PARENT"]
+
+
+# ── #iii transcript gate discriminator: real gate vs done-idle (the 100%-FP class) ──────────────────
+def _write_jsonl(path, rows):
+    path.write_text("".join(json.dumps(r) + "\n" for r in rows))
+    return str(path)
+
+
+_GATE_ROWS = [                                                  # last assistant ends on an UNANSWERED gate
+    {"type": "user", "message": {"role": "user", "content": "do the thing"}},
+    {"type": "assistant", "message": {"role": "assistant", "stop_reason": "tool_use",
+        "content": [{"type": "text", "text": "I need to ask."},
+                    {"type": "tool_use", "name": "AskUserQuestion", "input": {}}]}},
+]
+_DONE_ROWS = [                                                  # last assistant is a normal end_turn (done-idle)
+    {"type": "user", "message": {"role": "user", "content": "do the thing"}},
+    {"type": "assistant", "message": {"role": "assistant", "stop_reason": "end_turn",
+        "content": [{"type": "text", "text": "done."}]}},
+]
+
+
+def test_needs_input_fires_on_pending_gate(fs, monkeypatch, wake, tmp_path):
+    """End-to-end with a REAL transcript file: a needsInput member whose transcript ends on an UNANSWERED
+    AskUserQuestion is a genuine gate (the loom-dev 46h class), so the sweep alerts the parent."""
+    _seed_parent_child()
+    tp = _write_jsonl(tmp_path / "gate.jsonl", _GATE_ROWS)
+    monkeypatch.setattr(fs, "read_hook_store", lambda: _store("needsInput", NOW - 100, transcript=tp))
+    assert router.fleet_doctor_sweep(now=NOW) == 1
+    a = fs.inbox_pending("PARENT", kind="doctor")[0]
+    assert a["reason"] == "needs-input" and a["label"] == "child"
+    assert wake == ["PARENT"]
+
+
+def test_needs_input_suppressed_for_done_idle(fs, monkeypatch, wake, tmp_path):
+    """The 100%-FP class (timing-test 2026-07-07): cmux stamps needsInput ~60s after ANY turn ends, so a
+    done-idle agent (transcript ends stop_reason=end_turn) is indistinguishable from a gate by lifecycle
+    alone. The transcript discriminator suppresses it — no doctor row, no wake — and marks it seen. This
+    is the survey case (#iv) too: the survey follows a completed end_turn turn."""
+    session = _seed_parent_child()
+    tp = _write_jsonl(tmp_path / "done.jsonl", _DONE_ROWS)
+    monkeypatch.setattr(fs, "read_hook_store", lambda: _store("needsInput", NOW - 100, transcript=tp))
+    assert router.fleet_doctor_sweep(now=NOW) == 0
+    assert fs.inbox_pending("PARENT", kind="doctor") == []
+    assert wake == []
+    assert ("needs-input", "child", session) in fs.doctor_dedup_load()
+
+
+def test_pending_interactive_gate_discriminator(tmp_path):
+    """The pure discriminator: only a trailing UNANSWERED interactive tool_use is a gate. An answered gate
+    (a user/tool_result after it), a normal end_turn, an empty path, and an absent file are all not-a-gate
+    -> False (fail closed to suppress)."""
+    assert features.pending_interactive_gate(_write_jsonl(tmp_path / "g.jsonl", _GATE_ROWS))
+    assert not features.pending_interactive_gate(_write_jsonl(tmp_path / "d.jsonl", _DONE_ROWS))
+    answered = _GATE_ROWS + [{"type": "user", "message": {"role": "user",
+                             "content": [{"type": "tool_result", "content": "answer"}]}}]
+    assert not features.pending_interactive_gate(_write_jsonl(tmp_path / "a.jsonl", answered))
+    assert not features.pending_interactive_gate("")
+    assert not features.pending_interactive_gate(str(tmp_path / "nonexistent.jsonl"))
 
 
 # ── #0 dead-pid guard (the SessionEnd-freeze class, 2026-07-06) ────────────────────────────────────
@@ -268,6 +332,7 @@ def test_needs_input_dedups_then_rearms_on_leaving(fs, monkeypatch, wake):
     _seed_parent_child()
     store = {"v": _store("needsInput", NOW - 100)}
     monkeypatch.setattr(fs, "read_hook_store", lambda: store["v"])
+    monkeypatch.setattr(features, "pending_interactive_gate", lambda p: True)   # a genuine gate on the transcript
     assert router.fleet_doctor_sweep(now=NOW) == 1              # fires on entering needsInput
     assert router.fleet_doctor_sweep(now=NOW + 120) == 0        # steady-state wait -> no re-alert
     store["v"] = _store("running", NOW + 130)                  # answered -> back to work (re-arm)
@@ -276,15 +341,118 @@ def test_needs_input_dedups_then_rearms_on_leaving(fs, monkeypatch, wake):
     assert router.fleet_doctor_sweep(now=NOW + 210) == 1        # re-fires on the new transition
 
 
-# ── skips: conductors, muted, unresolved parent ────────────────────────────────────────────────────
-def test_conductor_is_never_swept(fs, monkeypatch, wake):
-    """A conductor has no parent to alert (branch on KIND, stale-path parity) — even a stalled one."""
-    fs.live_put("boss", {"surface": "BOSS", "kind": "conductor", "role": "c", "session": "claude-boss"})
-    monkeypatch.setattr(fs, "read_hook_store",
-                        lambda: _store("running", STALE_UA, surface="BOSS", sid="boss"))
-    fs.live_put("boss", {"surface": "BOSS", "kind": "conductor", "role": "c", "session": "claude-boss"})
+# ── #5 conductor-liveness: stall-lift (A) + DOWN husk (B), peer + desktop alerting ───────────────────
+CONDUCTOR_GRACE = router.CONDUCTOR_DOWN_GRACE_S
+
+
+def _seed_two_conductors():
+    """A down-candidate conductor 'downc' (surface DOWN) + a live peer 'peer' (surface PEER) to receive
+    the alert; a conductor has no parent, so the alert fans out to peers + desktop."""
+    fs.live_put("peer", {"surface": "PEER", "kind": "conductor", "role": "c", "session": "claude-peer"})
+    fs.live_put("downc", {"surface": "DOWN", "kind": "conductor", "role": "c", "session": "claude-down"})
+
+
+def _no_agents():
+    return {"sessions": {}, "activeSessionsBySurface": {}}
+
+
+def test_conductor_stall_fires_to_peer(fs, monkeypatch, wake):
+    """Predicate A: the blanket conductor-skip is lifted for STALL. A conductor whose bound 'running'
+    record is frozen in the recent window is a stalled turn — alert the PEER conductor + desktop."""
+    _seed_two_conductors()
+    monkeypatch.setattr(router, "cmux", lambda *a, **k: "")            # capture the desktop notify
+    monkeypatch.setattr(fs, "read_hook_store", lambda: _store("running", STALE_UA, surface="DOWN", sid="down"))
+    assert router.fleet_doctor_sweep(now=NOW) == 1
+    a = fs.inbox_pending("PEER", kind="doctor")[0]
+    assert a["reason"] == "stall" and a["label"] == "downc"
+    assert wake == ["PEER"]
+
+
+def test_conductor_needs_input_is_not_swept(fs, monkeypatch, wake):
+    """Content gates stay OFF for conductors: a conductor idling at needsInput is not a fleet gate to
+    escalate (no parent; the human drives it), so no alert."""
+    _seed_two_conductors()
+    monkeypatch.setattr(router, "cmux", lambda *a, **k: "")
+    monkeypatch.setattr(fs, "read_hook_store", lambda: _store("needsInput", NOW - 100, surface="DOWN", sid="down"))
     assert router.fleet_doctor_sweep(now=NOW) == 0
     assert fs.inbox_read() == []
+
+
+def test_conductor_down_fires_after_grace_once_seen_live(fs, monkeypatch, wake):
+    """Predicate B: a conductor SEEN live by this process that becomes a bare-shell husk (no live agent)
+    and stays down past the grace window alerts peers + desktop — the ~9h berg-sandbox outage class."""
+    _seed_two_conductors()
+    monkeypatch.setattr(router, "cmux", lambda *a, **k: "")
+    store = {"v": _store("running", FRESH_UA, surface="DOWN", sid="down")}     # downc alive this tick
+    monkeypatch.setattr(fs, "read_hook_store", lambda: store["v"])
+    assert router.fleet_doctor_sweep(now=NOW) == 0                             # seen live -> recorded, nothing fires
+    store["v"] = _no_agents()                                                 # recycle bricked it -> husk shell
+    assert router.fleet_doctor_sweep(now=NOW + CONDUCTOR_GRACE + 5) == 1
+    a = fs.inbox_pending("PEER", kind="doctor")[0]
+    assert a["reason"] == "conductor-down" and a["label"] == "downc"
+    assert wake == ["PEER"]
+
+
+def test_conductor_down_suppressed_within_grace(fs, monkeypatch, wake):
+    """A husk INSIDE the grace window is a recycle rebinding, not a death — no alert (600s is generous
+    on purpose: a real recovery took minutes of retries, 2026-07-08)."""
+    _seed_two_conductors()
+    monkeypatch.setattr(router, "cmux", lambda *a, **k: "")
+    store = {"v": _store("running", FRESH_UA, surface="DOWN", sid="down")}
+    monkeypatch.setattr(fs, "read_hook_store", lambda: store["v"])
+    assert router.fleet_doctor_sweep(now=NOW) == 0
+    store["v"] = _no_agents()
+    assert router.fleet_doctor_sweep(now=NOW + CONDUCTOR_GRACE - 30) == 0      # still inside grace
+    assert fs.inbox_read() == []
+
+
+def test_conductor_down_suppressed_if_never_seen_live(fs, monkeypatch, wake):
+    """The reboot/resume-menu storm guard: a conductor this PROCESS never observed live (post-reboot the
+    launchd daemon replays launch cmds, leaving conductors unbound at a resume menu) is not a transition
+    to DOWN — it must not fire even long past the grace window."""
+    _seed_two_conductors()
+    monkeypatch.setattr(router, "cmux", lambda *a, **k: "")
+    monkeypatch.setattr(fs, "read_hook_store", _no_agents)
+    assert router.fleet_doctor_sweep(now=NOW + 10 * CONDUCTOR_GRACE) == 0
+    assert fs.inbox_read() == []
+
+
+def test_conductor_down_rearms_on_recovery(fs, monkeypatch, wake):
+    """DOWN fires once, then the conductor is revived (live again) and later dies again — the second death
+    re-alerts (dedup re-armed on recovery), not silenced."""
+    _seed_two_conductors()
+    monkeypatch.setattr(router, "cmux", lambda *a, **k: "")
+    store = {"v": _store("running", FRESH_UA, surface="DOWN", sid="down")}
+    monkeypatch.setattr(fs, "read_hook_store", lambda: store["v"])
+    assert router.fleet_doctor_sweep(now=NOW) == 0                             # seen live
+    store["v"] = _no_agents()
+    assert router.fleet_doctor_sweep(now=NOW + CONDUCTOR_GRACE + 5) == 1       # down -> fires
+    assert router.fleet_doctor_sweep(now=NOW + CONDUCTOR_GRACE + 10) == 0      # steady down -> deduped
+    store["v"] = _store("running", NOW + CONDUCTOR_GRACE + 20, surface="DOWN", sid="down")  # revived
+    assert router.fleet_doctor_sweep(now=NOW + CONDUCTOR_GRACE + 25) == 0      # recovered, re-armed
+    store["v"] = _no_agents()
+    assert router.fleet_doctor_sweep(now=NOW + 3 * CONDUCTOR_GRACE) == 1       # dies again -> re-alerts
+
+
+def test_conductor_seen_clock_pruned_on_removal(fs, monkeypatch, wake):
+    """The seen-live clock is pruned when a conductor leaves the registry, so a REUSED label that starts
+    as a husk is 'never seen live by this process' again — no false DOWN from a stale timestamp."""
+    _seed_two_conductors()
+    monkeypatch.setattr(router, "cmux", lambda *a, **k: "")
+    store = {"v": _store("running", FRESH_UA, surface="DOWN", sid="down")}
+    monkeypatch.setattr(fs, "read_hook_store", lambda: store["v"])
+    assert router.fleet_doctor_sweep(now=NOW) == 0                 # downc seen live -> clock set
+    assert "downc" in router._conductor_live_seen
+    fs.live_del("downc")                                          # conductor removed from the registry
+    store["v"] = _no_agents()
+    assert router.fleet_doctor_sweep(now=NOW + 5) == 0
+    assert "downc" not in router._conductor_live_seen             # pruned on removal
+    _seed_two_conductors()                                        # label reused, starts as a husk
+    assert router.fleet_doctor_sweep(now=NOW + 2 * CONDUCTOR_GRACE) == 0   # never-seen guard holds -> no fire
+    assert fs.inbox_read() == []
+
+
+# ── skips: muted, unresolved parent ─────────────────────────────────────────────────────────────────
 
 
 def test_muted_child_is_skipped(fs, monkeypatch, wake):

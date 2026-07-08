@@ -88,6 +88,19 @@ def test_awareness_surfaces_doctor_alert(fs):
     assert "--doctor" in ctx                                          # per-kind ack hint
 
 
+def test_awareness_renders_conductor_liveness_alerts(fs):
+    """The two conductor-liveness rows (condition #5, routed to a PEER conductor) render a distinct DOWN
+    line and — unlike the still-live health rows — DO carry a `fleet revive` affordance (the seat is gone)."""
+    fs.inbox_put("doctor", SURF, {"reason": "conductor-down", "label": "berg-sandbox",
+                                  "child_surface": "F1C0AEDB", "down_s": 900})
+    fs.inbox_put("doctor", SURF, {"reason": "conductor-closed", "label": "cmux-advisor",
+                                  "child_surface": "DCCA9A19"})
+    ctx = json.loads(_run("hook-awareness").stdout)["hookSpecificOutput"]["additionalContext"]
+    assert "CONDUCTOR DOWN" in ctx and "berg-sandbox" in ctx
+    assert "CONDUCTOR SURFACE CLOSED" in ctx and "cmux-advisor" in ctx
+    assert "fleet revive berg-sandbox" in ctx                         # the seat is gone -> revive affordance
+
+
 def test_awareness_doctor_and_stale_coexist(fs):
     """A doctor health alert and a stale archive alert are DIFFERENT kinds and both surface independently
     (a member can't be both, but the inbox carries both channels)."""

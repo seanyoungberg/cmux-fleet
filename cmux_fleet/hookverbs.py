@@ -27,9 +27,11 @@ def _read_stdin():
 
 
 def _doctor_line(r):
-    """One rendered line for a kind='doctor' heartbeat-sweep alert (stall / low-ctx / needs-input). The
-    member is still LIVE — the affordance is inspect/drive/recycle, NOT revive (contrast the archived
-    'stale' rows). Unknown reasons degrade to a generic 'needs attention' rather than dropping."""
+    """One rendered line for a kind='doctor' heartbeat-sweep alert. Most rows flag a still-LIVE member
+    (inspect/drive/recycle, NOT revive — contrast the archived 'stale' rows); the two conductor-liveness
+    rows (conductor-down / conductor-closed) flag a PEER conductor that looks DOWN and route to the OTHER
+    conductors + Berg's desktop, where the affordance IS revive. Unknown reasons degrade to a generic
+    'needs attention' rather than dropping."""
     label = r.get("label", "?")
     surf = (r.get("child_surface") or "")[:8]
     reason = r.get("reason", "?")
@@ -47,6 +49,13 @@ def _doctor_line(r):
         err = (r.get("pane_error") or "").strip()
         detail = (f"NEVER BOUND — launched ~{mins}m ago, no session; the process died on spawn"
                   + (f" ({err})" if err else "") + f". `fleet rm {label} --kill` + relaunch (fix the flags)")
+    elif reason == "conductor-down":
+        mins = int(r.get("down_s") or 0) // 60
+        detail = (f"CONDUCTOR DOWN — no live agent on its surface for ~{mins}m (a bricked recycle husk); "
+                  f"check it and `fleet revive {label}` if it is dead")
+    elif reason == "conductor-closed":
+        detail = (f"CONDUCTOR SURFACE CLOSED — its surface vanished and it was archived; "
+                  f"`fleet revive {label}` to bring it back")
     else:
         detail = f"needs attention ({reason})"
     return f"seq {r.get('seq')}  {label} (surface {surf}): {detail}"
