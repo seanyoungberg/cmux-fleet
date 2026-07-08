@@ -82,6 +82,32 @@ def test_classify_keywords_only_apply_when_not_working():
     assert ff._classify("running", True, "error: transient") == "working"
 
 
+def test_open_gate_uuids_only_unreplied_gates(monkeypatch):
+    ff = _ff()
+    u_open = "2502f0f3-fd17-4370-9709-7f0417d188eb"
+    u_done = "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee"
+    feed = {"items": [
+        {"kind": "question", "request_id": f"claude-{u_open}-PermissionRequest"},            # OPEN gate
+        {"kind": "question", "request_id": f"claude-{u_done}-x", "resolved_at": "2026-07-08"},# resolved
+        {"kind": "permission", "workstream_id": f"claude-{u_done}", "status": "expired"},      # terminal
+        {"kind": "toolUse", "workstream_id": "claude-ffffffff-1111-2222-3333-444444444444"},   # not a gate
+    ]}
+    monkeypatch.setattr(ff, "_cmux", lambda *a: json.dumps(feed))
+    gates = ff._open_gate_uuids()
+    assert gates == {u_open}                                  # only the unreplied gate's session
+
+
+def test_infer_state_open_gate_forces_needs_input(monkeypatch):
+    ff = _ff()
+    u = "2502f0f3-fd17-4370-9709-7f0417d188eb"
+    monkeypatch.setattr(ff.fs, "lifecycle", lambda surf: "idle")
+    monkeypatch.setattr(ff.fs, "last_agent_text", lambda p, cap=400: "wrapped up cleanly")
+    entry = {"surface": "S1", "session": True}
+    sess = {"sessionId": u, "transcriptPath": ""}
+    assert ff._infer_state(entry, sess, {u}) == "needs-input"      # open gate -> genuinely blocked
+    assert ff._infer_state(entry, sess, frozenset()) == "idle"     # no gate -> refine default (idle)
+
+
 # ── context-token reading ─────────────────────────────────────────────────────────────────────
 def test_context_used_sums_claude_usage(tmp_path):
     ff = _ff()

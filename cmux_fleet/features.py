@@ -309,10 +309,40 @@ def _classify(life, has_session, last_text, open_gate=False):
     return _refine(last_text, "ready" if life == "needsInput" else "idle")
 
 
-def _infer_state(entry, session):
-    """state for one agent: read live signals, then classify (the impure edge over _classify)."""
+_GATE_KINDS = ("question", "permission", "exitplan", "exit_plan", "askuser", "askuserquestion")
+_TERMINAL_GATE = ("expired", "resolved", "replied", "answered", "completed", "dismissed", "cancelled")
+
+
+def _open_gate_uuids():
+    """Session uuids that currently have an UNREPLIED actionable Feed gate (AskUserQuestion / permission /
+    ExitPlan) — cmux's authoritative 'this agent is truly blocked' signal. A gate is OPEN when it has no
+    `resolved_at` and a non-terminal status. Maps a gate to its agent via the session uuid embedded in the
+    item's request_id / workstream_id / session_id. Fails OPEN (empty set) on any error, so a Feed hiccup
+    degrades to 'no false needs-input' rather than a crash."""
+    out = set()
+    try:
+        data = json.loads(_cmux("rpc", "feed.list", "{}") or "{}")
+    except Exception:
+        return out
+    for it in data.get("items", []):
+        if (it.get("kind") or "").lower() not in _GATE_KINDS:
+            continue
+        if it.get("resolved_at") or (it.get("status") or "").lower() in _TERMINAL_GATE:
+            continue                                          # already handled -> not an open gate
+        for field in ("request_id", "workstream_id", "session_id", "session"):
+            u = fs.bare_uuid(it.get(field) or "")
+            if u:
+                out.add(u)
+    return out
+
+
+def _infer_state(entry, session, open_gates=frozenset()):
+    """state for one agent: read live signals, then classify (the impure edge over _classify). `open_gates`
+    is the set of session uuids with an unreplied Feed gate (computed once per snapshot)."""
+    sid = fs.bare_uuid(session.get("sessionId", ""))
     return _classify(fs.lifecycle(entry.get("surface", "")), bool(entry.get("session")),
-                     fs.last_agent_text(session.get("transcriptPath", ""), cap=400))
+                     fs.last_agent_text(session.get("transcriptPath", ""), cap=400),
+                     open_gate=bool(sid) and sid in open_gates)
 
 
 def snapshot():
@@ -321,12 +351,13 @@ def snapshot():
         model effort cwd last_text last_age_s
     Pure derive: registry + hook store + transcripts. No cmux screen reads (keeps it cheap)."""
     store = fs.read_hook_store()
+    open_gates = _open_gate_uuids()                           # one Feed query per snapshot (not per agent)
     now = time.time()
     rows = []
     for label, e in fs.live_all().items():
         surf = e.get("surface", "")
         sess = _freshest_session(store, surf)
-        state = _infer_state(e, sess)
+        state = _infer_state(e, sess, open_gates)
         used, tmodel = _context_used(sess.get("transcriptPath", ""))
         # Fix 1: the LAUNCHED model carries the window flavor ([1m]); the transcript model doesn't.
         # Prefer it, fall back to the transcript's, then the tool keyword — window is derived from it.
