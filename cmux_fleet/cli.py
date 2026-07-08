@@ -25,7 +25,7 @@
 #   [role.<name>.<t>]     that role's config for tool <t> (plugins/flags/env/settings)
 # Resolution for `launch <role>`: tool = --tool | role.tool | defaults.tool. Merge
 # [defaults] (orchestration) -> [role] scalars -> tool config [tool.<t>] -> [role.<t>] -> caller `--`.
-import argparse, json, os, shlex, subprocess, sys, tempfile, time
+import argparse, json, os, re, shlex, subprocess, sys, tempfile, time
 
 from .config import ROOT, STATE, CMUX, FLOOR, FLEET_TOML, ADHOC_SUBDIR, PLUGIN_INDEX, load_plugin_index  # path resolver
 
@@ -449,6 +449,87 @@ def _all_workspace_uuids(tree_text):
     import re
     UUID = r"[0-9A-Fa-f]{8}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{12}"
     return {m.group(1) for m in re.finditer(r"workspace\s+workspace:\d+\s+(" + UUID + ")", tree_text or "")}
+
+
+# --- #6 bare-shell surface reaper: the husk safety gate (pure, testable) ---------------------------
+_HUSK_UUID = r"[0-9A-Fa-f]{8}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{12}"
+# The FLEET-specific launch fingerprint. A human's shell NEVER contains these env assignments; they are
+# emitted only by `fleet launch`/recycle (render_send_cmd). This env prefix is the core discriminator
+# that makes closing a matched surface safe — it is why a human's manual shell can never be a candidate.
+_FLEET_LAUNCH_SIG = re.compile(r"AGENT_ROLE=|AGENT_LABEL=|CMUX_FLEET_(?:STATE_DIR|TOML|ROOT|MARKETPLACE)")
+_HUSK_RESUME = re.compile(r"claude --resume\s+(" + _HUSK_UUID + r")")
+_HUSK_LABEL = re.compile(r"AGENT_LABEL=([A-Za-z0-9._-]+)")
+# A live claude/codex TUI paints one of these; a bare login-shell husk never does. SECONDARY guard —
+# pid/hook liveness (surface_has_live_agent, the union of both tool stores) is the authority.
+_HUSK_LIVE_TUI = re.compile(r"Context Remaining|bypass permissions on \(shift|esc to interrupt\)|"
+                            r"⏵⏵ bypass|Auto-accept edits|for shortcuts|\btokens \(\d", re.I)
+_HUSK_PROMPT = re.compile(r"^.*?@\S+\s+\S.*?[%$]\s?(.*)$|^\s*[❯➜\$%]\s?(.*)$")
+
+
+def _prompt_typed_text(line):
+    """If `line` is a shell prompt, return the text typed AFTER the prompt char ('' for a bare idle
+    prompt); None if the line is not a prompt at all. The tail-guard uses this to detect human activity
+    (any typed command) after a fleet launch artifact."""
+    m = _HUSK_PROMPT.match(line.strip())
+    if not m:
+        return None
+    return (m.group(1) or m.group(2) or "").strip()
+
+
+def _pane_shows_live_tui(pane_text):
+    """A painted claude/codex TUI (defensive backstop to the pid liveness check)."""
+    return bool(_HUSK_LIVE_TUI.search(pane_text or ""))
+
+
+def _husk_evidence(pane_text):
+    """PURE classifier for a NON-live surface's captured pane. Returns
+      {'husk': True,  'label': <AGENT_LABEL>, 'resume_id': <claude --resume id>, 'reason': ...}  or
+      {'husk': False, 'reason': <why not>}.
+    A surface is a husk ONLY IF it carries the FLEET launch signature AND that artifact is the pane's
+    TAIL — after the last signature line there is NOTHING but blank lines, claude's 'Resume this session
+    with:' exit hint, or a BARE shell prompt. Any human-typed command after the artifact (the 0A3A252A
+    case: a manual `cd` after a replayed launch line) FAILS the guard -> not a husk. This is the safety
+    gate: it never fingerprints a human's shell (no fleet env prefix) nor a shell a human has since used
+    (a typed command after the artifact)."""
+    lines = list((pane_text or "").splitlines())
+    ne = [(i, l) for i, l in enumerate(lines) if l.strip()]
+    if not ne:
+        return {"husk": False, "reason": "empty pane"}
+    sig_idx = None
+    for i, l in ne:
+        if _FLEET_LAUNCH_SIG.search(l):
+            sig_idx = i                                   # the LAST fleet-signature line
+    if sig_idx is None:
+        return {"husk": False, "reason": "no fleet launch signature (human shell)"}
+    for i, l in ne:
+        if i <= sig_idx:
+            continue
+        s = l.strip()
+        if s.lower().startswith("resume this session with") or _HUSK_RESUME.search(s):
+            continue                                      # claude's exit hint -> allowed after the artifact
+        typed = _prompt_typed_text(s)
+        if typed and not _FLEET_LAUNCH_SIG.search(typed) and not _HUSK_RESUME.search(typed):
+            return {"husk": False, "reason": f"human activity after launch artifact: {typed[:48]!r}"}
+        # a bare prompt (typed == '') or a launch-command continuation line -> allowed
+    lab = _HUSK_LABEL.search(pane_text)
+    rid = _HUSK_RESUME.search(pane_text)
+    return {"husk": True, "label": lab.group(1) if lab else "",
+            "resume_id": rid.group(1) if rid else "",
+            "reason": "fleet launch artifact is the tail; bare shell; no live agent"}
+
+
+def _iter_terminal_surfaces(tree_text):
+    """Yield (surface_uuid, workspace_uuid, title) for every TERMINAL surface in `cmux tree` TEXT (pure).
+    Tracks the most-recent workspace line, like surface_ws_from_tree."""
+    ws = ""
+    for line in (tree_text or "").splitlines():
+        mw = re.search(r"workspace\s+workspace:\d+\s+(" + _HUSK_UUID + ")", line)
+        if mw:
+            ws = mw.group(1)
+            continue
+        ms = re.search(r"surface\s+surface:\d+\s+(" + _HUSK_UUID + r")\s+\[terminal\]\s+\"([^\"]*)\"", line)
+        if ms:
+            yield ms.group(1), ws, ms.group(2)
 
 
 def _ref_to_uuid(kind, ref):
@@ -2797,6 +2878,89 @@ def _known_session(entry, surf, sid):
     return any(fs.bare_uuid(s) == want for s, *_ in _list_sessions(entry, surf))
 
 
+def cmd_reap_surfaces(argv):
+    """Survey (DRY-RUN) orphaned bare-shell HUSK surfaces: a terminal surface carrying a FLEET launch
+    artifact as its tail, with NO live agent and NO registry entry — the inert login shells cmux's
+    session-restore replays on reboot, and the shells a fleet agent leaves when its claude exits without
+    a fleet archive. Closes NOTHING by default. Every terminal surface is classified into tracked /
+    live-agent / human-shell / husk-candidate; only husk-candidate is ever reapable, and only via the
+    review-gated --close path (archive-first: harvest the resume id + label, write the archive record,
+    re-verify, THEN cmux close-surface). --close refuses until that path is signed off."""
+    ap = argparse.ArgumentParser(prog="fleet reap-surfaces", add_help=True,
+                                 description="find orphaned bare-shell husk surfaces (dry-run); --close is review-gated")
+    ap.add_argument("--all", action="store_true", help="survey EVERY workspace (default: fleet-managed only)")
+    ap.add_argument("--json", action="store_true", help="machine output")
+    ap.add_argument("--close", action="store_true", help="(review-gated) close husk candidates; refuses for now")
+    a = ap.parse_args(argv)
+    from . import state as fs
+
+    live = fs.live_all()
+    member_surf = {(e.get("surface") or "").upper(): lbl for lbl, e in live.items() if e.get("surface")}
+    # fleet-managed workspaces = where live OR archived members live (an agent that exited leaves its
+    # workspace member-less, so archived members matter for reach). A husk with a fleet AGENT_LABEL is
+    # proven fleet-origin regardless of workspace, so it is always in scope (see below).
+    managed_ws = {(e.get("workspace") or "").upper() for e in live.values() if e.get("workspace")}
+    managed_ws |= {(e.get("workspace") or "").upper() for e in fs.archive_all().values() if e.get("workspace")}
+    tree = cmuxq("tree", "--all", "--id-format", "both")
+
+    buckets = {"tracked": [], "live-agent": [], "human-shell": [], "husk-candidate": []}
+    for surf, ws, title in _iter_terminal_surfaces(tree):
+        u = surf.upper()
+        in_scope = a.all or (ws or "").upper() in managed_ws
+        if u in member_surf:
+            buckets["tracked"].append({"surface": surf, "label": member_surf[u], "title": title})
+            continue
+        if fs.surface_has_live_agent(surf):               # codex-aware: union hook store + live pid is the authority
+            buckets["live-agent"].append({"surface": surf, "note": "live agent (pid)", "title": title})
+            continue
+        pane = cmuxq("capture-pane", "--surface", surf) or ""
+        if _pane_shows_live_tui(pane):
+            buckets["live-agent"].append({"surface": surf, "note": "TUI painted", "title": title})
+            continue
+        ev = _husk_evidence(pane)
+        if ev["husk"]:
+            # a husk carrying a fleet AGENT_LABEL is proven fleet-origin -> always in scope (the env
+            # prefix, not the workspace, is the safety gate); a label-less husk falls back to workspace/--all.
+            husk_in_scope = in_scope or bool(ev.get("label"))
+            buckets["husk-candidate"].append({"surface": surf, "workspace": ws, "title": title,
+                                              "label": ev.get("label", ""), "resume_id": ev.get("resume_id", ""),
+                                              "reason": ev["reason"], "in_scope": husk_in_scope})
+        else:
+            buckets["human-shell"].append({"surface": surf, "title": title, "reason": ev["reason"]})
+
+    candidates = [h for h in buckets["husk-candidate"] if h["in_scope"]]
+    if a.json:
+        print(json.dumps({"scope": "all" if a.all else "fleet-managed",
+                          "buckets": buckets, "reapable_in_scope": len(candidates)}, indent=2))
+        return 0
+
+    scope = "ALL workspaces" if a.all else "fleet-managed workspaces (use --all for every workspace)"
+    total = sum(len(v) for v in buckets.values())
+    print(f"[reap-surfaces] DRY-RUN — {total} terminal surfaces in {scope}. Closes NOTHING.\n")
+    for k, lbl in (("tracked", "TRACKED (live fleet member)"),
+                   ("live-agent", "LIVE AGENT (live pid / painted TUI)"),
+                   ("human-shell", "HUMAN SHELL (no fleet launch signature, or human-touched)"),
+                   ("husk-candidate", "HUSK CANDIDATE (reapable)")):
+        print(f"  {lbl}: {len(buckets[k])}")
+    if buckets["husk-candidate"]:
+        print("\n  husk candidates:")
+        for h in buckets["husk-candidate"]:
+            mark = "" if h["in_scope"] else "   [out of default scope — use --all]"
+            print(f"    - {h['surface'][:8]}  label={h['label'] or '?'}  "
+                  f"resume={(h['resume_id'][:8] + '…') if h['resume_id'] else '(none)'}  "
+                  f"\"{h['title'][:34]}\"{mark}")
+            arch = (f"label={h['label']}, resume={h['resume_id']}" if h["resume_id"]
+                    else "NO resume id harvested — --close would SKIP it (never close a pointer we cannot record)")
+            print(f"        archive-on-close would record: {arch}")
+    print(f"\n  reapable in scope: {len(candidates)}")
+    if a.close:
+        print("\n[reap-surfaces] --close is REVIEW-GATED and not yet enabled. Run this dry-run, get sign-off, "
+              "then the gated close path ships (archive-first per candidate + re-verify + cmux close-surface).")
+        return 2
+    print("  (dry-run only) closing ships review-gated: fleet reap-surfaces --close")
+    return 0
+
+
 def cmd_sessions(argv):
     """List resumable prior claude sessions for an agent's surface (freshest first) so an operator can
     pick an id for `fleet recycle --session <id>` / `fleet revive --session <id>` without
@@ -4041,6 +4205,7 @@ def main():
               "  recycle --scope mine|all|conductors|children [--include-muted] [--dry-run]\n"
               "                                                    BULK restart (sequential + gated, skips self + muted); mine = your children; cross-conductor = the safe topology\n"
               "  unstick [label] [--surface UUID] [--dry-run]      reap a frozen dead-pid hook-store ghost (SessionEnd-less death) so ls/recycle/doctor stop trusting a dead 'running'; never touches a LIVE record\n"
+              "  reap-surfaces [--all] [--json] [--close]          DRY-RUN survey of orphaned bare-shell HUSK surfaces (fleet launch artifact + no live agent + no registry); gated on the fleet env prefix + tail guard; --close is review-gated\n"
               "  sessions <label> [--all] [--json]                 list resumable prior sessions for the agent's surface (id, age, size, snippet)\n"
               "  broadcast \"<msg>\" --scope mine|all|conductors|children [--no-wake] [--expect-reply] [--dry-run]\n"
               "                                                    input-safe heads-up to live agents (e.g. after a toml/floor change); never restarts them; --scope REQUIRED (an act)\n"
@@ -4075,7 +4240,7 @@ def main():
     fns = {"launch": cmd_launch, "config": cmd_config, "ls": cmd_ls, "plugins": cmd_plugins,
            "archive": cmd_archive, "revive": cmd_revive, "register": cmd_register, "recycle": cmd_recycle,
            "move": cmd_move, "group": cmd_group,
-           "unstick": cmd_unstick, "sessions": cmd_sessions,
+           "unstick": cmd_unstick, "reap-surfaces": cmd_reap_surfaces, "sessions": cmd_sessions,
            "_recycle-exec": cmd_recycle_exec, "_recycle-bulk-exec": cmd_recycle_bulk_exec,
            "broadcast": cmd_broadcast,
            "mute": lambda a: cmd_mute(a, mute=True), "unmute": lambda a: cmd_mute(a, mute=False),
