@@ -203,9 +203,11 @@ def _alert_pending(surface):
 def maybe_idle_wake(parent_surface, label):
     if not (LIVE and fs.idlewake_on()):
         return
-    if not _alert_pending(parent_surface):
+    pending = _alert_pending(parent_surface)
+    if not pending:
         return
     if fs.wake_if_idle(parent_surface, "(auto-wake) handle your pending fleet inbox items"):
+        fs.presented_mark(parent_surface, pending, "wake")   # cooldown: the heartbeat won't re-nudge these
         log(f"[IDLE-WAKE] {label}: empty prompt -> submitted wake trigger")
     elif fs.surface_busy(parent_surface):               # skip-on-RUNNING -> parent goes idle soon -> retry
         log(f"[idle-wake] skip {label}: mid-turn -> scheduling bounded retry")
@@ -232,10 +234,12 @@ def _idle_wake_retry_loop(surface, label):
             time.sleep(delay)
             if not fs.idlewake_on():                    # dial muted mid-retry -> stop
                 return
-            if not _alert_pending(surface):
+            pending = _alert_pending(surface)
+            if not pending:
                 log(f"[idle-wake-retry] {label}: inbox drained before wake -> done")
                 return                                  # handled meanwhile (woken elsewhere / acked)
             if fs.wake_if_idle(surface, "(auto-wake) handle your pending fleet inbox items"):
+                fs.presented_mark(surface, pending, "wake")
                 log(f"[idle-wake-retry] {label}: woke after ~{delay}s backoff")
                 return
             if not fs.surface_busy(surface):            # turn ended but still not wakeable (draft/no prompt)
@@ -346,8 +350,9 @@ def _alert_conductor_peers(reason, down_label, down_entry, surface, payload, now
         seq = s
         if fs.idlewake_on() and ps not in woke:
             woke.add(ps)
-            fs.wake_if_idle(ps, f"(fleet-doctor) conductor {down_label} appears DOWN ({reason}); "
-                                f"check it and `fleet revive {down_label}` if it is")
+            if fs.wake_if_idle(ps, f"(fleet-doctor) conductor {down_label} appears DOWN ({reason}); "
+                                   f"check it and `fleet revive {down_label}` if it is"):
+                fs.presented_mark(ps, [{"event_key": ekey}], "wake")
     cmux("notify", "--title", f"conductor {down_label} DOWN ({reason})",
          "--body", f"fleet-doctor found no live agent on {down_label}; revive with: fleet revive {down_label}")
     log(f"[CONDUCTOR-DOWN seq={seq}] {down_label} {reason} -> {len(peers)} peer(s) + desktop")
@@ -491,8 +496,9 @@ def fleet_doctor_sweep(now=None):
         log(f"[DOCTOR-ALERT seq={seq}] {label} {reason} -> {parent}")
         if fs.idlewake_on() and parent_surface not in woke:   # dial-gated wake, once per parent per tick
             woke.add(parent_surface)
-            fs.wake_if_idle(parent_surface, f"(fleet-doctor) child {label} needs attention ({reason}); "
-                                            f"handle your pending fleet inbox items")
+            if fs.wake_if_idle(parent_surface, f"(fleet-doctor) child {label} needs attention ({reason}); "
+                                               f"handle your pending fleet inbox items"):
+                fs.presented_mark(parent_surface, [{"event_key": _doctor_event_key(reason, label, session)}], "wake")
 
     def _emit_conductor(reason, label, entry, surface, payload):
         nonlocal fired

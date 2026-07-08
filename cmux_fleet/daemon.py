@@ -42,6 +42,10 @@ ROUTER_LOCK = os.path.join(STATE, "router.live.lock")   # the router's bus-level
 ROUTER_HEALTH = os.path.join(STATE, "router.health")    # the router's bus-consumption liveness stamp
 MANAGER_LOCK = os.path.join(STATE, "router.daemon.lock")  # the daemon MANAGER lock (start/ownership)
 DEFAULT_HEARTBEAT = 540                              # 9 min, within the spec's 8-10 min window
+HEARTBEAT_REMIND_S = 1800    # presentation cooldown (audit fix #4): a row a direct wake / drain / awareness
+                             # pass already showed is NOT re-nudged until it has gone unshown-and-unacked
+                             # this long. ~3 default ticks: a genuinely-ignored row still gets a reminder,
+                             # but the heartbeat stops re-nudging every tick for rows the agent has seen.
 USAGE_POLL_S = 180                                   # providers feature: refresh subscription-usage snapshot ~every 3 min
 HEALTH_STALE_S = 60          # a live router silent on the bus longer than this (bus HB ~15s) is WEDGED
 HEALTH_CHECK_S = 30          # how often the supervisor re-checks the router is still consuming the bus
@@ -358,11 +362,23 @@ def _heartbeat_tick():
         if e.get("kind") != "conductor" or e.get("muted"):
             continue
         surf = e.get("surface", "")
-        if not surf or not fs.inbox_pending(surf):   # both kinds; nothing pending -> skip
+        if not surf:
+            continue
+        pending = fs.inbox_pending(surf)             # both kinds; already event-ack-filtered
+        if not pending:
+            continue
+        # Presentation cooldown (audit fix #4): nudge ONLY for rows no path (direct wake / drain /
+        # awareness / a prior heartbeat) has shown within HEARTBEAT_REMIND_S. A fresh row nudges at
+        # once; an already-shown-but-unacked row waits out the reminder window. This is what turns the
+        # heartbeat from a re-nudge-every-tick backstop into a reminder — the duplicate-notification
+        # class the audit flagged (heartbeat re-waking rows a direct wake / drain already surfaced).
+        fresh = fs.unpresented(surf, pending, HEARTBEAT_REMIND_S)
+        if not fresh:
             continue
         if fs.wake_if_idle(surf, "(heartbeat) you have pending inbox items waiting in your context; handle them"):
+            fs.presented_mark(surf, fresh, "heartbeat")   # reminded now -> reset this row's cooldown clock
             nudged += 1
-            print(f"[heartbeat] nudged {label} ({surf[:8]})", flush=True)
+            print(f"[heartbeat] nudged {label} ({surf[:8]}; {len(fresh)} un-shown row(s))", flush=True)
     print(f"[heartbeat] tick: {nudged} nudge(s)", flush=True)
 
 

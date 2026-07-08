@@ -4102,8 +4102,9 @@ def cmd_broadcast(argv):
             "ptype": "broadcast", "to_label": label, "from_surface": from_surface,
             "from_label": from_label, "msg_id": bid, "reply_to": None,
             "reply_expected": expect_reply, "body": body,
-        })
+        }, event_key=f"peer:{bid}")                      # one broadcast id; per-surface in the ledger
         if not no_wake and fs.idlewake_on() and fs.wake_if_idle(surf, "(broadcast-wake) a fleet broadcast is waiting in your context; handle it"):
+            fs.presented_mark(surf, [{"event_key": f"peer:{bid}"}], "wake")   # cooldown: no heartbeat re-nudge
             woke.append(label)                          # 'passive' mutes the wake fleet-wide; the inbox rows are still written
     fs.log_event("broadcast", **{"from": from_label, "scope": scope, "count": len(sel), "msg_id": bid})
     print(f"[broadcast] {from_label} -> {len(sel)} agent(s) (scope {scope}, msg {bid}, "

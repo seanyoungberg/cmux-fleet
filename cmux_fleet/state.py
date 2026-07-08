@@ -261,6 +261,46 @@ def ack_events(surface, rows, now=None):
     _atomic_write(ACKED, json.dumps({s: ev for s, ev in m.items() if ev}, indent=2))
 
 
+# --- presentation cooldown (shown-recently state; distinct from ack) --------------------------
+def presented_mark(surface, rows, via, now=None):
+    """Stamp `rows` as PRESENTED to `surface` by path `via` (awareness|drain|wake|heartbeat).
+    Presentation state, NOT ack: the row stays pending until acked; this only answers 'was this agent
+    already shown this event recently?' — the ledger the heartbeat consults so it REMINDS on a
+    deliberate interval instead of re-nudging every tick for rows a wake/drain/awareness pass already
+    surfaced. Entries older than LEDGER_TTL_S are pruned on write. Best-effort (never raises into a
+    wake/hook path)."""
+    if not rows:
+        return
+    try:
+        now = time.time() if now is None else now
+        m = _read_json(PRESENTED, {})
+        m.setdefault(surface, {}).update({row_event_key(r): {"ts": now, "via": via} for r in rows})
+        m = {s: {k: v for k, v in ev.items() if now - float((v or {}).get("ts") or 0) < LEDGER_TTL_S}
+             for s, ev in m.items()}
+        _atomic_write(PRESENTED, json.dumps({s: ev for s, ev in m.items() if ev}, indent=2))
+    except Exception:
+        pass
+
+
+def unpresented(surface, rows, within, now=None):
+    """The subset of `rows` NOT shown to `surface` within the last `within` seconds by ANY path — the
+    heartbeat's re-nudge filter. A NEW row (never presented) passes at once; an already-shown row passes
+    again only after `within` elapses (the deliberate reminder backstop for a row nobody acked). Fails
+    open to 'not presented' so a garbage ledger can only cause an extra nudge, never a silent stall."""
+    now = time.time() if now is None else now
+    seen = _read_json(PRESENTED, {}).get(surface, {})
+    out = []
+    for r in rows:
+        v = seen.get(row_event_key(r))
+        try:
+            fresh = v is not None and (now - float((v or {}).get("ts") or 0)) < within
+        except (TypeError, ValueError):
+            fresh = False
+        if not fresh:
+            out.append(r)
+    return out
+
+
 def inbox_event_rearm(event_key):
     """Forget `event_key` in every surface's acked AND presented ledgers. For condition-keyed events
     (fleet-doctor): the sweep observed the condition CLEAR, so its next occurrence is a NEW event that

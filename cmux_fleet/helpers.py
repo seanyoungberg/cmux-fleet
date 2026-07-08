@@ -147,6 +147,9 @@ def cmd_peer_msg(argv):
         print(f"[peer-msg] no wake (notify-mode passive): {to_label} sees it on its next turn")
         return 0
     if fs.wake_if_idle(to_surface, "(peer-wake) you have a new peer message waiting in your context; handle it"):
+        # cooldown: a successful direct peer-wake shows the row NOW, so the heartbeat must not
+        # immediately re-nudge the same peer msg on its next tick (audit issue #6).
+        fs.presented_mark(to_surface, [{"event_key": f"peer:{msg_id}"}], "wake")
         print(f"[peer-msg] woke {to_label} to process it now")
     else:
         print(f"[peer-msg] no wake: {to_label} is busy or has a draft; it sees the msg on its next turn")

@@ -73,6 +73,11 @@ def cmd_hook_awareness(argv):
         peers = fs.inbox_pending(surface, kind="peer") if surface else []
         if not comp and not stale and not doctor and not peers:
             return 0
+        # Presentation cooldown (audit fix #4): every prompt shows the FULL pending inbox in context, so
+        # mark all of it PRESENTED. This is the heartbeat's re-nudge suppressor — an agent actively
+        # submitting prompts plainly sees its inbox, so the backstop stays quiet until the reminder
+        # window elapses. NOT an ack: the rows stay pending until the agent runs `fleet inbox-ack`.
+        fs.presented_mark(surface, comp + stale + doctor + peers, "awareness")
 
         lines = []
         if comp:
@@ -154,6 +159,11 @@ def cmd_hook_drain(argv):
 
         if not comp and not stale and not peers:
             return 0
+        # Presentation cooldown (audit fix #4): the Stop-hook block auto-continues the turn with these
+        # rows in the reason, so mark them PRESENTED. Keeps the heartbeat from re-nudging a row the drain
+        # just surfaced. Doctor rows never drain (by design), so they're not marked here — awareness /
+        # the heartbeat's own mark cover them.
+        fs.presented_mark(surface, comp + stale + peers, "drain")
 
         lines = []
         if comp:

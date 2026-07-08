@@ -4,9 +4,11 @@
 # producer replay of it; the presentation ledger keeps the heartbeat from re-nudging rows some path
 # already showed. Hermetic like test_fleet_doctor: hook store mocked, wakes captured, file-backed inbox.
 import os
+import time
 
 import pytest
 
+from cmux_fleet import daemon as fd
 from cmux_fleet import features
 from cmux_fleet import helpers as fh
 from cmux_fleet import router
@@ -168,3 +170,94 @@ def test_sweep_clear_then_bad_realerts_after_ack(monkeypatch, wake):
     store["v"] = _store("running", STALE_UA)                     # a NEW stall
     assert router.fleet_doctor_sweep(now=NOW) == 1               # ...alerts fresh
     assert len(fs.inbox_pending("PARENT", kind="doctor")) == 1
+
+
+# ══ PRESENTATION COOLDOWN (audit fix #4) ═════════════════════════════════════════════════════════
+# presented_mark / unpresented: shown-recently state (distinct from ack). The heartbeat REMINDS on an
+# interval instead of re-nudging every tick for a row a direct wake / drain / awareness already showed.
+
+# ── state primitives ────────────────────────────────────────────────────────────────────────────
+def test_unpresented_fresh_row_passes_then_cools_down():
+    rows = [{"event_key": "peer:m1"}]
+    assert fs.unpresented("S", rows, 1800) == rows              # never shown -> passes at once
+    fs.presented_mark("S", rows, "wake", now=NOW)
+    assert fs.unpresented("S", rows, 1800, now=NOW + 10) == []  # just shown -> in cooldown
+    assert fs.unpresented("S", rows, 1800, now=NOW + 1801) == rows  # window elapsed -> reminder due
+
+
+def test_presented_is_per_surface_and_per_event():
+    fs.presented_mark("S", [{"event_key": "peer:m1"}], "wake", now=NOW)
+    assert fs.unpresented("S", [{"event_key": "peer:m2"}], 1800, now=NOW + 10) == [{"event_key": "peer:m2"}]
+    assert fs.unpresented("T", [{"event_key": "peer:m1"}], 1800, now=NOW + 10) == [{"event_key": "peer:m1"}]
+
+
+def test_presented_mark_is_not_an_ack():
+    fs.inbox_put("completion", "S", {"label": "w"}, event_key="completion:w:x:1")
+    fs.presented_mark("S", fs.inbox_pending("S"), "awareness")
+    assert len(fs.inbox_pending("S")) == 1                      # still pending — cooldown never clears rows
+
+
+# ── heartbeat: nudge fresh, remind on interval, never re-nudge a shown row ────────────────────────
+@pytest.fixture
+def _quiet_sweep(monkeypatch):
+    """Isolate the heartbeat nudge logic from the doctor sweep (its own tested path)."""
+    monkeypatch.setattr(router, "fleet_doctor_sweep", lambda *a, **k: 0)
+
+
+def test_heartbeat_nudges_fresh_row_then_suppresses_on_next_tick(monkeypatch, _quiet_sweep):
+    fs.live_put("cond", {"role": "c", "kind": "conductor", "surface": "SC", "status": "live"})
+    fs.inbox_put("completion", "SC", {"gist": "x", "label": "k"}, event_key="completion:k:s:1")
+    attempted = []
+    monkeypatch.setattr(fs, "wake_if_idle", lambda surf, msg: attempted.append(surf) or True)
+    monkeypatch.setattr(fs, "idlewake_on", lambda: True)
+
+    fd._heartbeat_tick()
+    assert attempted == ["SC"]                                  # fresh pending row -> nudged (+ marked)
+    fd._heartbeat_tick()
+    assert attempted == ["SC"]                                  # 2nd tick within window -> NO re-nudge
+
+
+def test_heartbeat_skips_row_a_direct_wake_already_showed(monkeypatch, _quiet_sweep):
+    fs.live_put("cond", {"role": "c", "kind": "conductor", "surface": "SC", "status": "live"})
+    fs.inbox_put("peer", "SC", {"from_label": "p", "body": "hi", "msg_id": "m1"}, event_key="peer:m1")
+    fs.presented_mark("SC", fs.inbox_pending("SC"), "wake")     # peer-msg direct-wake already showed it
+    attempted = []
+    monkeypatch.setattr(fs, "wake_if_idle", lambda surf, msg: attempted.append(surf) or True)
+    monkeypatch.setattr(fs, "idlewake_on", lambda: True)
+    fd._heartbeat_tick()
+    assert attempted == []                                      # already shown -> heartbeat stays quiet
+
+
+def test_heartbeat_reminds_after_window(monkeypatch, _quiet_sweep):
+    fs.live_put("cond", {"role": "c", "kind": "conductor", "surface": "SC", "status": "live"})
+    fs.inbox_put("completion", "SC", {"gist": "x", "label": "k"}, event_key="completion:k:s:1")
+    # shown long ago (past the reminder window) and never acked -> the backstop reminder is due
+    fs.presented_mark("SC", fs.inbox_pending("SC"), "awareness",
+                      now=time.time() - (fd.HEARTBEAT_REMIND_S + 60))
+    attempted = []
+    monkeypatch.setattr(fs, "wake_if_idle", lambda surf, msg: attempted.append(surf) or True)
+    monkeypatch.setattr(fs, "idlewake_on", lambda: True)
+    fd._heartbeat_tick()
+    assert attempted == ["SC"]                                  # stale presentation -> reminded
+
+
+def test_heartbeat_skips_when_all_pending_acked(monkeypatch, _quiet_sweep):
+    fs.live_put("cond", {"role": "c", "kind": "conductor", "surface": "SC", "status": "live"})
+    seq = fs.inbox_put("completion", "SC", {"gist": "x", "label": "k"}, event_key="completion:k:s:1")
+    fs.ack_events("SC", fs.inbox_pending("SC"))
+    fs.inbox_ack("SC", "completion", seq)
+    attempted = []
+    monkeypatch.setattr(fs, "wake_if_idle", lambda surf, msg: attempted.append(surf) or True)
+    monkeypatch.setattr(fs, "idlewake_on", lambda: True)
+    fd._heartbeat_tick()
+    assert attempted == []                                      # nothing pending -> no nudge
+
+
+# ── direct-wake path marks presented (router idle-wake) ──────────────────────────────────────────
+def test_maybe_idle_wake_marks_presented(monkeypatch):
+    monkeypatch.setattr(router, "LIVE", True)
+    monkeypatch.setattr(fs, "idlewake_on", lambda: True)
+    monkeypatch.setattr(fs, "wake_if_idle", lambda surf, msg: True)
+    fs.inbox_put("completion", "SC", {"label": "k", "gist": "x"}, event_key="completion:k:s:1")
+    router.maybe_idle_wake("SC", "cond")
+    assert fs.unpresented("SC", fs.inbox_pending("SC"), fd.HEARTBEAT_REMIND_S) == []   # marked by the wake
