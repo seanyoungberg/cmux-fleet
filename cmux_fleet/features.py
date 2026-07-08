@@ -59,10 +59,11 @@ STATE_STYLE = {
     "review":      ("#3E63DD", "eye.fill",                      2),
     "working":     ("#30A46C", "gearshape.fill",                3),
     "done":        ("#46A758", "checkmark.circle.fill",         4),
-    "idle":        ("#8B8D98", "moon.zzz.fill",                 5),
-    "pending":     ("#8B8D98", "hourglass",                     6),
-    "stale":       ("#6F6E77", "questionmark.circle",           7),
-    "gone":        ("#6F6E77", "xmark.circle",                  7),
+    "ready":       ("#3DB9A0", "circle.dashed",                 5),   # calm teal — turn finished, available
+    "idle":        ("#8B8D98", "moon.zzz.fill",                 6),
+    "pending":     ("#8B8D98", "hourglass",                     7),
+    "stale":       ("#6F6E77", "questionmark.circle",           8),
+    "gone":        ("#6F6E77", "xmark.circle",                  8),
 }
 
 
@@ -277,26 +278,35 @@ def pending_interactive_gate(transcript_path):
                for c in (msg.get("content") or []))
 
 
-def _classify(life, has_session, last_text):
-    """PURE state classifier, NO LLM (unit-testable). cmux's agentLifecycle is authoritative for live
-    work; the keyword tables only REFINE an idle agent from its last transcript line. Stateless (no
-    stickiness in v0.1)."""
-    if life == "running":
-        return "working"
-    if life == "needsInput":
-        return "needs-input"
-    if life in ("", "ended", "unknown"):
-        return "pending" if not has_session else "stale"
-    text = (last_text or "").lower()                          # life == "idle": refine from last words
+def _refine(last_text, default):
+    """Keyword-refine a not-actively-working agent from its last transcript line. Returns error / review /
+    done, else `default`. NOTE: no longer emits 'needs-input' — a real block is now signalled ONLY by an
+    open Feed gate (see _classify), so stale block-phrases in the transcript can't raise a false alarm."""
+    text = (last_text or "").lower()
     if any(h in text for h in ERROR_HINTS):
         return "error"
-    if any(h in text for h in BLOCK_HINTS):
-        return "needs-input"
     if any(h in text for h in REVIEW_HINTS):
         return "review"
     if any(h in text for h in DONE_HINTS):
         return "done"
-    return "idle"
+    return default
+
+
+def _classify(life, has_session, last_text, open_gate=False):
+    """PURE state classifier, NO LLM (unit-testable). An open Feed GATE (unreplied AskUserQuestion /
+    permission / ExitPlan) is the authoritative 'needs-input' signal — it means the agent truly cannot
+    proceed. cmux's agentLifecycle is authoritative for live work; when cmux says `needsInput` but NO gate
+    is open, that's just a FINISHED TURN, so we fall through to the keyword-refine and land on review / done
+    / 'ready' (the calm just-finished-and-available state) instead of a false 'needs-input'. Stateless."""
+    if open_gate:
+        return "needs-input"                                  # unreplied Feed gate -> genuinely blocked
+    if life == "running":
+        return "working"
+    if life in ("", "ended", "unknown"):
+        return "pending" if not has_session else "stale"
+    # life == "needsInput" (turn ended, no open gate) OR "idle": refine from last words. A just-ended turn
+    # defaults to 'ready' (recently active, available); a long-dormant agent stays 'idle'.
+    return _refine(last_text, "ready" if life == "needsInput" else "idle")
 
 
 def _infer_state(entry, session):

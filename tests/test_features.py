@@ -42,8 +42,17 @@ def _ff():
 def test_classify_lifecycle_authoritative():
     ff = _ff()
     assert ff._classify("running", True, "anything") == "working"
-    assert ff._classify("needsInput", True, "") == "needs-input"
     assert ff._classify("idle", True, "") == "idle"
+
+
+def test_classify_needs_input_only_on_open_gate():
+    ff = _ff()
+    # an UNREPLIED Feed gate is the ONLY needs-input signal -> genuinely blocked
+    assert ff._classify("needsInput", True, "", open_gate=True) == "needs-input"
+    assert ff._classify("idle", True, "", open_gate=True) == "needs-input"
+    # cmux says needsInput but NO open gate = the turn just ENDED -> 'ready', never a false needs-input
+    assert ff._classify("needsInput", True, "") == "ready"
+    assert ff._classify("needsInput", True, "Standing by for your direction.") == "ready"
 
 
 def test_classify_pending_vs_stale_when_no_session():
@@ -52,16 +61,22 @@ def test_classify_pending_vs_stale_when_no_session():
     assert ff._classify("", True, "") == "stale"             # had one, surface gone
 
 
-def test_classify_keyword_refines_idle():
+def test_classify_keyword_refines_finished_turn_and_idle():
     ff = _ff()
-    assert ff._classify("idle", True, "Traceback (most recent call last)") == "error"
-    assert ff._classify("idle", True, "Do you want to proceed? [y/n]") == "needs-input"
+    # a finished turn (needsInput, no gate) refines to error/review/done, else 'ready'
+    assert ff._classify("needsInput", True, "Traceback (most recent call last)") == "error"
+    assert ff._classify("needsInput", True, "opened pull request #42") == "review"
+    assert ff._classify("needsInput", True, "all tests passed ✓ done") == "done"
+    assert ff._classify("needsInput", True, "wrapped up, standing by") == "ready"
+    # idle refines the same way but defaults to 'idle' (long-dormant), not 'ready'
     assert ff._classify("idle", True, "opened pull request #42") == "review"
-    assert ff._classify("idle", True, "all tests passed ✓ done") == "done"
     assert ff._classify("idle", True, "still chugging along on the refactor") == "idle"
+    # a stale block-phrase in the transcript NO LONGER forces needs-input (Feed gate is authoritative)
+    assert ff._classify("idle", True, "Do you want to proceed? [y/n]") == "idle"
+    assert ff._classify("needsInput", True, "approve? [y/n]") == "ready"
 
 
-def test_classify_keywords_only_apply_to_idle():
+def test_classify_keywords_only_apply_when_not_working():
     ff = _ff()
     # a running agent that happens to print "error" mid-work stays working (lifecycle wins)
     assert ff._classify("running", True, "error: transient") == "working"
