@@ -343,25 +343,36 @@ def test_handle_archives_muted_member_on_surface_closed(fs, monkeypatch):
     assert len(fs.inbox_pending("PARENT", kind="stale")) == 1         # muted still alerts
 
 
-def test_handle_conductor_surface_closed_archives_without_alert(fs, monkeypatch):
-    """A CONDUCTOR's own surface closing is archived like any stale row but alerts NOBODY — it has no
-    parent to tell (branch on KIND, not role, same as the Stop path)."""
+def test_handle_conductor_surface_closed_alerts_peers(fs, monkeypatch):
+    """A CONDUCTOR's surface closing is the SAME undetected-down gap as the sweep's husk predicate: no
+    parent means the old silent return let a dead conductor sit unnoticed. It is archived like any stale
+    row AND now alerts every peer conductor + Berg's desktop (conductor-liveness #5, 2026-07-08 ruling)."""
     from cmux_fleet import cli
     fs.live_put("boss", {"surface": "BOSS", "kind": "conductor", "role": "c",
                          "session": "claude-boss"})
-    monkeypatch.setattr(router, "LIVE", True)
+    fs.live_put("peer", {"surface": "PEER", "kind": "conductor", "role": "c",
+                         "session": "claude-peer"})
+    monkeypatch.setattr(router, "fs", fs)   # test_features's reimport can leave router.fs stale; pin it so
+    monkeypatch.setattr(router, "LIVE", True)  # the real wake path (fs.idlewake_on/wake_if_idle) is the one we patch
     monkeypatch.setattr(router, "_reg", {"mtime": 0, "by_label": {}, "by_surface": {}})
     monkeypatch.setattr(cli, "_resume_binding", lambda surf: {})
     monkeypatch.setattr(router, "_surface_ws_now", lambda s: "")     # surface is GONE (a true close)
-    waked = []
-    monkeypatch.setattr(router, "maybe_idle_wake", lambda parent_surface, label: waked.append(parent_surface))
+    monkeypatch.setattr(fs, "idlewake_on", lambda: True)
+    woke = []
+    monkeypatch.setattr(fs, "wake_if_idle", lambda surf, msg: woke.append(surf) or True)
+    notified = []
+    monkeypatch.setattr(router, "cmux", lambda *a, **k: notified.append(a) or "")
 
     router.handle(_surface_closed_ev("BOSS"))
 
     assert fs.live_get("boss") is None                                # archived...
     assert fs.archive_get("boss") is not None
-    assert fs.inbox_read() == []                                      # ...but NO alert queued anywhere
-    assert waked == []                                                # and no wake attempted
+    alerts = fs.inbox_pending("PEER", kind="doctor")                  # ...and the PEER conductor is alerted
+    assert len(alerts) == 1
+    assert alerts[0]["reason"] == "conductor-closed" and alerts[0]["label"] == "boss"
+    assert alerts[0]["child_surface"] == "BOSS"
+    assert woke == ["PEER"]                                           # peer woken
+    assert any("notify" in a for a in notified)                       # + surfaceless desktop banner for Berg
 
 
 def test_maybe_idle_wake_fires_on_stale_only_inbox(monkeypatch):

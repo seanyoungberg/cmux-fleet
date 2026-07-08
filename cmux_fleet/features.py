@@ -223,6 +223,60 @@ def _context_used(path):
     return used, model
 
 
+# The interactive tool calls that genuinely BLOCK a turn on the human. A trailing, unanswered one of
+# these is the ONLY needsInput state the fleet-doctor should alert on (fleet-doctor #iii). Everything
+# else at needsInput — a completed turn idling >~60s at the prompt (which cmux also stamps needsInput via
+# Claude's idle Notification hook), the feedback survey, a max-tokens stop — is a done-idle NON-gate.
+_INPUT_GATE_TOOLS = frozenset({"AskUserQuestion", "ExitPlanMode"})
+_GATE_TAIL_BYTES = 262144   # read only the transcript tail: a gate is always the last thing written
+
+
+def pending_interactive_gate(transcript_path):
+    """True iff the transcript's LAST assistant turn ends on an UNANSWERED interactive gate
+    (AskUserQuestion / ExitPlanMode) with nothing after it — the one 'agent is blocked on the human'
+    state a needsInput lifecycle can mean. This is the discriminator the needs-input predicate needs:
+    cmux stamps needsInput for BOTH a real gate AND an ordinary done-idle turn (>~60s at the prompt), so
+    the lifecycle string alone can't tell them apart, but the transcript can — a done-idle turn ends with
+    stop_reason=end_turn, a gate ends on the tool_use.
+
+    Reads only the tail (a gate is always the last write). FAILS CLOSED to False on any ambiguity —
+    absent/unreadable transcript, end_turn, an answered gate, codex (no transcript) — so the predicate
+    SUPPRESSES rather than alerts when it can't prove a gate. The needs-input FP flood is what we are
+    killing, and the genuine gate still has the completion backstop + a human eventually noticing; a
+    false SUPPRESS is strictly safer than the 100%-FP status quo."""
+    if not transcript_path or not os.path.exists(transcript_path):
+        return False
+    try:
+        with open(transcript_path, "rb") as f:
+            f.seek(0, 2)
+            size = f.tell()
+            f.seek(max(0, size - _GATE_TAIL_BYTES), 0)
+            chunk = f.read().decode("utf-8", "ignore")
+    except Exception:
+        return False
+    rows = []
+    for line in chunk.splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            rows.append(json.loads(line))          # a leading partial line just fails to parse -> skipped
+        except Exception:
+            continue
+    last = next((i for i in range(len(rows) - 1, -1, -1) if rows[i].get("type") == "assistant"), None)
+    if last is None:
+        return False
+    # anything AFTER the last assistant answered it (a tool_result / a new user turn) -> not pending
+    if any(r.get("type") == "user" for r in rows[last + 1:]):
+        return False
+    msg = rows[last].get("message") or {}
+    if msg.get("stop_reason") not in ("tool_use", None):       # end_turn / max_tokens / stop -> done-idle
+        return False
+    return any(isinstance(c, dict) and c.get("type") == "tool_use"
+               and c.get("name") in _INPUT_GATE_TOOLS
+               for c in (msg.get("content") or []))
+
+
 def _classify(life, has_session, last_text):
     """PURE state classifier, NO LLM (unit-testable). cmux's agentLifecycle is authoritative for live
     work; the keyword tables only REFINE an idle agent from its last transcript line. Stateless (no

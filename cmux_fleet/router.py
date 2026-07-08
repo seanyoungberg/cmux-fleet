@@ -72,7 +72,23 @@ NEVER_BOUND_S = 600     # a LAZY child (codex) registered but with NO session bo
                         # healthy batch-launched-not-yet-driven child never false-fires) -- see condition #4.
 NEEDS_INPUT_COMPLETION_SUPPRESS_S = 120      # only the immediate post-Stop idle duplicate; not later gates
 NEEDS_INPUT_COMPLETION_SKEW_S = 2.0          # row write can lag the hook-store lifecycle stamp slightly
+# --- conductor-liveness (condition #5, the both-down backstop the sweep used to skip entirely) ----------
+# A conductor has no parent to alert, so it went uncaught: a self-recycle could brick the seat and it sat
+# down for hours (berg-sandbox, ~9h, 2026-07-04). The sweep now runs TWO conductor-only predicates —
+# stall (reuses #1) and DOWN (a registry-live conductor whose surface holds no live agent: a bare-shell
+# husk a failed recycle left). Alerting a conductor is higher-stakes than a child nudge (a false-alarm
+# STORM on conductors is worse than the gap), so DOWN fires only under two guards: (1) transition-only —
+# the conductor was seen LIVE by THIS process before it went husk, which defuses the reboot/resume-menu
+# storm (launchd replays launch cmds on boot, so post-reboot conductors sit unbound at a resume menu; a
+# process that never saw them live never fires); and (2) a generous grace window, so a legit recycle that
+# rebinds within it never fires. See the conductor-down issue + REPORT-doctor-reliability.
+CONDUCTOR_DOWN_GRACE_S = 600   # unbound past this = down, not mid-recycle (2026-07-08: a real recovery that
+                               # day took several minutes of retries; 300s would false-fire mid-recovery)
 _doctor_fired = set()   # {(reason, label, session)} — parent-alert/seen-state dedup across ticks/restarts
+# {label: last_ts_seen_LIVE} — PROCESS-LOCAL (never persisted): the transition guard for conductor-down.
+# Deliberately reset on restart so a fresh daemon never fires DOWN on a conductor it never observed live
+# (the reboot/resume-menu storm guard). Persisting it would reintroduce that storm.
+_conductor_live_seen = {}
 
 
 def cmux(*args, timeout=10):
@@ -277,6 +293,33 @@ def _surface_error_line(surface):
     return cli.launch_error_line(cmux("capture-pane", "--surface", surface) or "")
 
 
+def _alert_conductor_peers(reason, down_label, down_entry, surface, payload, now=None, members=None, woke=None):
+    """Alert every OTHER live conductor plus Berg's desktop that conductor `down_label` looks DOWN
+    (conductor-liveness condition #5). A conductor has no parent, so the alert fans out to peers and to a
+    surfaceless macOS banner (`cmux notify` with no --surface) that reaches Berg regardless of focus or
+    which peers are awake. Rides the same inbox+wake rail as completions/stale. Shared by BOTH the sweep's
+    DOWN/stall predicates and _archive_closed_surface's conductor branch. Best-effort per channel; the
+    desktop banner fires even with zero live peers (the both-down case this backstop exists for)."""
+    now = time.time() if now is None else now
+    members = fs.live_all() if members is None else members
+    woke = set() if woke is None else woke
+    peers = [(lbl, e) for lbl, e in members.items()
+             if e.get("kind") == "conductor" and lbl != down_label and e.get("surface")]
+    seq = None
+    for pl, pe in peers:                                # write the inbox row regardless of the --live
+        ps = pe.get("surface")                          # global (like _emit; the sweep runs from the daemon
+        seq = fs.inbox_put("doctor", ps, {"reason": reason, "label": down_label,   # and _archive_closed_surface
+                                          "child_surface": surface, **payload})     # already LIVE-gates upstream)
+        if fs.idlewake_on() and ps not in woke:
+            woke.add(ps)
+            fs.wake_if_idle(ps, f"(fleet-doctor) conductor {down_label} appears DOWN ({reason}); "
+                                f"check it and `fleet revive {down_label}` if it is")
+    cmux("notify", "--title", f"conductor {down_label} DOWN ({reason})",
+         "--body", f"fleet-doctor found no live agent on {down_label}; revive with: fleet revive {down_label}")
+    log(f"[CONDUCTOR-DOWN seq={seq}] {down_label} {reason} -> {len(peers)} peer(s) + desktop")
+    return seq
+
+
 def _archive_closed_surface(ev):
     """surface.closed -> registry hygiene. The event IS the ground truth that a tracked member's surface
     just died (no lifecycle re-derivation needed): if the close came through `fleet rm`/`fleet archive`,
@@ -337,7 +380,14 @@ def _archive_closed_surface(ev):
     log(f"[stale] archived {label}: surface {surface[:8]} closed out from under the registry "
         f"(origin={origin}); revive with: fleet revive {label}")
     if entry.get("kind") == "conductor":                # branch on KIND, not role (same as the Stop path):
-        return                                          # a conductor has no parent to alert
+        # A conductor's surface closing is the SAME undetected-down gap as the sweep's husk predicate:
+        # no parent means the old silent return let a dead conductor sit unnoticed (Berg's 2026-07-08
+        # ruling: a closed conductor surface must ALERT, not vanish quietly). Already archived above; the
+        # alert fans out to peers + Berg's desktop so a human revives it. registry() is post-live_del, so
+        # the down conductor is not its own peer.
+        _alert_conductor_peers("conductor-closed", label, entry, surface,
+                               {"origin": origin, "via": "surface-closed"}, members=registry()["by_label"])
+        return
     # Muted members still alert: mute suppresses the child's COMPLETION push specifically; a tracked
     # member vanishing is a registry-integrity signal the parent needs regardless of the chatter dial.
     parent = entry.get("parent")                        # parent LABEL (durable); resolve like deliver()'s path
@@ -362,11 +412,13 @@ def fleet_doctor_sweep(now=None):
     field ('stall'|'low-ctx'|'needs-input') the awareness hook renders and `fleet inbox-ack --doctor`
     clears. Rows are written regardless of the dial (they surface next turn via awareness — 'passive' is
     a wake mute, not an inbox mute); the WAKE is dial-gated (fs.idlewake_on), the same coherent mute as
-    the heartbeat nudge. SKIPS conductors (no parent to alert — branch on KIND, stale-path parity) and
-    MUTED members (mute = 'this one is my manual concern, don't nudge me'; all three signals are
-    member-health nudges, exactly the chatter class mute governs — unlike _archive_closed_surface, where
-    a VANISHED surface is a hard integrity fact that alerts even muted). Self-contained + fail-safe per
-    member; no dependence on the router's --live/observe globals, so it runs from the daemon process."""
+    the heartbeat nudge. CONDUCTORS take a separate path (_sweep_conductor, condition #5): the child
+    content gates (needs-input/low-ctx) stay off, but a conductor is now checked for stall and DOWN and
+    the alert fans out to PEER conductors + Berg's desktop (a conductor has no parent). SKIPS MUTED
+    children (mute = 'this one is my manual concern, don't nudge me'; the child health signals are
+    exactly the chatter class mute governs — unlike a VANISHED surface, a hard integrity fact that alerts
+    even muted; conductor liveness likewise ignores mute). Self-contained + fail-safe per member; no
+    dependence on the router's --live/observe globals, so it runs from the daemon process."""
     from . import features                              # lazy: the heavier view module, off the hot path
     now = time.time() if now is None else now
     members = fs.live_all()
@@ -398,16 +450,57 @@ def fleet_doctor_sweep(now=None):
             fs.wake_if_idle(parent_surface, f"(fleet-doctor) child {label} needs attention ({reason}); "
                                             f"handle your pending fleet inbox items")
 
+    def _emit_conductor(reason, label, entry, surface, payload):
+        nonlocal fired
+        key = (reason, label, entry.get("session") or "")
+        if key in _doctor_fired:
+            return                                     # already alerted this occurrence -> dedup (no storm)
+        _alert_conductor_peers(reason, label, entry, surface, payload, now=now, members=members, woke=woke)
+        _doctor_fired.add(key)
+        fired += 1
+
+    def _sweep_conductor(label, entry, surface, session):
+        # Conductor-liveness (#5). Content gates (needs-input / low-ctx) stay OFF for conductors — only
+        # STALL (a stuck turn) and DOWN (a husk seat) apply. Keeping the dedup key live across the
+        # end-of-sweep prune (like the child path) needs this member in live_keys.
+        live_keys.add((label, session))
+        if fs.surface_has_live_agent(surface):
+            _conductor_live_seen[label] = now                  # transition-guard clock: last seen alive
+            _doctor_fired.discard(("conductor-down", label, session))   # recovered -> re-arm DOWN
+            rec = fs.resolve_bound_record(surface, st=st, bound=fs.bare_uuid(session))
+            life = (rec.get("agentLifecycle") or "") if rec else ""
+            ua = (rec.get("updatedAt") or 0) if rec else 0
+            # A. stall — reuses #1's RECENT-window guard (a running record frozen for HOURS is a
+            # done-stuck ghost, not a live stall; the window excludes it).
+            if life == "running" and ua and STALL_S < (now - ua) < STALL_WINDOW:
+                _emit_conductor("stall", label, entry, surface, {"stalled_s": int(now - ua)})
+            else:
+                _doctor_fired.discard(("stall", label, session))
+            return
+        # B. DOWN — a registry-live conductor whose surface holds NO live agent (a bare-shell husk a
+        # failed recycle left; also the dead-pid brick, which surface_has_live_agent already reads as
+        # not-live). Two guards keep this from storming: transition-only (seen live by THIS process) +
+        # grace (a legit recycle rebinds within it). expected_close was already filtered by the caller.
+        seen = _conductor_live_seen.get(label)
+        if seen is None:
+            return                                     # never seen live here (boot/resume-menu) -> not a transition
+        if now - seen < CONDUCTOR_DOWN_GRACE_S:
+            return                                     # inside the recycle grace window -> not yet down
+        _emit_conductor("conductor-down", label, entry, surface, {"down_s": int(now - seen)})
+
     for label, entry in members.items():
         try:
-            if entry.get("kind") == "conductor" or entry.get("muted"):
-                continue                               # conductors: no parent; muted: manual concern
             surface, session = entry.get("surface") or "", entry.get("session") or ""
             if not surface:
                 continue
             if fs.expected_close_recent(surface, now=now):
                 log(f"[fleet-doctor] skip {label}: expected CLI close (surface {surface[:8]})")
                 continue
+            if entry.get("kind") == "conductor":       # conductor-liveness path (no parent; stall/down only)
+                _sweep_conductor(label, entry, surface, session)
+                continue
+            if entry.get("muted"):
+                continue                               # muted child: manual concern (conductors still checked)
 
             # #4 never-bound — a LAZY child registered with NO session bound past NEVER_BOUND_S. claude
             # binds at boot (a failed bind sys.exits BEFORE register), so a no-session live row is always a
@@ -473,6 +566,16 @@ def fleet_doctor_sweep(now=None):
                     _doctor_fired.add(("needs-input", label, session))
                     log(f"[fleet-doctor] {label}: needs-input suppressed after recent completion")
                     continue
+                # cmux stamps needsInput for a DONE-IDLE turn too (Claude's idle Notification fires ~60s
+                # after a turn ends), indistinguishable from a real gate by the lifecycle string alone —
+                # the 100%-FP class (fleet-doctor #iii, timing-test 2026-07-07). The transcript IS
+                # distinguishable: only a trailing UNANSWERED AskUserQuestion/ExitPlanMode is a genuine
+                # wait. Suppress everything else (done-idle, the feedback survey #iv, unreadable) +
+                # dedup like the recent-completion path; leaving needsInput re-arms (below).
+                if not features.pending_interactive_gate(rec.get("transcriptPath", "") if rec else ""):
+                    _doctor_fired.add(("needs-input", label, session))
+                    log(f"[fleet-doctor] {label}: needs-input suppressed — no pending interactive gate (done-idle)")
+                    continue
                 _emit("needs-input", label, entry, surface, {})
             else:
                 _doctor_fired.discard(("needs-input", label, session))  # re-arm on leaving needsInput
@@ -496,6 +599,11 @@ def fleet_doctor_sweep(now=None):
     # bounds the set AND lets a recycled-while-still-bad member re-alert fresh under its new session.
     for k in [k for k in _doctor_fired if (k[1], k[2]) not in live_keys]:
         _doctor_fired.discard(k)
+    # prune the conductor seen-live clock for conductors no longer in the registry, so a removed label
+    # can't carry a stale 'seen live' timestamp into a later reuse and false-fire DOWN on a fresh husk.
+    for lbl in [l for l in _conductor_live_seen
+                if members.get(l, {}).get("kind") != "conductor"]:
+        _conductor_live_seen.pop(lbl, None)
     if _doctor_fired != persisted:
         try:
             fs.doctor_dedup_save(_doctor_fired, now=now)
