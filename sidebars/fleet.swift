@@ -37,6 +37,7 @@ func colorFor(_ s) -> String {
     if s == "review" { return "#3E63DD" }
     if s == "working" { return "#30A46C" }
     if s == "done" { return "#46A758" }
+    if s == "ready" { return "#3DB9A0" }
     if s == "idle" { return "#8B8D98" }
     return "#6F6E77"
 }
@@ -46,6 +47,7 @@ func iconFor(_ s) -> String {
     if s == "review" { return "eye.fill" }
     if s == "working" { return "gearshape.fill" }
     if s == "done" { return "checkmark.circle.fill" }
+    if s == "ready" { return "circle.dashed" }
     if s == "idle" { return "moon.zzz.fill" }
     return "questionmark.circle"
 }

@@ -1743,6 +1743,7 @@ def cmd_ls(argv):
     `--scope all` so nobody mistakes their corner for the empty fleet. `--json` emits the reconciled
     rows (live + archived, with the computed status/lifecycle) as machine output."""
     from . import state as fs
+    from . import features as ff
     as_json = "--json" in argv
     argv = [a for a in argv if a != "--json"]
     scope_arg, _ = fs.pop_scope(argv, default=None)
@@ -1751,11 +1752,17 @@ def cmd_ls(argv):
     if scope != "all":
         live = {l: v for l, v in live.items() if fs.scope_matches(scope, v, l, caller, include_self=True)}
         arch = {l: v for l, v in arch.items() if fs.scope_matches(scope, v, l, caller, include_self=True)}
+    store = fs.read_hook_store()
+    open_gates = ff._open_gate_uuids()                        # feed-gated needs-input (once for the listing)
     # reconcile ONCE -> render as JSON or the text table (identical status/lifecycle either way).
     live_rows = []
     for label, v in sorted(live.items()):
         surf = v.get("surface", "")
         life = fs.lifecycle(surf)
+        # classified fleet state (coarse - no transcript read here, so no review/done refine): an open Feed
+        # gate -> needs-input; needsInput-no-gate -> ready; running -> working; else idle/pending/stale.
+        _sid = fs.bare_uuid(ff._freshest_session(store, surf).get("sessionId", ""))
+        state = ff._classify(life or "", bool(v.get("session")), "", open_gate=bool(_sid) and _sid in open_gates)
         # STALE if NO genuinely-live agent holds the surface: lifecycle terminal, OR frozen non-terminal
         # on a DEAD pid (the SessionEnd-less brick, root-caused 2026-07-06). Routed through the shared
         # surface_has_live_agent predicate so the pid -- not the lifecycle string -- is the authority: a
@@ -1767,6 +1774,7 @@ def cmd_ls(argv):
         else:
             status = v.get("status", "live")
         live_rows.append({"label": label, "role": v.get("role"), "kind": v.get("kind"),
+                          "state": state,
                           "status": status, "lifecycle": life or None, "surface": surf,
                           "muted": bool(v.get("muted"))})
     if as_json:
@@ -1775,10 +1783,10 @@ def cmd_ls(argv):
         print(json.dumps({"scope": scope, "live": live_rows, "archived": arch_rows}, indent=2))
         return 0
     scope_tag = "" if scope == "all" else f"{scope}: "
-    print(f"LIVE FLEET ({scope_tag}{len(live)}):  {'label':<24}{'role':<16}{'kind':<11}{'status':<8}{'lifecycle':<11}surface")
+    print(f"LIVE FLEET ({scope_tag}{len(live)}):  {'label':<24}{'role':<16}{'kind':<11}{'state':<12}{'status':<8}{'lifecycle':<11}surface")
     for r in live_rows:
         muted = "  MUTED" if r["muted"] else ""
-        print(f"  {r['label']:<24}{(r['role'] or '-'):<16}{(r['kind'] or '-'):<11}{r['status']:<8}{(r['lifecycle'] or '-'):<11}{r['surface'][:8]}{muted}")
+        print(f"  {r['label']:<24}{(r['role'] or '-'):<16}{(r['kind'] or '-'):<11}{r['state']:<12}{r['status']:<8}{(r['lifecycle'] or '-'):<11}{r['surface'][:8]}{muted}")
     if arch:
         print(f"\nARCHIVED ({len(arch)}, revivable):")
         for label, v in sorted(arch.items()):

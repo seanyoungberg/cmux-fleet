@@ -442,7 +442,7 @@ def _render_vitals(rows):
              f"    {'label':<17}{'state':<12}{'ctx-left':<15}{'model':<13}{'eff':<7}{'cwd':<17}{'idle':<6}last"]
     for r in rows:
         glyph = {"error": "✗", "needs-input": "◍", "review": "⊙", "working": "▶",
-                 "done": "✓", "idle": "·", "pending": "…", "stale": "?", "gone": "✗"}.get(r["state"], "·")
+                 "done": "✓", "ready": "◌", "idle": "·", "pending": "…", "stale": "?", "gone": "✗"}.get(r["state"], "·")
         muted = " M" if r["muted"] else ""
         lines.append(f"  {glyph} {_fit(r['label'], 16):<17}{r['state']:<12}{_ctx(r):<15}"
                      f"{_fit(_short_model(r['model']), 12):<13}{_fit(r['effort'] or '-', 6):<7}"
