@@ -6,6 +6,21 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Fixed
+
+- **Notification dedup: event-key ack** — every inbox row now carries a durable `event_key`, and one
+  `fleet inbox-ack <seq>` clears that event on **every** presentation path at once (awareness, Stop-drain,
+  heartbeat, the router wake gate, `fleet inbox`) and refuses a producer re-put of it. A bare
+  `inbox-ack <seq>` acks the kind the seq actually points at (no more advancing the completion cursor
+  because `--doctor` was forgotten); the kind flags stay as compat fallbacks. Kills the daemon-restart /
+  dedup-loss replay of already-handled doctor alerts. (audit fix-order #5)
+- **Notification dedup: presentation cooldown** — a presentation ledger (distinct from ack) records which
+  events each surface was shown recently. The heartbeat now **reminds** on an interval instead of
+  re-nudging every tick: it wakes only for rows no path (direct wake / Stop-drain / awareness / a prior
+  reminder) has surfaced within `HEARTBEAT_REMIND_S`, and a genuinely-ignored unacked row still gets a
+  reminder once the window elapses. Kills the heartbeat re-waking a row a direct peer/doctor/completion
+  wake or a drain block already put in front of the agent. (audit fix-order #4)
+
 ## [0.9.0] - 2026-07-08
 
 ### Changed
