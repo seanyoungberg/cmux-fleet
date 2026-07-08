@@ -6,6 +6,8 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [0.9.0] - 2026-07-08
+
 ### Changed
 
 - **Plugin loadout is now one key + one flag.** The mechanism-agnostic roster key `use` is renamed
