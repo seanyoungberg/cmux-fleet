@@ -86,11 +86,14 @@ def _providers_doc():
         for name, spec in block.items():
             if not isinstance(spec, dict):          # skip the scalar `default` key
                 continue
-            provs[name] = {
-                "type": str(spec.get("type", "subscription")),
-                "auth": str(spec.get("auth", "")),
-                "track": str(spec.get("track", "windows" if spec.get("type") == "subscription" else "none")),
-            }
+            # carry every key through (pluggability: a new provider kind can read its own keys), then
+            # normalize the ones every provider has.
+            entry = dict(spec)
+            entry["type"] = str(spec.get("type", "subscription"))
+            entry["auth"] = str(spec.get("auth", ""))
+            entry["track"] = str(spec.get("track", "windows" if spec.get("type") == "subscription" else "none"))
+            entry["poller"] = str(spec["poller"]) if spec.get("poller") else ""
+            provs[name] = entry
         out[tool] = {"default": default, "providers": provs}
     return out
 
@@ -268,9 +271,12 @@ def poll_claude(auth):
     return {
         "ok": True, "error": None,
         "windows": {
-            "five_hour": {"pct": fh.get("utilization"), "resets_at": _iso_to_epoch(fh.get("resets_at"))},
-            "seven_day": {"pct": sd.get("utilization"), "resets_at": _iso_to_epoch(sd.get("resets_at"))},
+            "five_hour": {"pct": fh.get("utilization"), "resets_at": _iso_to_epoch(fh.get("resets_at")),
+                          "window_minutes": 300},
+            "seven_day": {"pct": sd.get("utilization"), "resets_at": _iso_to_epoch(sd.get("resets_at")),
+                          "window_minutes": 10080},
         },
+        "plan": data.get("plan") or "",
         "scoped": scoped,
         "extra_usage": {"enabled": bool(xu.get("is_enabled")), "pct": xu.get("utilization")},
         "active_limit": active,
@@ -358,25 +364,126 @@ def poll_codex(home):
     }
 
 
+# --- poller registry (the pluggability seam) ----------------------------------------------------
+# Adding a provider family (Vertex-metered, Gemini, a direct inference API with a usage endpoint) is:
+#   1. write a poller  fn(spec) -> {ok, error?, windows{...}, plan?, extra_usage?, scoped?, budget?}
+#   2. register_poller("<kind>", fn)
+#   3. config: [providers.<tool>.<acct>] poller = "<kind>"   (defaults to the tool name)
+# No change to poll_all, the state shape, or the paint accessor. `windows` is length-labelled
+# (see _window_label), so any provider's window cadence renders through the same contract.
+def _poll_claude_provider(spec):
+    return poll_claude(spec["auth"])
+
+
+def _poll_codex_provider(spec):
+    method, arg = _parse_auth(spec["auth"])
+    return poll_codex(arg if method == "codex-home" else "~/.codex")
+
+
+_POLLERS = {"claude": _poll_claude_provider, "codex": _poll_codex_provider}
+
+
+def register_poller(kind, fn):
+    """Register a usage poller for a provider `kind` (extension point for Vertex/Gemini/API/…)."""
+    _POLLERS[kind] = fn
+
+
 def poll_all():
-    """Poll every configured SUBSCRIPTION provider (track != none) and persist the snapshot to
-    provider-usage.json. Called by the daemon timer. Returns the written dict. Never raises per-provider
-    (one bad token doesn't sink the rest)."""
+    """Poll every configured TRACKED provider and persist the snapshot to provider-usage.json. Called by
+    the daemon timer. Returns the written dict. Never raises per-provider (one bad token doesn't sink the
+    rest). The poller is chosen from the registry by `spec.poller` (default = the tool name); a provider
+    with `track = none` (e.g. vertex) or no registered poller is skipped."""
     from . import state as fs
     out = {}
     for tool, name, spec, is_default in iter_providers():
-        if spec["type"] != "subscription" or spec.get("track") == "none":
+        if spec.get("track") == "none":
             continue
+        poller = _POLLERS.get(spec.get("poller") or tool)
+        if poller is None:
+            continue                                 # trackless / no poller for this kind — nothing to record
         rec = {"tool": tool, "name": name, "type": spec["type"], "is_default": is_default}
         try:
-            method, arg = _parse_auth(spec["auth"])
-            if tool == "codex":
-                rec.update(poll_codex(arg if method == "codex-home" else "~/.codex"))
-            else:
-                rec.update(poll_claude(spec["auth"]))
+            rec.update(poller(spec))
         except Exception as e:                       # defensive: a provider must never sink poll_all
             rec.update({"ok": False, "error": f"{type(e).__name__}"})
         rec["checked_at"] = int(time.time())
         out[f"{tool}:{name}"] = rec
     fs.provider_usage_write(out)
     return out
+
+
+# --- the paint accessor: the STABLE render contract (usage-ops -> fleet paint -> sidebar) --------
+PAINT_SCHEMA = 1
+
+_WIN_PRETTY = {"five_hour": "5h", "seven_day": "7d", "thirty_day": "30d"}
+
+
+def _paint_windows(rec):
+    """Normalize one poll record's windows into an ORDERED, render-ready list (shortest window first),
+    provider-agnostic: a provider with one 30-day window, two (5h+weekly), or none all produce the same
+    shape. `binding` marks the currently-limiting window (from active_limit). Scoped limits (e.g. Fable)
+    are appended, flagged scoped=true."""
+    active = str(rec.get("active_limit", ""))
+    out = []
+    for key, w in (rec.get("windows") or {}).items():
+        mins = w.get("window_minutes")
+        binding = (key == "five_hour" and active == "session") or (key == "seven_day" and active.startswith("weekly"))
+        out.append({"key": key, "label": _WIN_PRETTY.get(key, key), "pct": w.get("pct"),
+                    "resets_at": w.get("resets_at"), "resets_in_s": _resets_in(w.get("resets_at")),
+                    "window_minutes": mins, "binding": bool(binding), "scoped": False})
+    out.sort(key=lambda d: d["window_minutes"] or 0)
+    for sc in (rec.get("scoped") or []):
+        out.append({"key": "scoped", "label": sc.get("label", "scoped"), "pct": sc.get("pct"),
+                    "resets_at": sc.get("resets_at"), "resets_in_s": _resets_in(sc.get("resets_at")),
+                    "window_minutes": None, "binding": False, "scoped": True})
+    return out
+
+
+def _resets_in(epoch):
+    if not epoch:
+        return None
+    return max(0, int(epoch) - int(time.time()))
+
+
+def _headline(windows):
+    """The single most-constrained window (highest %) — the one-glance figure for a compact panel."""
+    ranked = [w for w in windows if isinstance(w.get("pct"), (int, float))]
+    if not ranked:
+        return None
+    w = max(ranked, key=lambda d: d["pct"])
+    return {"key": w["key"], "label": w["label"], "pct": w["pct"], "resets_in_s": w["resets_in_s"]}
+
+
+def usage_for_paint():
+    """STABLE, versioned, render-ready view of the last usage poll — THE contract that `fleet paint` (and
+    the sidebar behind it) consume. Decoupled from the raw poll record so the poller can evolve without
+    breaking the sidebar. Provider-agnostic by construction: `kind` says how to read a row (subscription
+    has `windows`; api has `budget`; vertex has neither), and `windows` is an ordered list, not fixed keys.
+
+      { "schema": 1, "generated_at": <epoch>,
+        "providers": [ {
+          "id": "claude:berg-max", "tool": "claude", "account": "berg-max",
+          "kind": "subscription", "plan": "max", "is_default": true,
+          "ok": true, "error": null, "stale": false, "checked_at": <epoch>, "age_s": 36,
+          "windows": [ {"key":"five_hour","label":"5h","pct":19.0,"resets_at":<epoch>,
+                        "resets_in_s":3000,"window_minutes":300,"binding":true,"scoped":false}, … ],
+          "headline": {"key":"five_hour","label":"5h","pct":19.0,"resets_in_s":3000},
+          "budget": null } ] }
+
+    Never raises: an empty/absent snapshot returns {schema, generated_at, providers: []}."""
+    from . import state as fs
+    snap = fs.provider_usage_read() or {}
+    provs = []
+    for pid in sorted(snap):
+        r = snap[pid]
+        windows = _paint_windows(r) if r.get("ok") else []
+        ca = r.get("checked_at")
+        provs.append({
+            "id": pid, "tool": r.get("tool", ""), "account": r.get("name", ""),
+            "kind": r.get("type", ""), "plan": r.get("plan", ""),
+            "is_default": bool(r.get("is_default")),
+            "ok": bool(r.get("ok")), "error": r.get("error"), "stale": bool(r.get("stale")),
+            "checked_at": ca, "age_s": (int(time.time()) - int(ca)) if ca else None,
+            "windows": windows, "headline": _headline(windows), "budget": r.get("budget"),
+        })
+    return {"schema": PAINT_SCHEMA, "generated_at": int(time.time()), "providers": provs}

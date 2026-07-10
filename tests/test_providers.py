@@ -212,6 +212,92 @@ def test_poll_all_writes_snapshot(providers_toml, monkeypatch):
         assert "checked_at" in rec
 
 
+# --- the paint accessor: the stable contract with sidebar-build ----------------------------------
+def test_usage_for_paint_shape_and_ordering():
+    now = int(time.time())
+    fs.provider_usage_write({
+        "claude:berg-max": {
+            "tool": "claude", "name": "berg-max", "type": "subscription", "plan": "max",
+            "is_default": True, "ok": True, "error": None, "stale": False, "checked_at": now - 30,
+            "active_limit": "session",
+            "windows": {
+                "seven_day": {"pct": 14.0, "resets_at": now + 86400, "window_minutes": 10080},
+                "five_hour": {"pct": 19.0, "resets_at": now + 3000, "window_minutes": 300},
+            },
+            "scoped": [{"label": "Fable", "pct": 8.0, "resets_at": now + 86400}],
+        },
+        "codex:free": {
+            "tool": "codex", "name": "free", "type": "subscription", "plan": None,
+            "is_default": False, "ok": True, "stale": True, "checked_at": now,
+            "windows": {"thirty_day": {"pct": 17.0, "resets_at": now + 20 * 86400, "window_minutes": 43200}},
+            "scoped": [], "active_limit": "",
+        },
+    })
+    view = pv.usage_for_paint()
+    assert view["schema"] == pv.PAINT_SCHEMA and "generated_at" in view
+    by_id = {p["id"]: p for p in view["providers"]}
+
+    c = by_id["claude:berg-max"]
+    assert c["kind"] == "subscription" and c["plan"] == "max" and c["is_default"] is True
+    assert c["age_s"] >= 30
+    # windows ordered shortest-first, then scoped last
+    assert [w["label"] for w in c["windows"]] == ["5h", "7d", "Fable"]
+    assert c["windows"][0]["binding"] is True                 # 5h is the active/binding limit
+    assert c["windows"][-1]["scoped"] is True
+    assert c["headline"]["label"] == "5h" and c["headline"]["pct"] == 19.0   # most-constrained
+    assert all(w["resets_in_s"] >= 0 for w in c["windows"])
+
+    z = by_id["codex:free"]
+    assert [w["label"] for w in z["windows"]] == ["30d"]       # single-window plan renders one row
+    assert z["stale"] is True and z["headline"]["label"] == "30d"
+
+
+def test_usage_for_paint_empty_and_errored():
+    assert pv.usage_for_paint()["providers"] == []            # no snapshot -> empty, no raise
+    now = int(time.time())
+    fs.provider_usage_write({"codex:x": {"tool": "codex", "name": "x", "type": "subscription",
+                                         "ok": False, "error": "no rollout", "checked_at": now}})
+    p = pv.usage_for_paint()["providers"][0]
+    assert p["ok"] is False and p["error"] == "no rollout" and p["windows"] == [] and p["headline"] is None
+
+
+def test_poller_registry_is_pluggable(providers_toml, monkeypatch):
+    # register a NEW provider kind without touching poll_all; config selects it via `poller`.
+    toml = _toml(providers_toml["tmp"], """
+        [providers.gemini]
+        default = "g1"
+        [providers.gemini.g1]
+        type = "subscription"
+        auth = "env:GEMINI_KEY"
+        poller = "gemini-fake"
+        track = "windows"
+    """)
+    monkeypatch.setattr(pv, "FLEET_TOML", toml)
+    monkeypatch.setattr(pv, "_read_oauth_token", lambda a: None)
+    pv.register_poller("gemini-fake", lambda spec: {
+        "ok": True, "windows": {"one_day": {"pct": 42.0, "resets_at": None, "window_minutes": 1440}}})
+    try:
+        snap = pv.poll_all()
+        assert snap["gemini:g1"]["ok"] and snap["gemini:g1"]["windows"]["one_day"]["pct"] == 42.0
+        view = {p["id"]: p for p in pv.usage_for_paint()["providers"]}
+        assert view["gemini:g1"]["windows"][0]["label"] == "one_day"
+    finally:
+        pv._POLLERS.pop("gemini-fake", None)
+
+
+def test_poll_all_skips_track_none(providers_toml, monkeypatch):
+    toml = _toml(providers_toml["tmp"], """
+        [providers.claude]
+        default = "vtx"
+        [providers.claude.vtx]
+        type = "vertex"
+        auth = "env-file:/nonexistent"
+        track = "none"
+    """)
+    monkeypatch.setattr(pv, "FLEET_TOML", toml)
+    assert pv.poll_all() == {}                                # vertex (track none) is not polled
+
+
 # --- render_send_cmd raw_env (secret stays out of the command string) -----------------------------
 def test_render_send_cmd_raw_env_unquoted():
     cmd = cli.render_send_cmd("claude", ["--foo"], {"A": "b c"}, "/tmp/x",
