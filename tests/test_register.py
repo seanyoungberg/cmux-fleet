@@ -216,3 +216,27 @@ def test_register_roster_role_is_toml_authoritative(fs, monkeypatch):
     assert e["kind"] == "conductor"                     # from resolve(), not the archived 'child'
     assert e["plugins"] == ["p"] and e["cwd"].endswith("roles/hl")   # register stores abs_cwd
     assert fs.archive_get("hl") is None                 # promoted from archive
+
+
+def test_ws_uuid_for_surface_prefers_the_live_record_over_stale_ghosts(fs, monkeypatch):
+    # THE 2026-07-10 berg-sandbox incident, replayed. cmux never drops a surface's old records, and a
+    # reboot/resume re-homes the surface into a NEW workspace — so the lingering DEAD records keep naming
+    # the OLD, now-closed workspace. The old first-in-dict-order pick handed `fleet launch --place tab`
+    # that dead workspace and every launch aborted 'Workspace not found'. Dict order puts the ghosts first
+    # here on purpose: a dead pid cannot be the agent, so it cannot name the agent's workspace.
+    DEAD_WS, LIVE_WS = "WS-DEAD", "WS-LIVE"
+    store = {"sessions": {
+        "ghost1": {"surfaceId": "S", "sessionId": "g1", "updatedAt": 30, "pid": 999999, "workspaceId": DEAD_WS},
+        "ghost2": {"surfaceId": "S", "sessionId": "g2", "updatedAt": 20, "pid": None,   "workspaceId": DEAD_WS},
+        "live":   {"surfaceId": "S", "sessionId": "l1", "updatedAt": 10, "pid": os.getpid(), "workspaceId": LIVE_WS},
+        "other":  {"surfaceId": "X", "sessionId": "o1", "updatedAt": 99, "pid": os.getpid(), "workspaceId": "WS-OTHER"},
+    }}
+    monkeypatch.setattr(fleet, "_store", lambda: store)
+    # the live record wins even though BOTH ghosts are newer by updatedAt and come first in dict order
+    assert fleet.ws_uuid_for_surface("S") == LIVE_WS
+    assert fleet.ws_uuid_for_surface("s") == LIVE_WS          # surface match is case-insensitive
+    # no live record on the surface -> fall back to the freshest record of any liveness (best effort)
+    del store["sessions"]["live"]
+    assert fleet.ws_uuid_for_surface("S") == DEAD_WS
+    # surface absent entirely -> ''
+    assert fleet.ws_uuid_for_surface("NOPE") == ""

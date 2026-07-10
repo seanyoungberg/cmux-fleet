@@ -409,10 +409,31 @@ def surface_loc(surf):
 
 
 def ws_uuid_for_surface(surf):
+    """The workspace UUID of the agent LIVING on `surf`: the freshest hook-store record with an ALIVE
+    pid wins, falling back to the freshest record of any liveness, then ''.
+
+    The old form returned the FIRST surface-matching record in dict order — no aliveness, no recency —
+    the same stale-ghost pick that `_pid_for_surface` made before it was deleted (2026-07-10). cmux
+    never drops a surface's old records, and a reboot/resume re-homes the surface into a NEW workspace,
+    so the lingering dead records keep pointing at the OLD (now-closed) workspace. Diagnosed live by
+    berg-sandbox: its surface carried four records — three dead ones naming a dead workspace, and the
+    one LIVE record naming the real one. Feeding the dead pick to `fleet launch --place tab|pane` made
+    every such launch abort with 'Workspace not found'. The correct workspace was in the store the whole
+    time; we were reading the wrong row. A dead pid cannot be the agent, so it cannot name its workspace.
+
+    Still a store read: if a live agent is MOVED between workspaces without a record update, the record
+    can lag. Callers that need certainty resolve against the live tree (`surface_ws_from_tree`)."""
+    from . import state as fs
+    live_ws, live_ts, any_ws, any_ts = "", -1.0, "", -1.0
     for s in (_store().get("sessions") or {}).values():
-        if (s.get("surfaceId") or "").upper() == surf.upper():
-            return s.get("workspaceId", "")
-    return ""
+        if (s.get("surfaceId") or "").upper() != (surf or "").upper():
+            continue
+        ts = s.get("updatedAt") or 0
+        if ts >= any_ts:
+            any_ws, any_ts = s.get("workspaceId", ""), ts
+        if fs.pid_alive(s.get("pid")) and ts >= live_ts:
+            live_ws, live_ts = s.get("workspaceId", ""), ts
+    return live_ws or any_ws
 
 
 def surface_ws_from_tree(tree_text, surf):
