@@ -72,7 +72,9 @@ class FakeCmux:
 
     def __init__(self, model=None, groups=None):
         self.model = model if model is not None else _tree_model()
-        # one group, anchored on the conductor's workspace — `fleet group init`'s shape
+        # one group whose anchor IS the conductor's own workspace — the LEGACY Model A shape (or the
+        # scaffold-close case). Model B never archives its empty anchor, so this is the fixture for the
+        # defensive re-anchor path: closing this anchor must re-anchor onto a FRESH scaffold, never a member.
         self.groups = groups if groups is not None else {"groups": [{
             "ref": "workspace_group:2", "name": "Conductor - cmux-advisor",
             "anchor_workspace_ref": R_COND,
@@ -99,6 +101,24 @@ class FakeCmux:
             return _render_tree(self.model)
         if args[:3] == ("workspace-group", "list", "--json"):
             return json.dumps(self.groups)
+        if args[:1] == ("new-workspace",):                 # mint a bare scaffold (Model B re-anchor target)
+            n = 900 + len(self.model)
+            ref, uuid = f"workspace:{n}", f"F00DF00D-0000-0000-0000-{n:012d}"
+            name = self._flag(args, "--name")
+            self.model.append((ref, uuid, name,
+                               [(f"surface:{n}", f"5CAF01D0-0000-0000-0000-{n:012d}", "terminal", name)]))
+            gref = self._flag(args, "--group")
+            if gref:
+                g = next((g for g in self.groups["groups"] if g["ref"] == gref), None)
+                if g:
+                    g["member_workspace_refs"].append(ref)
+            return f"created {ref}\n"
+        if args[:1] == ("rename-workspace",):              # retitle a workspace in the model (Model B anchor)
+            w = self._ws(self._flag(args, "--workspace"))
+            if w:
+                title = args[-1]                           # `rename-workspace --workspace <ws> -- <title>`
+                self.model[self.model.index(w)] = (w[0], w[1], title, w[3])
+            return ""
         if args[:2] == ("workspace-group", "set-anchor"):
             if self.set_anchor_works:
                 ws = self._flag(args, "--workspace")
@@ -295,24 +315,34 @@ def test_close_seat_survives_an_unreadable_tree(fs, monkeypatch):
 
 
 # ================================ 3. the workspace-group anchor ====================================
-def test_close_seat_reanchors_the_group_before_closing_its_anchor(fs, cmux):
-    """Guard 3. cmux: "Closing the anchor dissolves the group while preserving its other members as
-    ungrouped workspaces." Retiring a conductor must not scatter its live children out of the sidebar."""
+def test_close_seat_reanchors_onto_a_fresh_scaffold_never_a_member(fs, cmux):
+    """Guard 3, Model B (empty-anchor). cmux: "Closing the anchor dissolves the group while preserving its
+    other members as ungrouped workspaces." When the anchor WORKSPACE is removed (here a legacy Model A
+    group whose conductor IS the anchor), re-anchor onto a FRESH empty scaffold minted in the group --
+    NEVER onto a surviving member conductor (that is Model A: the bare-folder header this flip reverses)."""
     _seed(fs, "cond", S_COND, place="workspace", parent="")
     _seed(fs, "graph-view", S_GRAPH, place="workspace", parent="cond")
     cmux.model[0][3].pop()                       # the conductor is alone in its workspace (tab child gone)
     fs.live_del("graph-view")                    # ...and its children are untracked bystanders elsewhere
     _ok, notes = fleet._close_seat("cond", fs.live_get("cond"), "archive")
-    anchor = ("workspace-group", "set-anchor", "--group", "workspace_group:2", "--workspace", W_GRAPH)
-    assert anchor in cmux.calls
-    assert cmux.calls.index(anchor) < cmux.calls.index(("close-workspace", "--workspace", W_COND))
-    assert cmux.groups["groups"][0]["anchor_workspace_ref"] == R_GRAPH
-    assert any("re-anchored" in n for n in notes)
+    # a fresh scaffold was minted IN the group and titled with the group's header name...
+    mint = [c for c in cmux.calls if c[0] == "new-workspace"][0]
+    assert "--group" in mint and "workspace_group:2" in mint and "Conductor - cmux-advisor" in mint
+    new_ref = cmux.groups["groups"][0]["anchor_workspace_ref"]
+    assert new_ref not in (R_COND, R_GRAPH, R_RESEARCH)          # a brand-new anchor, NOT a member
+    new_uuid = next(w[1] for w in cmux.model if w[0] == new_ref)
+    setanchor = [c for c in cmux.calls if c[:2] == ("workspace-group", "set-anchor")][0]
+    assert new_uuid in setanchor
+    assert W_GRAPH not in setanchor and W_RESEARCH not in setanchor  # the survivors are NEVER made the anchor
+    close = ("close-workspace", "--workspace", W_COND)
+    assert close in cmux.calls
+    assert cmux.calls.index(setanchor) < cmux.calls.index(close)    # re-anchor BEFORE closing the old anchor
+    assert any("re-anchored" in n and "scaffold" in n for n in notes)
 
 
 def test_close_seat_refuses_the_close_when_the_reanchor_does_not_take(fs, cmux):
-    """The re-anchor is a cmux mutation, so it is VERIFIED. An unverified anchor move means the next call
-    dissolves the group: refuse the workspace close, retire the surface, and say so."""
+    """The mint + re-anchor is a cmux mutation, so it is VERIFIED. An unverified anchor move means the next
+    call dissolves the group: refuse the workspace close, retire the surface, and say so."""
     cmux.set_anchor_works = False
     _seed(fs, "cond", S_COND, place="workspace", parent="")
     cmux.model[0][3].pop()
@@ -321,6 +351,32 @@ def test_close_seat_refuses_the_close_when_the_reanchor_does_not_take(fs, cmux):
     assert not any(c[:1] == ("close-workspace",) for c in cmux.calls)
     assert any("did not move the anchor" in n for n in notes)
     assert cmux.groups["groups"][0]["anchor_workspace_ref"] == R_COND      # group intact
+
+
+def test_close_seat_of_a_modelb_conductor_member_never_touches_the_empty_anchor(fs, monkeypatch):
+    """Model B live-group NO-DISTURB: the anchor is an EMPTY scaffold and the conductor is an ordinary
+    MEMBER. Archiving the conductor closes ONLY its member workspace -- no re-anchor, no mint, the empty
+    anchor and the group are left exactly as they were. This is the guarantee for the live groups already
+    restructured by hand."""
+    scaffold_r, scaffold_w = "workspace:61", "0B0B0B0B-0000-0000-0000-000000000061"
+    model = _tree_model()
+    model.append((scaffold_r, scaffold_w, "Conductor - cmux-advisor",
+                  [("surface:200", "0B0B0B0B-0000-0000-0000-0000000000C8", "terminal", "")]))
+    groups = {"groups": [{"ref": "workspace_group:2", "name": "Conductor - cmux-advisor",
+                          "anchor_workspace_ref": scaffold_r,
+                          "member_workspace_refs": [scaffold_r, R_COND, R_GRAPH]}]}
+    c = FakeCmux(model=model, groups=groups)
+    monkeypatch.setattr(fleet, "cmuxq", c)
+    monkeypatch.setattr(fs, "read_hook_store", lambda: {"sessions": {}, "activeSessionsBySurface": {}})
+    monkeypatch.setattr(rs.fs, "read_hook_store", lambda: {"sessions": {}, "activeSessionsBySurface": {}})
+    monkeypatch.delenv("CMUX_SURFACE_ID", raising=False)
+    _seed(fs, "cond", S_COND, place="workspace", parent="")
+    c.model[0][3].pop()                          # the conductor is alone in its own member workspace
+    ok, notes = fleet._close_seat("cond", fs.live_get("cond"), "archive")
+    assert ("close-workspace", "--workspace", W_COND) in c.calls        # the MEMBER workspace closed...
+    assert not any(x[:2] == ("workspace-group", "set-anchor") for x in c.calls)  # ...anchor untouched
+    assert not any(x[:1] == ("new-workspace",) for x in c.calls)        # no scaffold minted
+    assert c.groups["groups"][0]["anchor_workspace_ref"] == scaffold_r  # the empty anchor is intact
 
 
 def test_close_seat_of_a_plain_group_member_leaves_the_group_alone(fs, cmux):

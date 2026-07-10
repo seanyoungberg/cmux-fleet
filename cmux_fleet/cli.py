@@ -602,48 +602,6 @@ def _term_surface_in(ws_uuid, pane_ref=None):
     return ""
 
 
-def _close_group_scaffold(before, keep_ws):
-    """Close the scaffolding workspace `workspace-group create` spawns. Returns (closed_uuids, notes).
-
-    THE CONTRACT, live-measured on cmux 0.64.17 (2026-07-10, reproduced twice): `workspace-group create
-    --name N --from <ref>` does NOT anchor the group on <ref>. It creates a NEW workspace named N holding
-    a bare login shell, anchors the group on THAT, and adopts <ref> as an ordinary member. So a
-    `fleet launch --place workspace --group <new-name>` left behind a bare-shell workspace named after the
-    group, sitting in the sidebar forever, anchoring the group -- the same residue class Berg's archive
-    ruling names, only created at LAUNCH. `fleet group init` half-guarded against it (it re-anchors, then
-    tries to close a "provably empty" new workspace) but cmux gives the scaffold a terminal surface, so
-    the emptiness test never fired and the scaffold survived there too.
-
-    Safe to close: `before` is the workspace set snapshotted immediately BEFORE the create, so `after -
-    before` is exactly what cmux made in the last instant -- nothing of anyone's can be inside. `keep_ws`
-    (the agent's own workspace) is excluded. The never-orphan floor is still CHECKED per surface
-    (resolve.occupants, any tool) rather than assumed away: a workspace that somehow holds a live agent or
-    a registered seat is reported and left alone."""
-    from . import state as fs
-    from . import resolve as rs
-    tree = cmuxq("tree", "--all", "--id-format", "both")
-    fresh = sorted(w for w in (_all_workspace_uuids(tree) - before) if w.upper() != (keep_ws or "").upper())
-    if not fresh:
-        return [], []
-    ws_map = surface_ws_map_from_tree(tree)
-    registered = {(v.get("surface") or "").upper() for v in fs.live_all().values()}
-    ps_out = rs._ps_axeww()                                # ONE sweep across every candidate surface
-    closed, notes = [], []
-    for w in fresh:
-        held = [s for s in rs.workspace_surfaces(w, ws_map=ws_map)
-                if s in registered or rs.occupants(s, ps_out=ps_out)]
-        if held:
-            notes.append(f"note: brand-new workspace {w[:8]} is OCCUPIED ({', '.join(s[:8] for s in held)}); "
-                         f"NOT closing it (inspect: cmux tree)")
-            continue
-        cmuxq("close-workspace", "--workspace", w)
-        closed.append(w)
-    if closed:
-        notes.append(f"closed {len(closed)} scaffolding workspace(s) `workspace-group create` spawned "
-                     f"({', '.join(w[:8] for w in closed)})")
-    return closed, notes
-
-
 def _group_ref(name_or_ref):
     """Resolve a workspace-group NAME to its ref (`workspace_group:N`), or '' if no such group exists.
     A value already in ref form is returned unchanged. cmux's `new-workspace --group` and
@@ -702,6 +660,49 @@ def _group_of_workspace(ws, tree_text):
     return None
 
 
+def _group_name(gref):
+    """The display NAME of a group ref (e.g. 'Conductor - berg-sandbox'), or '' if unknown. Used to
+    title a replacement anchor scaffold so the sidebar header keeps reading the same label."""
+    try:
+        gd = json.loads(cmuxq("workspace-group", "list", "--json"))
+    except Exception:
+        return ""
+    return next((g.get("name", "") for g in (gd.get("groups") or []) if g.get("ref") == gref), "")
+
+
+def _title_group_anchor_scaffold(gref, member_ws, conductor_label):
+    """Model B (empty-anchor, ratified 2026-07-10): a workspace-group's anchor is an EMPTY scaffold
+    workspace titled 'Conductor - <label>' with no agent on it, and the conductor runs as an ordinary
+    MEMBER in its own '<label>' workspace. cmux's `workspace-group create --name N --from <ref>` ALWAYS
+    mints exactly such a scaffold and anchors the group on it, adopting <ref> as a member. THE CONTRACT,
+    live-measured on cmux 0.64.17 (2026-07-10, reproduced twice): `workspace-group create --name N --from
+    <ref>` does NOT anchor on <ref> -- it builds a NEW workspace named N with a bare login shell, anchors
+    the group on THAT, and adopts <ref> as an ordinary member. So bootstrap KEEPS that scaffold as the
+    header and just titles it; it does NOT re-anchor onto the conductor and close the scaffold (Model A,
+    reversed — an anchored conductor renders as a bare folder shim and has its workspace title forced to
+    the group name, which fleet.swift then shows as the label).
+
+    Returns (anchor_uuid, notes). `member_ws` is the conductor's OWN workspace UUID and is never retitled
+    here. A defensive branch covers the contract-breaking case where create anchored on the member
+    itself (no scaffold minted): the anchor is left untitled rather than mislabel a live member."""
+    tree = cmuxq("tree", "--all", "--id-format", "both")
+    info = _group_of_workspace(member_ws, tree)
+    if not info:
+        return "", [f"warn: {conductor_label}'s workspace {(member_ws or '')[:8]} is not in group {gref} "
+                    f"after create; anchor NOT titled. Inspect: cmux workspace-group list --json"]
+    _, anchor, _ = info
+    title = f"Conductor - {conductor_label}"
+    if anchor and anchor.upper() != (member_ws or "").upper():
+        cmuxq("rename-workspace", "--workspace", anchor, "--", title)
+        return anchor, [f"anchored group {gref} on empty scaffold {anchor[:8]} titled '{title}'; "
+                        f"{conductor_label} joined as a member"]
+    if anchor:                                             # create anchored on the member (contract drift)
+        return anchor, [f"warn: group {gref} anchored on {conductor_label}'s OWN workspace ({anchor[:8]}) "
+                        f"instead of a fresh scaffold as measured; anchor NOT retitled (that would mislabel "
+                        f"a live member). Inspect: cmux workspace-group list --json"]
+    return "", [f"warn: group {gref} has no resolvable anchor workspace to title"]
+
+
 def create_surface(spec, parent_surf, direction):
     """Create the target surface per spec['place']; return (ws_uuid, surf_uuid). Aborts (None) on any
     unresolved UUID -- never send blind."""
@@ -739,29 +740,28 @@ def create_surface(spec, parent_surf, direction):
                 print(f"[fleet] ABORT: new-workspace gave no workspace ref: {out.strip()}"); return None, None
             ws = _ref_to_uuid("workspace", m.group(1))
             return ws, _term_surface_in(ws)
-        # group does NOT exist -> BOOTSTRAP it, anchored on this agent's OWN new workspace (one
-        # conductor = one group). Create the workspace standalone, THEN `workspace-group create --from
-        # <that ref>` with an ALWAYS-EXPLICIT --from: the implicit form adopts the CALLER's workspace
-        # (a known footgun). `create` does NOT honour --from as the anchor -- it spawns its own
-        # bare-shell anchor workspace named after the group (measured, cmux 0.64.17) -- so this is the
-        # same three-step dance `fleet group init` performs: snapshot, create, then re-anchor onto the
-        # agent's workspace and close the scaffold. Without it, `--place workspace --group <new>` left a
-        # workspace named after the group sitting in the sidebar forever. Anchoring the group on the
-        # AGENT is what makes `fleet archive` able to re-anchor off it later, rather than dissolve it.
+        # group does NOT exist -> BOOTSTRAP it (one conductor = one group). Model B (empty-anchor,
+        # ratified 2026-07-10): the group anchor is an EMPTY scaffold titled 'Conductor - <label>' and
+        # the conductor runs as an ordinary MEMBER in its own '<label>' workspace. Create the conductor's
+        # workspace standalone, THEN `workspace-group create --from <that ref>` with an ALWAYS-EXPLICIT
+        # --from (the implicit form adopts the CALLER's workspace, a known footgun). cmux's `create`
+        # ALWAYS mints a fresh bare-shell workspace, anchors the group on THAT, and adopts <ref> as a
+        # member (measured, cmux 0.64.17) -- which is already Model B's shape. So we KEEP that scaffold as
+        # the anchor and just title it; we do NOT re-anchor onto the conductor and close the scaffold
+        # (Model A, which rendered the conductor as a bare folder shim with its title forced to the group
+        # name). `fleet archive` re-anchors off the scaffold onto a fresh scaffold, never dissolving it.
         out = cmuxq("new-workspace", "--name", spec["label"], "--cwd", spec["abs_cwd"], "--focus", "false")
         m = re.search(r"(workspace:\d+)", out)
         if not m:
-            print(f"[fleet] ABORT: new-workspace (anchor) gave no workspace ref: {out.strip()}"); return None, None
-        anchor_ref = m.group(1)
-        before = _all_workspace_uuids(cmuxq("tree", "--all", "--id-format", "both"))
-        cmuxq("workspace-group", "create", "--name", group, "--from", anchor_ref)
-        ws = _ref_to_uuid("workspace", anchor_ref)
+            print(f"[fleet] ABORT: new-workspace gave no workspace ref: {out.strip()}"); return None, None
+        member_ref = m.group(1)
+        cmuxq("workspace-group", "create", "--name", group, "--from", member_ref)
+        ws = _ref_to_uuid("workspace", member_ref)
         gref = _group_ref(group)
         if gref:
-            cmuxq("workspace-group", "set-anchor", "--group", gref, "--workspace", ws)   # the AGENT anchors
-            for n in _close_group_scaffold(before, keep_ws=ws)[1]:
+            for n in _title_group_anchor_scaffold(gref, ws, spec["label"])[1]:
                 print(f"[fleet] {n}")
-            print(f"[fleet] created group '{group}' ({gref}) anchored on {spec['label']} ({anchor_ref})")
+            print(f"[fleet] created group '{group}' ({gref}); {spec['label']} joined as member ({member_ref})")
         else:
             print(f"[fleet] warn: group '{group}' did not register; {spec['label']} workspace is standalone")
         return ws, _term_surface_in(ws)
@@ -2229,23 +2229,24 @@ def plan_seat_close(label, surface, workspace, caller_workspace, place, siblings
     return {"verb": "close-workspace", "workspace": workspace, "blockers": [], "collateral": list(siblings)}
 
 
-def _reanchor_group_off(ws, prefer, tree_text, ws_map=None):
+def _reanchor_group_off(ws, tree_text):
     """Move a group's ANCHOR off workspace `ws` before `ws` is closed. Returns (ok, note).
 
     Closing an anchor dissolves its group -- cmux's documented behavior, and confirmed live on 0.64.17:
-    closing a two-member group's anchor left the survivor as an ungrouped workspace. So a conductor's
-    retirement would silently scatter its still-live children out of the sidebar group. Re-anchor onto a
-    surviving member first -- `workspace-group set-anchor` takes a group REF, never a name, plus a
-    workspace UUID.
+    closing a two-member group's anchor left the survivor as an ungrouped workspace. So closing the
+    anchor workspace would silently scatter a group's still-live members out of the sidebar group.
 
-    Who inherits the header: `prefer` in order (the parent conductor's workspace, then the caller's),
-    then any survivor that HOSTS A REGISTERED AGENT, then the lowest-sorted survivor. The agent-hosting
-    rule matters because a group's other members can include workspaces nobody lives in -- anchoring the
-    group header onto an empty one is how a sidebar group ends up named after nothing.
+    Under Model B (empty-anchor, ratified 2026-07-10) the anchor is an EMPTY scaffold that no agent lives
+    on, and the conductor runs as an ordinary MEMBER -- so archiving a conductor closes a plain member and
+    returns early below, never touching the anchor. The re-anchor branch is the DEFENSIVE path for when
+    the anchor WORKSPACE itself is removed: a legacy Model A group whose conductor IS the anchor, or a
+    deliberate scaffold close. It re-anchors onto a FRESH empty scaffold minted in the group, NEVER onto a
+    surviving member -- re-anchoring onto a peopled member conductor is exactly Model A (the bare-folder
+    header with the forced title that this flip reverses). `workspace-group set-anchor` takes a group REF,
+    never a name, plus a workspace UUID.
 
-    ok=False REFUSES the close: the re-anchor is a cmux mutation we VERIFY (re-read the group list), and
-    an unverified anchor move means the next call would dissolve the group. Refuse and report."""
-    from . import state as fs
+    ok=False REFUSES the close: the mint + re-anchor is a cmux mutation we VERIFY (re-read the group
+    list), and an unverified anchor move means the next call would dissolve the group. Refuse and report."""
     info = _group_of_workspace(ws, tree_text)
     if not info:
         return True, ""                                   # ungrouped -> nothing to protect
@@ -2255,21 +2256,26 @@ def _reanchor_group_off(ws, prefer, tree_text, ws_map=None):
     survivors = sorted(m for m in members if m and m.upper() != ws.upper())
     if not survivors:
         return True, (f"group {gref} has no member besides {ws[:8]}; closing it dissolves an empty group")
-    surv_up = {s.upper() for s in survivors}
-    m = surface_ws_map_from_tree(tree_text) if ws_map is None else ws_map
-    peopled = sorted(w for w in survivors
-                     if any(m.get((v.get("surface") or "").upper(), "").upper() == w.upper()
-                            for v in fs.live_all().values()))
-    new = next((p for p in prefer if p and p.upper() in surv_up), None) or \
-        (peopled[0] if peopled else survivors[0])
+    # Model B: re-anchor onto a FRESH empty scaffold, never onto a surviving member. Mint a bare workspace
+    # in the group, title it with the group's header name, anchor there.
+    title = _group_name(gref) or "Conductor"
+    out = cmuxq("new-workspace", "--group", gref, "--name", title, "--focus", "false")
+    m = re.search(r"(workspace:\d+)", out)
+    fresh_tree = cmuxq("tree", "--all", "--id-format", "both")
+    new = _ref_to_uuid("workspace", m.group(1), fresh_tree) if m else ""
+    if not new:
+        return False, (f"could not mint a replacement scaffold anchor for group {gref}; NOT closing "
+                       f"{ws[:8]} (closing an anchor dissolves group {gref} and ungroups its "
+                       f"{len(survivors)} surviving member(s)). Re-anchor by hand, then re-run.")
     cmuxq("workspace-group", "set-anchor", "--group", gref, "--workspace", new)
-    after = _group_of_workspace(ws, tree_text)             # VERIFY: cmuxq gives us no rc worth trusting
+    after = _group_of_workspace(ws, fresh_tree)            # VERIFY: cmuxq gives us no rc worth trusting
     if after and after[1] and after[1].upper() == ws.upper():
-        return False, (f"`workspace-group set-anchor --group {gref} --workspace {new}` did not move the "
-                       f"anchor off {ws[:8]}. NOT closing the workspace: closing an anchor dissolves "
+        return False, (f"`workspace-group set-anchor --group {gref} --workspace {new[:8]}` did not move "
+                       f"the anchor off {ws[:8]}. NOT closing the workspace: closing an anchor dissolves "
                        f"group {gref} and ungroups its {len(survivors)} surviving member(s). Re-anchor "
                        f"by hand, then re-run.")
-    return True, f"re-anchored group {gref} onto {new[:8]} (was anchored on {ws[:8]})"
+    return True, (f"re-anchored group {gref} onto fresh empty scaffold {new[:8]} '{title}' "
+                  f"(was anchored on {ws[:8]}) -- the conductor stays a member")
 
 
 def seat_close_plan(label, e):
@@ -2373,8 +2379,7 @@ def _close_seat(label, e, verb, planned=None):
                          f"{out.strip()[:140] or '(nothing)'}")
             return False, notes
         return True, notes
-    ok, note = _reanchor_group_off(ws, [planned["parent_ws"], planned["caller_ws"]], planned["tree"],
-                                   ws_map=planned["ws_map"])
+    ok, note = _reanchor_group_off(ws, planned["tree"])
     if note:
         notes.append(f"  {note}")
     if not ok:
@@ -3410,26 +3415,22 @@ def cmd_group(argv):
             print(f"[fleet] group '{name}' ({gref}) already exists; recorded on {self_label}. "
                   f"Children launched with --place workspace (no --group) now join it.")
             return 0
-        # bootstrap: snapshot workspaces, create anchored on MY ws, set-anchor, close the empty scaffold.
-        before = _all_workspace_uuids(cmuxq("tree", "--all", "--id-format", "both"))
+        # bootstrap (Model B, empty-anchor, ratified 2026-07-10): create the group from MY ws, then KEEP
+        # the scaffold cmux mints as the EMPTY anchor and title it 'Conductor - <label>'. My workspace
+        # stays an ordinary MEMBER. The old model re-anchored onto my workspace and closed the scaffold --
+        # that rendered the conductor as a bare folder shim and forced its title to the group name.
         cmuxq("workspace-group", "create", "--name", name, "--from", my_ws)   # ALWAYS explicit --from
         gref = _group_ref(name)
         if not gref:
             sys.exit(f"[fleet] group init: `workspace-group create` did not register a group named "
                      f"'{name}'. No registry change. Inspect: cmux workspace-group list --json")
-        cmuxq("workspace-group", "set-anchor", "--group", gref, "--workspace", my_ws)  # my ws IS the anchor
-        # close the bare-shell anchor cmux spawns for the group (the 2026-07-02 footgun). The old test
-        # here was "provably empty" (_term_surface_in) -- but cmux gives the scaffold a login shell, so it
-        # never fired and the scaffold survived. _close_group_scaffold tests the thing that actually
-        # matters (does any surface hold a live agent or a registered seat) and closes the WORKSPACE.
-        closed, notes = _close_group_scaffold(before, keep_ws=my_ws)
-        for n in notes:
+        for n in _title_group_anchor_scaffold(gref, my_ws, self_label)[1]:
             print(f"[fleet] group init: {n}")
         fs.live_put(self_label, {**self_entry, "group": name, "place": "workspace"})
         fs.log_event("group-init", label=self_label, via="bootstrap", group=name)
-        tail = f"; closed {len(closed)} scaffold workspace(s)" if closed else ""
-        print(f"[fleet] group '{name}' ({gref}) anchored on {self_label}'s workspace{tail}. "
-              f"Children launched with --place workspace (no --group) now join it.")
+        print(f"[fleet] group '{name}' ({gref}) created; {self_label} joined as a member under the empty "
+              f"'Conductor - {self_label}' anchor. Children launched with --place workspace (no --group) "
+              f"now join it.")
         return 0
 
     # --- add <label> ---------------------------------------------------------------------------

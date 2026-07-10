@@ -24,6 +24,18 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Changed
 
+- **Workspace-group anchor model flipped A→B (empty-anchor), ratified 2026-07-10.** A conductor's group
+  anchor is now the EMPTY scaffold workspace `workspace-group create` always mints, titled
+  `Conductor - <label>`; the conductor runs as an ordinary MEMBER in its own `<label>` workspace. The old
+  model re-anchored the group onto the conductor's own workspace and reaped the scaffold — which rendered
+  the conductor as a bare folder shim in the native sidebar and forced its workspace title to the group
+  name (shown by `fleet.swift` as the label). Three sites flipped: the launch bootstrap (`create_surface`)
+  and `fleet group init` now KEEP + title the scaffold instead of `set-anchor`+close (strictly less code —
+  the `_close_group_scaffold` reaper is gone); the archive re-anchor path (`_reanchor_group_off`) now mints
+  a FRESH empty scaffold and anchors there when an anchor workspace is removed, NEVER onto a surviving
+  member conductor (which would recreate model A). Live groups already restructured by hand are untouched:
+  archiving a Model B member conductor closes only its member workspace, never the empty anchor. Contract
+  verified live (`create --from` mints the scaffold anchor; `rename-workspace` titles it).
 - **Sidebar state model: no post-turn lag, and "ready" no longer reads as "asleep".** A real-time,
   transcript-based turn-end signal clears a just-finished agent's "working" in ~5s instead of ~60s (cmux's
   own idle timer lags at `running` post-turn); it fails closed, so it only ever *clears* a stale "working".

@@ -1,6 +1,7 @@
 # tests/test_groups.py — built-in workspace-group handling (one conductor = one group). Covers the
 # logic that decides join-vs-bootstrap and the name->ref resolution, with cmux shelled calls captured
 # via a fake cmuxq (no real cmux). Plus an e2e dry-run for the conductor group default.
+import json
 import os
 import subprocess
 import sys
@@ -23,34 +24,97 @@ def test_group_ref_resolves_name_passthrough_and_missing(monkeypatch):
     assert fleet._group_ref("") == ""
 
 
-def test_workspace_bootstrap_uses_explicit_from(monkeypatch):
-    # group ABSENT -> create a standalone anchor workspace, then workspace-group create --from <that ref>.
+def _modelb_group_list(gref="workspace_group:3", name="g1", anchor_ref="workspace:88",
+                       member_refs=("workspace:88", "workspace:7")):
+    """The `workspace-group list --json` cmux serves AFTER `workspace-group create --name N --from <ref>`:
+    a Model B shape where the group's anchor is the FRESH scaffold cmux minted (anchor_ref, NOT <ref>) and
+    <ref> is an ordinary member. This is the measured cmux 0.64.17 contract the old code compensated for."""
+    return json.dumps({"groups": [{"ref": gref, "name": name, "anchor_workspace_ref": anchor_ref,
+                                    "member_workspace_refs": list(member_refs)}]})
+
+
+def test_workspace_bootstrap_modelb_titles_scaffold_and_keeps_conductor_a_member(monkeypatch):
+    # group ABSENT -> create the conductor's own workspace STANDALONE, then `workspace-group create --from
+    # <that ref>`. Model B (empty-anchor): cmux mints a fresh scaffold and anchors the group on it, so the
+    # bootstrap KEEPS that scaffold as the anchor and TITLES it 'Conductor - <label>' -- it does NOT
+    # re-anchor onto the conductor (that made the conductor a bare folder shim) and does NOT close it.
     calls = []
     def fake_cmuxq(*args):
         calls.append(args)
-        return "created workspace:7\n" if args[:1] == ("new-workspace",) else ""
+        if args[:1] == ("new-workspace",):
+            return "created workspace:7\n"
+        if args[:3] == ("workspace-group", "list", "--json"):
+            return _modelb_group_list()
+        return ""
     monkeypatch.setattr(fleet, "cmuxq", fake_cmuxq)
     refs = iter(["", "workspace_group:3"])                       # absent on first check, present after create
     monkeypatch.setattr(fleet, "_group_ref", lambda g: next(refs))
-    monkeypatch.setattr(fleet, "_ref_to_uuid", lambda kind, ref: "WS")
+    monkeypatch.setattr(fleet, "_ref_to_uuid",
+                        lambda kind, ref, tree=None: {"workspace:7": "WS-MEMBER",
+                                                      "workspace:88": "WS-SCAFFOLD"}.get(ref, ""))
     monkeypatch.setattr(fleet, "_term_surface_in", lambda ws, pane=None: "SF")
 
     ws, surf = fleet.create_surface(
         {"place": "workspace", "group": "g1", "label": "cond", "abs_cwd": "/tmp/x"}, "PARENT", "down")
-    assert (ws, surf) == ("WS", "SF")
-    anchor = [c for c in calls if c[0] == "new-workspace"][0]
-    assert "--group" not in anchor                              # the anchor is created STANDALONE, not joined
+    assert (ws, surf) == ("WS-MEMBER", "SF")                     # the AGENT's return is its OWN member ws
+    nw = [c for c in calls if c[0] == "new-workspace"][0]
+    assert "--group" not in nw and "--name" in nw and "cond" in nw  # conductor's own ws, standalone + titled
     create = [c for c in calls if c[:2] == ("workspace-group", "create")][0]
     assert "--from" in create and "workspace:7" in create       # ALWAYS explicit --from (never implicit)
     assert "--name" in create and "g1" in create
-    # ...and --from is NOT enough: cmux anchors the new group on a bare-shell workspace it spawns itself,
-    # so the bootstrap must re-anchor onto the AGENT's workspace (and later reap the scaffold). Without
-    # this, `fleet archive` of the agent would find itself a plain member and leave the group behind,
-    # anchored on an empty workspace named after the group.
-    setanchor = [c for c in calls if c[:2] == ("workspace-group", "set-anchor")][0]
-    assert "--group" in setanchor and "workspace_group:3" in setanchor
-    assert "--workspace" in setanchor and "WS" in setanchor
-    assert calls.index(create) < calls.index(setanchor)
+    # Model B: the scaffold cmux minted is KEPT as the anchor and TITLED with the conductor's label...
+    rename = [c for c in calls if c[0] == "rename-workspace"][0]
+    assert "WS-SCAFFOLD" in rename and "Conductor - cond" in rename
+    assert "WS-MEMBER" not in rename                             # the conductor's OWN workspace is never retitled
+    # ...and the conductor is NEVER re-anchored onto and no scaffold is reaped (strictly less code than A).
+    assert not [c for c in calls if c[:2] == ("workspace-group", "set-anchor")]
+    assert not [c for c in calls if c[0] == "close-workspace"]
+
+
+def test_title_group_anchor_scaffold_renames_the_scaffold_not_the_member(monkeypatch):
+    # The unit: given the Model B group list cmux serves after create, title the anchor scaffold and leave
+    # the conductor's member workspace alone. Returns the anchor uuid.
+    calls = []
+    def fake_cmuxq(*args):
+        calls.append(args)
+        if args[:3] == ("workspace-group", "list", "--json"):
+            return _modelb_group_list(gref="workspace_group:9")
+        return ""
+    monkeypatch.setattr(fleet, "cmuxq", fake_cmuxq)
+    monkeypatch.setattr(fleet, "_ref_to_uuid",
+                        lambda kind, ref, tree=None: {"workspace:7": "WS-MEMBER",
+                                                      "workspace:88": "WS-SCAFFOLD"}.get(ref, ""))
+    anchor, notes = fleet._title_group_anchor_scaffold("workspace_group:9", "WS-MEMBER", "berg-sandbox")
+    assert anchor == "WS-SCAFFOLD"
+    rename = [c for c in calls if c[0] == "rename-workspace"][0]
+    assert "WS-SCAFFOLD" in rename and "Conductor - berg-sandbox" in rename
+    assert not any("WS-MEMBER" in c for c in calls if c and c[0] == "rename-workspace")
+    assert any("Conductor - berg-sandbox" in n for n in notes)
+
+
+def test_title_group_anchor_scaffold_refuses_to_retitle_a_member_on_contract_drift(monkeypatch):
+    # DEFENSIVE: if cmux ever anchored the group on the conductor's OWN workspace (no scaffold minted),
+    # do NOT retitle it 'Conductor - ...' (that would mislabel a live member) -- warn and leave it.
+    calls = []
+    def fake_cmuxq(*args):
+        calls.append(args)
+        if args[:3] == ("workspace-group", "list", "--json"):
+            return _modelb_group_list(anchor_ref="workspace:7", member_refs=("workspace:7",))  # anchor==member
+        return ""
+    monkeypatch.setattr(fleet, "cmuxq", fake_cmuxq)
+    monkeypatch.setattr(fleet, "_ref_to_uuid",
+                        lambda kind, ref, tree=None: {"workspace:7": "WS-MEMBER"}.get(ref, ""))
+    anchor, notes = fleet._title_group_anchor_scaffold("workspace_group:3", "WS-MEMBER", "cond")
+    assert anchor == "WS-MEMBER"
+    assert not [c for c in calls if c[0] == "rename-workspace"]         # nothing retitled
+    assert any("NOT retitled" in n for n in notes)
+
+
+def test_group_name_resolves_ref_to_display_name(monkeypatch):
+    monkeypatch.setattr(fleet, "cmuxq", lambda *a: _modelb_group_list(gref="workspace_group:2",
+                                                                      name="Conductor - berg-sandbox"))
+    assert fleet._group_name("workspace_group:2") == "Conductor - berg-sandbox"
+    assert fleet._group_name("workspace_group:404") == ""
 
 
 def test_workspace_joins_existing_group(monkeypatch):

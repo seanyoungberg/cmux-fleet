@@ -2,6 +2,7 @@
 # `fleet group init|add` (one-conductor-one-group). cmux shell-outs are faked via a capturing cmuxq;
 # the tree/group resolvers are monkeypatched so the units never touch a live cmux. Registry side runs
 # against the throwaway $CMUX_STATE_DIR. Companion to the router move-vs-close tests in test_router.py.
+import json
 import os
 import sys
 
@@ -23,109 +24,66 @@ def _seq(*vals):
 
 # =============================== fleet group init / add =========================================
 
-def test_group_init_bootstraps_and_records(fs, monkeypatch):
-    # group ABSENT -> create --from MY ws, set-anchor MY ws, close the empty scaffold anchor, record group.
+def _modelb_group_cmux(calls, gref="workspace_group:7", name="AD - Berg Sandbox",
+                       anchor_ref="workspace:88", member_ref="workspace:2"):
+    """A cmux where `workspace-group create --from <member>` has already produced a Model B group: the
+    group's anchor is the FRESH scaffold cmux minted (anchor_ref, NOT <member>) and <member> is an
+    ordinary member. This models the measured cmux 0.64.17 contract the old code compensated for."""
+    def fake(*a):
+        calls.append(a)
+        if a[:3] == ("workspace-group", "list", "--json"):
+            return json.dumps({"groups": [{"ref": gref, "name": name, "anchor_workspace_ref": anchor_ref,
+                                           "member_workspace_refs": [anchor_ref, member_ref]}]})
+        return ""
+    return fake
+
+
+def test_group_init_bootstraps_modelb_and_records(fs, monkeypatch):
+    # group ABSENT -> create --from MY ws; Model B: KEEP the scaffold cmux mints as the empty anchor and
+    # TITLE it 'Conductor - <label>'. My workspace stays an ordinary MEMBER -- NO set-anchor onto it, NO
+    # close. Then record the group on the conductor's row.
     fs.live_put("cond", {"role": "c", "kind": "conductor", "tool": "claude", "surface": "COND-S",
                          "workspace": "WS-COND", "status": "live"})
     calls = []
-    monkeypatch.setattr(fleet, "cmuxq", lambda *a: (calls.append(a) or ""))
+    monkeypatch.setattr(fleet, "cmuxq", _modelb_group_cmux(calls, member_ref="workspace:2"))
     monkeypatch.setattr(fleet, "current_ws_for_surface", lambda surf: "WS-COND")
-    grefs = iter(["", "workspace_group:7"])                 # absent on first check, present after create
-    monkeypatch.setattr(fleet, "_group_ref", lambda g: next(grefs))
-    wsets = iter([{"WS-COND"}, {"WS-COND", "WS-SCAFFOLD"}])  # a NEW empty anchor appears after create
-    monkeypatch.setattr(fleet, "_all_workspace_uuids", lambda txt: next(wsets))
-    monkeypatch.setattr(fleet, "_term_surface_in", lambda ws, pane=None: "")   # scaffold is EMPTY
+    monkeypatch.setattr(fleet, "_group_ref", _seq("", "workspace_group:7"))   # absent, then present
+    monkeypatch.setattr(fleet, "_ref_to_uuid",
+                        lambda kind, ref, tree=None: {"workspace:88": "WS-SCAFFOLD",
+                                                      "workspace:2": "WS-COND"}.get(ref, ""))
 
     assert fleet.cmd_group(["init", "--name", "AD - Berg Sandbox", "--surface", "COND-S"]) == 0
 
     create = [c for c in calls if c[:2] == ("workspace-group", "create")][0]
     assert "--from" in create and "WS-COND" in create and "AD - Berg Sandbox" in create
-    setanchor = [c for c in calls if c[:2] == ("workspace-group", "set-anchor")][0]
-    assert "WS-COND" in setanchor and "workspace_group:7" in setanchor
-    assert ("close-workspace", "--workspace", "WS-SCAFFOLD") in calls   # empty scaffold reaped
-    assert fs.live_get("cond")["group"] == "AD - Berg Sandbox"          # recorded in the registry
+    # Model B: the scaffold is TITLED with the CONDUCTOR's label (not the group name) and KEPT...
+    rename = [c for c in calls if c[0] == "rename-workspace"][0]
+    assert "WS-SCAFFOLD" in rename and "Conductor - cond" in rename
+    assert "WS-COND" not in rename                                      # the conductor's own ws is never retitled
+    # ...and the conductor is NEVER re-anchored onto, and no scaffold is reaped.
+    assert not [c for c in calls if c[:2] == ("workspace-group", "set-anchor")]
+    assert not [c for c in calls if c[0] == "close-workspace"]
+    assert fs.live_get("cond")["group"] == "AD - Berg Sandbox"         # recorded in the registry
     assert fs.live_get("cond")["place"] == "workspace"
 
 
-# The scaffold cmux spawns for a new group is NOT "provably empty": `workspace-group create --name N
-# --from <ref>` builds a whole new workspace named N with a bare login shell in it, anchors the group
-# there, and adopts <ref> as a member (measured on cmux 0.64.17, 2026-07-10). The old emptiness test
-# (_term_surface_in) therefore never fired, and every `fleet launch --place workspace --group <new>` left
-# a workspace named after the group sitting in the sidebar. _close_group_scaffold tests what actually
-# matters -- does any surface in it hold a live agent or a registered seat -- so these two tests feed it a
-# REAL `cmux tree` and a REAL `ps axeww` table rather than stubbing the question away.
-
-_WS_COND = "85576ACB-D5B9-4817-9A71-3FEBB54BC9EA"
-_WS_NEW = "F008C803-63B1-420C-8FAE-480787E454E1"
-_S_COND = "DCCA9A19-4F0C-4C22-9E5B-1C4C1A3F60B1"
-_S_NEW = "B941BC13-7380-4596-B58C-E0EB20B463EA"
-
-
-def _tree_with_scaffold(new_title="Terminal"):
-    return (f'window window:1 9FBB70C6-7B17-4DA5-B54D-8FF3641D24E2 [current] ◀ active\n'
-            f'├── workspace workspace:7 {_WS_COND} "Conductor - cmux-advisor" [selected]\n'
-            f'│   └── pane pane:9 00B68660-784E-4838-BB90-0C37093FB39D [focused]\n'
-            f'│       └── surface surface:12 {_S_COND} [terminal] "✳ Claude Code" [selected]\n'
-            f'├── workspace workspace:37 {_WS_NEW} "cond"\n'
-            f'│   └── pane pane:51 1BE4BFB8-33CD-4131-BA64-FA3508A3AAF1 [focused]\n'
-            f'│       └── surface surface:155 {_S_NEW} [terminal] "{new_title}" [selected]\n')
-
-
-def _init_with(monkeypatch, calls, tree):
-    monkeypatch.setattr(fleet, "cmuxq",
-                        lambda *a: (calls.append(a) or (tree if a[:1] == ("tree",) else "")))
-    monkeypatch.setattr(fleet, "current_ws_for_surface", lambda surf: _WS_COND)
+def test_group_init_defaults_the_group_name_to_the_label(fs, monkeypatch):
+    # no --name -> the group (and the 'Conductor - <label>' anchor title) default to the conductor's label.
+    fs.live_put("cond", {"role": "c", "kind": "conductor", "tool": "claude", "surface": "COND-S",
+                         "workspace": "WS-COND", "status": "live"})
+    calls = []
+    monkeypatch.setattr(fleet, "cmuxq", _modelb_group_cmux(calls, name="cond"))
+    monkeypatch.setattr(fleet, "current_ws_for_surface", lambda surf: "WS-COND")
     monkeypatch.setattr(fleet, "_group_ref", _seq("", "workspace_group:7"))
-
-
-def test_group_init_reaps_the_bare_shell_scaffold_cmux_spawns(fs, monkeypatch):
-    """The scaffold holds a login shell, not nothing. It is still reapable: it did not exist a moment ago
-    (the before/after tree diff brackets the `create`), and no surface in it holds a live agent."""
-    fs.live_put("cond", {"role": "c", "kind": "conductor", "tool": "claude", "surface": _S_COND,
-                         "workspace": _WS_COND, "status": "live"})
-    calls = []
-    _init_with(monkeypatch, calls, _tree_with_scaffold())
-    # before-set: only the conductor's ws; after-set: the real tree above (both through the REAL parser)
-    monkeypatch.setattr(fleet, "_all_workspace_uuids",
-                        _seq({_WS_COND}, {_WS_COND, _WS_NEW}))
-    assert fleet.cmd_group(["init", "--surface", _S_COND]) == 0
-    assert ("close-workspace", "--workspace", _WS_NEW) in calls        # the scaffold WORKSPACE, not a surface
-    assert fs.live_get("cond")["group"] == "cond"                      # name defaulted to the label
-
-
-def test_group_init_never_closes_a_new_workspace_holding_a_live_agent(fs, monkeypatch):
-    """SAFETY, restated against the check that replaced 'provably empty': a brand-new workspace that
-    somehow holds a LIVE agent is reported and left alone. Driven through the real `ps axeww` parse --
-    the conftest blanks that sweep, which is exactly the blindness that lets a teardown bug ship green."""
-    from cmux_fleet import resolve as rs
-    AGENT = 71001
-    ps_table = (f"  PID   TT  STAT      TIME COMMAND\n"
-                f"{AGENT} s001  S+   0:05.00 /Users/berg/.local/bin/claude "
-                f"CMUX_SURFACE_ID={_S_NEW} CMUX_CLAUDE_PID={AGENT}\n")
-    monkeypatch.setattr(rs, "_ps_axeww", lambda: ps_table)
-    monkeypatch.setattr(rs.fs, "pid_alive", lambda pid: pid == AGENT)
-    fs.live_put("cond", {"role": "c", "kind": "conductor", "tool": "claude", "surface": _S_COND,
-                         "workspace": _WS_COND, "status": "live"})
-    calls = []
-    _init_with(monkeypatch, calls, _tree_with_scaffold(new_title="✳ someone else's agent"))
-    monkeypatch.setattr(fleet, "_all_workspace_uuids", _seq({_WS_COND}, {_WS_COND, _WS_NEW}))
-    assert fleet.cmd_group(["init", "--surface", _S_COND]) == 0
-    assert not [c for c in calls if c[0] == "close-workspace"]          # nothing closed
+    monkeypatch.setattr(fleet, "_ref_to_uuid",
+                        lambda kind, ref, tree=None: {"workspace:88": "WS-SCAFFOLD",
+                                                      "workspace:2": "WS-COND"}.get(ref, ""))
+    assert fleet.cmd_group(["init", "--surface", "COND-S"]) == 0
+    create = [c for c in calls if c[:2] == ("workspace-group", "create")][0]
+    assert "cond" in create                                            # group name defaulted to the label
+    rename = [c for c in calls if c[0] == "rename-workspace"][0]
+    assert "Conductor - cond" in rename
     assert fs.live_get("cond")["group"] == "cond"
-
-
-def test_group_init_never_closes_a_new_workspace_holding_a_registered_seat(fs, monkeypatch):
-    """The other half of the floor: a registered agent's surface blocks the close even with no live pid
-    (a wedged agent still owns its seat)."""
-    fs.live_put("cond", {"role": "c", "kind": "conductor", "tool": "claude", "surface": _S_COND,
-                         "workspace": _WS_COND, "status": "live"})
-    fs.live_put("someone", {"role": "w", "kind": "child", "tool": "claude", "surface": _S_NEW,
-                            "workspace": _WS_NEW, "status": "live"})
-    calls = []
-    _init_with(monkeypatch, calls, _tree_with_scaffold())
-    monkeypatch.setattr(fleet, "_all_workspace_uuids", _seq({_WS_COND}, {_WS_COND, _WS_NEW}))
-    assert fleet.cmd_group(["init", "--surface", _S_COND]) == 0
-    assert not [c for c in calls if c[0] == "close-workspace"]
 
 
 def test_group_init_existing_group_just_records(fs, monkeypatch):
