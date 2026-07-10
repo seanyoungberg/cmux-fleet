@@ -3082,31 +3082,60 @@ def _latest_handover(abs_cwd):
     return max(files, key=os.path.getmtime) if files else ""
 
 
-def _poll_session_back(surf, old_sid, mode, timeout=90, exclude=None):
+def _live_bound_sid(surf):
+    """The sessionId of the freshest hook-store record on `surf` whose pid is ALIVE, or ''. THE live-pid
+    truth for 'which session is actually running on this seat right now'. poll_session's sessions[]
+    fallback returns the FIRST record that matches the surface — dict insertion order, i.e. usually the
+    OLD lingering entry cmux never drops post-respawn — so a confirm built on it can stare at a dead
+    ghost forever while the real fresh agent sits unconfirmed (the 2026-07-09 berg-sandbox recycle
+    misdetect: four recycles in a row 'no fresh session bound' with a live claude on the seat). A dead
+    pid cannot host a TUI, so filtering to live pids and taking the freshest is the record that IS the
+    running agent."""
+    from . import state as fs
+    best, best_ts = "", -1.0
+    for s in (fs.read_hook_store().get("sessions") or {}).values():
+        if (s.get("surfaceId") or "").upper() != (surf or "").upper():
+            continue
+        if not fs.pid_alive(s.get("pid")):
+            continue
+        ts = s.get("updatedAt") or 0
+        if ts >= best_ts:
+            best, best_ts = s.get("sessionId", ""), ts
+    return best
+
+
+def _poll_session_back(surf, old_sid, mode, timeout=90):
     """Confirm the recycled agent re-bound a session to `surf`. respawn-pane fully REMOVES the old
     session entry from cmux's hook store (session-end), then the relaunch re-creates it:
-      FRESH  -> a brand-new session id (sid != old_sid).
+      FRESH  -> confirm on the LIVE-PID truth (_live_bound_sid): the freshest record on the surface
+                with an ALIVE pid is the running agent, whatever sid cmux assigned it. This replaced
+                the old sid-exclusion-vs-{old_sid, pre_sid} confirm, which rode poll_session's
+                arbitrary-first-record fallback and could stare at the dead lingering ghost forever
+                while a healthy fresh agent sat on the seat unconfirmed — the destructive misdetect
+                that made the self-heal paste the launch into a LIVE TUI (berg-sandbox, 2026-07-09).
+                A live bind that equals old_sid does NOT confirm: that seat resumed the OLD session
+                (cmux restart-resume interference), which is live but not the fresh context the
+                recycle promised — fall through to WARN + escalation, never declare fresh.
       RESUME -> the SAME session id. `claude --resume <id>` CONTINUES the session (same id, same
                 transcript JSONL -- no fork; verified live), re-created with a fresh pid and
                 agentLifecycle '' -> 'unknown'. So we CANNOT wait for a different sid (it never
                 comes); we wait for the surface to carry a live (non-empty) lifecycle again, which
                 only happens once resume's session-start fires. activeSessionsBySurface stays null
-                until the first turn, so we rely on poll_session's sessions[] fallback + lifecycle.
-    `exclude` is a set of sids that do NOT count as a fresh bind (old_sid plus any stale store entry
-    lingering on the surface post-respawn) -- prevents a crashed launch from false-confirming.
+                until the first turn, so we rely on poll_session's sessions[] fallback + the
+                surface_has_live_agent (non-terminal AND live-pid) gate — a frozen dead-pid ghost
+                (SessionEnd-less brick, 2026-07-06) must not false-confirm the re-bind.
     Returns the bound sid, or '' on timeout."""
     from . import state as fs
-    exclude = exclude or {old_sid}
     end = time.time() + timeout
     while time.time() < end:
-        sid = poll_session(surf, timeout=1)
-        # RESUME confirm waits for the surface to carry a live lifecycle again (resume reuses old_sid, so
-        # 'a different sid' never comes). Require surface_has_live_agent -- non-terminal AND a LIVE pid --
-        # not just the string: a leftover frozen dead-pid 'running' ghost (SessionEnd-less brick,
-        # 2026-07-06) would else false-confirm the re-bind before the resumed agent has actually booted.
-        if sid and (sid not in exclude if mode == "fresh"
-                    else fs.surface_has_live_agent(surf)):
-            return sid
+        if mode == "fresh":
+            sid = _live_bound_sid(surf)
+            if sid and sid != old_sid:
+                return sid
+        else:
+            sid = poll_session(surf, timeout=1)
+            if sid and fs.surface_has_live_agent(surf):
+                return sid
         time.sleep(1)
     return ""
 
@@ -3687,12 +3716,77 @@ def _resume_and_gate(surf, send_cmd, tool, sess, log):
 _RESPAWN_VERIFY_TIMEOUT = 30
 
 
+def _fire_launch(surf, guarded, log):
+    """Paste the launch into the fresh post-respawn shell and verify the ENTER submitted it. GUARDED:
+    if an agent TUI is ALREADY UP on the surface (or its resume menu is), firing is refused — pasting a
+    launch into a live agent is exactly the inert-garbled-draft failure (berg-sandbox 2026-07-09: the
+    confirm misdetected a healthy fresh claude, and the self-heal re-fired the launch into its input
+    box as a collapsed '[Pasted text #1]' block). Returns True iff the launch was actually sent.
+
+    Submission verify mirrors _send_launch_and_confirm's shape (retry the ENTER, never the paste). The
+    terminating newline can lose the paste-settle race, leaving the launch as an inert DRAFT at the
+    shell; re-sending the WHOLE TEXT on top of it doubles the draft (orphan surface AAF4EC13), so only
+    a bare Enter is ever re-kicked. Either signal means the line submitted: _agent_surfaced (a TUI
+    marker painted) OR _resume_menu_visible (claude's resume-summary menu is up). Bounded to max_kicks
+    (~10s worst case), tiny vs the outer _poll_session_back(90) ceiling that runs AFTER this returns;
+    re-kicks stop the instant a TUI surfaces, so a slow boot is never spammed."""
+    if _agent_surfaced(surf) or _resume_menu_visible(surf):
+        log("SKIP launch: an agent TUI is already up on this surface — never paste a launch into a live agent")
+        return False
+    log("launching agent into the fresh shell")
+    cmuxq("send", "--surface", surf, guarded)
+    cmuxq("send-key", "--surface", surf, "enter")
+    kicks, max_kicks = 0, 5
+    while kicks < max_kicks:
+        if _agent_surfaced(surf) or _resume_menu_visible(surf):
+            return True                                  # submitted -> stop re-kicking
+        cmuxq("send-key", "--surface", surf, "enter")    # re-kick the ENTER only, never the paste
+        kicks += 1
+        time.sleep(2)
+    return True
+
+
+def _escalate_recycle_failure(label, surf, mode, reason, detail):
+    """Route a recycle failure to an ACTOR, not just the log. The pre-existing 'recycle FAILED' banner
+    targets the failed seat's OWN surface — which is a dead shell or an untracked agent at exactly that
+    moment, so nobody sees it (how the 9h berg-sandbox outage went unnoticed). A CHILD's failure alerts
+    its parent conductor through the SAME doctor inbox+wake rail the fleet-doctor sweep uses; a
+    CONDUCTOR's (or an unresolvable-parent's) failure fans out to peer conductors + the desktop exactly
+    like conductor-down (router._alert_conductor_peers). The child row's event key is per-attempt
+    (timestamped): each deliberate re-run that fails again re-alerts even if the prior failure was
+    acked. Best-effort: escalation must never mask the recycle's own exit path."""
+    from . import state as fs
+    try:
+        entry = fs.live_get(label) or {}
+        payload = {"failure": reason, "mode": mode, "detail": detail, "via": "recycle"}
+        parent = entry.get("parent")
+        pe = fs.live_get(parent) if parent else None
+        if entry.get("kind") == "child" and pe and pe.get("surface"):
+            ps = pe["surface"]
+            ekey = f"doctor:recycle-failed:{label}:{surf}:{int(time.time())}"
+            seq = fs.inbox_put("doctor", ps, {"reason": "recycle-failed", "label": label,
+                                              "child_surface": surf, **payload}, event_key=ekey)
+            print(f"[recycle] escalated to parent '{parent}' (doctor seq {seq}): {reason}", flush=True)
+            if seq and fs.idlewake_on():
+                if fs.wake_if_idle(ps, f"(fleet-doctor) recycle FAILED for child {label} ({reason}); "
+                                       f"handle your pending fleet inbox items"):
+                    fs.presented_mark(ps, [{"event_key": ekey}], "wake")
+        else:
+            from . import router                        # lazy: no import cycle (router lazy-imports cli)
+            router._alert_conductor_peers("recycle-failed", label, entry, surf, payload)
+        fs.log_event("recycle_escalated", label=label, surface=surf, mode=mode, reason=reason)
+    except Exception as e:
+        print(f"[recycle] escalation error (non-fatal): {e}", flush=True)
+
+
 def _recycle_exec_one(p):
     """Run ONE recycle: quiet-gate -> respawn-pane (verified) -> confirm new session -> reconcile the
     registry -> auto-prime. Never half-kills: aborts before respawn if the surface won't go quiet, and
     never sends the launch unless the old session is confirmed dead (see _respawn_and_verify) -- a
     respawn-pane timeout that goes unverified leaves the old claude ALIVE, and blindly firing the launch
     types it as an unsubmitted draft into that live TUI (the 9h berg-sandbox silent-recycle failure).
+    Every terminal failure ESCALATES to an actor via _escalate_recycle_failure (parent conductor /
+    peer-conductor fan-out) — a banner on the failed seat itself reaches nobody.
     Shared by the single `_recycle-exec` verb and the sequential `_recycle-bulk-exec` orchestrator.
     Returns 0 when the respawn proceeded (bound or lazy), 1 on a pre-respawn / verify-respawn /
     resume-gate abort."""
@@ -3722,27 +3816,6 @@ def _recycle_exec_one(p):
     # PATH, the wrapper exits 127 'claude not found in PATH'. Prepending the standard dirs makes the
     # binary resolvable regardless of shell-init timing (harmless no-op for codex/other tools).
     guarded = 'export PATH="$HOME/.local/bin:/opt/homebrew/bin:$PATH"; ' + send_cmd
-
-    def _fire_launch():
-        log("launching agent into the fresh shell")
-        cmuxq("send", "--surface", surf, guarded)
-        cmuxq("send-key", "--surface", surf, "enter")
-        # VERIFY the ENTER actually SUBMITTED the paste -- mirrors _send_launch_and_confirm's shape
-        # (retry the ENTER, never the paste). The terminating newline can lose the paste-settle race,
-        # leaving the launch as an inert DRAFT at the shell; the downstream self-heal then re-sends the
-        # WHOLE TEXT on top of it -> the doubled/tripled draft seen in orphan surface AAF4EC13. So we
-        # ONLY ever re-kick a bare Enter here -- the launch text is NEVER resent. Either signal means
-        # the line submitted: _agent_surfaced (a TUI marker painted) OR _resume_menu_visible (claude's
-        # resume-summary menu is up). Bounded to max_kicks (~10s worst case), tiny vs the outer
-        # _poll_session_back(90) ceiling that runs AFTER this returns; re-kicks stop the instant a TUI
-        # surfaces, so a slow boot is never spammed.
-        kicks, max_kicks = 0, 5
-        while kicks < max_kicks:
-            if _agent_surfaced(surf) or _resume_menu_visible(surf):
-                return                                       # submitted -> stop re-kicking
-            cmuxq("send-key", "--surface", surf, "enter")    # re-kick the ENTER only, never the paste
-            kicks += 1
-            time.sleep(2)
 
     def _direct_kill():
         """cmux-INDEPENDENT teardown of the old claude process: SIGINT x2 (clean TUI exit) straight to
@@ -3845,16 +3918,16 @@ def _recycle_exec_one(p):
                             "still on the old session; re-run")
             fs.log_event("recycle_abort", label=label, surface=surf, mode=mode,
                          reason="respawn-not-confirmed")
+            _escalate_recycle_failure(label, surf, mode, "respawn-not-confirmed",
+                                      "respawn didn't take; the OLD session is (almost certainly) "
+                                      "still live on the seat; re-run fleet recycle when it is idle")
             return 1
         log("confirmed after direct-kill fallback")
-    # SNAPSHOT the surface's store sid right after the verified kill but BEFORE relaunch. cmux's
-    # session-end does NOT reliably DROP the old entry from sessions[] (poll_session's fallback still
-    # sees it even once its lifecycle reads terminal), so a fresh-mode confirm could match this STALE
-    # sid and falsely report success even when the launch crashed -- then prime/wakes get typed into a
-    # dead shell (the 'claude not found' incident). Excluding pre_sid makes a crash correctly resolve to
-    # '' (no new session) -> WARN + no prime.
-    pre_sid = poll_session(surf, timeout=1)
-    _fire_launch()
+    # (The old pre_sid snapshot + fresh-mode sid-exclusion lived here. Retired: the fresh confirm is now
+    # LIVE-PID-resolved (_live_bound_sid via _poll_session_back), so cmux's undropped stale sessions[]
+    # entry — a DEAD pid by this point, the respawn was just verified — can never false-confirm, and no
+    # exclusion set is needed.)
+    _fire_launch(surf, guarded, log)
 
     # CONFIRM is tool-aware. claude binds a session at BOOT -> poll for it (a NEW sid for fresh, the
     # surface live again for resume). codex (and others) bind LAZILY on their first turn AND fire no
@@ -3885,18 +3958,22 @@ def _recycle_exec_one(p):
             if not _resume_and_gate(surf, send_cmd, p.get("tool"), old_sid, log):
                 log("ABORT: resume-summary menu never resolved within ceiling; NOT binding/registering "
                     "(surface still booting or wedged at the menu). Re-run `fleet recycle` later.")
+                _escalate_recycle_failure(label, surf, mode, "resume-menu-wedged",
+                                          "resume-summary menu never resolved; the seat is unbound/"
+                                          "unregistered; re-run fleet recycle once it settles")
                 return 1
-        # exclude pre_sid (the stale store entry snapshotted post-respawn) so a crashed launch can't
-        # false-confirm on it; fresh requires a sid that is neither old_sid nor pre_sid.
-        exclude = {old_sid, pre_sid} if mode == "fresh" else {old_sid}
-        sid = _poll_session_back(surf, old_sid, mode, 90, exclude=exclude)
+        sid = _poll_session_back(surf, old_sid, mode, 90)
         if not sid and mode == "fresh":
             # SELF-HEAL: the launch likely crashed into the bare shell (e.g. PATH not ready -> wrapper
             # 'claude not found'). The shell is fully initialized by now, so re-fire ONCE -- mirrors the
             # manual recovery (re-running the same command succeeds) instead of leaving a dead pane.
-            log("no fresh session bound; re-firing launch once (shell now settled)")
-            _fire_launch()
-            sid = _poll_session_back(surf, old_sid, mode, 60, exclude=exclude)
+            # _fire_launch's TUI-up guard makes this NON-DESTRUCTIVE: if an agent is already live on the
+            # seat (a confirm miss, an old-sid zombie, a cmux restart-resume), the re-fire is refused
+            # instead of pasting the launch into its input box (berg-sandbox 2026-07-09) — we fall
+            # through to WARN + escalation and let an actor decide.
+            log("no fresh session bound; attempting ONE self-heal re-fire (refused if a TUI is up)")
+            if _fire_launch(surf, guarded, log):
+                sid = _poll_session_back(surf, old_sid, mode, 60)
         if not sid:
             log(f"WARN: no {'resumed' if mode == 'resume' else 'fresh'} session bound; check the surface manually")
             # ESCALATE (mirror the respawn-abort path above): the launch was sent but nothing bound even
@@ -3908,6 +3985,10 @@ def _recycle_exec_one(p):
                             f"{'resumed' if mode == 'resume' else 'fresh'} session bound; check the surface manually")
             fs.log_event("recycle_abort", label=label, surface=surf, mode=mode,
                          reason="no-session-after-launch")
+            _escalate_recycle_failure(label, surf, mode, "no-session-after-launch",
+                                      "launch fired but nothing bound; the seat may be a bare shell, "
+                                      "an old-session zombie, or a flagless default-model agent — "
+                                      "check it, then re-run fleet recycle")
         else:
             if mode == "resume":
                 # prefer cmux's CHECKPOINT (the id it will `--resume`) over a possibly-bridge poll id, so

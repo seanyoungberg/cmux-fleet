@@ -56,6 +56,9 @@ def _doctor_line(r):
     elif reason == "conductor-closed":
         detail = (f"CONDUCTOR SURFACE CLOSED — its surface vanished and it was archived; "
                   f"`fleet revive {label}` to bring it back")
+    elif reason == "recycle-failed":
+        detail = (f"RECYCLE FAILED ({r.get('failure', '?')}) — the seat may be a dead shell, the OLD "
+                  f"session, or a flagless default-model agent; check it, then re-run `fleet recycle {label}`")
     else:
         detail = f"needs attention ({reason})"
     return f"seq {r.get('seq')}  {label} (surface {surf}): {detail}"

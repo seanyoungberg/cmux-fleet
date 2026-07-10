@@ -242,6 +242,9 @@ def _inbox_line(r):
     elif kind == "doctor":
         if r.get("reason") == "never-bound":
             summary = f"never-bound — launched but died on spawn, no session; rm --kill + relaunch (fix flags)"
+        elif r.get("reason") == "recycle-failed":
+            summary = (f"recycle FAILED ({r.get('failure','?')}) — check the seat, then re-run "
+                       f"fleet recycle {r.get('label','?')}")
         else:
             summary = f"{r.get('reason','?')} — still LIVE, needs attention (inspect/drive/recycle)"
     elif kind == "peer":

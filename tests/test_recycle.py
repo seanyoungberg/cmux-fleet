@@ -1,7 +1,10 @@
-# tests/test_recycle.py — regression coverage for the recycle confirm logic (the b337d1f hotfix).
-# `_poll_session_back` is what decides whether a recycled agent actually re-bound a session. The fix
-# added `exclude` so a STALE store sid (snapshotted pre-relaunch) can't false-confirm a crashed launch.
-# These are pure unit tests: poll_session / fleet_state.lifecycle / time.sleep are monkeypatched, no cmux.
+# tests/test_recycle.py — regression coverage for the recycle confirm logic. `_poll_session_back` is
+# what decides whether a recycled agent actually re-bound a session. FRESH mode confirms on the
+# LIVE-PID truth (_live_bound_sid, 2026-07-09 fix): the old sid-exclusion confirm rode poll_session's
+# arbitrary-first-record fallback, which kept returning the dead lingering ghost while a healthy fresh
+# agent sat on the seat unconfirmed — four identical berg-sandbox misdetects in one day, each ending
+# with the self-heal pasting the launch into the live TUI as a garbled draft.
+# These are pure unit tests: the hook store / lifecycle / time.sleep are monkeypatched, no cmux.
 import os
 import sys
 
@@ -9,35 +12,51 @@ import sys
 from cmux_fleet import cli as fleet           # noqa: E402  (never popped by other test files)
 
 # NOTE: `_poll_session_back` does `import fleet_state as fs` INTERNALLY, and another test module
-# (test_features) pops `fleet_state` from sys.modules on teardown. So the resume tests below import
+# (test_features) pops `fleet_state` from sys.modules on teardown. So the tests below import
 # fleet_state *inside* the test (after any popping) to patch the SAME cached object the function gets.
 
 
-def test_fresh_excludes_old_and_pre_sid(monkeypatch):
-    # the surface keeps reporting a stale (excluded) sid -> never a fresh bind -> "" within timeout.
+def test_fresh_confirms_on_live_pid_record(monkeypatch):
+    # the ghost has the HIGHER updatedAt: it is the DEAD PID (not freshness) that must exclude it.
+    from cmux_fleet import state as fleet_state
     monkeypatch.setattr(fleet.time, "sleep", lambda *_: None)
-    monkeypatch.setattr(fleet, "poll_session", lambda surf, timeout=1: "stale-pre")
-    got = fleet._poll_session_back("S", "old", "fresh", timeout=0.05, exclude={"old", "stale-pre"})
+    monkeypatch.setattr(fleet_state, "read_hook_store", lambda: {"sessions": {
+        "g": {"sessionId": "stale-pre", "surfaceId": "S", "pid": None, "updatedAt": 100},
+        "f": {"sessionId": "brand-new", "surfaceId": "S", "pid": os.getpid(), "updatedAt": 50}}})
+    got = fleet._poll_session_back("S", "old", "fresh", timeout=5)
+    assert got == "brand-new"                     # the record with a LIVE pid IS the running agent
+
+
+def test_fresh_ignores_dead_ghost_records(monkeypatch):
+    # only dead-pid records on the seat (the crashed-launch case) -> no false confirm -> "" at timeout.
+    from cmux_fleet import state as fleet_state
+    monkeypatch.setattr(fleet.time, "sleep", lambda *_: None)
+    monkeypatch.setattr(fleet_state, "read_hook_store", lambda: {"sessions": {
+        "g": {"sessionId": "stale-pre", "surfaceId": "S", "pid": None, "updatedAt": 100}}})
+    got = fleet._poll_session_back("S", "old", "fresh", timeout=0.05)
     assert got == ""                              # a crashed launch resolves to no-session, not success
 
 
-def test_fresh_confirms_a_genuinely_new_sid(monkeypatch):
+def test_fresh_does_not_confirm_a_live_old_sid_zombie(monkeypatch):
+    # cmux restart-resume interference can put the OLD session back live on the seat. Live it may be,
+    # fresh it is not: never declare a fresh bind on old_sid (fall through to WARN + escalation).
+    from cmux_fleet import state as fleet_state
     monkeypatch.setattr(fleet.time, "sleep", lambda *_: None)
-    monkeypatch.setattr(fleet, "poll_session", lambda surf, timeout=1: "brand-new")
-    got = fleet._poll_session_back("S", "old", "fresh", timeout=5, exclude={"old", "stale-pre"})
-    assert got == "brand-new"                     # a real new bind confirms
+    monkeypatch.setattr(fleet_state, "read_hook_store", lambda: {"sessions": {
+        "z": {"sessionId": "old", "surfaceId": "S", "pid": os.getpid(), "updatedAt": 100}}})
+    got = fleet._poll_session_back("S", "old", "fresh", timeout=0.05)
+    assert got == ""
 
 
-def test_resume_ignores_exclude_and_uses_lifecycle(monkeypatch):
-    # resume keeps the SAME sid; confirmation is the surface going live again, not a new sid. So a sid
-    # that is IN exclude still confirms in resume mode (exclude is a fresh-mode-only guard). Confirm =
+def test_resume_confirms_old_sid_via_lifecycle(monkeypatch):
+    # resume keeps the SAME sid; confirmation is the surface going live again, not a new sid. Confirm =
     # surface_has_live_agent: a live lifecycle AND a live pid (pid-aware, round 2).
     from cmux_fleet import state as fleet_state
     monkeypatch.setattr(fleet.time, "sleep", lambda *_: None)
     monkeypatch.setattr(fleet, "poll_session", lambda surf, timeout=1: "old")
     monkeypatch.setattr(fleet_state, "lifecycle", lambda surf: "idle")
     monkeypatch.setattr(fleet_state, "surface_has_live_pid", lambda surf: True)   # resumed agent is live
-    got = fleet._poll_session_back("S", "old", "resume", timeout=5, exclude={"old"})
+    got = fleet._poll_session_back("S", "old", "resume", timeout=5)
     assert got == "old"
 
 
@@ -47,7 +66,7 @@ def test_resume_waits_while_lifecycle_dead(monkeypatch):
     monkeypatch.setattr(fleet.time, "sleep", lambda *_: None)
     monkeypatch.setattr(fleet, "poll_session", lambda surf, timeout=1: "old")
     monkeypatch.setattr(fleet_state, "lifecycle", lambda surf: "ended")
-    got = fleet._poll_session_back("S", "old", "resume", timeout=0.05, exclude={"old"})
+    got = fleet._poll_session_back("S", "old", "resume", timeout=0.05)
     assert got == ""
 
 
@@ -60,7 +79,7 @@ def test_resume_does_not_falseconfirm_on_dead_pid_ghost(monkeypatch):
     monkeypatch.setattr(fleet, "poll_session", lambda surf, timeout=1: "old")
     monkeypatch.setattr(fleet_state, "lifecycle", lambda surf: "running")         # frozen non-terminal...
     monkeypatch.setattr(fleet_state, "surface_has_live_pid", lambda surf: False)  # ...but the pid is DEAD
-    got = fleet._poll_session_back("S", "old", "resume", timeout=0.05, exclude={"old"})
+    got = fleet._poll_session_back("S", "old", "resume", timeout=0.05)
     assert got == ""
 
 
@@ -421,7 +440,9 @@ def test_direct_kill_skips_quietly_with_no_known_pid(fs, monkeypatch):
 #     sent exactly once no matter how many kicks it takes. --------------------------------------------
 def _run_recycle_counting_keys(monkeypatch, surfaced_seq):
     """Run ONE fresh recycle to a clean bind, driving _agent_surfaced by `surfaced_seq` (bool per check)
-    with _resume_menu_visible always False. Returns (n_send_text, n_sendkey_enter)."""
+    with _resume_menu_visible always False. A False is PREPENDED for _fire_launch's TUI-up GUARD (the
+    pre-paste never-type-into-a-live-agent check), so `surfaced_seq` keeps describing the POST-paste
+    submission checks the kick counts are about. Returns (n_send_text, n_sendkey_enter)."""
     from cmux_fleet import state as fleet_state
     fleet_state.live_put("w", {"role": "w", "tool": "claude", "surface": "S", "cwd": "/x",
                                "session": "claude-OLD", "kind": "child"})
@@ -433,9 +454,8 @@ def _run_recycle_counting_keys(monkeypatch, surfaced_seq):
     monkeypatch.setattr(fleet, "cmuxq", fake_cmuxq)
     monkeypatch.setattr(fleet, "_quiet_gate", lambda *a, **k: True)
     monkeypatch.setattr(fleet_state, "lifecycle", lambda surf: "ended")          # old session confirmed dead
-    monkeypatch.setattr(fleet, "poll_session", lambda surf, timeout=1: "")        # no stale pre_sid
     monkeypatch.setattr(fleet, "_poll_session_back", lambda *a, **k: "NEWSID")     # clean fresh bind -> no self-heal
-    surfaced = iter(surfaced_seq)
+    surfaced = iter([False] + list(surfaced_seq))     # [0] = the guard check (fresh shell, not surfaced)
     monkeypatch.setattr(fleet, "_agent_surfaced", lambda surf: next(surfaced))
     monkeypatch.setattr(fleet, "_resume_menu_visible", lambda surf: False)
     assert fleet._recycle_exec_one(_base_payload()) == 0
@@ -473,7 +493,10 @@ def test_enter_rekick_exhausts_all_kicks(fs, monkeypatch):
 #     tail WARN must ESCALATE like the respawn-abort path (a desktop notify + a recycle_abort event),
 #     not fail silently -- the same silent-failure class that left berg-sandbox down ~9h. Same event
 #     type as the respawn-abort path (a different `reason`) so one consumer catches both classes. -------
-def test_no_session_after_launch_escalates(fs, monkeypatch):
+def test_no_session_after_launch_escalates_and_never_pastes_into_live_tui(fs, monkeypatch):
+    # THE 2026-07-09 berg-sandbox failure shape: a TUI IS up on the seat but the confirm resolves no
+    # session. The guard must refuse BOTH the initial fire and the self-heal re-fire (zero pastes into
+    # the live agent — the old code fired twice, garbling its input box), and the WARN must escalate.
     from cmux_fleet import state as fleet_state
     fleet_state.live_put("w", {"role": "w", "tool": "claude", "surface": "S", "cwd": "/x",
                                "session": "claude-OLD", "kind": "child"})
@@ -485,9 +508,8 @@ def test_no_session_after_launch_escalates(fs, monkeypatch):
     monkeypatch.setattr(fleet, "cmuxq", fake_cmuxq)
     monkeypatch.setattr(fleet, "_quiet_gate", lambda *a, **k: True)
     monkeypatch.setattr(fleet_state, "lifecycle", lambda surf: "ended")
-    monkeypatch.setattr(fleet, "poll_session", lambda surf, timeout=1: "")
     monkeypatch.setattr(fleet, "_poll_session_back", lambda *a, **k: "")           # nothing binds, both polls
-    monkeypatch.setattr(fleet, "_agent_surfaced", lambda surf: True)               # keep _fire_launch's kick loop short
+    monkeypatch.setattr(fleet, "_agent_surfaced", lambda surf: True)               # a live TUI is on the seat
     monkeypatch.setattr(fleet, "_resume_menu_visible", lambda surf: False)
     logged = []
     monkeypatch.setattr(fleet_state, "log_event", lambda event, **fields: logged.append((event, fields)))
@@ -495,7 +517,122 @@ def test_no_session_after_launch_escalates(fs, monkeypatch):
     assert any(c and c[0] == "notify" for c in calls)          # desktop banner fired (was a silent WARN before)
     aborts = [f for e, f in logged if e == "recycle_abort"]
     assert aborts and aborts[0]["reason"] == "no-session-after-launch"
+    assert sum(1 for c in calls if c and c[0] == "send") == 0  # NOT ONE paste into the live agent
+
+
+def test_no_session_after_launch_self_heal_preserved_on_bare_shell(fs, monkeypatch):
+    # the self-heal's legit case is intact: seat stays a BARE SHELL (nothing surfaced) -> initial fire
+    # + exactly ONE re-fire (the PATH-not-ready crash recovery), then WARN + escalate.
+    from cmux_fleet import state as fleet_state
+    fleet_state.live_put("w", {"role": "w", "tool": "claude", "surface": "S", "cwd": "/x",
+                               "session": "claude-OLD", "kind": "child"})
+    monkeypatch.setattr(fleet.time, "sleep", lambda *_: None)
+    calls = []
+    def fake_cmuxq(*a, **k):
+        calls.append(a)
+        return "OK" if a and a[0] == "respawn-pane" else ""
+    monkeypatch.setattr(fleet, "cmuxq", fake_cmuxq)
+    monkeypatch.setattr(fleet, "_quiet_gate", lambda *a, **k: True)
+    monkeypatch.setattr(fleet_state, "lifecycle", lambda surf: "ended")
+    monkeypatch.setattr(fleet, "_poll_session_back", lambda *a, **k: "")           # nothing ever binds
+    monkeypatch.setattr(fleet, "_agent_surfaced", lambda surf: False)              # bare shell throughout
+    monkeypatch.setattr(fleet, "_resume_menu_visible", lambda surf: False)
+    logged = []
+    monkeypatch.setattr(fleet_state, "log_event", lambda event, **fields: logged.append((event, fields)))
+    assert fleet._recycle_exec_one(_base_payload()) == 0
     assert sum(1 for c in calls if c and c[0] == "send") == 2  # initial + ONE self-heal re-fire, no runaway resend
+    aborts = [f for e, f in logged if e == "recycle_abort"]
+    assert aborts and aborts[0]["reason"] == "no-session-after-launch"
+
+
+def test_fire_launch_guard_unit(monkeypatch):
+    # B at the unit level: a surfaced TUI refuses the fire before a single keystroke is sent.
+    calls = []
+    monkeypatch.setattr(fleet, "cmuxq", lambda *a, **k: calls.append(a) or "")
+    monkeypatch.setattr(fleet, "_agent_surfaced", lambda surf: True)
+    monkeypatch.setattr(fleet, "_resume_menu_visible", lambda surf: False)
+    assert fleet._fire_launch("S", "cd /x && claude", lambda m: None) is False
+    assert calls == []                                          # zero sends, zero enters
+
+
+# --- D: recycle failures escalate to an ACTOR (parent conductor / peer fan-out), not just the log ----
+def test_escalation_routes_child_failure_to_parent_inbox(fs, monkeypatch):
+    from cmux_fleet import state as fleet_state
+    fleet_state.live_put("parent", {"role": "c", "kind": "conductor", "surface": "PARENT"})
+    fleet_state.live_put("w", {"role": "w", "kind": "child", "parent": "parent", "surface": "S"})
+    woke = []
+    monkeypatch.setattr(fleet_state, "wake_if_idle", lambda surf, msg: woke.append(surf) or True)
+    monkeypatch.setattr(fleet_state, "idlewake_on", lambda: True)
+    fleet._escalate_recycle_failure("w", "S", "fresh", "no-session-after-launch", "detail-x")
+    rows = fleet_state.inbox_pending("PARENT", kind="doctor")
+    assert len(rows) == 1
+    r = rows[0]
+    assert r["reason"] == "recycle-failed" and r["label"] == "w" and r["failure"] == "no-session-after-launch"
+    assert r["event_key"].startswith("doctor:recycle-failed:w:S:")   # per-attempt (timestamped) event
+    assert woke == ["PARENT"]                                        # the actor was woken
+    assert fleet_state.unpresented("PARENT", rows, 1800) == []       # wake marked presented (no heartbeat re-nudge)
+
+
+def test_escalation_fans_out_conductor_failure_to_peers(fs, monkeypatch):
+    from cmux_fleet import router
+    from cmux_fleet import state as fleet_state
+    monkeypatch.setattr(router, "fs", fleet_state)                   # keep module handles consistent
+    monkeypatch.setattr(router, "cmux", lambda *a, **k: "")          # no real desktop notify
+    monkeypatch.setattr(fleet_state, "wake_if_idle", lambda surf, msg: True)
+    monkeypatch.setattr(fleet_state, "idlewake_on", lambda: True)
+    fleet_state.live_put("cond-a", {"role": "a", "kind": "conductor", "surface": "SA", "session": "sa"})
+    fleet_state.live_put("cond-b", {"role": "b", "kind": "conductor", "surface": "SB", "session": "sb"})
+    fleet._escalate_recycle_failure("cond-a", "SA", "resume", "respawn-not-confirmed", "detail-y")
+    rows = fleet_state.inbox_pending("SB", kind="doctor")            # the PEER is alerted...
+    assert len(rows) == 1 and rows[0]["reason"] == "recycle-failed" and rows[0]["label"] == "cond-a"
+    assert fleet_state.inbox_pending("SA", kind="doctor") == []      # ...never the failed seat itself
+
+
+def test_child_escalation_is_per_attempt_realerts_after_ack(fs, monkeypatch):
+    # each deliberate re-run that fails again must re-alert, even though the prior failure was acked —
+    # the event key is timestamped per attempt, so the event-ack ledger can't swallow a NEW failure.
+    from cmux_fleet import state as fleet_state
+    fleet_state.live_put("parent", {"role": "c", "kind": "conductor", "surface": "PARENT"})
+    fleet_state.live_put("w", {"role": "w", "kind": "child", "parent": "parent", "surface": "S"})
+    monkeypatch.setattr(fleet_state, "wake_if_idle", lambda surf, msg: False)
+    clock = {"t": 1_800_000_000.0}
+    monkeypatch.setattr(fleet.time, "time", lambda: clock["t"])      # fleet.time IS the time module
+    fleet._escalate_recycle_failure("w", "S", "fresh", "no-session-after-launch", "d")
+    row = fleet_state.inbox_pending("PARENT", kind="doctor")[0]
+    fleet_state.ack_events("PARENT", [row])                          # parent handles + acks attempt #1
+    fleet_state.inbox_ack("PARENT", "doctor", row["seq"])
+    clock["t"] += 600                                                # 10 min later: re-run fails again
+    fleet._escalate_recycle_failure("w", "S", "fresh", "no-session-after-launch", "d")
+    assert len(fleet_state.inbox_pending("PARENT", kind="doctor")) == 1   # attempt #2 re-alerts
+
+
+def test_doctor_line_renders_recycle_failed():
+    from cmux_fleet import hookverbs
+    line = hookverbs._doctor_line({"seq": 7, "label": "w", "child_surface": "SURFACE1",
+                                   "reason": "recycle-failed", "failure": "no-session-after-launch"})
+    assert "RECYCLE FAILED" in line and "no-session-after-launch" in line and "fleet recycle w" in line
+
+
+def test_resume_gate_abort_escalates(fs, monkeypatch):
+    # the third terminal-failure site: a wedged resume-summary menu aborts AND escalates (it previously
+    # only logged — the one failure path with not even a surface banner).
+    from cmux_fleet import state as fleet_state
+    fleet_state.live_put("parent", {"role": "c", "kind": "conductor", "surface": "PARENT"})
+    fleet_state.live_put("w", {"role": "w", "kind": "child", "parent": "parent", "surface": "S",
+                               "tool": "claude", "session": "claude-OLD", "cwd": "/x"})
+    monkeypatch.setattr(fleet.time, "sleep", lambda *_: None)
+    monkeypatch.setattr(fleet, "cmuxq", lambda *a, **k: "OK" if a and a[0] == "respawn-pane" else "")
+    monkeypatch.setattr(fleet, "_quiet_gate", lambda *a, **k: True)
+    monkeypatch.setattr(fleet_state, "lifecycle", lambda surf: "ended")
+    monkeypatch.setattr(fleet, "_agent_surfaced", lambda surf: False)
+    monkeypatch.setattr(fleet, "_resume_menu_visible", lambda surf: False)
+    monkeypatch.setattr(fleet, "_resume_and_gate", lambda *a, **k: False)          # menu never resolves
+    monkeypatch.setattr(fleet_state, "wake_if_idle", lambda surf, msg: False)
+    payload = {"label": "w", "surface": "S", "send_cmd": "cd /x && claude", "mode": "resume",
+               "tool": "claude", "force": True, "prime": None, "old_session": "OLD", "cwd": "/x"}
+    assert fleet._recycle_exec_one(payload) == 1                     # ABORT preserved
+    rows = fleet_state.inbox_pending("PARENT", kind="doctor")
+    assert rows and rows[0]["failure"] == "resume-menu-wedged"       # ...and the parent was told
 
 
 # --- Part 3: _session_pref_provenance needs a MODEL-analog of the effort floor-warning. The per-key loop
