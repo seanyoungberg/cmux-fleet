@@ -6,10 +6,26 @@
 # with the self-heal pasting the launch into the live TUI as a garbled draft.
 # These are pure unit tests: the hook store / lifecycle / time.sleep are monkeypatched, no cmux.
 import os
+import subprocess
 import sys
 
 
 from cmux_fleet import cli as fleet           # noqa: E402  (never popped by other test files)
+
+
+def _ps_argv0_basename(pid):
+    """The argv0 basename EXACTLY as `ps` reports it for `pid` — the same string `_identifies_as`
+    compares against. Derived, never hardcoded: the running interpreter's argv0 varies by install
+    (a uv/stdlib venv reports `python`; a Homebrew *framework* python reports `Python`, capital P,
+    via Python.framework/.../Resources/Python.app). This test drives the REAL ps seam, so hardcoding
+    "python" made it fail for environment reasons in the canonical checkout while passing in a fresh
+    uv worktree. A real-seam guard that is red for environment reasons gets normalized as "the known
+    failure" and then ignored or deleted — and this is the ONLY real-seam guard over the ps identity
+    path (the v2 lesson: hermetic stubs hide the boundary they stub). So derive the expectation."""
+    out = subprocess.run(["ps", "-o", "command=", "-p", str(pid)],
+                         capture_output=True, text=True, timeout=5).stdout or ""
+    toks = out.split()
+    return os.path.basename(toks[0]) if toks else ""
 
 # NOTE: `_poll_session_back` does `import fleet_state as fs` INTERNALLY, and another test module
 # (test_features) pops `fleet_state` from sys.modules on teardown. So the tests below import
@@ -867,11 +883,30 @@ def test_signal_skips_a_live_pid_that_fails_the_identity_check(monkeypatch):
 
 
 def test_agent_pid_check_real_ps_identity():
-    # the check runs REAL ps: this very test process identifies as python, and not as claude.
-    assert fleet._agent_pid_check(os.getpid(), "python") is True
+    # the check runs REAL ps: this very test process identifies as its own argv0, and not as claude.
+    # The POSITIVE expectation is derived from what ps actually reports (see _ps_argv0_basename); the
+    # NEGATIVE cases are the load-bearing half and stay fixed.
+    me = _ps_argv0_basename(os.getpid())
+    assert me, "ps reported no command for this process — the seam itself is broken"
+    assert me != "claude", "precondition: this interpreter must not be named 'claude'"
+    assert fleet._agent_pid_check(os.getpid(), me) is True
     assert fleet._agent_pid_check(os.getpid(), "claude") is False
     assert fleet._agent_pid_check(99_999_999, "claude") is False      # nonexistent pid -> fail closed
     assert fleet._agent_pid_check("garbage", "claude") is False       # unparseable -> fail closed
+
+
+def test_identifies_as_stays_case_sensitive():
+    """The kill-target rule is EXACT argv0-basename equality. Do NOT relax it to a case-insensitive
+    compare to make the test above pass on a framework python: that widens the set of processes we are
+    willing to SIGINT, which is the opposite of what this rule exists for. Production is unaffected by
+    the case quirk — `claude` and `codex` both report lowercase argv0."""
+    assert fleet._identifies_as("/usr/bin/python foo", "python") is True
+    assert fleet._identifies_as("/usr/bin/Python foo", "python") is False   # capital-P must NOT match
+    assert fleet._identifies_as("/x/Python.app/Contents/MacOS/Python -m pytest", "python") is False
+    # and against the real process, whatever its case
+    me = _ps_argv0_basename(os.getpid())
+    if me and me != me.swapcase():
+        assert fleet._agent_pid_check(os.getpid(), me.swapcase()) is False
 
 
 def test_graceful_close_reaps_the_live_record_not_the_first(monkeypatch):
