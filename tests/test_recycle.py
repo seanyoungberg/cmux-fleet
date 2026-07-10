@@ -293,8 +293,11 @@ def test_verify_waits_out_a_slow_kill_before_launching(fs, monkeypatch):
 
 def test_respawn_error_falls_back_to_direct_kill_then_succeeds(fs, monkeypatch):
     # respawn-pane errors on the first attempt (the confirmed 05:44 failure: 'Command timed out'). The
-    # fallback SIGINTs the old pid directly (cmux-independent) and re-respawns; once that confirms, the
-    # launch proceeds normally -- this is NOT the abort path.
+    # fallback SIGINTs the LIVE agent pid directly (cmux-independent) and re-respawns; once that
+    # confirms, the launch proceeds normally -- this is NOT the abort path. (2026-07-10 update: the
+    # fallback used to SIGINT bare _pid_for_surface with NO aliveness check — the blind corpse-shot at
+    # pid 70208. It now targets _surface_pids, live + identity-checked, so the graceful close is
+    # stubbed out here to isolate the fallback's own selection.)
     from cmux_fleet import state as fleet_state
     import signal
     fleet_state.live_put("w", {"role": "w", "tool": "claude", "surface": "S", "cwd": "/x",
@@ -311,16 +314,15 @@ def test_respawn_error_falls_back_to_direct_kill_then_succeeds(fs, monkeypatch):
     monkeypatch.setattr(fleet, "poll_session", lambda surf, timeout=1: "")
     monkeypatch.setattr(fleet, "_poll_session_back", lambda *a, **k: "NEWSID")
     monkeypatch.setattr(fleet_state, "lifecycle", lambda surf: "ended")   # dead by the time we actually poll
-    monkeypatch.setattr(fleet, "_pid_for_surface", lambda surf: 4242)
-    # graceful-close pre-step sees the pid as already gone -> skips (no SIGINT); this test isolates the
-    # respawn-error -> direct-kill FALLBACK path, whose SIGINTx2 is the only kill we expect to see.
-    monkeypatch.setattr(fleet_state, "pid_alive", lambda pid: False)
+    monkeypatch.setattr(fleet, "_graceful_close", lambda *a, **k: None)   # isolate the FALLBACK's kill
+    monkeypatch.setattr(fleet, "_surface_pids", lambda surf: {4242})      # one LIVE agent pid on the seat
+    monkeypatch.setattr(fleet, "_agent_pid_check", lambda pid, tool: True)  # identity confirms at signal time
     killed = []
     monkeypatch.setattr(fleet.os, "kill", lambda pid, sig: killed.append((pid, sig)))
     assert fleet._recycle_exec_one(_base_payload()) == 0
     assert len(respawn_calls) == 3                            # verify attempt + fallback re-respawn + the exec LAUNCH
     assert len(_exec_respawns(respawn_calls)) == 1            # launch fired after the fallback confirmed
-    assert killed == [(4242, signal.SIGINT), (4242, signal.SIGINT)]   # SIGINT x2, cmux-independent
+    assert killed == [(4242, signal.SIGINT), (4242, signal.SIGINT)]   # SIGINT x2 at the LIVE pid only
     assert not any(c[0] == "notify" for c in other_calls)      # not an abort
 
 
@@ -818,4 +820,121 @@ def test_recycle_uses_exec_launch_by_default_end_to_end(fs, monkeypatch):
     respawns = [c for c in calls if c[0] == "respawn-pane"]
     assert len(respawns) == 2 and len(_exec_respawns(respawns)) == 1
     assert not any(c[0] in ("send",) for c in calls)              # the paste class is dead on this path
+    assert fleet_state.live_get("w")["session"] == "claude-NEWSID"
+
+
+# --- kill-path live-pid targeting (2026-07-10 wedge): the kill must target what the confirm trusts ---
+# Fix A taught the CONFIRM path live-pid truth; the KILL path still drew targets from the stale-record
+# lookup (_pid_for_surface = first record, no aliveness check). Live incident, surface F1C0AEDB with 4
+# hook-store records: graceful close SIGINT'd dead 76035, the fallback SIGINT'd dead 70208, respawn-pane
+# abandoned the REAL agent (76142, 4th record) orphaned on its old tty, and the verify — correctly —
+# refused forever. B+D failed it safely; these lock in the fix that makes it not fail at all.
+def _incident_store(live_pid, dead_pid=70208):
+    """The 2026-07-10 hook-store shape: three dead/None-pid ghosts ordered FIRST, the real agent LAST
+    (the pids are the incident's own: 70208 the corpse the fallback shot, 76142 the survivor)."""
+    return {"sessions": {
+        "3deb145a": {"sessionId": "3deb145a", "surfaceId": "F1C0", "pid": dead_pid, "updatedAt": 10},
+        "b19a6251": {"sessionId": "b19a6251", "surfaceId": "F1C0", "pid": None, "updatedAt": 20},
+        "ca54276c": {"sessionId": "ca54276c", "surfaceId": "F1C0", "pid": None, "updatedAt": 30},
+        "f717aca3": {"sessionId": "f717aca3", "surfaceId": "F1C0", "pid": live_pid, "updatedAt": 40},
+    }}
+
+
+def test_signal_targets_only_the_live_pid_never_the_ghosts(monkeypatch):
+    # NOTE: pid_alive is PATCHED (not real) — the os.kill capture below would otherwise swallow
+    # pid_alive's own signal-0 probe and make every pid read alive.
+    from cmux_fleet import state as fleet_state
+    import signal
+    live = 76142
+    monkeypatch.setattr(fleet, "_store", lambda: _incident_store(live))
+    monkeypatch.setattr(fleet_state, "pid_alive", lambda pid: pid == live)
+    monkeypatch.setattr(fleet, "_agent_pid_check", lambda pid, tool: True)
+    monkeypatch.setattr(fleet.time, "sleep", lambda *_: None)
+    killed = []
+    monkeypatch.setattr(fleet.os, "kill", lambda pid, sig: killed.append((pid, sig)))
+    got = fleet._signal_agent_pids("F1C0", "claude", lambda m: None, "t")
+    assert got == [live]                                       # the 4th record's LIVE pid was targeted
+    assert killed == [(live, signal.SIGINT), (live, signal.SIGINT)]   # ...and NOTHING else was signalled
+
+
+def test_signal_skips_a_live_pid_that_fails_the_identity_check(monkeypatch):
+    # pid-reuse guard: alive but not identifiable as this tool's process (an OS-recycled pid) -> NEVER
+    # signalled; better to let the verify refuse + escalate than SIGINT an unrelated process.
+    from cmux_fleet import state as fleet_state
+    live = 76142
+    monkeypatch.setattr(fleet, "_store", lambda: _incident_store(live))
+    monkeypatch.setattr(fleet_state, "pid_alive", lambda pid: pid == live)
+    monkeypatch.setattr(fleet, "_agent_pid_check", lambda pid, tool: False)
+    killed = []
+    monkeypatch.setattr(fleet.os, "kill", lambda pid, sig: killed.append((pid, sig)))
+    assert fleet._signal_agent_pids("F1C0", "claude", lambda m: None, "t") == []
+    assert killed == []                                        # not one signal fired
+
+
+def test_agent_pid_check_real_ps_identity():
+    # the check runs REAL ps: this very test process identifies as python, and not as claude.
+    assert fleet._agent_pid_check(os.getpid(), "python") is True
+    assert fleet._agent_pid_check(os.getpid(), "claude") is False
+    assert fleet._agent_pid_check(99_999_999, "claude") is False      # nonexistent pid -> fail closed
+    assert fleet._agent_pid_check("garbage", "claude") is False       # unparseable -> fail closed
+
+
+def test_graceful_close_reaps_the_live_record_not_the_first(monkeypatch):
+    # the graceful close draws its target from the live set: the first-record ghost (the old
+    # _pid_for_surface pick) is never signalled, the real agent is, and the close returns as soon as
+    # the signalled pid dies.
+    from cmux_fleet import state as fleet_state
+    import signal
+    live = 76142
+    monkeypatch.setattr(fleet, "_store", lambda: _incident_store(live))
+    monkeypatch.setattr(fleet, "_agent_pid_check", lambda pid, tool: True)
+    monkeypatch.setattr(fleet.time, "sleep", lambda *_: None)
+    state = {"alive": True}
+    killed = []
+    def fake_kill(pid, sig):
+        killed.append((pid, sig))
+        state["alive"] = False                                 # the SIGINT lands; the agent exits
+    monkeypatch.setattr(fleet.os, "kill", fake_kill)
+    monkeypatch.setattr(fleet_state, "pid_alive", lambda pid: state["alive"] if pid == live else False)
+    monkeypatch.setattr(fleet_state, "lifecycle", lambda surf: "unknown")   # frozen, like the incident
+    fleet._graceful_close("F1C0", "claude", lambda m: None, timeout=5)
+    assert [p for p, _ in killed] == [live, live]              # only the real agent, SIGINT x2
+    assert state["alive"] is False
+
+
+def test_orphaned_live_agent_is_reaped_by_the_fallback_end_to_end(fs, monkeypatch):
+    # THE incident, replayed to the FIXED outcome: a live orphan (record claims the surface, process
+    # alive on an abandoned tty) survives the first respawn+verify; the direct-kill fallback now
+    # selects IT (live + identity-checked), it dies cleanly, the re-respawn verifies, and the exec
+    # launch proceeds — where the old code SIGINT'd corpses and wedged until a human killed the orphan.
+    from cmux_fleet import state as fleet_state
+    import signal
+    fleet_state.live_put("w", {"role": "w", "tool": "claude", "surface": "S", "cwd": "/x",
+                               "session": "claude-OLD", "kind": "child"})
+    monkeypatch.setattr(fleet.time, "sleep", lambda *_: None)
+    monkeypatch.setattr(fleet, "_RESPAWN_VERIFY_TIMEOUT", 0.05)          # don't burn 30s on attempt 1
+    orphan = {"alive": True}
+    calls = []
+    def fake_cmuxq(*a, **k):
+        calls.append(a)
+        return "OK" if a and a[0] == "respawn-pane" else ""
+    monkeypatch.setattr(fleet, "cmuxq", fake_cmuxq)
+    monkeypatch.setattr(fleet, "_quiet_gate", lambda *a, **k: True)
+    monkeypatch.setattr(fleet, "_surface_pids", lambda surf: {76142} if orphan["alive"] else set())
+    monkeypatch.setattr(fleet, "_agent_pid_check", lambda pid, tool: True)
+    monkeypatch.setattr(fleet, "_graceful_close", lambda *a, **k: None)  # the close missed it (incident shape)
+    monkeypatch.setattr(fleet_state, "lifecycle", lambda surf: "unknown")           # never terminal
+    monkeypatch.setattr(fleet_state, "surface_has_live_pid", lambda surf: orphan["alive"])
+    monkeypatch.setattr(fleet_state, "pid_alive", lambda pid: orphan["alive"] if pid == 76142 else False)
+    killed = []
+    def fake_kill(pid, sig):
+        killed.append((pid, sig))
+        orphan["alive"] = False                                          # the SIGINT reaps the orphan
+    monkeypatch.setattr(fleet.os, "kill", fake_kill)
+    monkeypatch.setattr(fleet, "_agent_surfaced", lambda surf: False)
+    monkeypatch.setattr(fleet, "_resume_menu_visible", lambda surf: False)
+    monkeypatch.setattr(fleet, "_poll_session_back", lambda *a, **k: "NEWSID")
+    assert fleet._recycle_exec_one(_base_payload()) == 0                 # SUCCEEDS (old code: wedged abort)
+    assert killed == [(76142, signal.SIGINT), (76142, signal.SIGINT)]    # the ORPHAN was the target
+    assert len(_exec_respawns(calls)) == 1                               # and the launch proceeded
     assert fleet_state.live_get("w")["session"] == "claude-NEWSID"

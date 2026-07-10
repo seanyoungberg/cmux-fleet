@@ -23,6 +23,16 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Fixed
 
+- **Recycle kill path targets live pids, identity-checked** — the graceful close and the direct-kill
+  fallback now SIGINT every ALIVE agent pid whose hook-store record maps to the surface, each re-verified
+  as this tool's live process via `ps` immediately before signalling (the pid-reuse guard). The old form
+  drew a single target from the FIRST hook-store record with no aliveness check: on a surface with several
+  lingering records it SIGINT'd dead ghosts (corpses 76035/70208, live incident 2026-07-10) while the real
+  agent survived orphaned on an abandoned tty and the verify — correctly — refused every subsequent
+  recycle until a human killed it. With live-only targeting the direct-kill fallback is also the orphan
+  reaper: the abandoned-but-alive agent still maps to the surface, so it is selected and cleanly SIGINT'd
+  instead of wedging the seat. A live pid that fails the identity check is skipped loudly (abort +
+  escalate beats signalling a foreign process).
 - **Recycle: fresh confirm is live-pid-resolved** — `_poll_session_back` fresh mode now confirms on the
   freshest hook-store record with an ALIVE pid (`_live_bound_sid`), replacing the sid-exclusion confirm
   that rode poll_session's arbitrary-first-record fallback and could stare at the dead lingering ghost

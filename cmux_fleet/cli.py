@@ -1728,11 +1728,93 @@ def _pid_for_surface(surface):
 
 def _surface_pids(surface):
     """The set of pids currently ALIVE on `surface` per the hook store — the pre-respawn safety
-    snapshot for the recycle verify: any of these still alive AFTER the respawn means the old agent
-    survived the kill, so we must NOT relaunch over it (the 'never type into a live TUI' invariant)."""
+    snapshot for the recycle verify AND the kill-path target set: any of these still alive AFTER the
+    respawn means the old agent survived the kill, so we must NOT relaunch over it (the 'never type
+    into a live TUI' invariant). ALL records are scanned and DEAD pids are excluded — the kill-path
+    twin of _live_bound_sid's rule (a dead pid cannot be the agent). Contrast _pid_for_surface, which
+    returns the FIRST record's pid in dict order with no aliveness check: on a surface with several
+    lingering records that is usually a dead ghost (the 2026-07-10 wedge: SIGINTs hit corpses 76035
+    and 70208 while the real agent, 76142 on the 4th record, survived orphaned)."""
     from . import state as fs
     return {s.get("pid") for s in (_store().get("sessions") or {}).values()
             if s.get("surfaceId") == surface and fs.pid_alive(s.get("pid"))}
+
+
+def _agent_pid_check(pid, tool):
+    """True iff `pid` is a live process whose command line looks like this agent `tool` — the same
+    ps-identity pattern _is_live_router/_is_daemon_supervisor use, applied to KILL targets immediately
+    before signalling. The pid-reuse guard: the 2026-07-10 direct-kill fired SIGINT x2 at bare pid
+    70208, which by then belonged to no claude at all — had the OS recycled that pid, we'd have
+    signalled an unrelated process. Fails CLOSED (unreadable ps -> False): never signal a process we
+    can't identify; the verify then refuses and the recycle aborts safely instead."""
+    try:
+        out = subprocess.run(["ps", "-o", "command=", "-p", str(int(pid))],
+                             capture_output=True, text=True, timeout=5).stdout or ""
+    except Exception:
+        return False
+    return (tool or "claude") in out
+
+
+def _signal_agent_pids(surf, tool, log, tag):
+    """SIGINT x2 EVERY live, identity-checked agent pid on `surf`; returns the pids actually signalled.
+    THE one kill-target selector for the recycle tail (graceful close + direct-kill fallback), fixing
+    the 2026-07-10 wedge class: targets come from _surface_pids (every ALIVE pid whose record maps to
+    this surface — never the first record, never a dead one), and each is re-verified as this tool's
+    live process at signal time (_agent_pid_check, the pid-reuse guard). A dead pid is a no-op by
+    construction; a live pid that fails the identity check is SKIPPED loudly (better to abort the
+    recycle than SIGINT a foreign process)."""
+    import signal
+    signalled = []
+    for pid in sorted(_surface_pids(surf)):
+        if not _agent_pid_check(pid, tool):
+            log(f"{tag}: pid {pid} is alive but does not identify as a live {tool} process "
+                f"(reused/foreign pid?); NOT signalling it")
+            continue
+        log(f"{tag}: SIGINT x2 -> pid {pid}")
+        try:
+            os.kill(int(pid), signal.SIGINT); time.sleep(0.5); os.kill(int(pid), signal.SIGINT)
+            signalled.append(int(pid))
+        except (ProcessLookupError, PermissionError, ValueError):
+            pass
+    return signalled
+
+
+def _graceful_close(surf, tool, log, timeout=6):
+    """Close the OLD session GRACEFULLY before respawn-pane so cmux's lifecycle reaches a clean
+    terminal state and EVERY consumer (the verify, `fleet ls`, the fleet-doctor, vitals) sees honest
+    state -- not a frozen 'running' ghost. SIGINT x2 straight to the pid is claude's clean TUI exit;
+    empirically it fires SessionEnd even mid-turn (~0.5s; the 2026-07-06 sandbox matrix). Targets EVERY
+    live identity-checked agent pid on the surface (_signal_agent_pids) — the old single-pid form drew
+    its target from the first hook-store record and SIGINT'd a dead ghost while the real agent (a later
+    record) kept running (the 2026-07-10 wedge). Best-effort + bounded: no live target -> skip (the
+    pid-aware verify handles ghosts), returns the instant the lifecycle goes terminal or every
+    signalled pid dies, and ALWAYS falls through to the respawn. This is an HONESTY step, NOT the
+    confirming signal: _confirmed_gone -- not this -- authorizes the relaunch."""
+    from . import state as fs
+    pids = _signal_agent_pids(surf, tool, log, "graceful close")
+    if not pids:
+        return                                        # nothing live to close -> pid-aware verify confirms
+    end = time.time() + timeout
+    while time.time() < end:
+        if fs.lifecycle(surf) in ("", "-", "ended") or not any(fs.pid_alive(p) for p in pids):
+            log("graceful close: old session reached a clean terminal lifecycle (SessionEnd fired)")
+            return
+        time.sleep(0.5)
+    log("graceful close: no terminal lifecycle within window; proceeding to respawn (pid-verify decides)")
+
+
+def _direct_kill(surf, tool, log):
+    """cmux-INDEPENDENT teardown of the old agent process(es): SIGINT x2 straight to every live,
+    identity-checked pid on the surface (_signal_agent_pids). respawn-pane's OWN kill goes through cmux
+    itself, so a wedged/unresponsive cmux can hang or silently no-op it; a raw os.kill doesn't care
+    whether cmux is responsive. With live-only targeting this fallback is ALSO the ORPHAN REAPER: an
+    agent respawn-pane abandoned on an old tty (live process, hook-store record still claiming this
+    surface — the 2026-07-10 berg-sandbox orphan, pid 76142 on ttys003 after the pane moved to ttys001)
+    is selected and cleanly SIGINT'd here, instead of wedging every subsequent recycle until a human
+    kills it by hand. A dead/stale pid is never a target (the old form SIGINT'd bare _pid_for_surface
+    with no aliveness check — corpse 70208 — while the orphan survived)."""
+    if not _signal_agent_pids(surf, tool, log, "direct-kill fallback"):
+        log("direct-kill fallback: no live agent pid on this surface; skipping straight to respawn")
 
 
 def cmd_ls(argv):
@@ -3862,23 +3944,7 @@ def _recycle_exec_one(p):
     # binary resolvable regardless of shell-init timing (harmless no-op for codex/other tools).
     guarded = 'export PATH="$HOME/.local/bin:/opt/homebrew/bin:$PATH"; ' + send_cmd
 
-    def _direct_kill():
-        """cmux-INDEPENDENT teardown of the old claude process: SIGINT x2 (clean TUI exit) straight to
-        its pid, the exact mechanism cmd_archive/cmd_rm already use for a reliable kill (Berg's manual
-        Ctrl-C-twice). respawn-pane's OWN kill goes through cmux itself, so a wedged/unresponsive cmux
-        (the confirmed 05:44 failure: a 15s 'Command timed out') can hang or silently no-op it; a raw
-        os.kill on the pid doesn't care whether cmux is responsive. No-ops quietly if the pid is already
-        gone or unreadable (best-effort fallback, not the primary path)."""
-        import signal
-        pid = _pid_for_surface(surf)
-        if not pid:
-            log("direct-kill fallback: no pid on record for this surface; skipping straight to respawn")
-            return
-        log(f"direct-kill fallback: SIGINT x2 -> pid {pid} (cmux-independent)")
-        try:
-            os.kill(pid, signal.SIGINT); time.sleep(0.5); os.kill(pid, signal.SIGINT)
-        except (ProcessLookupError, PermissionError):
-            pass
+    tool_name = p.get("tool", "claude") or "claude"      # kill-target identity check (_agent_pid_check)
 
     def _confirmed_gone(old_pids):
         """The old agent is gone iff EITHER cmux flipped the lifecycle TERMINAL ('', '-', 'ended' --
@@ -3909,7 +3975,7 @@ def _recycle_exec_one(p):
         reports an error or the poll exhausts `_RESPAWN_VERIFY_TIMEOUT` while a live pid persists."""
         old_pids = _surface_pids(surf)                    # pre-respawn safety snapshot (alive pids only)
         if kill_first:
-            _direct_kill()
+            _direct_kill(surf, tool_name, log)
         out = cmuxq("respawn-pane", "--surface", surf, "--command", "exec /bin/zsh -il")
         log(f"respawn-pane -> {out.strip()}")
         if "error" in out.lower():
@@ -3921,36 +3987,8 @@ def _recycle_exec_one(p):
             time.sleep(1)
         return _confirmed_gone(old_pids)
 
-    def _graceful_close(timeout=6):
-        """Close the OLD session GRACEFULLY before respawn-pane so cmux's lifecycle reaches a clean
-        terminal state and EVERY consumer (this verify, `fleet ls`, the fleet-doctor, vitals) sees
-        honest state -- not a frozen 'running' ghost. SIGINT x2 straight to the pid is claude's clean
-        TUI exit; empirically it fires SessionEnd even mid-turn (~0.5s; the 2026-07-06 sandbox matrix),
-        and cmux then drops the record. Best-effort + bounded: skips when the pid is already dead
-        (nothing to close -- the pid-aware verify handles the ghost), returns the instant the lifecycle
-        goes terminal or the process dies, and ALWAYS falls through to the respawn. This is an HONESTY
-        step, NOT the confirming signal: a fired SessionEnd can still be clobbered by a cmux write race
-        (the berg-sandbox incident), which is exactly why _confirmed_gone -- not this -- authorizes the
-        relaunch."""
-        import signal
-        pid = _pid_for_surface(surf)
-        if not pid or not fs.pid_alive(pid):
-            return                                        # already gone -> pid-aware verify confirms
-        log(f"graceful close: SIGINT x2 -> pid {pid} (let claude fire SessionEnd before respawn)")
-        try:
-            os.kill(int(pid), signal.SIGINT); time.sleep(0.5); os.kill(int(pid), signal.SIGINT)
-        except (ProcessLookupError, PermissionError, ValueError):
-            return
-        end = time.time() + timeout
-        while time.time() < end:
-            if fs.lifecycle(surf) in ("", "-", "ended") or not fs.pid_alive(pid):
-                log("graceful close: old session reached a clean terminal lifecycle (SessionEnd fired)")
-                return
-            time.sleep(0.5)
-        log("graceful close: no terminal lifecycle within window; proceeding to respawn (pid-verify decides)")
-
     log("quiet; respawn-pane -> fresh interactive shell (cmux kills the old agent in place)")
-    _graceful_close()
+    _graceful_close(surf, tool_name, log)
     if not _respawn_and_verify():
         log(f"respawn not confirmed within {_RESPAWN_VERIFY_TIMEOUT}s; falling back to a direct "
             "SIGINTx2 kill (cmux-independent) then re-respawning")
