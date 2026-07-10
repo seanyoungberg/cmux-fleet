@@ -220,6 +220,9 @@ def test_rm_signals_live_pid_then_closes(fs, monkeypatch):
     def fake_kill(pid, sig):
         killed.append((pid, sig)); state["alive"] = False              # the SIGINT lands cleanly
     monkeypatch.setattr(fleet.os, "kill", fake_kill)
+    # death is observed on the SIGNALLED pids (never store emptiness — SessionEnd reaps the record
+    # ~0.3s before the process exits), so pid_alive must track the kill for the close to proceed.
+    monkeypatch.setattr(fs, "pid_alive", lambda pid: state["alive"] if pid == 76142 else False)
     monkeypatch.setattr(fleet.time, "sleep", lambda *_: None)
     assert fleet.cmd_rm(["w9"]) == 0
     assert killed == [(76142, signal.SIGINT), (76142, signal.SIGINT)]  # the LIVE pid, x2
@@ -271,6 +274,7 @@ def test_archive_signals_live_pid_then_closes(fs, monkeypatch):
     def fake_kill(pid, sig):
         killed.append((pid, sig)); state["alive"] = False
     monkeypatch.setattr(fleet.os, "kill", fake_kill)
+    monkeypatch.setattr(fs, "pid_alive", lambda pid: state["alive"] if pid == 76142 else False)
     monkeypatch.setattr(fleet.time, "sleep", lambda *_: None)
     assert fleet.cmd_archive(["w12"]) == 0
     assert killed == [(76142, signal.SIGINT), (76142, signal.SIGINT)]

@@ -20,6 +20,7 @@ from datetime import datetime
 
 from .config import CMUX  # path resolver
 from . import state as fs
+from . import resolve as rs
 
 LIVE = "--live" in sys.argv
 os.makedirs(fs.STATE, exist_ok=True)
@@ -463,6 +464,7 @@ def fleet_doctor_sweep(now=None):
     now = time.time() if now is None else now
     members = fs.live_all()
     st = fs.read_hook_store()
+    ws_map = rs.surface_ws_map()               # one tree read per sweep, shared by the attachment checks
     live_keys, woke = set(), set()
     fired = 0
     persisted = fs.doctor_dedup_load()
@@ -514,10 +516,10 @@ def fleet_doctor_sweep(now=None):
         # STALL (a stuck turn) and DOWN (a husk seat) apply. Keeping the dedup key live across the
         # end-of-sweep prune (like the child path) needs this member in live_keys.
         live_keys.add((label, session))
-        if fs.surface_has_live_agent(surface):
+        if rs.present(surface):
             _conductor_live_seen[label] = now                  # transition-guard clock: last seen alive
             _rearm("conductor-down", label, session)           # recovered -> re-arm DOWN (+ its event ack)
-            rec = fs.resolve_bound_record(surface, st=st, bound=fs.bare_uuid(session))
+            rec = rs.bound_record(surface, st=st, bound=fs.bare_uuid(session))
             life = (rec.get("agentLifecycle") or "") if rec else ""
             ua = (rec.get("updatedAt") or 0) if rec else 0
             # A. stall — reuses #1's RECENT-window guard (a running record frozen for HOURS is a
@@ -526,6 +528,20 @@ def fleet_doctor_sweep(now=None):
                 _emit_conductor("stall", label, entry, surface, {"stalled_s": int(now - ua)})
             else:
                 _rearm("stall", label, session)
+            # C. detached (invariant I4) — present but hook-dead: the record is frozen while the agent
+            # demonstrably works (transcript advancing), or an env/pointer mismatch proves the channel
+            # dead. A conductor has no parent, so this fans out to peers + the desktop like DOWN. The
+            # live case this exists for: berg-sandbox, record frozen 3.5h while actively writing turns.
+            att = rs.attachment(surface, st=st, ws_map=ws_map, now=now)
+            if att["attached"] is False:
+                _emit_conductor("detached", label, entry, surface, {
+                    "evidence": att["reasons"],
+                    "record_frozen_min": int((att["record_age_s"] or 0) / 60),
+                    "transcript_age_min": (int((att["transcript_age_s"] or 0) / 60)
+                                           if att["transcript_age_s"] is not None else None),
+                    "remedy": f"fleet recycle {label} (resume) reattaches in ~8s"})
+            else:
+                _rearm("detached", label, session)
             return
         # B. DOWN — a registry-live conductor whose surface holds NO live agent (a bare-shell husk a
         # failed recycle left; also the dead-pid brick, which surface_has_live_agent already reads as
@@ -576,11 +592,11 @@ def fleet_doctor_sweep(now=None):
                         f"— undriven or silent exit; not alerting")
                 continue
 
-            if session and not fs.surface_has_live_agent(surface):
+            if session and not rs.present(surface):
                 log(f"[fleet-doctor] skip {label}: surface {surface[:8]} has no live agent")
                 continue
             live_keys.add((label, session))
-            rec = fs.resolve_bound_record(surface, st=st, bound=fs.bare_uuid(session))
+            rec = rs.bound_record(surface, st=st, bound=fs.bare_uuid(session))
             life = (rec.get("agentLifecycle") or "") if rec else ""
             ua = (rec.get("updatedAt") or 0) if rec else 0
 
@@ -593,11 +609,28 @@ def fleet_doctor_sweep(now=None):
             # (or a `fleet recycle`, now pid-aware) clears the ghost record itself; the daemon only
             # READS cmux's store, so it deliberately does not rewrite it here.
             if rec and life not in ("", "-", "ended") and not fs.pid_alive(rec.get("pid")):
-                for r in ("stall", "needs-input", "low-ctx"):
+                for r in ("stall", "needs-input", "low-ctx", "detached"):
                     _rearm(r, label, session)
                 log(f"[fleet-doctor] {label}: bound record {life!r} on a DEAD pid {rec.get('pid')} "
                     f"(surface {surface[:8]}) — down; suppressing health alerts. `fleet unstick {label}` to clear")
                 continue
+
+            # #6 detached (invariant I4) — present but hook-dead: record frozen while the transcript
+            # advances (the agent works, cmux is deaf), or an env/pointer mismatch proves the channel
+            # dead. Requires the conjunction, never record-frozen alone: an idle agent freezes BOTH
+            # clocks together and must never read detached (live-validated across 11 agents,
+            # 2026-07-10, zero false positives). Completions and Feed gates from a detached child are
+            # silently lost, so the parent hears about it here. Remedy: a reseat (recycle resume).
+            att = rs.attachment(surface, st=st, ws_map=ws_map, now=now)
+            if att["attached"] is False:
+                _emit("detached", label, entry, surface, {
+                    "evidence": att["reasons"],
+                    "record_frozen_min": int((att["record_age_s"] or 0) / 60),
+                    "transcript_age_min": (int((att["transcript_age_s"] or 0) / 60)
+                                           if att["transcript_age_s"] is not None else None),
+                    "remedy": f"fleet recycle {label} (resume) reattaches in ~8s"})
+            else:
+                _rearm("detached", label, session)
 
             # #1 stall — bound 'running' record frozen in the RECENT window (STALL_S, STALL_WINDOW). A
             # missing/zero updatedAt never fires; a record stale for HOURS (a done-stuck ghost, not a live

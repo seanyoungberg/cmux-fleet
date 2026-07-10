@@ -27,7 +27,10 @@ def _reset_pkg_modules():
     sys.modules is NOT enough for a package: `from cmux_fleet import X` reuses the stale attribute
     still bound on the parent package object, so we clear those attributes too."""
     import cmux_fleet
-    for sub in ("config", "state", "features"):
+    # `resolve` MUST re-import with `state`: it holds a module-level `from . import state as fs`,
+    # so resetting state without it leaves resolve delegating to the STALE state object while the
+    # tests patch the fresh one — a split-brain that poisoned every later test file (found step 1).
+    for sub in ("config", "state", "resolve", "features"):
         sys.modules.pop(f"cmux_fleet.{sub}", None)
         if hasattr(cmux_fleet, sub):
             delattr(cmux_fleet, sub)

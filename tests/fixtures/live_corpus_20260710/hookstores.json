@@ -1,0 +1,1660 @@
+{
+ "claude-hook-sessions.json": {
+  "activeSessionsBySurface": {
+   "2694CB4C-706E-45A7-BB64-EA572AA9421C": {
+    "allowsNewSessionReplacement": true,
+    "sessionId": "af7a51b7-0daa-4852-9317-0c5917a931e2",
+    "updatedAt": 1783520736.3093982
+   },
+   "3D4EE4D9-0D41-4084-BD45-853674AE9638": {
+    "allowsNewSessionReplacement": true,
+    "sessionId": "4fbeaa03-c196-4718-8c75-8a571b9da254",
+    "updatedAt": 1783199027.564606
+   },
+   "4930F190-3D56-4B54-8A5F-5AB3056277A2": {
+    "sessionId": "7c2ae762-3feb-4b61-806d-3374b2736ce8",
+    "updatedAt": 1783672561.508582
+   },
+   "49E7E91B-E612-4780-B4A2-97B4A27B33E9": {
+    "allowsNewSessionReplacement": true,
+    "sessionId": "3b564b60-a8ee-4ef9-b802-1fd812905586",
+    "updatedAt": 1783437434.340403
+   },
+   "4E496E4B-A010-482B-BB04-A7DF9929EBCD": {
+    "sessionId": "b0646b0c-daef-4497-bfa5-7c93ce1180b4",
+    "updatedAt": 1783673320.584142
+   },
+   "566F4FB8-8027-452E-A068-0BB770FD96E2": {
+    "sessionId": "7748b634-78de-43be-8396-f24327d00f0a",
+    "updatedAt": 1783673317.330226
+   },
+   "6023A4E7-9DD9-45AD-8FFD-3E10CEAA1E87": {
+    "allowsNewSessionReplacement": true,
+    "sessionId": "ac25285b-5656-4960-9209-3af9648664a3",
+    "updatedAt": 1783673367.793236
+   },
+   "669F3F2E-54FE-4BB8-AADE-C72B8C7071AD": {
+    "allowsNewSessionReplacement": true,
+    "sessionId": "63df61bd-b75a-4b7d-8798-3fc94859241f",
+    "updatedAt": 1783132558.858854
+   },
+   "68B3B5FA-9F23-438F-8C89-F89F615767BA": {
+    "allowsNewSessionReplacement": true,
+    "sessionId": "7bc89d6f-5969-4139-8963-0363510285b5",
+    "updatedAt": 1783522231.168685
+   },
+   "6FDF7455-35CF-4B77-82B6-8895EE22CDEA": {
+    "sessionId": "9492ce09-ebd4-4bc2-97a3-616eb35fdf20",
+    "updatedAt": 1783521578.468323
+   },
+   "7367065E-7147-4F48-B31B-6FB5EB562C52": {
+    "allowsNewSessionReplacement": true,
+    "sessionId": "2a94e2aa-2c63-45e2-887f-a818842acbaa",
+    "updatedAt": 1783669841.873138
+   },
+   "90A31C70-7A62-409E-A4DF-525DB4406ECB": {
+    "allowsNewSessionReplacement": true,
+    "sessionId": "e883213d-6bac-4e9b-9df7-d4f75c859521",
+    "updatedAt": 1783202003.3358731
+   },
+   "9690F6E8-094A-48EC-84AA-C106804BCD56": {
+    "allowsNewSessionReplacement": true,
+    "sessionId": "745141fe-7920-40ee-9755-2b5311180089",
+    "updatedAt": 1783671925.408577
+   },
+   "ACCC8581-E8A8-4A01-8B96-1636E25B6F81": {
+    "allowsNewSessionReplacement": true,
+    "sessionId": "1f37343e-f01f-4e50-b6c5-0d30674679a0",
+    "updatedAt": 1783672904.35094
+   },
+   "B129C46C-2646-4435-A7B1-CFC641587849": {
+    "allowsNewSessionReplacement": true,
+    "sessionId": "ceb7e64a-776f-4f99-9af7-0bcf882e4d3f",
+    "updatedAt": 1783200721.005295
+   },
+   "B9D286A1-70B7-4110-8A29-3A21B44A346B": {
+    "allowsNewSessionReplacement": true,
+    "sessionId": "d6b76251-731e-4503-a3a6-e8bdca38f644",
+    "updatedAt": 1783522099.904824
+   },
+   "C0298D7F-DC14-45C8-BD38-A79777687DD3": {
+    "allowsNewSessionReplacement": true,
+    "sessionId": "e3a5d523-e200-4aa5-adee-5586ce16c43f",
+    "updatedAt": 1783672484.3069
+   },
+   "DCCA9A19-16C4-4314-BEA6-F4105EF61459": {
+    "sessionId": "1d83f66f-488a-4754-8252-5cd9ea8e6243",
+    "updatedAt": 1783672722.772655
+   },
+   "EA666A01-6944-4DC8-9970-D252970E1962": {
+    "sessionId": "98d34a22-9b3a-435c-b1a9-926ec352b8ef",
+    "updatedAt": 1783438467.472281
+   },
+   "EB4C4487-B5FF-4F40-82CD-F38B9DFDDAC7": {
+    "allowsNewSessionReplacement": true,
+    "sessionId": "85df67c2-da19-48c7-93b7-c9de630a123c",
+    "updatedAt": 1783187583.252925
+   },
+   "F1C0AEDB-8CA3-49AB-8BCA-440989FF7C57": {
+    "sessionId": "ca54276c-b8c3-4c7f-b3b8-d134463caef5",
+    "updatedAt": 1783514044.8906999
+   }
+  },
+  "activeSessionsByWorkspace": {
+   "01C93C8F-705B-4459-9C89-5D843AAB45A0": {
+    "allowsNewSessionReplacement": true,
+    "sessionId": "1f37343e-f01f-4e50-b6c5-0d30674679a0",
+    "updatedAt": 1783672904.35094
+   },
+   "022AF32C-AF42-4603-B610-E4DC16F40717": {
+    "sessionId": "b0646b0c-daef-4497-bfa5-7c93ce1180b4",
+    "updatedAt": 1783673320.584142
+   },
+   "281DE96E-2C9B-4D90-829C-04570E653EE5": {
+    "allowsNewSessionReplacement": true,
+    "sessionId": "1f37343e-f01f-4e50-b6c5-0d30674679a0",
+    "updatedAt": 1783645779.63433
+   },
+   "2B2B30E6-65B3-4440-90AA-513151FB3467": {
+    "allowsNewSessionReplacement": true,
+    "sessionId": "ac25285b-5656-4960-9209-3af9648664a3",
+    "updatedAt": 1783673367.793236
+   },
+   "35DBDB74-5476-4DFB-86D3-A0C03D1C3ED8": {
+    "sessionId": "7c2ae762-3feb-4b61-806d-3374b2736ce8",
+    "updatedAt": 1783672561.508582
+   },
+   "3F1ABB74-720F-4127-9EDF-6843CFEF902C": {
+    "sessionId": "7748b634-78de-43be-8396-f24327d00f0a",
+    "updatedAt": 1783673317.330226
+   },
+   "85576ACB-D5B9-4817-9A71-3FEBB54BC9EA": {
+    "sessionId": "1d83f66f-488a-4754-8252-5cd9ea8e6243",
+    "updatedAt": 1783672722.772655
+   },
+   "8717C71C-1A1C-455C-9AD8-A4742F217F02": {
+    "allowsNewSessionReplacement": true,
+    "sessionId": "2a94e2aa-2c63-45e2-887f-a818842acbaa",
+    "updatedAt": 1783669841.873138
+   },
+   "A7FF3E7C-5F54-4EC3-BB8A-2D21C2459FF7": {
+    "allowsNewSessionReplacement": true,
+    "sessionId": "745141fe-7920-40ee-9755-2b5311180089",
+    "updatedAt": 1783671925.408577
+   },
+   "E390A00F-9391-40B7-B668-9B9F5F61CC23": {
+    "allowsNewSessionReplacement": true,
+    "sessionId": "af7a51b7-0daa-4852-9317-0c5917a931e2",
+    "updatedAt": 1783520736.3093982
+   },
+   "E7823A6E-0444-4413-A6D4-A0536B5A9078": {
+    "allowsNewSessionReplacement": true,
+    "sessionId": "e3a5d523-e200-4aa5-adee-5586ce16c43f",
+    "updatedAt": 1783672484.3069
+   }
+  },
+  "sessions": {
+   "1d83f66f-488a-4754-8252-5cd9ea8e6243": {
+    "agentLifecycle": "running",
+    "cwd": "/Users/seanyoungberg/tapestry/_meta/agents/conductors/cmux-advisor",
+    "isRestorable": true,
+    "launchCommand": {
+     "arguments": [
+      "/Users/seanyoungberg/.local/bin/claude",
+      "--setting-sources",
+      "user,local",
+      "--plugin-dir",
+      "/Users/seanyoungberg/tapestry/domains/ai-workflows/code/claude-marketplace/plugins/cmux-fleet",
+      "--plugin-dir",
+      "/Users/seanyoungberg/tapestry/domains/ai-workflows/code/claude-marketplace/plugins/memsearch",
+      "--plugin-dir",
+      "/Users/seanyoungberg/tapestry/domains/ai-workflows/code/claude-marketplace/plugins/cmux",
+      "--plugin-dir",
+      "/Users/seanyoungberg/tapestry/domains/ai-workflows/code/claude-marketplace/plugins/lavish",
+      "--model",
+      "claude-opus-4-8[1m]",
+      "--dangerously-skip-permissions",
+      "--effort",
+      "max"
+     ],
+     "capturedAt": 1783672719.318182,
+     "executablePath": "/Users/seanyoungberg/.local/bin/claude",
+     "launcher": "claude",
+     "source": "environment",
+     "workingDirectory": "/Users/seanyoungberg/tapestry/_meta/agents/conductors/cmux-advisor"
+    },
+    "pid": 41861,
+    "sessionId": "1d83f66f-488a-4754-8252-5cd9ea8e6243",
+    "startedAt": 1783672719.326775,
+    "surfaceId": "DCCA9A19-16C4-4314-BEA6-F4105EF61459",
+    "transcriptPath": "/Users/seanyoungberg/.claude/projects/-Users-seanyoungberg-tapestry--meta-agents-conductors-cmux-advisor/1d83f66f-488a-4754-8252-5cd9ea8e6243.jsonl",
+    "updatedAt": 1783673464.271824,
+    "workspaceId": "85576ACB-D5B9-4817-9A71-3FEBB54BC9EA"
+   },
+   "1f37343e-f01f-4e50-b6c5-0d30674679a0": {
+    "agentLifecycle": "needsInput",
+    "cwd": "/Users/seanyoungberg/tapestry/_meta/agents/homelab",
+    "isRestorable": true,
+    "lastBody": "Claude is waiting for your input",
+    "lastSubtitle": "Waiting",
+    "launchCommand": {
+     "arguments": [
+      "/Users/seanyoungberg/.local/bin/claude",
+      "--setting-sources",
+      "user,local",
+      "--plugin-dir",
+      "/Users/seanyoungberg/tapestry/domains/ai-workflows/code/claude-marketplace/plugins/cmux-fleet",
+      "--plugin-dir",
+      "/Users/seanyoungberg/tapestry/domains/ai-workflows/code/claude-marketplace/plugins/memsearch",
+      "--plugin-dir",
+      "/Users/seanyoungberg/tapestry/domains/ai-workflows/code/claude-marketplace/plugins/loom",
+      "--plugin-dir",
+      "/Users/seanyoungberg/tapestry/domains/ai-workflows/code/claude-marketplace/plugins/berg-TrueNAS",
+      "--plugin-dir",
+      "/Users/seanyoungberg/tapestry/domains/ai-workflows/code/claude-marketplace/plugins/Proxmox",
+      "--plugin-dir",
+      "/Users/seanyoungberg/tapestry/domains/ai-workflows/code/claude-marketplace/plugins/basic-memory",
+      "--model",
+      "claude-opus-4-8[1m]",
+      "--dangerously-skip-permissions",
+      "--effort",
+      "max",
+      "--settings",
+      "{\"enabledPlugins\": {\"cloudflare@cloudflare\": true}}"
+     ],
+     "capturedAt": 1783656341.593235,
+     "executablePath": "/Users/seanyoungberg/.local/bin/claude",
+     "launcher": "claude",
+     "source": "environment",
+     "workingDirectory": "/Users/seanyoungberg/tapestry/_meta/agents/homelab"
+    },
+    "pid": 76430,
+    "sessionId": "1f37343e-f01f-4e50-b6c5-0d30674679a0",
+    "startedAt": 1783520329.1024508,
+    "surfaceId": "ACCC8581-E8A8-4A01-8B96-1636E25B6F81",
+    "transcriptPath": "/Users/seanyoungberg/.claude/projects/-Users-seanyoungberg-tapestry--meta-agents-homelab/1f37343e-f01f-4e50-b6c5-0d30674679a0.jsonl",
+    "updatedAt": 1783672964.740545,
+    "workspaceId": "01C93C8F-705B-4459-9C89-5D843AAB45A0"
+   },
+   "2a94e2aa-2c63-45e2-887f-a818842acbaa": {
+    "agentLifecycle": "needsInput",
+    "cwd": "/Users/seanyoungberg/tapestry/_meta/agents/usage-ops",
+    "isRestorable": true,
+    "lastBody": "Claude is waiting for your input",
+    "lastSubtitle": "Waiting",
+    "launchCommand": {
+     "arguments": [
+      "/Users/seanyoungberg/.local/bin/claude",
+      "--setting-sources",
+      "user,local",
+      "--plugin-dir",
+      "/Users/seanyoungberg/tapestry/domains/ai-workflows/code/claude-marketplace/plugins/cmux-fleet",
+      "--plugin-dir",
+      "/Users/seanyoungberg/tapestry/domains/ai-workflows/code/claude-marketplace/plugins/memsearch",
+      "--plugin-dir",
+      "/Users/seanyoungberg/tapestry/domains/ai-workflows/code/claude-marketplace/plugins/cmux",
+      "--plugin-dir",
+      "/Users/seanyoungberg/tapestry/domains/ai-workflows/code/claude-marketplace/plugins/browser-fetch",
+      "--model",
+      "claude-opus-4-8[1m]",
+      "--dangerously-skip-permissions",
+      "--effort",
+      "xhigh"
+     ],
+     "capturedAt": 1783669805.0810099,
+     "executablePath": "/Users/seanyoungberg/.local/bin/claude",
+     "launcher": "claude",
+     "source": "environment",
+     "workingDirectory": "/Users/seanyoungberg/tapestry/_meta/agents/usage-ops"
+    },
+    "pid": 19799,
+    "sessionId": "2a94e2aa-2c63-45e2-887f-a818842acbaa",
+    "startedAt": 1783669805.08349,
+    "surfaceId": "7367065E-7147-4F48-B31B-6FB5EB562C52",
+    "transcriptPath": "/Users/seanyoungberg/.claude/projects/-Users-seanyoungberg-tapestry--meta-agents-usage-ops/2a94e2aa-2c63-45e2-887f-a818842acbaa.jsonl",
+    "updatedAt": 1783669902.1819339,
+    "workspaceId": "8717C71C-1A1C-455C-9AD8-A4742F217F02"
+   },
+   "3b564b60-a8ee-4ef9-b802-1fd812905586": {
+    "agentLifecycle": "needsInput",
+    "cwd": "/Users/seanyoungberg/tapestry/_meta/agents/ad-hoc/lifetest",
+    "isRestorable": true,
+    "lastBody": "Claude is waiting for your input",
+    "lastSubtitle": "Waiting",
+    "launchCommand": {
+     "arguments": [
+      "/Users/seanyoungberg/.local/bin/claude",
+      "--setting-sources",
+      "user,local",
+      "--plugin-dir",
+      "/Users/seanyoungberg/tapestry/domains/ai-workflows/code/claude-marketplace/plugins/cmux-fleet",
+      "--plugin-dir",
+      "/Users/seanyoungberg/tapestry/domains/ai-workflows/code/claude-marketplace/plugins/memsearch",
+      "--model",
+      "claude-opus-4-8[1m]",
+      "--dangerously-skip-permissions",
+      "--effort",
+      "xhigh"
+     ],
+     "capturedAt": 1783437125.644099,
+     "executablePath": "/Users/seanyoungberg/.local/bin/claude",
+     "launcher": "claude",
+     "source": "environment",
+     "workingDirectory": "/Users/seanyoungberg/tapestry/_meta/agents/ad-hoc/lifetest"
+    },
+    "pid": 76896,
+    "sessionId": "3b564b60-a8ee-4ef9-b802-1fd812905586",
+    "startedAt": 1783437125.646621,
+    "surfaceId": "49E7E91B-E612-4780-B4A2-97B4A27B33E9",
+    "transcriptPath": "/Users/seanyoungberg/.claude/projects/-Users-seanyoungberg-tapestry--meta-agents-ad-hoc-lifetest/3b564b60-a8ee-4ef9-b802-1fd812905586.jsonl",
+    "updatedAt": 1783437495.620274,
+    "workspaceId": "1578A59A-E070-427F-9F74-8900A557831A"
+   },
+   "3deb145a-b344-4827-b51b-c9a5eb866015": {
+    "agentLifecycle": "unknown",
+    "cwd": "/Users/seanyoungberg/tapestry/_meta/agents/conductors/berg-sandbox",
+    "isRestorable": false,
+    "launchCommand": {
+     "arguments": [
+      "/Users/seanyoungberg/.local/bin/claude",
+      "--setting-sources",
+      "user,local",
+      "--plugin-dir",
+      "/Users/seanyoungberg/tapestry/domains/ai-workflows/code/claude-marketplace/plugins/cmux-fleet",
+      "--plugin-dir",
+      "/Users/seanyoungberg/tapestry/domains/ai-workflows/code/claude-marketplace/plugins/memsearch",
+      "--plugin-dir",
+      "/Users/seanyoungberg/tapestry/domains/ai-workflows/code/claude-marketplace/plugins/loom",
+      "--plugin-dir",
+      "/Users/seanyoungberg/tapestry/domains/ai-workflows/code/claude-marketplace/plugins/basic-memory",
+      "--plugin-dir",
+      "/Users/seanyoungberg/tapestry/domains/ai-workflows/code/claude-m"
+     ],
+     "capturedAt": 1783559899.662983,
+     "executablePath": "/Users/seanyoungberg/.local/bin/claude",
+     "launcher": "claude",
+     "source": "environment",
+     "workingDirectory": "/Users/seanyoungberg/tapestry/_meta/agents/conductors/berg-sandbox"
+    },
+    "pid": 70208,
+    "sessionId": "3deb145a-b344-4827-b51b-c9a5eb866015",
+    "startedAt": 1783559899.665693,
+    "surfaceId": "F1C0AEDB-8CA3-49AB-8BCA-440989FF7C57",
+    "transcriptPath": "/Users/seanyoungberg/.claude/projects/-Users-seanyoungberg-tapestry--meta-agents-conductors-berg-sandbox/3deb145a-b344-4827-b51b-c9a5eb866015.jsonl",
+    "updatedAt": 1783559899.665693,
+    "workspaceId": "8AE217AC-E4B2-4DB0-8C6C-ADF22E0EB29E"
+   },
+   "4bf201e9-d378-4459-8a8d-446a9b8d476b": {
+    "agentLifecycle": "unknown",
+    "cwd": "/Users/seanyoungberg/tapestry/domains/ai-workflows/cmux/code/cmux-fleet/.worktrees/plugin-review",
+    "isRestorable": false,
+    "pid": 20930,
+    "sessionId": "4bf201e9-d378-4459-8a8d-446a9b8d476b",
+    "startedAt": 1783438989.572346,
+    "surfaceId": "915E69EF-50F0-410A-8FB5-908068412B1B",
+    "transcriptPath": "/Users/seanyoungberg/.claude/projects/-Users-seanyoungberg-tapestry-domains-ai-workflows-cmux-code-cmux-fleet--worktrees-plugin-review/4bf201e9-d378-4459-8a8d-446a9b8d476b.jsonl",
+    "updatedAt": 1783438989.572346,
+    "workspaceId": "186BBD89-3973-4A52-9AED-CE5451EE5B97"
+   },
+   "4fbeaa03-c196-4718-8c75-8a571b9da254": {
+    "agentLifecycle": "needsInput",
+    "cwd": "/Users/seanyoungberg/tapestry/domains/ai-workflows/cmux/code/cmux-fleet/.worktrees/plugin-build-p1",
+    "isRestorable": true,
+    "lastBody": "Claude is waiting for your input",
+    "lastSubtitle": "Waiting",
+    "launchCommand": {
+     "arguments": [
+      "/Users/seanyoungberg/.local/bin/claude",
+      "--setting-sources",
+      "user,local",
+      "--plugin-dir",
+      "/Users/seanyoungberg/tapestry/domains/ai-workflows/code/claude-marketplace/plugins/cmux-fleet",
+      "--plugin-dir",
+      "/Users/seanyoungberg/tapestry/domains/ai-workflows/code/claude-marketplace/plugins/memsearch",
+      "--plugin-dir",
+      "/Users/seanyoungberg/tapestry/domains/ai-workflows/code/claude-marketplace/plugins/cmux",
+      "--model",
+      "claude-opus-4-8[1m]",
+      "--dangerously-skip-permissions",
+      "--add-dir",
+      "/Users/seanyoungberg/tapestry/_meta/agents/cmux-dev",
+      "--effort",
+      "xhigh"
+     ],
+     "capturedAt": 1783197945.0753999,
+     "executablePath": "/Users/seanyoungberg/.local/bin/claude",
+     "launcher": "claude",
+     "source": "environment",
+     "workingDirectory": "/Users/seanyoungberg/tapestry/domains/ai-workflows/cmux/code/cmux-fleet/.worktrees/plugin-build-p1"
+    },
+    "pid": 47994,
+    "sessionId": "4fbeaa03-c196-4718-8c75-8a571b9da254",
+    "startedAt": 1783197945.077697,
+    "surfaceId": "3D4EE4D9-0D41-4084-BD45-853674AE9638",
+    "transcriptPath": "/Users/seanyoungberg/.claude/projects/-Users-seanyoungberg-tapestry-domains-ai-workflows-cmux-code-cmux-fleet--worktrees-plugin-build-p1/4fbeaa03-c196-4718-8c75-8a571b9da254.jsonl",
+    "updatedAt": 1783199088.071154,
+    "workspaceId": "12E76241-C845-409D-8B91-A53DB11ECDB7"
+   },
+   "63df61bd-b75a-4b7d-8798-3fc94859241f": {
+    "agentLifecycle": "idle",
+    "cwd": "/Users/seanyoungberg/tapestry/domains/ai-workflows/cmux/code/cmux-fleet/.worktrees/rm-docs-cleanup",
+    "isRestorable": true,
+    "lastBody": "Done. All five stale `fleet rm` descriptions are updated and committed on `dev/rm-docs-cleanup` @ `beb7604` (not merged, per the brief). The worktree HEAD matched current main (`406cb35`), so no reba\u2026",
+    "lastSubtitle": "Completed in rm-docs-cleanup",
+    "launchCommand": {
+     "arguments": [
+      "/Users/seanyoungberg/.local/bin/claude",
+      "--setting-sources",
+      "user,local",
+      "--plugin-dir",
+      "/Users/seanyoungberg/tapestry/domains/ai-workflows/code/claude-marketplace/plugins/cmux-fleet",
+      "--plugin-dir",
+      "/Users/seanyoungberg/tapestry/domains/ai-workflows/code/claude-marketplace/plugins/memsearch",
+      "--dangerously-skip-permissions",
+      "--effort",
+      "high",
+      "--add-dir",
+      "/Users/seanyoungberg/tapestry/_meta/agents/cmux-dev"
+     ],
+     "capturedAt": 1783132410.60902,
+     "executablePath": "/Users/seanyoungberg/.local/bin/claude",
+     "launcher": "claude",
+     "source": "environment",
+     "workingDirectory": "/Users/seanyoungberg/tapestry/domains/ai-workflows/cmux/code/cmux-fleet/.worktrees/rm-docs-cleanup"
+    },
+    "pid": 12953,
+    "sessionId": "63df61bd-b75a-4b7d-8798-3fc94859241f",
+    "startedAt": 1783132410.615355,
+    "surfaceId": "669F3F2E-54FE-4BB8-AADE-C72B8C7071AD",
+    "transcriptPath": "/Users/seanyoungberg/.claude/projects/-Users-seanyoungberg-tapestry-domains-ai-workflows-cmux-code-cmux-fleet--worktrees-rm-docs-cleanup/63df61bd-b75a-4b7d-8798-3fc94859241f.jsonl",
+    "updatedAt": 1783132558.858854,
+    "workspaceId": "12E76241-C845-409D-8B91-A53DB11ECDB7"
+   },
+   "726c3cd9-7b99-43de-b407-5cf0a64bda07": {
+    "agentLifecycle": "unknown",
+    "cwd": "/Users/seanyoungberg/tapestry/_meta/agents/conductors/berg-sandbox",
+    "isRestorable": false,
+    "launchCommand": {
+     "arguments": [
+      "/Users/seanyoungberg/.local/bin/claude",
+      "--setting-sources",
+      "user,local",
+      "--plugin-dir",
+      "/Users/seanyoungberg/tapestry/domains/ai-workflows/code/claude-marketplace/plugins/cmux-fleet",
+      "--plugin-dir",
+      "/Users/seanyoungberg/tapestry/domains/ai-workflows/code/claude-marketplace/plugins/memsearch",
+      "--plugin-dir",
+      "/Users/seanyoungberg/tapestry/domains/ai-workflows/code/claude-marketplace/plugins/loom",
+      "--plugin-dir",
+      "/Users/seanyoungberg/tapestry/domains/ai-workflows/code/claude-marketplace/plugins/basic-memory",
+      "--plugin-dir",
+      "/Users/seanyoungberg/tapestry/domains/ai-workflows/code/claude-marketplace/plugins/cmux",
+      "--plugin-dir",
+      "/Users/seanyoungberg/tapestry/domains/ai-workflows/code/claude-marketplace/plugins/lavish",
+      "--dangerously-skip-permissions",
+      "--effort",
+      "xhigh",
+      "--model",
+      "claude-fable-5[1m]"
+     ],
+     "capturedAt": 1783659160.858249,
+     "executablePath": "/Users/seanyoungberg/.local/bin/claude",
+     "launcher": "claude",
+     "source": "environment",
+     "workingDirectory": "/Users/seanyoungberg/tapestry/_meta/agents/conductors/berg-sandbox"
+    },
+    "pid": 30141,
+    "sessionId": "726c3cd9-7b99-43de-b407-5cf0a64bda07",
+    "startedAt": 1783659160.860578,
+    "surfaceId": "F1C0AEDB-8CA3-49AB-8BCA-440989FF7C57",
+    "transcriptPath": "/Users/seanyoungberg/.claude/projects/-Users-seanyoungberg-tapestry--meta-agents-conductors-berg-sandbox/726c3cd9-7b99-43de-b407-5cf0a64bda07.jsonl",
+    "updatedAt": 1783659160.860578,
+    "workspaceId": "A7FF3E7C-5F54-4EC3-BB8A-2D21C2459FF7"
+   },
+   "745141fe-7920-40ee-9755-2b5311180089": {
+    "agentLifecycle": "needsInput",
+    "cwd": "/Users/seanyoungberg/tapestry/domains/ai-workflows/loom/code/loom-plugin",
+    "isRestorable": true,
+    "lastBody": "Claude is waiting for your input",
+    "lastSubtitle": "Waiting",
+    "launchCommand": {
+     "arguments": [
+      "/Users/seanyoungberg/.local/bin/claude",
+      "--setting-sources",
+      "user,local",
+      "--plugin-dir",
+      "/Users/seanyoungberg/tapestry/domains/ai-workflows/code/claude-marketplace/plugins/cmux-fleet",
+      "--plugin-dir",
+      "/Users/seanyoungberg/tapestry/domains/ai-workflows/code/claude-marketplace/plugins/memsearch",
+      "--plugin-dir",
+      "/Users/seanyoungberg/tapestry/domains/ai-workflows/code/claude-marketplace/plugins/loom",
+      "--model",
+      "claude-opus-4-8[1m]",
+      "--dangerously-skip-permissions",
+      "--effort",
+      "xhigh",
+      "--add-dir",
+      "/Users/seanyoungberg/tapestry/_meta/agents/loom-dev"
+     ],
+     "capturedAt": 1783662755.055217,
+     "executablePath": "/Users/seanyoungberg/.local/bin/claude",
+     "launcher": "claude",
+     "source": "environment",
+     "workingDirectory": "/Users/seanyoungberg/tapestry/domains/ai-workflows/loom/code/loom-plugin"
+    },
+    "pid": 49283,
+    "sessionId": "745141fe-7920-40ee-9755-2b5311180089",
+    "startedAt": 1783662755.0577512,
+    "surfaceId": "9690F6E8-094A-48EC-84AA-C106804BCD56",
+    "transcriptPath": "/Users/seanyoungberg/.claude/projects/-Users-seanyoungberg-tapestry-domains-ai-workflows-loom-code-loom-plugin/745141fe-7920-40ee-9755-2b5311180089.jsonl",
+    "updatedAt": 1783671985.726593,
+    "workspaceId": "A7FF3E7C-5F54-4EC3-BB8A-2D21C2459FF7"
+   },
+   "7748b634-78de-43be-8396-f24327d00f0a": {
+    "agentLifecycle": "running",
+    "cwd": "/Users/seanyoungberg/tapestry/_meta/agents/ad-hoc/l1-remainder",
+    "isRestorable": true,
+    "lastBody": "The sweep is complete. `inbox/` renamed on all five unpinned containers, `activity-log/` on all twenty-three. Per-domain lint is unchanged in every one of the nine domains, residue is zero, lint chec\u2026",
+    "lastSubtitle": "Completed in l1-remainder",
+    "launchCommand": {
+     "arguments": [
+      "/Users/seanyoungberg/.local/bin/claude",
+      "--setting-sources",
+      "user,local",
+      "--plugin-dir",
+      "/Users/seanyoungberg/tapestry/domains/ai-workflows/code/claude-marketplace/plugins/cmux-fleet",
+      "--plugin-dir",
+      "/Users/seanyoungberg/tapestry/domains/ai-workflows/code/claude-marketplace/plugins/memsearch",
+      "--plugin-dir",
+      "/Users/seanyoungberg/tapestry/domains/ai-workflows/code/claude-marketplace/plugins/loom",
+      "--effort",
+      "xhigh",
+      "--model",
+      "claude-opus-4-8[1m]",
+      "--dangerously-skip-permissions"
+     ],
+     "capturedAt": 1783668944.099654,
+     "executablePath": "/Users/seanyoungberg/.local/bin/claude",
+     "launcher": "claude",
+     "source": "environment",
+     "workingDirectory": "/Users/seanyoungberg/tapestry/_meta/agents/ad-hoc/l1-remainder"
+    },
+    "pid": 73309,
+    "sessionId": "7748b634-78de-43be-8396-f24327d00f0a",
+    "startedAt": 1783668944.1019878,
+    "surfaceId": "566F4FB8-8027-452E-A068-0BB770FD96E2",
+    "transcriptPath": "/Users/seanyoungberg/.claude/projects/-Users-seanyoungberg-tapestry--meta-agents-ad-hoc-l1-remainder/7748b634-78de-43be-8396-f24327d00f0a.jsonl",
+    "updatedAt": 1783673488.695508,
+    "workspaceId": "3F1ABB74-720F-4127-9EDF-6843CFEF902C"
+   },
+   "7bc89d6f-5969-4139-8963-0363510285b5": {
+    "agentLifecycle": "needsInput",
+    "cwd": "/Users/seanyoungberg/tapestry/domains/ai-workflows/loom/code/loom-plugin",
+    "isRestorable": true,
+    "lastBody": "Claude is waiting for your input",
+    "lastSubtitle": "Waiting",
+    "launchCommand": {
+     "arguments": [
+      "/Users/seanyoungberg/.local/bin/claude",
+      "--setting-sources",
+      "user,local",
+      "--plugin-dir",
+      "/Users/seanyoungberg/tapestry/domains/ai-workflows/code/claude-marketplace/plugins/cmux-fleet",
+      "--plugin-dir",
+      "/Users/seanyoungberg/tapestry/domains/ai-workflows/code/claude-marketplace/plugins/memsearch",
+      "--plugin-dir",
+      "/Users/seanyoungberg/tapestry/domains/ai-workflows/code/claude-marketplace/plugins/loom",
+      "--dangerously-skip-permissions",
+      "--effort",
+      "xhigh",
+      "--model",
+      "claude-fable-5[1m]"
+     ],
+     "capturedAt": 1783519948.024832,
+     "executablePath": "/Users/seanyoungberg/.local/bin/claude",
+     "launcher": "claude",
+     "source": "environment",
+     "workingDirectory": "/Users/seanyoungberg/tapestry"
+    },
+    "pid": 43496,
+    "sessionId": "7bc89d6f-5969-4139-8963-0363510285b5",
+    "startedAt": 1783519948.027491,
+    "surfaceId": "68B3B5FA-9F23-438F-8C89-F89F615767BA",
+    "transcriptPath": "/Users/seanyoungberg/.claude/projects/-Users-seanyoungberg-tapestry/7bc89d6f-5969-4139-8963-0363510285b5.jsonl",
+    "updatedAt": 1783522292.90691,
+    "workspaceId": "8AE217AC-E4B2-4DB0-8C6C-ADF22E0EB29E"
+   },
+   "7c2ae762-3feb-4b61-806d-3374b2736ce8": {
+    "agentLifecycle": "running",
+    "cwd": "/Users/seanyoungberg/tapestry/_meta/agents/ad-hoc/fleet-architect",
+    "isRestorable": true,
+    "lastBody": "Claude is waiting for your input",
+    "lastSubtitle": "Waiting",
+    "launchCommand": {
+     "arguments": [
+      "/Users/seanyoungberg/.local/bin/claude",
+      "--setting-sources",
+      "user,local",
+      "--plugin-dir",
+      "/Users/seanyoungberg/tapestry/domains/ai-workflows/code/claude-marketplace/plugins/cmux-fleet",
+      "--plugin-dir",
+      "/Users/seanyoungberg/tapestry/domains/ai-workflows/code/claude-marketplace/plugins/memsearch",
+      "--dangerously-skip-permissions",
+      "--effort",
+      "max",
+      "--model",
+      "claude-fable-5"
+     ],
+     "capturedAt": 1783666436.414679,
+     "executablePath": "/Users/seanyoungberg/.local/bin/claude",
+     "launcher": "claude",
+     "source": "environment",
+     "workingDirectory": "/Users/seanyoungberg/tapestry/_meta/agents/ad-hoc/fleet-architect"
+    },
+    "pid": 42277,
+    "sessionId": "7c2ae762-3feb-4b61-806d-3374b2736ce8",
+    "startedAt": 1783666436.417182,
+    "surfaceId": "4930F190-3D56-4B54-8A5F-5AB3056277A2",
+    "transcriptPath": "/Users/seanyoungberg/.claude/projects/-Users-seanyoungberg-tapestry--meta-agents-ad-hoc-fleet-architect/7c2ae762-3feb-4b61-806d-3374b2736ce8.jsonl",
+    "updatedAt": 1783673459.7174459,
+    "workspaceId": "35DBDB74-5476-4DFB-86D3-A0C03D1C3ED8"
+   },
+   "85df67c2-da19-48c7-93b7-c9de630a123c": {
+    "agentLifecycle": "needsInput",
+    "cwd": "/Users/seanyoungberg/tapestry/domains/ai-workflows/cmux/code/cmux-fleet/.worktrees/submission-verify",
+    "isRestorable": true,
+    "lastBody": "Claude is waiting for your input",
+    "lastSubtitle": "Waiting",
+    "launchCommand": {
+     "arguments": [
+      "/Users/seanyoungberg/.local/bin/claude",
+      "--setting-sources",
+      "user,local",
+      "--plugin-dir",
+      "/Users/seanyoungberg/tapestry/domains/ai-workflows/code/claude-marketplace/plugins/cmux-fleet",
+      "--plugin-dir",
+      "/Users/seanyoungberg/tapestry/domains/ai-workflows/code/claude-marketplace/plugins/memsearch",
+      "--dangerously-skip-permissions",
+      "--add-dir",
+      "/Users/seanyoungberg/tapestry/_meta/agents/cmux-dev",
+      "--effort",
+      "xhigh",
+      "--model",
+      "claude-opus-4-8[1m]"
+     ],
+     "capturedAt": 1783186794.613982,
+     "executablePath": "/Users/seanyoungberg/.local/bin/claude",
+     "launcher": "claude",
+     "source": "environment",
+     "workingDirectory": "/Users/seanyoungberg/tapestry/domains/ai-workflows/cmux/code/cmux-fleet/.worktrees/submission-verify"
+    },
+    "pid": 46422,
+    "sessionId": "85df67c2-da19-48c7-93b7-c9de630a123c",
+    "startedAt": 1783186794.61603,
+    "surfaceId": "EB4C4487-B5FF-4F40-82CD-F38B9DFDDAC7",
+    "transcriptPath": "/Users/seanyoungberg/.claude/projects/-Users-seanyoungberg-tapestry-domains-ai-workflows-cmux-code-cmux-fleet--worktrees-submission-verify/85df67c2-da19-48c7-93b7-c9de630a123c.jsonl",
+    "updatedAt": 1783187643.604059,
+    "workspaceId": "12E76241-C845-409D-8B91-A53DB11ECDB7"
+   },
+   "9492ce09-ebd4-4bc2-97a3-616eb35fdf20": {
+    "agentLifecycle": "needsInput",
+    "cwd": "/Users/seanyoungberg/tapestry/domains/ai-workflows/loom/code/loom-plugin",
+    "isRestorable": true,
+    "lastBody": "Claude is waiting for your input",
+    "lastSubtitle": "Waiting",
+    "launchCommand": {
+     "arguments": [
+      "/Users/seanyoungberg/.local/bin/claude",
+      "--setting-sources",
+      "user,local",
+      "--plugin-dir",
+      "/Users/seanyoungberg/tapestry/domains/ai-workflows/code/claude-marketplace/plugins/cmux-fleet",
+      "--plugin-dir",
+      "/Users/seanyoungberg/tapestry/domains/ai-workflows/code/claude-marketplace/plugins/memsearch",
+      "--plugin-dir",
+      "/Users/seanyoungberg/tapestry/domains/ai-workflows/code/claude-marketplace/plugins/loom",
+      "--dangerously-skip-permissions",
+      "--effort",
+      "max",
+      "--model",
+      "claude-fable-5[1m]"
+     ],
+     "capturedAt": 1783521531.768862,
+     "executablePath": "/Users/seanyoungberg/.local/bin/claude",
+     "launcher": "claude",
+     "source": "environment",
+     "workingDirectory": "/Users/seanyoungberg/tapestry"
+    },
+    "pid": 24880,
+    "sessionId": "9492ce09-ebd4-4bc2-97a3-616eb35fdf20",
+    "startedAt": 1783521531.7718592,
+    "surfaceId": "6FDF7455-35CF-4B77-82B6-8895EE22CDEA",
+    "transcriptPath": "/Users/seanyoungberg/.claude/projects/-Users-seanyoungberg-tapestry/9492ce09-ebd4-4bc2-97a3-616eb35fdf20.jsonl",
+    "updatedAt": 1783522267.613463,
+    "workspaceId": "8AE217AC-E4B2-4DB0-8C6C-ADF22E0EB29E"
+   },
+   "98d34a22-9b3a-435c-b1a9-926ec352b8ef": {
+    "agentLifecycle": "running",
+    "cwd": "/Users/seanyoungberg/tapestry/_meta/agents/ad-hoc/e2e-mechanical",
+    "isRestorable": true,
+    "lastBody": "Claude is waiting for your input",
+    "lastSubtitle": "Waiting",
+    "launchCommand": {
+     "arguments": [
+      "/Users/seanyoungberg/.local/bin/claude",
+      "--setting-sources",
+      "user,local",
+      "--plugin-dir",
+      "/Users/seanyoungberg/tapestry/domains/ai-workflows/code/claude-marketplace/plugins/loom",
+      "--plugin-dir",
+      "/Users/seanyoungberg/tapestry/domains/ai-workflows/code/claude-marketplace/plugins/cmux-fleet",
+      "--plugin-dir",
+      "/Users/seanyoungberg/tapestry/domains/ai-workflows/code/claude-marketplace/plugins/memsearch",
+      "--model",
+      "claude-opus-4-8[1m]",
+      "--dangerously-skip-permissions",
+      "--effort",
+      "xhigh"
+     ],
+     "capturedAt": 1783436710.772839,
+     "executablePath": "/Users/seanyoungberg/.local/bin/claude",
+     "launcher": "claude",
+     "source": "environment",
+     "workingDirectory": "/Users/seanyoungberg/tapestry/_meta/agents/ad-hoc/e2e-mechanical"
+    },
+    "pid": 41180,
+    "sessionId": "98d34a22-9b3a-435c-b1a9-926ec352b8ef",
+    "startedAt": 1783436710.7751222,
+    "surfaceId": "EA666A01-6944-4DC8-9970-D252970E1962",
+    "transcriptPath": "/Users/seanyoungberg/.claude/projects/-Users-seanyoungberg-tapestry--meta-agents-ad-hoc-e2e-mechanical/98d34a22-9b3a-435c-b1a9-926ec352b8ef.jsonl",
+    "updatedAt": 1783438544.008881,
+    "workspaceId": "8AE217AC-E4B2-4DB0-8C6C-ADF22E0EB29E"
+   },
+   "ac25285b-5656-4960-9209-3af9648664a3": {
+    "agentLifecycle": "needsInput",
+    "cwd": "/Users/seanyoungberg/tapestry/_meta/agents/book-keeper",
+    "isRestorable": true,
+    "lastBody": "Claude is waiting for your input",
+    "lastSubtitle": "Waiting",
+    "launchCommand": {
+     "arguments": [
+      "/Users/seanyoungberg/.local/bin/claude",
+      "--setting-sources",
+      "user,local",
+      "--plugin-dir",
+      "/Users/seanyoungberg/tapestry/domains/ai-workflows/code/claude-marketplace/plugins/cmux-fleet",
+      "--plugin-dir",
+      "/Users/seanyoungberg/tapestry/domains/ai-workflows/code/claude-marketplace/plugins/memsearch",
+      "--plugin-dir",
+      "/Users/seanyoungberg/tapestry/domains/ai-workflows/code/claude-marketplace/plugins/loom",
+      "--plugin-dir",
+      "/Users/seanyoungberg/tapestry/domains/ai-workflows/code/claude-marketplace/plugins/basic-memory",
+      "--model",
+      "claude-opus-4-8[1m]",
+      "--dangerously-skip-permissions",
+      "--effort",
+      "xhigh"
+     ],
+     "capturedAt": 1783667185.9614348,
+     "executablePath": "/Users/seanyoungberg/.local/bin/claude",
+     "launcher": "claude",
+     "source": "environment",
+     "workingDirectory": "/Users/seanyoungberg/tapestry/_meta/agents/book-keeper"
+    },
+    "pid": 80631,
+    "sessionId": "ac25285b-5656-4960-9209-3af9648664a3",
+    "startedAt": 1783667185.964005,
+    "surfaceId": "6023A4E7-9DD9-45AD-8FFD-3E10CEAA1E87",
+    "transcriptPath": "/Users/seanyoungberg/.claude/projects/-Users-seanyoungberg-tapestry--meta-agents-book-keeper/ac25285b-5656-4960-9209-3af9648664a3.jsonl",
+    "updatedAt": 1783673428.1391459,
+    "workspaceId": "2B2B30E6-65B3-4440-90AA-513151FB3467"
+   },
+   "af7a51b7-0daa-4852-9317-0c5917a931e2": {
+    "agentLifecycle": "unknown",
+    "cwd": "/Users/seanyoungberg/tapestry/domains/career",
+    "isRestorable": true,
+    "lastBody": "Claude is waiting for your input",
+    "lastSubtitle": "Waiting",
+    "launchCommand": {
+     "arguments": [
+      "/Users/seanyoungberg/.local/bin/claude",
+      "--setting-sources",
+      "user,local",
+      "--plugin-dir",
+      "/Users/seanyoungberg/tapestry/domains/ai-workflows/code/claude-marketplace/plugins/cmux-fleet",
+      "--plugin-dir",
+      "/Users/seanyoungberg/tapestry/domains/ai-workflows/code/claude-marketplace/plugins/memsearch",
+      "--plugin-dir",
+      "/Users/seanyoungberg/tapestry/domains/ai-workflows/code/claude-marketplace/plugins/loom",
+      "--plugin-dir",
+      "/Users/seanyoungberg/tapestry/domains/ai-workflows/code/claude-marketplace/plugins/basic-memory",
+      "--effort",
+      "high",
+      "--dangerously-skip-permissions"
+     ],
+     "capturedAt": 1783656341.875274,
+     "executablePath": "/Users/seanyoungberg/.local/bin/claude",
+     "launcher": "claude",
+     "source": "environment",
+     "workingDirectory": "/Users/seanyoungberg/tapestry/domains/career"
+    },
+    "pid": 76624,
+    "sessionId": "af7a51b7-0daa-4852-9317-0c5917a931e2",
+    "startedAt": 1782974782.3690639,
+    "surfaceId": "2694CB4C-706E-45A7-BB64-EA572AA9421C",
+    "transcriptPath": "/Users/seanyoungberg/.claude/projects/-Users-seanyoungberg-tapestry-domains-career/af7a51b7-0daa-4852-9317-0c5917a931e2.jsonl",
+    "updatedAt": 1783656341.878358,
+    "workspaceId": "B1656D4C-22E7-438F-9797-B62A92B7AF81"
+   },
+   "b0646b0c-daef-4497-bfa5-7c93ce1180b4": {
+    "agentLifecycle": "running",
+    "cwd": "/Users/seanyoungberg/tapestry/_meta/agents/graph-view/code",
+    "isRestorable": true,
+    "lastBody": "Claude is waiting for your input",
+    "lastSubtitle": "Waiting",
+    "launchCommand": {
+     "arguments": [
+      "/Users/seanyoungberg/.local/bin/claude",
+      "--setting-sources",
+      "user,local",
+      "--plugin-dir",
+      "/Users/seanyoungberg/tapestry/domains/ai-workflows/code/claude-marketplace/plugins/cmux-fleet",
+      "--plugin-dir",
+      "/Users/seanyoungberg/tapestry/domains/ai-workflows/code/claude-marketplace/plugins/memsearch",
+      "--plugin-dir",
+      "/Users/seanyoungberg/tapestry/domains/ai-workflows/code/claude-marketplace/plugins/loom",
+      "--plugin-dir",
+      "/Users/seanyoungberg/tapestry/domains/ai-workflows/code/claude-marketplace/plugins/lavish",
+      "--effort",
+      "xhigh",
+      "--model",
+      "claude-opus-4-8[1m]",
+      "--dangerously-skip-permissions"
+     ],
+     "capturedAt": 1783661339.788765,
+     "executablePath": "/Users/seanyoungberg/.local/bin/claude",
+     "launcher": "claude",
+     "source": "environment",
+     "workingDirectory": "/Users/seanyoungberg/tapestry/_meta/agents/graph-view"
+    },
+    "pid": 73404,
+    "sessionId": "b0646b0c-daef-4497-bfa5-7c93ce1180b4",
+    "startedAt": 1783661339.791,
+    "surfaceId": "4E496E4B-A010-482B-BB04-A7DF9929EBCD",
+    "transcriptPath": "/Users/seanyoungberg/.claude/projects/-Users-seanyoungberg-tapestry--meta-agents-graph-view/b0646b0c-daef-4497-bfa5-7c93ce1180b4.jsonl",
+    "updatedAt": 1783673474.872016,
+    "workspaceId": "022AF32C-AF42-4603-B610-E4DC16F40717"
+   },
+   "b19a6251-815a-4b12-8d79-17154fab83ea": {
+    "agentLifecycle": "unknown",
+    "cwd": "/Users/seanyoungberg/tapestry/_meta/agents/conductors/berg-sandbox",
+    "isRestorable": true,
+    "sessionId": "b19a6251-815a-4b12-8d79-17154fab83ea",
+    "startedAt": 1783298823.852985,
+    "surfaceId": "F1C0AEDB-8CA3-49AB-8BCA-440989FF7C57",
+    "transcriptPath": "/Users/seanyoungberg/.claude/projects/-Users-seanyoungberg-tapestry--meta-agents-conductors-berg-sandbox/b19a6251-815a-4b12-8d79-17154fab83ea.jsonl",
+    "updatedAt": 1783298824.286978,
+    "workspaceId": "8AE217AC-E4B2-4DB0-8C6C-ADF22E0EB29E"
+   },
+   "ca54276c-b8c3-4c7f-b3b8-d134463caef5": {
+    "agentLifecycle": "unknown",
+    "cwd": "/Users/seanyoungberg/tapestry/_meta/agents/conductors/berg-sandbox",
+    "isRestorable": true,
+    "sessionId": "ca54276c-b8c3-4c7f-b3b8-d134463caef5",
+    "startedAt": 1783514044.8906999,
+    "surfaceId": "F1C0AEDB-8CA3-49AB-8BCA-440989FF7C57",
+    "transcriptPath": "/Users/seanyoungberg/.claude/projects/-Users-seanyoungberg-tapestry--meta-agents-conductors-berg-sandbox/ca54276c-b8c3-4c7f-b3b8-d134463caef5.jsonl",
+    "updatedAt": 1783514045.174604,
+    "workspaceId": "8AE217AC-E4B2-4DB0-8C6C-ADF22E0EB29E"
+   },
+   "ceb7e64a-776f-4f99-9af7-0bcf882e4d3f": {
+    "agentLifecycle": "needsInput",
+    "cwd": "/Users/seanyoungberg/tapestry/domains/ai-workflows/cmux/code/cmux-fleet/.worktrees/plugin-build-p2",
+    "isRestorable": true,
+    "lastBody": "Claude is waiting for your input",
+    "lastSubtitle": "Waiting",
+    "launchCommand": {
+     "arguments": [
+      "/Users/seanyoungberg/.local/bin/claude",
+      "--setting-sources",
+      "user,local",
+      "--plugin-dir",
+      "/Users/seanyoungberg/tapestry/domains/ai-workflows/code/claude-marketplace/plugins/cmux-fleet",
+      "--plugin-dir",
+      "/Users/seanyoungberg/tapestry/domains/ai-workflows/code/claude-marketplace/plugins/memsearch",
+      "--plugin-dir",
+      "/Users/seanyoungberg/tapestry/domains/ai-workflows/code/claude-marketplace/plugins/cmux",
+      "--model",
+      "claude-opus-4-8[1m]",
+      "--dangerously-skip-permissions",
+      "--add-dir",
+      "/Users/seanyoungberg/tapestry/_meta/agents/cmux-dev",
+      "--effort",
+      "xhigh"
+     ],
+     "capturedAt": 1783199360.640975,
+     "executablePath": "/Users/seanyoungberg/.local/bin/claude",
+     "launcher": "claude",
+     "source": "environment",
+     "workingDirectory": "/Users/seanyoungberg/tapestry/domains/ai-workflows/cmux/code/cmux-fleet/.worktrees/plugin-build-p2"
+    },
+    "pid": 97708,
+    "sessionId": "ceb7e64a-776f-4f99-9af7-0bcf882e4d3f",
+    "startedAt": 1783199360.6434798,
+    "surfaceId": "B129C46C-2646-4435-A7B1-CFC641587849",
+    "transcriptPath": "/Users/seanyoungberg/.claude/projects/-Users-seanyoungberg-tapestry-domains-ai-workflows-cmux-code-cmux-fleet--worktrees-plugin-build-p2/ceb7e64a-776f-4f99-9af7-0bcf882e4d3f.jsonl",
+    "updatedAt": 1783200782.396177,
+    "workspaceId": "12E76241-C845-409D-8B91-A53DB11ECDB7"
+   },
+   "d199c379-3d21-4fa9-8cb4-093e9b28ed78": {
+    "agentLifecycle": "needsInput",
+    "cwd": "/Users/seanyoungberg/tapestry/domains/ai-workflows/cmux/code/cmux-fleet/.worktrees/sidebar-build",
+    "isRestorable": true,
+    "lastBody": "Claude is waiting for your input",
+    "lastSubtitle": "Waiting",
+    "launchCommand": {
+     "arguments": [
+      "/Users/seanyoungberg/.local/bin/claude",
+      "--setting-sources",
+      "user,local",
+      "--plugin-dir",
+      "/Users/seanyoungberg/tapestry/domains/ai-workflows/code/claude-marketplace/plugins/cmux-fleet",
+      "--plugin-dir",
+      "/Users/seanyoungberg/tapestry/domains/ai-workflows/code/claude-marketplace/plugins/memsearch",
+      "--plugin-dir",
+      "/Users/seanyoungberg/tapestry/domains/ai-workflows/code/claude-marketplace/plugins/cmux",
+      "--model",
+      "claude-opus-4-8[1m]",
+      "--dangerously-skip-permissions",
+      "--effort",
+      "high",
+      "--add-dir",
+      "/Users/seanyoungberg/tapestry/_meta/agents/cmux-dev"
+     ],
+     "capturedAt": 1783516108.2411551,
+     "executablePath": "/Users/seanyoungberg/.local/bin/claude",
+     "launcher": "claude",
+     "source": "environment",
+     "workingDirectory": "/Users/seanyoungberg/tapestry/domains/ai-workflows/cmux/code/cmux-fleet/.worktrees/sidebar-build"
+    },
+    "pid": 56565,
+    "sessionId": "d199c379-3d21-4fa9-8cb4-093e9b28ed78",
+    "startedAt": 1783516108.242013,
+    "surfaceId": "DCCA9A19-16C4-4314-BEA6-F4105EF61459",
+    "transcriptPath": "/Users/seanyoungberg/.claude/projects/-Users-seanyoungberg-tapestry-domains-ai-workflows-cmux-code-cmux-fleet--worktrees-sidebar-build/d199c379-3d21-4fa9-8cb4-093e9b28ed78.jsonl",
+    "updatedAt": 1783516325.570726,
+    "workspaceId": "12E76241-C845-409D-8B91-A53DB11ECDB7"
+   },
+   "d6b76251-731e-4503-a3a6-e8bdca38f644": {
+    "agentLifecycle": "needsInput",
+    "cwd": "/Users/seanyoungberg/tapestry/domains/ai-workflows/loom/code/loom-plugin",
+    "isRestorable": true,
+    "lastBody": "Claude is waiting for your input",
+    "lastSubtitle": "Waiting",
+    "launchCommand": {
+     "arguments": [
+      "/Users/seanyoungberg/.local/bin/claude",
+      "--setting-sources",
+      "user,local",
+      "--plugin-dir",
+      "/Users/seanyoungberg/tapestry/domains/ai-workflows/code/claude-marketplace/plugins/cmux-fleet",
+      "--plugin-dir",
+      "/Users/seanyoungberg/tapestry/domains/ai-workflows/code/claude-marketplace/plugins/memsearch",
+      "--plugin-dir",
+      "/Users/seanyoungberg/tapestry/domains/ai-workflows/code/claude-marketplace/plugins/loom",
+      "--dangerously-skip-permissions",
+      "--effort",
+      "max",
+      "--model",
+      "claude-fable-5[1m]"
+     ],
+     "capturedAt": 1783521528.270951,
+     "executablePath": "/Users/seanyoungberg/.local/bin/claude",
+     "launcher": "claude",
+     "source": "environment",
+     "workingDirectory": "/Users/seanyoungberg/tapestry"
+    },
+    "pid": 24053,
+    "sessionId": "d6b76251-731e-4503-a3a6-e8bdca38f644",
+    "startedAt": 1783521528.273615,
+    "surfaceId": "B9D286A1-70B7-4110-8A29-3A21B44A346B",
+    "transcriptPath": "/Users/seanyoungberg/.claude/projects/-Users-seanyoungberg-tapestry/d6b76251-731e-4503-a3a6-e8bdca38f644.jsonl",
+    "updatedAt": 1783522161.624968,
+    "workspaceId": "8AE217AC-E4B2-4DB0-8C6C-ADF22E0EB29E"
+   },
+   "e3a5d523-e200-4aa5-adee-5586ce16c43f": {
+    "agentLifecycle": "needsInput",
+    "cwd": "/Users/seanyoungberg/tapestry/domains/ai-workflows/cmux/code/cmux-fleet/.worktrees/sidebar-build",
+    "isRestorable": true,
+    "lastBody": "Claude is waiting for your input",
+    "lastSubtitle": "Waiting",
+    "launchCommand": {
+     "arguments": [
+      "/Users/seanyoungberg/.local/bin/claude",
+      "--setting-sources",
+      "user,local",
+      "--plugin-dir",
+      "/Users/seanyoungberg/tapestry/domains/ai-workflows/code/claude-marketplace/plugins/cmux-fleet",
+      "--plugin-dir",
+      "/Users/seanyoungberg/tapestry/domains/ai-workflows/code/claude-marketplace/plugins/memsearch",
+      "--plugin-dir",
+      "/Users/seanyoungberg/tapestry/domains/ai-workflows/code/claude-marketplace/plugins/cmux",
+      "--model",
+      "claude-opus-4-8[1m]",
+      "--dangerously-skip-permissions",
+      "--effort",
+      "xhigh",
+      "--add-dir",
+      "/Users/seanyoungberg/tapestry/_meta/agents/cmux-dev"
+     ],
+     "capturedAt": 1783668910.0521321,
+     "executablePath": "/Users/seanyoungberg/.local/bin/claude",
+     "launcher": "claude",
+     "source": "environment",
+     "workingDirectory": "/Users/seanyoungberg/tapestry/domains/ai-workflows/cmux/code/cmux-fleet/.worktrees/sidebar-build"
+    },
+    "pid": 71098,
+    "sessionId": "e3a5d523-e200-4aa5-adee-5586ce16c43f",
+    "startedAt": 1783668910.054857,
+    "surfaceId": "C0298D7F-DC14-45C8-BD38-A79777687DD3",
+    "transcriptPath": "/Users/seanyoungberg/.claude/projects/-Users-seanyoungberg-tapestry-domains-ai-workflows-cmux-code-cmux-fleet--worktrees-sidebar-build/e3a5d523-e200-4aa5-adee-5586ce16c43f.jsonl",
+    "updatedAt": 1783672544.625945,
+    "workspaceId": "E7823A6E-0444-4413-A6D4-A0536B5A9078"
+   },
+   "e883213d-6bac-4e9b-9df7-d4f75c859521": {
+    "agentLifecycle": "needsInput",
+    "cwd": "/Users/seanyoungberg/tapestry/domains/ai-workflows/cmux/code/cmux-fleet/.worktrees/plugin-build-p3",
+    "isRestorable": true,
+    "lastBody": "Claude is waiting for your input",
+    "lastSubtitle": "Waiting",
+    "launchCommand": {
+     "arguments": [
+      "/Users/seanyoungberg/.local/bin/claude",
+      "--setting-sources",
+      "user,local",
+      "--plugin-dir",
+      "/Users/seanyoungberg/tapestry/domains/ai-workflows/code/claude-marketplace/plugins/cmux-fleet",
+      "--plugin-dir",
+      "/Users/seanyoungberg/tapestry/domains/ai-workflows/code/claude-marketplace/plugins/memsearch",
+      "--plugin-dir",
+      "/Users/seanyoungberg/tapestry/domains/ai-workflows/code/claude-marketplace/plugins/cmux",
+      "--model",
+      "claude-opus-4-8[1m]",
+      "--dangerously-skip-permissions",
+      "--add-dir",
+      "/Users/seanyoungberg/tapestry/_meta/agents/cmux-dev",
+      "--effort",
+      "xhigh"
+     ],
+     "capturedAt": 1783200958.754987,
+     "executablePath": "/Users/seanyoungberg/.local/bin/claude",
+     "launcher": "claude",
+     "source": "environment",
+     "workingDirectory": "/Users/seanyoungberg/tapestry/domains/ai-workflows/cmux/code/cmux-fleet/.worktrees/plugin-build-p3"
+    },
+    "pid": 47819,
+    "sessionId": "e883213d-6bac-4e9b-9df7-d4f75c859521",
+    "startedAt": 1783200958.757468,
+    "surfaceId": "90A31C70-7A62-409E-A4DF-525DB4406ECB",
+    "transcriptPath": "/Users/seanyoungberg/.claude/projects/-Users-seanyoungberg-tapestry-domains-ai-workflows-cmux-code-cmux-fleet--worktrees-plugin-build-p3/e883213d-6bac-4e9b-9df7-d4f75c859521.jsonl",
+    "updatedAt": 1783202064.544121,
+    "workspaceId": "12E76241-C845-409D-8B91-A53DB11ECDB7"
+   }
+  },
+  "version": 1
+ },
+ "codex-hook-sessions.json": {
+  "activeSessionsBySurface": {},
+  "activeSessionsByWorkspace": {},
+  "sessions": {
+   "019f1417-1862-7830-bcd9-e01e5f0a3cdf": {
+    "agentLifecycle": "idle",
+    "cwd": "/Users/seanyoungberg/tapestry/domains/career",
+    "lastBody": "Exiting.",
+    "lastNotificationStatus": "idle",
+    "lastPromptTurnId": "019f1ca6-2b55-7a93-877f-35b2d0599211",
+    "lastSubtitle": "Completed in career",
+    "launchCommand": {
+     "arguments": [
+      "codex",
+      "--dangerously-bypass-approvals-and-sandbox"
+     ],
+     "capturedAt": 1782892089.793273,
+     "executablePath": "codex",
+     "launcher": "codex",
+     "source": "process",
+     "workingDirectory": "/Users/seanyoungberg/tapestry/domains/career"
+    },
+    "pid": 1459,
+    "runtimeStatus": "idle",
+    "sessionId": "019f1417-1862-7830-bcd9-e01e5f0a3cdf",
+    "startedAt": 1782748513.006485,
+    "surfaceId": "02558B6A-E14B-4B57-8C4C-8A026614B248",
+    "terminalPromptTurnIds": [
+     "019f1417-8130-7810-a457-bbd7b906d279",
+     "019f142e-a444-7d13-b57a-806c9595ec88",
+     "019f1441-d314-7512-b44a-3b28ca80c141",
+     "019f144d-c391-7ce3-a886-d99a138465b8",
+     "019f1ca6-2b55-7a93-877f-35b2d0599211"
+    ],
+    "transcriptPath": "/Users/seanyoungberg/.codex/sessions/2026/06/29/rollout-2026-06-29T11-54-45-019f1417-1862-7830-bcd9-e01e5f0a3cdf.jsonl",
+    "updatedAt": 1782892090.126731,
+    "workspaceId": "98A1E548-5711-4DE5-8CE1-C0F5CA7E283F"
+   },
+   "019f1616-d93f-7050-9a03-b5cf8b8081ca": {
+    "agentLifecycle": "idle",
+    "cwd": "/Users/seanyoungberg/tapestry/_meta/agents/ad-hoc/fleet-review",
+    "lastBody": "Sent to `cmux-advisor` via peer-msg: `d5b879`. Verdict: **HOLD**. 1. **P1 group sweep is fixed**: direct probe confirmed live + archived entries sharing the dissolved group are swept, and a different\u2026",
+    "lastNotificationStatus": "idle",
+    "lastPromptTurnId": "019f18ec-2a55-7550-b28a-f0192eb42f4d",
+    "lastSubtitle": "Completed in fleet-review",
+    "launchCommand": {
+     "arguments": [
+      "codex",
+      "--dangerously-bypass-approvals-and-sandbox"
+     ],
+     "capturedAt": 1782829790.5554929,
+     "executablePath": "codex",
+     "launcher": "codex",
+     "source": "process",
+     "workingDirectory": "/Users/seanyoungberg/tapestry/_meta/agents/ad-hoc/fleet-review"
+    },
+    "pid": 78915,
+    "runtimeStatus": "idle",
+    "sessionId": "019f1616-d93f-7050-9a03-b5cf8b8081ca",
+    "startedAt": 1782782049.075742,
+    "surfaceId": "503F0C67-5D78-4D3E-867D-9AF499DEDA3A",
+    "terminalPromptTurnIds": [
+     "019f1617-37e3-7d40-b5c7-3bef0a4a014d",
+     "019f1625-36dc-7a62-8e99-57fc809cf426",
+     "019f185f-6c56-7543-87b1-f4b38d707103",
+     "019f18e4-23af-7d00-bf00-643c0e1fa8a5",
+     "019f18ec-2a55-7550-b28a-f0192eb42f4d"
+    ],
+    "transcriptPath": "/Users/seanyoungberg/.codex/sessions/2026/06/29/rollout-2026-06-29T21-13-44-019f1616-d93f-7050-9a03-b5cf8b8081ca.jsonl",
+    "updatedAt": 1782829790.846682,
+    "workspaceId": "40B70FBF-B9EC-424B-AA49-794643997E1F"
+   },
+   "019f1bae-ce54-7d50-90b7-c58399438195": {
+    "agentLifecycle": "idle",
+    "cwd": "/Users/seanyoungberg/tapestry/domains/ai-workflows/cmux/code/cmux-fleet",
+    "lastBody": "cmux-advisor: Review written to [REVIEW-daemon-v011-codex.md](/Users/seanyoungberg/tapestry/_meta/agents/conductors/cmux-advisor/cmux-fleet-project/REVIEW-daemon-v011-codex.md:1). I reviewed `671c4f8\u2026",
+    "lastNotificationStatus": "idle",
+    "lastPromptTurnId": "019f1baf-4884-7ee0-bd11-c0b6d0231d00",
+    "lastSubtitle": "Completed in cmux-fleet",
+    "launchCommand": {
+     "arguments": [
+      "codex",
+      "--dangerously-bypass-approvals-and-sandbox"
+     ],
+     "capturedAt": 1782876230.703147,
+     "executablePath": "codex",
+     "launcher": "codex",
+     "source": "process",
+     "workingDirectory": "/Users/seanyoungberg/tapestry/domains/ai-workflows/cmux/code/cmux-fleet"
+    },
+    "pid": 11745,
+    "runtimeStatus": "idle",
+    "sessionId": "019f1bae-ce54-7d50-90b7-c58399438195",
+    "startedAt": 1782875900.487642,
+    "surfaceId": "9BFCD771-59C7-4F58-BFB0-7BD8C903671D",
+    "terminalPromptTurnIds": [
+     "019f1baf-4884-7ee0-bd11-c0b6d0231d00"
+    ],
+    "transcriptPath": "/Users/seanyoungberg/.codex/sessions/2026/06/30/rollout-2026-06-30T23-17-48-019f1bae-ce54-7d50-90b7-c58399438195.jsonl",
+    "updatedAt": 1782876230.9700952,
+    "workspaceId": "401B6570-38C3-4B9E-9304-6331C8DBCAA3"
+   },
+   "019f1bb0-4f4d-78e3-843d-ab3eaa0676a4": {
+    "agentLifecycle": "idle",
+    "cwd": "/Users/seanyoungberg/.codex/memories",
+    "lastBody": "Updated [MEMORY.md](/Users/seanyoungberg/.codex/memories/MEMORY.md) and [memory_summary.md](/Users/seanyoungberg/.codex/memories/memory_summary.md). The consolidation added a new top-priority `cmux-f\u2026",
+    "lastNotificationStatus": "idle",
+    "lastPromptTurnId": "019f1bb0-4f70-7340-af79-0e129bf1eb97",
+    "lastSubtitle": "Completed in memories",
+    "launchCommand": {
+     "arguments": [
+      "codex",
+      "--dangerously-bypass-approvals-and-sandbox"
+     ],
+     "capturedAt": 1782876118.5033898,
+     "executablePath": "codex",
+     "launcher": "codex",
+     "source": "process",
+     "workingDirectory": "/Users/seanyoungberg/.codex/memories"
+    },
+    "pid": 11745,
+    "runtimeStatus": "idle",
+    "sessionId": "019f1bb0-4f4d-78e3-843d-ab3eaa0676a4",
+    "startedAt": 1782875968.1888108,
+    "surfaceId": "9BFCD771-59C7-4F58-BFB0-7BD8C903671D",
+    "terminalPromptTurnIds": [
+     "019f1bb0-4f70-7340-af79-0e129bf1eb97"
+    ],
+    "updatedAt": 1782876118.7722158,
+    "workspaceId": "401B6570-38C3-4B9E-9304-6331C8DBCAA3"
+   },
+   "019f1ca8-415f-71d2-91c1-791c40e57c00": {
+    "agentLifecycle": "idle",
+    "cwd": "/Users/seanyoungberg/tapestry/domains/ai-workflows/cmux/code/cmux-fleet",
+    "lastBody": "Wrote the review artifact here: [REVIEW-packaging-plan-codex.md](/Users/seanyoungberg/tapestry/_meta/agents/conductors/cmux-advisor/cmux-fleet-project/REVIEW-packaging-plan-codex.md). Verdict in the \u2026",
+    "lastNotificationStatus": "idle",
+    "lastPromptTurnId": "019f1ca9-1497-7e22-a92d-ec8aa9df21e9",
+    "lastSubtitle": "Completed in cmux-fleet",
+    "launchCommand": {
+     "arguments": [
+      "codex",
+      "--dangerously-bypass-approvals-and-sandbox"
+     ],
+     "capturedAt": 1782892726.848401,
+     "executablePath": "codex",
+     "launcher": "codex",
+     "source": "process",
+     "workingDirectory": "/Users/seanyoungberg/tapestry/domains/ai-workflows/cmux/code/cmux-fleet"
+    },
+    "pid": 39612,
+    "runtimeStatus": "idle",
+    "sessionId": "019f1ca8-415f-71d2-91c1-791c40e57c00",
+    "startedAt": 1782892271.1977348,
+    "surfaceId": "57177CCF-9B10-47DC-8C38-6E8340AA5019",
+    "terminalPromptTurnIds": [
+     "019f1ca9-1497-7e22-a92d-ec8aa9df21e9"
+    ],
+    "transcriptPath": "/Users/seanyoungberg/.codex/sessions/2026/07/01/rollout-2026-07-01T03-50-16-019f1ca8-415f-71d2-91c1-791c40e57c00.jsonl",
+    "updatedAt": 1782892727.122536,
+    "workspaceId": "401B6570-38C3-4B9E-9304-6331C8DBCAA3"
+   },
+   "019f1d1e-1bbd-7ed3-8445-5bb38c51eb40": {
+    "agentLifecycle": "idle",
+    "cwd": "/Users/seanyoungberg/tapestry/_meta/agents/ad-hoc/packaging-review",
+    "lastBody": "Done. Wrote the review to [REVIEW-packaging-p2p4-codex.md](/Users/seanyoungberg/tapestry/_meta/agents/conductors/cmux-advisor/cmux-fleet-project/REVIEW-packaging-p2p4-codex.md). Verdict: **ship-to-st\u2026",
+    "lastNotificationStatus": "idle",
+    "lastPromptTurnId": "019f1d1e-9a3f-71b1-bae6-558e05fff178",
+    "lastSubtitle": "Completed in packaging-review",
+    "launchCommand": {
+     "arguments": [
+      "codex",
+      "--dangerously-bypass-approvals-and-sandbox"
+     ],
+     "capturedAt": 1782900401.3658519,
+     "executablePath": "codex",
+     "launcher": "codex",
+     "source": "process",
+     "workingDirectory": "/Users/seanyoungberg/tapestry/_meta/agents/ad-hoc/packaging-review"
+    },
+    "pid": 84540,
+    "runtimeStatus": "idle",
+    "sessionId": "019f1d1e-1bbd-7ed3-8445-5bb38c51eb40",
+    "startedAt": 1782899973.122381,
+    "surfaceId": "25FCD3F3-7EDB-4E60-A601-5DEE13A83EC1",
+    "terminalPromptTurnIds": [
+     "019f1d1e-9a3f-71b1-bae6-558e05fff178"
+    ],
+    "transcriptPath": "/Users/seanyoungberg/.codex/sessions/2026/07/01/rollout-2026-07-01T05-59-00-019f1d1e-1bbd-7ed3-8445-5bb38c51eb40.jsonl",
+    "updatedAt": 1782900401.637042,
+    "workspaceId": "401B6570-38C3-4B9E-9304-6331C8DBCAA3"
+   },
+   "019f1d1f-6c58-79f3-91b3-3177b9a094c6": {
+    "agentLifecycle": "idle",
+    "cwd": "/Users/seanyoungberg/.codex/memories",
+    "lastBody": "Updated [MEMORY.md](/Users/seanyoungberg/.codex/memories/MEMORY.md) and [memory_summary.md](/Users/seanyoungberg/.codex/memories/memory_summary.md) for the new `cmux-fleet` v0.1.1 review thread. I ke\u2026",
+    "lastNotificationStatus": "idle",
+    "lastPromptTurnId": "019f1d1f-6c83-7191-91d9-373d747ebdce",
+    "lastSubtitle": "Completed in memories",
+    "launchCommand": {
+     "arguments": [
+      "codex",
+      "--dangerously-bypass-approvals-and-sandbox"
+     ],
+     "capturedAt": 1782900167.1862411,
+     "executablePath": "codex",
+     "launcher": "codex",
+     "source": "process",
+     "workingDirectory": "/Users/seanyoungberg/.codex/memories"
+    },
+    "pid": 84540,
+    "runtimeStatus": "idle",
+    "sessionId": "019f1d1f-6c58-79f3-91b3-3177b9a094c6",
+    "startedAt": 1782900027.382989,
+    "surfaceId": "25FCD3F3-7EDB-4E60-A601-5DEE13A83EC1",
+    "terminalPromptTurnIds": [
+     "019f1d1f-6c83-7191-91d9-373d747ebdce"
+    ],
+    "updatedAt": 1782900167.461173,
+    "workspaceId": "401B6570-38C3-4B9E-9304-6331C8DBCAA3"
+   },
+   "019f1e32-a711-7a41-af76-d42013486987": {
+    "activePromptDepth": 1,
+    "activePromptTurnId": "019f1e4d-d5b3-7371-b091-17742f3fe4ae",
+    "activePromptTurnIds": [
+     "019f1e4d-d5b3-7371-b091-17742f3fe4ae"
+    ],
+    "agentLifecycle": "running",
+    "cwd": "/Users/seanyoungberg/tapestry/domains/ai-workflows/cmux/code/cmux-fleet",
+    "lastBody": "Wrote the review artifact here: [REVIEW-lifecycle-hardening-codex.md](/Users/seanyoungberg/tapestry/_meta/agents/conductors/cmux-advisor/cmux-fleet-project/REVIEW-lifecycle-hardening-codex.md:1) Verd\u2026",
+    "lastNotificationStatus": "idle",
+    "lastPromptTurnId": "019f1e4d-d5b3-7371-b091-17742f3fe4ae",
+    "lastSubtitle": "Completed in cmux-fleet",
+    "launchCommand": {
+     "arguments": [
+      "codex",
+      "--dangerously-bypass-approvals-and-sandbox"
+     ],
+     "capturedAt": 1782919845.535758,
+     "executablePath": "codex",
+     "launcher": "codex",
+     "source": "process",
+     "workingDirectory": "/Users/seanyoungberg/tapestry/domains/ai-workflows/cmux/code/cmux-fleet"
+    },
+    "pid": 43001,
+    "runtimeStatus": "running",
+    "sessionId": "019f1e32-a711-7a41-af76-d42013486987",
+    "startedAt": 1782918124.517171,
+    "surfaceId": "1D4238E7-48A1-4BE7-8FEC-9B81020031AC",
+    "terminalPromptTurnIds": [
+     "019f1e33-91e6-7571-b86c-527c8dd5dc82"
+    ],
+    "transcriptPath": "/Users/seanyoungberg/.codex/sessions/2026/07/01/rollout-2026-07-01T11-01-03-019f1e32-a711-7a41-af76-d42013486987.jsonl",
+    "updatedAt": 1782919845.871982,
+    "workspaceId": "401B6570-38C3-4B9E-9304-6331C8DBCAA3"
+   },
+   "019f1e46-f888-7131-8088-ffac52740dbd": {
+    "activePromptDepth": 1,
+    "activePromptTurnId": "019f1ebc-2321-7cf3-a9cd-1de980fe4530",
+    "activePromptTurnIds": [
+     "019f1ebc-2321-7cf3-a9cd-1de980fe4530"
+    ],
+    "agentLifecycle": "running",
+    "cwd": "/Users/seanyoungberg/tapestry/domains/ai-workflows/cmux/code/cmux-fleet",
+    "lastBody": "Wrote the review artifact here: [REVIEW-notif-wake-codex.md](/Users/seanyoungberg/tapestry/_meta/agents/conductors/cmux-advisor/cmux-fleet-project/REVIEW-notif-wake-codex.md:1). I did not edit repo c\u2026",
+    "lastNotificationStatus": "idle",
+    "lastPromptTurnId": "019f1ebc-2321-7cf3-a9cd-1de980fe4530",
+    "lastSubtitle": "Completed in cmux-fleet",
+    "launchCommand": {
+     "arguments": [
+      "codex",
+      "--dangerously-bypass-approvals-and-sandbox"
+     ],
+     "capturedAt": 1782927074.2930079,
+     "executablePath": "codex",
+     "launcher": "codex",
+     "source": "process",
+     "workingDirectory": "/Users/seanyoungberg/tapestry/domains/ai-workflows/cmux/code/cmux-fleet"
+    },
+    "pid": 96991,
+    "runtimeStatus": "running",
+    "sessionId": "019f1e46-f888-7131-8088-ffac52740dbd",
+    "startedAt": 1782919430.754283,
+    "surfaceId": "7BFD8BCA-ED40-4594-AB14-252E06E029B1",
+    "terminalPromptTurnIds": [
+     "019f1e47-800b-7363-97dd-c8fa9c680735"
+    ],
+    "transcriptPath": "/Users/seanyoungberg/.codex/sessions/2026/07/01/rollout-2026-07-01T11-23-15-019f1e46-f888-7131-8088-ffac52740dbd.jsonl",
+    "updatedAt": 1782927074.610667,
+    "workspaceId": "401B6570-38C3-4B9E-9304-6331C8DBCAA3"
+   },
+   "019f1ebd-0d8b-7c81-9786-3c5ae165eb78": {
+    "agentLifecycle": "idle",
+    "cwd": "/Users/seanyoungberg/.codex/memories",
+    "lastBody": "Updated [MEMORY.md](/Users/seanyoungberg/.codex/memories/MEMORY.md) and [memory_summary.md](/Users/seanyoungberg/.codex/memories/memory_summary.md) incrementally. The main consolidation change is a n\u2026",
+    "lastNotificationStatus": "idle",
+    "lastPromptTurnId": "019f1ebd-0db7-72a3-83f9-68c096f248fe",
+    "lastSubtitle": "Completed in memories",
+    "launchCommand": {
+     "arguments": [
+      "codex",
+      "--dangerously-bypass-approvals-and-sandbox"
+     ],
+     "capturedAt": 1782927395.752686,
+     "executablePath": "codex",
+     "launcher": "codex",
+     "source": "process",
+     "workingDirectory": "/Users/seanyoungberg/.codex/memories"
+    },
+    "pid": 96991,
+    "runtimeStatus": "idle",
+    "sessionId": "019f1ebd-0d8b-7c81-9786-3c5ae165eb78",
+    "startedAt": 1782927135.2076,
+    "surfaceId": "7BFD8BCA-ED40-4594-AB14-252E06E029B1",
+    "terminalPromptTurnIds": [
+     "019f1ebd-0db7-72a3-83f9-68c096f248fe"
+    ],
+    "updatedAt": 1782927396.020865,
+    "workspaceId": "401B6570-38C3-4B9E-9304-6331C8DBCAA3"
+   },
+   "019f2141-38fa-7d21-bbc5-080b74fe00df": {
+    "agentLifecycle": "idle",
+    "cwd": "/Users/seanyoungberg/tapestry/_meta/agents/ad-hoc/codex-review",
+    "lastBody": "Wrote and verified the review artifact: [codex-review-findings.md](/Users/seanyoungberg/tapestry/_meta/agents/ad-hoc/codex-review/codex-review-findings.md:1). It is 103 lines and lives under `_meta/a\u2026",
+    "lastNotificationStatus": "idle",
+    "lastPromptTurnId": "019f2142-918f-7eb3-85ff-90bd7cc9e377",
+    "lastSubtitle": "Completed in codex-review",
+    "launchCommand": {
+     "arguments": [
+      "codex",
+      "--dangerously-bypass-approvals-and-sandbox"
+     ],
+     "capturedAt": 1782969804.54243,
+     "executablePath": "codex",
+     "launcher": "codex",
+     "source": "process",
+     "workingDirectory": "/Users/seanyoungberg/tapestry/_meta/agents/ad-hoc/codex-review"
+    },
+    "pid": 34794,
+    "runtimeStatus": "idle",
+    "sessionId": "019f2141-38fa-7d21-bbc5-080b74fe00df",
+    "startedAt": 1782969439.091399,
+    "surfaceId": "42567834-E4BC-44AC-836A-EFC6424BA6FE",
+    "terminalPromptTurnIds": [
+     "019f2142-918f-7eb3-85ff-90bd7cc9e377"
+    ],
+    "transcriptPath": "/Users/seanyoungberg/.codex/sessions/2026/07/02/rollout-2026-07-02T01-15-50-019f2141-38fa-7d21-bbc5-080b74fe00df.jsonl",
+    "updatedAt": 1782969804.819067,
+    "workspaceId": "98A1E548-5711-4DE5-8CE1-C0F5CA7E283F"
+   },
+   "019f2143-578a-7b83-86c4-8dad37fe59a8": {
+    "agentLifecycle": "idle",
+    "cwd": "/Users/seanyoungberg/.codex/memories",
+    "lastBody": "Updated the memory repo incrementally around the two new `cmux-fleet` review rollouts. `[MEMORY.md](/Users/seanyoungberg/.codex/memories/MEMORY.md)` now extends the existing `cmux-fleet adversarial r\u2026",
+    "lastNotificationStatus": "idle",
+    "lastPromptTurnId": "019f2143-57b9-7c51-b156-fd76acc579fe",
+    "lastSubtitle": "Completed in memories",
+    "launchCommand": {
+     "arguments": [
+      "codex",
+      "--dangerously-bypass-approvals-and-sandbox"
+     ],
+     "capturedAt": 1782969662.330884,
+     "executablePath": "codex",
+     "launcher": "codex",
+     "source": "process",
+     "workingDirectory": "/Users/seanyoungberg/.codex/memories"
+    },
+    "pid": 34794,
+    "runtimeStatus": "idle",
+    "sessionId": "019f2143-578a-7b83-86c4-8dad37fe59a8",
+    "startedAt": 1782969490.253475,
+    "surfaceId": "42567834-E4BC-44AC-836A-EFC6424BA6FE",
+    "terminalPromptTurnIds": [
+     "019f2143-57b9-7c51-b156-fd76acc579fe"
+    ],
+    "updatedAt": 1782969662.6039,
+    "workspaceId": "98A1E548-5711-4DE5-8CE1-C0F5CA7E283F"
+   },
+   "019f22a5-ff7a-7211-891b-095f4277626b": {
+    "agentLifecycle": "idle",
+    "cwd": "/Users/seanyoungberg/tapestry/domains/career",
+    "lastBody": "You\u2019re right. I restored the original body you pasted into the filed candidate and removed the blended version. File is updated here: [cloudflare-fde-cover-letter-resume-codex-2026-07-02.md](/Users/s\u2026",
+    "lastNotificationStatus": "idle",
+    "lastPromptTurnId": "019f22c2-21f0-7973-9906-d28b56177c39",
+    "lastSubtitle": "Completed in career",
+    "launchCommand": {
+     "arguments": [
+      "codex",
+      "--dangerously-bypass-approvals-and-sandbox"
+     ],
+     "capturedAt": 1782994642.462163,
+     "executablePath": "codex",
+     "launcher": "codex",
+     "source": "process",
+     "workingDirectory": "/Users/seanyoungberg/tapestry/domains/career"
+    },
+    "pid": 40830,
+    "runtimeStatus": "idle",
+    "sessionId": "019f22a5-ff7a-7211-891b-095f4277626b",
+    "startedAt": 1782992778.385757,
+    "surfaceId": "9B88DB52-FD6B-427B-A370-4873EE6911F8",
+    "terminalPromptTurnIds": [
+     "019f22a6-b2d9-71f2-9e11-4497664467eb",
+     "019f22aa-ed88-7783-adf0-c67d9654d0bb",
+     "019f22b5-edf7-7490-9f56-3a49bd88961f",
+     "019f22be-d510-7b32-861f-c0ac4a909a4a",
+     "019f22c2-21f0-7973-9906-d28b56177c39"
+    ],
+    "transcriptPath": "/Users/seanyoungberg/.codex/sessions/2026/07/02/rollout-2026-07-02T07-45-32-019f22a5-ff7a-7211-891b-095f4277626b.jsonl",
+    "updatedAt": 1782994642.73052,
+    "workspaceId": "8AE217AC-E4B2-4DB0-8C6C-ADF22E0EB29E"
+   },
+   "019f22a7-72fe-7290-a080-0e522286b3ff": {
+    "agentLifecycle": "idle",
+    "cwd": "/Users/seanyoungberg/.codex/memories",
+    "lastBody": "Updated [MEMORY.md](/Users/seanyoungberg/.codex/memories/MEMORY.md) and [memory_summary.md](/Users/seanyoungberg/.codex/memories/memory_summary.md) for the new `2026-07-02` rollout. I added a new top\u2026",
+    "lastNotificationStatus": "idle",
+    "lastPromptTurnId": "019f22a7-7326-7221-9511-49bb79834f83",
+    "lastSubtitle": "Completed in memories",
+    "launchCommand": {
+     "arguments": [
+      "codex",
+      "--dangerously-bypass-approvals-and-sandbox"
+     ],
+     "capturedAt": 1782992945.400766,
+     "executablePath": "codex",
+     "launcher": "codex",
+     "source": "process",
+     "workingDirectory": "/Users/seanyoungberg/.codex/memories"
+    },
+    "pid": 40830,
+    "runtimeStatus": "idle",
+    "sessionId": "019f22a7-72fe-7290-a080-0e522286b3ff",
+    "startedAt": 1782992828.132628,
+    "surfaceId": "9B88DB52-FD6B-427B-A370-4873EE6911F8",
+    "terminalPromptTurnIds": [
+     "019f22a7-7326-7221-9511-49bb79834f83"
+    ],
+    "updatedAt": 1782992945.679615,
+    "workspaceId": "8AE217AC-E4B2-4DB0-8C6C-ADF22E0EB29E"
+   },
+   "019f2b38-858c-7040-8126-71dd412f0972": {
+    "agentLifecycle": "idle",
+    "cwd": "/Users/seanyoungberg/tapestry/_meta/agents/ad-hoc/codex-entity-review",
+    "lastBody": "Done. The report is written at [design-review.md](/Users/seanyoungberg/tapestry/_meta/agents/ad-hoc/codex-entity-review/design-review.md:1). I verified the required shape is present in order: - `## F\u2026",
+    "lastNotificationStatus": "idle",
+    "lastPromptTurnId": "019f2b39-0884-7510-b36b-b659d65c5110",
+    "lastSubtitle": "Completed in codex-entity-review",
+    "launchCommand": {
+     "arguments": [
+      "codex",
+      "--dangerously-bypass-approvals-and-sandbox"
+     ],
+     "capturedAt": 1783137220.811315,
+     "executablePath": "codex",
+     "launcher": "codex",
+     "source": "process",
+     "workingDirectory": "/Users/seanyoungberg/tapestry/_meta/agents/ad-hoc/codex-entity-review"
+    },
+    "pid": 3498,
+    "runtimeStatus": "idle",
+    "sessionId": "019f2b38-858c-7040-8126-71dd412f0972",
+    "startedAt": 1783136587.103651,
+    "surfaceId": "B47E24FC-36DD-4CAB-9F0C-684B013F0922",
+    "terminalPromptTurnIds": [
+     "019f2b39-0884-7510-b36b-b659d65c5110"
+    ],
+    "transcriptPath": "/Users/seanyoungberg/.codex/sessions/2026/07/03/rollout-2026-07-03T23-42-32-019f2b38-858c-7040-8126-71dd412f0972.jsonl",
+    "updatedAt": 1783137221.099968,
+    "workspaceId": "8AE217AC-E4B2-4DB0-8C6C-ADF22E0EB29E"
+   },
+   "019f2b39-7640-7651-b47f-e1d0df86fd5e": {
+    "agentLifecycle": "idle",
+    "cwd": "/Users/seanyoungberg/.codex/memories",
+    "lastBody": "Updated [MEMORY.md](/Users/seanyoungberg/.codex/memories/MEMORY.md) and [memory_summary.md](/Users/seanyoungberg/.codex/memories/memory_summary.md). The main consolidation change is a new career-doma\u2026",
+    "lastNotificationStatus": "idle",
+    "lastPromptTurnId": "019f2b39-7666-7372-994b-e0d0dce0cdf3",
+    "lastSubtitle": "Completed in memories",
+    "launchCommand": {
+     "arguments": [
+      "codex",
+      "--dangerously-bypass-approvals-and-sandbox"
+     ],
+     "capturedAt": 1783136937.115436,
+     "executablePath": "codex",
+     "launcher": "codex",
+     "source": "process",
+     "workingDirectory": "/Users/seanyoungberg/.codex/memories"
+    },
+    "pid": 3498,
+    "runtimeStatus": "idle",
+    "sessionId": "019f2b39-7640-7651-b47f-e1d0df86fd5e",
+    "startedAt": 1783136614.870142,
+    "surfaceId": "B47E24FC-36DD-4CAB-9F0C-684B013F0922",
+    "terminalPromptTurnIds": [
+     "019f2b39-7666-7372-994b-e0d0dce0cdf3"
+    ],
+    "updatedAt": 1783136937.406608,
+    "workspaceId": "8AE217AC-E4B2-4DB0-8C6C-ADF22E0EB29E"
+   },
+   "019f3bdf-e113-7f40-bd39-99ced24a70c3": {
+    "agentLifecycle": "idle",
+    "cwd": "/Users/seanyoungberg/tapestry/_meta/agents/default-worker",
+    "lastBody": "Done. I wrote the audit here: [notif-flow-audit.md](/Users/seanyoungberg/tapestry/_meta/agents/default-worker/notif-flow-audit.md:1) I kept the `cmux-fleet` repo read-only; its `git status --short` s\u2026",
+    "lastNotificationStatus": "idle",
+    "lastPromptTurnId": "019f3be0-9532-7720-b04f-90deb706d1ed",
+    "lastSubtitle": "Completed in default-worker",
+    "launchCommand": {
+     "arguments": [
+      "codex",
+      "--dangerously-bypass-approvals-and-sandbox"
+     ],
+     "capturedAt": 1783416734.530612,
+     "executablePath": "codex",
+     "launcher": "codex",
+     "source": "process",
+     "workingDirectory": "/Users/seanyoungberg/tapestry/_meta/agents/default-worker"
+    },
+    "pid": 66267,
+    "runtimeStatus": "idle",
+    "sessionId": "019f3bdf-e113-7f40-bd39-99ced24a70c3",
+    "startedAt": 1783416003.747247,
+    "surfaceId": "F3AD83A3-0519-4D3B-9C8D-E6AA396D1DEF",
+    "terminalPromptTurnIds": [
+     "019f3be0-9532-7720-b04f-90deb706d1ed"
+    ],
+    "transcriptPath": "/Users/seanyoungberg/.codex/sessions/2026/07/07/rollout-2026-07-07T05-19-15-019f3bdf-e113-7f40-bd39-99ced24a70c3.jsonl",
+    "updatedAt": 1783416734.802371,
+    "workspaceId": "12E76241-C845-409D-8B91-A53DB11ECDB7"
+   },
+   "019f3bf2-ec6d-7893-9296-3578223dc6d4": {
+    "agentLifecycle": "idle",
+    "cwd": "/Users/seanyoungberg/tapestry/domains/ai-workflows/cmux/code/cmux-fleet/.worktrees/notif-build",
+    "lastBody": "Fixed the review finding. The completion suppression in [router.py](/Users/seanyoungberg/tapestry/domains/ai-workflows/cmux/code/cmux-fleet/.worktrees/notif-build/cmux_fleet/router.py) is no longer a\u2026",
+    "lastNotificationStatus": "idle",
+    "lastPromptTurnId": "019f3bff-91ff-7a22-a847-5d046c947e4f",
+    "lastSubtitle": "Completed in notif-build",
+    "launchCommand": {
+     "arguments": [
+      "codex",
+      "--dangerously-bypass-approvals-and-sandbox"
+     ],
+     "capturedAt": 1783418164.058989,
+     "executablePath": "codex",
+     "launcher": "codex",
+     "source": "process",
+     "workingDirectory": "/Users/seanyoungberg/tapestry/domains/ai-workflows/cmux/code/cmux-fleet/.worktrees/notif-build"
+    },
+    "pid": 7309,
+    "runtimeStatus": "idle",
+    "sessionId": "019f3bf2-ec6d-7893-9296-3578223dc6d4",
+    "startedAt": 1783417262.828696,
+    "surfaceId": "B31AC019-9E4D-44CA-8DA8-CFAFCAA0596B",
+    "terminalPromptTurnIds": [
+     "019f3bf3-cf9a-7b90-9a56-0af0ae5b4cf5",
+     "019f3bff-91ff-7a22-a847-5d046c947e4f"
+    ],
+    "transcriptPath": "/Users/seanyoungberg/.codex/sessions/2026/07/07/rollout-2026-07-07T05-40-03-019f3bf2-ec6d-7893-9296-3578223dc6d4.jsonl",
+    "updatedAt": 1783418164.331356,
+    "workspaceId": "12E76241-C845-409D-8B91-A53DB11ECDB7"
+   },
+   "019f3c7a-3210-79a3-a8e7-372f5e947622": {
+    "agentLifecycle": "idle",
+    "cwd": "/Users/seanyoungberg/tapestry/_meta/agents/ad-hoc/codex-probe",
+    "lastBody": "Executed the brief fully and reported to `cmux-advisor`. The peer message was sent successfully: `[peer-msg] codex-probe -> cmux-advisor (msg 93d96f, reply: expected)` Key verdict: **CODEX_ACCESS_TOK\u2026",
+    "lastNotificationStatus": "idle",
+    "lastPromptTurnId": "019f3c7b-8985-74f0-86bf-79080fcece94",
+    "lastSubtitle": "Completed in codex-probe",
+    "launchCommand": {
+     "arguments": [
+      "codex",
+      "--dangerously-bypass-approvals-and-sandbox"
+     ],
+     "capturedAt": 1783426608.046146,
+     "executablePath": "codex",
+     "launcher": "codex",
+     "source": "process",
+     "workingDirectory": "/Users/seanyoungberg/tapestry/_meta/agents/ad-hoc/codex-probe"
+    },
+    "pid": 12061,
+    "runtimeStatus": "idle",
+    "sessionId": "019f3c7a-3210-79a3-a8e7-372f5e947622",
+    "startedAt": 1783426157.388381,
+    "surfaceId": "B222DC07-F871-4025-956A-1CD759EA10E8",
+    "terminalPromptTurnIds": [
+     "019f3c7b-8985-74f0-86bf-79080fcece94"
+    ],
+    "transcriptPath": "/Users/seanyoungberg/.codex/sessions/2026/07/07/rollout-2026-07-07T08-07-49-019f3c7a-3210-79a3-a8e7-372f5e947622.jsonl",
+    "updatedAt": 1783426608.31714,
+    "workspaceId": "A43F96BE-076E-495F-86EA-86CB13BDC80B"
+   }
+  },
+  "version": 1
+ }
+}

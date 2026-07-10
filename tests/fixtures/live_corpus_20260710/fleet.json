@@ -1,0 +1,298 @@
+{
+ "cmux-advisor": {
+  "role": "cmux-advisor",
+  "kind": "conductor",
+  "tool": "claude",
+  "cwd": "/Users/seanyoungberg/tapestry/_meta/agents/conductors/cmux-advisor",
+  "parent": "berg-sandbox",
+  "place": "workspace",
+  "status": "live",
+  "surface": "DCCA9A19-16C4-4314-BEA6-F4105EF61459",
+  "workspace": "85576ACB-D5B9-4817-9A71-3FEBB54BC9EA",
+  "session": "claude-1d83f66f-488a-4754-8252-5cd9ea8e6243",
+  "plugins": [
+   "cmux-fleet",
+   "memsearch",
+   "cmux"
+  ],
+  "flags": [
+   "--effort",
+   "high",
+   "--dangerously-skip-permissions"
+  ],
+  "settings": "",
+  "group": "Conductor - cmux-advisor",
+  "worktree": null
+ },
+ "berg-sandbox": {
+  "role": "berg-sandbox",
+  "kind": "conductor",
+  "tool": "claude",
+  "cwd": "/Users/seanyoungberg/tapestry/_meta/agents/conductors/berg-sandbox",
+  "parent": "cmux-advisor",
+  "place": "workspace",
+  "status": "live",
+  "surface": "F1C0AEDB-8CA3-49AB-8BCA-440989FF7C57",
+  "workspace": "A7FF3E7C-5F54-4EC3-BB8A-2D21C2459FF7",
+  "session": "claude-726c3cd9-7b99-43de-b407-5cf0a64bda07",
+  "plugins": [
+   "cmux-fleet",
+   "memsearch",
+   "loom",
+   "cmux"
+  ],
+  "flags": [
+   "--dangerously-skip-permissions",
+   "--effort",
+   "xhigh"
+  ],
+  "settings": "",
+  "group": "AD - Berg Sandbox",
+  "worktree": null
+ },
+ "loom-dev": {
+  "role": "loom-dev",
+  "kind": "child",
+  "tool": "claude",
+  "cwd": "/Users/seanyoungberg/tapestry/domains/ai-workflows/loom/code/loom-plugin",
+  "parent": "berg-sandbox",
+  "place": "tab",
+  "status": "live",
+  "surface": "9690F6E8-094A-48EC-84AA-C106804BCD56",
+  "workspace": "A7FF3E7C-5F54-4EC3-BB8A-2D21C2459FF7",
+  "session": "claude-745141fe-7920-40ee-9755-2b5311180089",
+  "plugins": [
+   "cmux-fleet",
+   "memsearch",
+   "loom"
+  ],
+  "flags": [
+   "--dangerously-skip-permissions",
+   "--effort",
+   "high",
+   "--add-dir",
+   "/Users/seanyoungberg/tapestry/_meta/agents/loom-dev"
+  ],
+  "settings": "",
+  "group": "",
+  "worktree": null
+ },
+ "homelab": {
+  "role": "homelab",
+  "kind": "child",
+  "tool": "claude",
+  "cwd": "/Users/seanyoungberg/tapestry/_meta/agents/homelab",
+  "parent": "berg-sandbox",
+  "place": "workspace",
+  "status": "live",
+  "surface": "ACCC8581-E8A8-4A01-8B96-1636E25B6F81",
+  "workspace": "01C93C8F-705B-4459-9C89-5D843AAB45A0",
+  "session": "claude-1f37343e-f01f-4e50-b6c5-0d30674679a0",
+  "plugins": [
+   "cmux-fleet",
+   "memsearch",
+   "loom",
+   "berg-TrueNAS",
+   "Proxmox"
+  ],
+  "flags": [
+   "--effort",
+   "high",
+   "--dangerously-skip-permissions"
+  ],
+  "settings": "",
+  "group": "AD - Berg Sandbox",
+  "worktree": null,
+  "muted": true
+ },
+ "resume-research": {
+  "role": "resume-research",
+  "kind": "child",
+  "tool": "claude",
+  "cwd": "/Users/seanyoungberg/tapestry/domains/career",
+  "parent": "berg-sandbox",
+  "place": "workspace",
+  "status": "live",
+  "surface": "2694CB4C-706E-45A7-BB64-EA572AA9421C",
+  "workspace": "B1656D4C-22E7-438F-9797-B62A92B7AF81",
+  "session": "claude-af7a51b7-0daa-4852-9317-0c5917a931e2",
+  "plugins": [
+   "cmux-fleet",
+   "memsearch",
+   "loom"
+  ],
+  "flags": [
+   "--effort",
+   "high",
+   "--dangerously-skip-permissions"
+  ],
+  "settings": "",
+  "group": "AD - Berg Sandbox",
+  "worktree": null,
+  "muted": true
+ },
+ "book-keeper": {
+  "role": "book-keeper",
+  "kind": "child",
+  "tool": "claude",
+  "cwd": "/Users/seanyoungberg/tapestry/_meta/agents/book-keeper",
+  "parent": "berg-sandbox",
+  "place": "tab",
+  "status": "live",
+  "surface": "6023A4E7-9DD9-45AD-8FFD-3E10CEAA1E87",
+  "workspace": "2B2B30E6-65B3-4440-90AA-513151FB3467",
+  "session": "claude-ac25285b-5656-4960-9209-3af9648664a3",
+  "plugins": [
+   "cmux-fleet",
+   "memsearch",
+   "loom"
+  ],
+  "flags": [
+   "--dangerously-skip-permissions",
+   "--effort",
+   "high"
+  ],
+  "settings": "",
+  "group": "AD - Berg Sandbox",
+  "worktree": null
+ },
+ "graph-view": {
+  "role": "graph-view",
+  "kind": "child",
+  "tool": "claude",
+  "cwd": "/Users/seanyoungberg/tapestry/_meta/agents/graph-view",
+  "parent": "berg-sandbox",
+  "place": "workspace",
+  "status": "live",
+  "surface": "4E496E4B-A010-482B-BB04-A7DF9929EBCD",
+  "workspace": "022AF32C-AF42-4603-B610-E4DC16F40717",
+  "session": "claude-b0646b0c-daef-4497-bfa5-7c93ce1180b4",
+  "launchedAt": 1783661340.994016,
+  "plugins": [
+   "cmux-fleet",
+   "memsearch",
+   "loom",
+   "lavish"
+  ],
+  "flags": [
+   "--effort",
+   "xhigh",
+   "--model",
+   "claude-opus-4-8[1m]",
+   "--dangerously-skip-permissions"
+  ],
+  "settings": "",
+  "provider": "claude:berg-max",
+  "group": "AD - Berg Sandbox",
+  "worktree": null
+ },
+ "l1-remainder": {
+  "role": "l1-remainder",
+  "kind": "child",
+  "tool": "claude",
+  "cwd": "/Users/seanyoungberg/tapestry/_meta/agents/ad-hoc/l1-remainder",
+  "parent": "berg-sandbox",
+  "place": "workspace",
+  "status": "live",
+  "surface": "566F4FB8-8027-452E-A068-0BB770FD96E2",
+  "workspace": "3F1ABB74-720F-4127-9EDF-6843CFEF902C",
+  "session": "claude-7748b634-78de-43be-8396-f24327d00f0a",
+  "launchedAt": 1783661558.059818,
+  "plugins": [
+   "cmux-fleet",
+   "memsearch",
+   "loom"
+  ],
+  "flags": [
+   "--effort",
+   "xhigh",
+   "--model",
+   "claude-opus-4-8[1m]",
+   "--dangerously-skip-permissions"
+  ],
+  "settings": "",
+  "provider": "claude:berg-max",
+  "group": "AD - Berg Sandbox",
+  "worktree": null
+ },
+ "sidebar-build": {
+  "role": "cmux-dev",
+  "kind": "child",
+  "tool": "claude",
+  "cwd": "/Users/seanyoungberg/tapestry/domains/ai-workflows/cmux/code/cmux-fleet/.worktrees/sidebar-build",
+  "parent": "cmux-advisor",
+  "place": "workspace",
+  "status": "live",
+  "surface": "C0298D7F-DC14-45C8-BD38-A79777687DD3",
+  "workspace": "E7823A6E-0444-4413-A6D4-A0536B5A9078",
+  "session": "claude-e3a5d523-e200-4aa5-adee-5586ce16c43f",
+  "launchedAt": 1783664806.218741,
+  "plugins": [],
+  "flags": [
+   "--model",
+   "claude-opus-4-8[1m]",
+   "--dangerously-skip-permissions",
+   "--effort",
+   "xhigh",
+   "--add-dir",
+   "/Users/seanyoungberg/tapestry/_meta/agents/cmux-dev"
+  ],
+  "settings": "",
+  "provider": "",
+  "group": "",
+  "worktree": "/Users/seanyoungberg/tapestry/domains/ai-workflows/cmux/code/cmux-fleet/.worktrees/sidebar-build"
+ },
+ "usage-ops": {
+  "role": "usage-ops",
+  "kind": "child",
+  "tool": "claude",
+  "cwd": "/Users/seanyoungberg/tapestry/_meta/agents/usage-ops",
+  "parent": "cmux-advisor",
+  "place": "workspace",
+  "status": "live",
+  "surface": "7367065E-7147-4F48-B31B-6FB5EB562C52",
+  "workspace": "8717C71C-1A1C-455C-9AD8-A4742F217F02",
+  "session": "claude-2a94e2aa-2c63-45e2-887f-a818842acbaa",
+  "launchedAt": 1783664818.7554,
+  "plugins": [],
+  "flags": [
+   "--model",
+   "claude-opus-4-8[1m]",
+   "--dangerously-skip-permissions",
+   "--effort",
+   "xhigh"
+  ],
+  "settings": "",
+  "provider": "",
+  "group": "",
+  "worktree": null
+ },
+ "fleet-architect": {
+  "role": "fleet-architect",
+  "kind": "child",
+  "tool": "claude",
+  "cwd": "/Users/seanyoungberg/tapestry/_meta/agents/ad-hoc/fleet-architect",
+  "parent": "cmux-advisor",
+  "place": "workspace",
+  "status": "live",
+  "surface": "4930F190-3D56-4B54-8A5F-5AB3056277A2",
+  "workspace": "35DBDB74-5476-4DFB-86D3-A0C03D1C3ED8",
+  "session": "claude-7c2ae762-3feb-4b61-806d-3374b2736ce8",
+  "launchedAt": 1783666437.360984,
+  "plugins": [
+   "cmux-fleet",
+   "memsearch"
+  ],
+  "flags": [
+   "--effort",
+   "xhigh",
+   "--model",
+   "claude-opus-4-8[1m]",
+   "--dangerously-skip-permissions"
+  ],
+  "settings": "",
+  "provider": "claude:berg-max",
+  "group": "Conductor - cmux-advisor",
+  "worktree": null
+ }
+}

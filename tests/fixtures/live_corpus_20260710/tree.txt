@@ -1,0 +1,111 @@
+window window:1 9FBB70C6-7B17-4DA5-B54D-8FF3641D24E2 [current] ◀ active
+├── workspace workspace:2 A7FF3E7C-5F54-4EC3-BB8A-2D21C2459FF7 "AD - Berg Sandbox" [selected] ◀ active
+│   ├── pane pane:2 B5D88949-4ABE-4D2D-8F82-DC857B65F1F7
+│   │   ├── surface surface:3 429081CD-0A23-4B7C-8EC0-E73CBFC92C72 [browser] "The coherent plan — one overview · Lavish" http://127.0.0.1:4387/session/cf3f4dceb682ad7b
+│   │   ├── surface surface:4 4B63F663-6F4E-45E6-878A-FA39B6C2C08F [browser] "Three doctrine answers — your forks · Lavish" http://127.0.0.1:4387/session/3cf2c6838386940d
+│   │   ├── surface surface:97 B72B1E12-B1D3-482F-877F-AD5D807241B3 [browser] "graph-view: evaluation and recommendation · Lavish" [selected] http://127.0.0.1:4387/session/ef75a34e85a35914
+│   │   └── surface surface:116 46B1B77F-9C48-4699-9E66-2F65EBC4C4C0 [browser] "graph · Filtered set" http://127.0.0.1:8900/graph
+│   └── pane pane:3 00B68660-784E-4838-BB90-0C37093FB39D [focused] ◀ active
+│       ├── surface surface:10 F1C0AEDB-8CA3-49AB-8BCA-440989FF7C57 [terminal] "✳ Chat with Berg about recycling handover" [selected] ◀ active
+│       └── surface surface:11 9690F6E8-094A-48EC-84AA-C106804BCD56 [terminal] "✳ Continue loom-dev session from handover"
+├── workspace workspace:24 3F1ABB74-720F-4127-9EDF-6843CFEF902C "l1-remainder"
+│   └── pane pane:30 5AB870BA-F308-4BB9-8B8A-00B72FA1CE4E [focused]
+│       └── surface surface:84 566F4FB8-8027-452E-A068-0BB770FD96E2 [terminal] "⠐ Resume L1 remainder agent from checkpoint" [selected]
+├── workspace workspace:23 022AF32C-AF42-4603-B610-E4DC16F40717 "graph-view"
+│   └── pane pane:29 A2146F3B-4772-42F3-B31B-033EB72CB239 [focused]
+│       └── surface surface:83 4E496E4B-A010-482B-BB04-A7DF9929EBCD [terminal] "⠐ Execute graph-view mission briefing and evaluation" [selected] tty=ttys023
+├── workspace workspace:4 01C93C8F-705B-4459-9C89-5D843AAB45A0 "homelab"
+│   ├── pane pane:5 D0AA4E2F-3805-4F4D-B8F2-CFC482BCD6BE
+│   │   └── surface surface:20 419EDD2A-1055-4F35-9681-FFE10A205AC0 [browser] "Cloudflare PS Take-Home: Build Plan · Lavish" [selected] http://127.0.0.1:4387/session/b4f52bbfe757d5d6
+│   └── pane pane:6 0B467AC2-223A-49D3-9ED7-9DC9282D8397 [focused]
+│       ├── surface surface:19 ACCC8581-E8A8-4A01-8B96-1636E25B6F81 [terminal] "✳ Build awesome project with Cloudflare and GitLab" [selected] tty=ttys019
+│       └── surface surface:18 B50D04E7-E9C5-4753-BC1E-5BB48896CB65 [terminal] "…/_meta/agents/homelab" tty=ttys019
+├── workspace workspace:25 2B2B30E6-65B3-4440-90AA-513151FB3467 "book-keeper"
+│   └── pane pane:31 81C19FCA-EDDE-4302-B46D-08813C403424 [focused]
+│       └── surface surface:6 6023A4E7-9DD9-45AD-8FFD-3E10CEAA1E87 [terminal] "✳ Resume book-keeper agent from handover" [selected]
+├── workspace workspace:6 B1656D4C-22E7-438F-9797-B62A92B7AF81 "resume-research"
+│   └── pane pane:8 CD82F4D9-4D4C-4177-A985-51950E26B88A [focused]
+│       ├── surface surface:25 2694CB4C-706E-45A7-BB64-EA572AA9421C [terminal] "✳ Resume research continuation" [selected] tty=ttys021
+│       └── surface surface:24 5CD821D0-5098-4C77-941B-32352BD866FD [markdown] "cloudflare-fde-cover-letter-2026-07-02.md"
+├── workspace workspace:7 85576ACB-D5B9-4817-9A71-3FEBB54BC9EA "Conductor - cmux-advisor"
+│   ├── pane pane:9 6E1CCA8F-2855-4E07-BC05-5B67D86C5EF7
+│   │   ├── surface surface:27 9DFC15A2-7014-4558-AB81-A7E9F2D2093E [markdown] "usage-ops-deepdive-2026-07-07.md"
+│   │   ├── surface surface:31 DF50FDC4-D70A-418C-8B2C-44B7EC8727A2 [markdown] "vocab-standard-decision-2026-07-07.md"
+│   │   ├── surface surface:28 8F85B819-9ACE-40F2-B8C4-5470D463D34B [markdown] "plugin-model-review-2026-07-07.md"
+│   │   ├── surface surface:26 0EE53D49-28D2-4B94-A585-079A24059D7B [markdown] "provider-config-design-2026-07-07.md"
+│   │   ├── surface surface:123 10803D3B-4832-437D-90A3-4639378241E9 [markdown] "REVIEW-agent-management.md"
+│   │   ├── surface surface:124 69B5C405-7C6C-48E0-A903-42D75A9A70D1 [markdown] "DESIGN-agent-management-v2.md" [selected]
+│   │   └── surface surface:125 D0478A32-2515-4AC1-B8A0-B749C6BB146E [markdown] "JUDGMENT-LOG.md"
+│   └── pane pane:10 9044F365-03A0-4112-8401-04AFD40B1D72 [focused]
+│       └── surface surface:29 DCCA9A19-16C4-4314-BEA6-F4105EF61459 [terminal] "⠂ Evaluate fleet re-architecture v2 implementation" [selected]
+├── workspace workspace:11 E7823A6E-0444-4413-A6D4-A0536B5A9078 "sidebar-build"
+│   └── pane pane:14 704AE9B2-8D45-40DB-ADBA-3F0B3C95DA72 [focused]
+│       └── surface surface:117 C0298D7F-DC14-45C8-BD38-A79777687DD3 [terminal] "✳ Plan fleet vitals dock pane per cmux findings" [selected]
+├── workspace workspace:27 35DBDB74-5476-4DFB-86D3-A0C03D1C3ED8 "fleet-architect"
+│   └── pane pane:38 EACCFCC5-B332-464C-8BFA-9403C2A585AF [focused]
+│       └── surface surface:121 4930F190-3D56-4B54-8A5F-5AB3056277A2 [terminal] "⠐ Fleet agent management rearchitecture review" [selected] ◀ here tty=ttys009
+├── workspace workspace:13 8717C71C-1A1C-455C-9AD8-A4742F217F02 "usage-ops"
+│   └── pane pane:16 86CE1F1B-8869-4D88-B55B-CE7A46C15544 [focused]
+│       └── surface surface:118 7367065E-7147-4F48-B31B-6FB5EB562C52 [terminal] "✳ Usage-ops deep dive and design doc" [selected]
+├── workspace workspace:14 3B14B7A4-A144-49E3-8A83-6A7401990862 "AD - Conductors"
+│   ├── pane pane:17 1FE66645-D7C7-4AF3-B978-821CF2E95DAD
+│   │   └── surface surface:43 A544AB50-175A-448E-8F45-96CCA1B1C58F [terminal] "~/tapestry" [selected] tty=ttys024
+│   ├── pane pane:18 37C5A754-9C97-406F-B588-BBB46C127F37 [focused]
+│   │   ├── surface surface:41 0E1F2406-C3D0-45F5-B369-4593509458B5 [terminal] "~/tapestry" [selected] tty=ttys023
+│   │   └── surface surface:39 4CB49CCC-9E0E-4004-9D71-D2B6564828F0 [terminal] "~/tapestry" tty=ttys027
+│   ├── pane pane:19 66D7FC59-D560-4AAF-ADB9-B021F03AE890
+│   │   ├── surface surface:44 30981C49-4A46-4BB6-A33B-2C7F43655AF9 [rightSidebarTool] "Files"
+│   │   ├── surface surface:52 9B17E270-F9A0-4A1C-89C0-907DB535D296 [markdown] "resume-material-bank-2026-06-23.md" [selected]
+│   │   ├── surface surface:51 F094D026-DA78-411A-9DCE-C4C5D80EF6C6 [markdown] "resume-v3-2026-06-24.md"
+│   │   ├── surface surface:47 7EAF4CAB-C3F9-4DFE-A7B8-34ACEFA20F96 [markdown] "resume-v5-kit2-2026-06-24.md"
+│   │   └── surface surface:40 F6412DFC-C9F9-4B9F-9E10-1A2D52E441FD [markdown] "resume-v2-2026-06-24.md"
+│   └── pane pane:20 7FAB9BFD-A265-4754-842C-FC778AB75F52
+│       ├── surface surface:50 9100A41E-3781-4D69-BCA9-E7CD6E3378B9 [terminal] "~/tapestry" tty=ttys028
+│       ├── surface surface:38 AFE8E90F-5B10-41D4-849A-9B71F0808A4D [browser] "artifacts.berglabs.net" https://artifacts.berglabs.net/boot-corpus-inventory.md
+│       ├── surface surface:48 55AF3048-D75C-4CB5-9026-11353CBB00A6 [browser] "artifacts.berglabs.net" https://artifacts.berglabs.net/design-of-record.md
+│       ├── surface surface:49 A11FFB64-840E-458F-8B2A-FB0727B753B3 [markdown] "bootstrap-priming-audit-2026-06-17.md"
+│       ├── surface surface:45 EC8C0A0C-EDB6-424D-8104-E2822A320C4D [markdown] "agent-bootstrap-architecture.md"
+│       ├── surface surface:42 CA4213B3-4A7A-4FC8-98E7-796B75DFCE8C [markdown] "bootstrap-migration-plan.md" [selected]
+│       └── surface surface:46 3E32ECB8-FC35-4492-8FF1-6F70F102A998 [markdown] "reference-docs-use-relations-not-observations.md"
+├── workspace workspace:15 169B004E-F3DE-464F-BC8D-583E152833FE "staging"
+│   └── pane pane:21 201FE70B-45F7-44F7-8DE7-C4558465E059 [focused]
+│       └── surface surface:53 3F2CDDD4-BD68-4057-AC1A-2ED4B3E9A326 [terminal] "~/builds/staging-home" [selected] tty=ttys013
+├── workspace workspace:16 4A698390-B817-419B-AF06-0B4D78FB7D46 "staging"
+│   └── pane pane:22 8A349159-CD1E-4219-AF1A-7F2635A5AD36 [focused]
+│       └── surface surface:54 21B2E0A5-EF11-461A-B04B-7E9641AC499C [terminal] "~/builds/staging-home" [selected] tty=ttys014
+├── workspace workspace:17 3D23D535-E2D5-4119-A9F6-24A8F31E7B0E "Group 1"
+│   └── pane pane:23 B0CE7BBF-DA56-4335-A46F-4DD892EBF119 [focused]
+│       └── surface surface:55 3E631480-196A-4ECD-A17E-DA9B128C457C [terminal] "~/tapestry" [selected] tty=ttys009
+├── workspace workspace:18 13D5FAF9-F02E-483A-A388-BC40CD9C665A "Files"
+│   └── pane pane:24 05F3D173-1DE8-4A89-94B7-909DA02591FF [focused]
+│       ├── surface surface:58 9B516530-5B50-4538-A566-625453BE975E [rightSidebarTool] "Files"
+│       ├── surface surface:63 40407CDD-9C9F-481C-8DCD-74A0FDCDCB9B [markdown] "cmux-native-design.md"
+│       ├── surface surface:56 D4CA3513-C4FE-4BBE-A3D9-E0AEF8CFF4DA [markdown] "cmux-ad-learnings.md"
+│       ├── surface surface:57 1266793F-2583-4ABC-8078-CE8782C288B9 [markdown] "2026-06-25-cloudflare-resume-refine.md"
+│       ├── surface surface:62 9B9BF632-AE09-4E83-A03C-2FFEAD86788E [markdown] "SKILL.md"
+│       ├── surface surface:59 F70ED024-8984-4A50-8D2C-CC3ECE1F54BC [markdown] "SKILL.md"
+│       ├── surface surface:60 8E880D74-9375-4FD3-9742-E6740052CE1A [markdown] "SKILL.md" [selected]
+│       └── surface surface:61 1B07BE95-D93D-4036-8321-918FF39F70C7 [markdown] "SKILL.md"
+├── workspace workspace:19 35C426D5-A995-4301-8779-BEA1DFEDEC15 "Vault"
+│   └── pane pane:25 14ACC675-AD27-4592-B45B-5476FFCD5A58 [focused]
+│       └── surface surface:64 2359DDA1-DD06-44C5-AAB6-3AA50C43BE00 [rightSidebarTool] "Vault" [selected]
+├── workspace workspace:20 3B265C44-8791-4440-8605-131FD01FE6FC "Canvas"
+│   └── pane pane:26 7B1D4825-25E8-4832-9AE7-4F94FA9EB6A6 [focused]
+│       ├── surface surface:65 65A456A9-3418-4A3A-98EC-730E5E5FAA95 [terminal] "~/tapestry" tty=ttys006
+│       ├── surface surface:71 33B5370A-450D-4C43-9E49-D62380AC216D [browser] "cmux.com" https://cmux.com/docs/session-restore
+│       ├── surface surface:70 8822F6B1-7EC3-4504-B214-7D73C4A785D2 [markdown] "CLAUDE.md"
+│       ├── surface surface:66 FF82FBD0-F569-451D-A944-5FA92C2E3BA0 [rightSidebarTool] "Files" [selected]
+│       ├── surface surface:68 E4120FD6-DF83-429E-A523-2465B2330691 [markdown] "loom-conventions.md"
+│       ├── surface surface:69 9A7B2CF1-D6A9-439E-8098-0AACB7E44463 [markdown] "activity-log.md"
+│       └── surface surface:67 738536BD-FBF0-4139-846B-BF0AF20D5CB1 [terminal] "~/tapestry" tty=ttys007
+└── workspace workspace:21 7A54E4F7-2788-4F3C-BB77-EDCBB10A01D9 "claude-hook-sessions.json"
+    └── pane pane:27 7FD284F3-3B55-40A2-8040-3DD8342990D3 [focused]
+        ├── surface surface:74 0A3A252A-A0EF-417B-A7C3-04126A9FC6DB [terminal] "~/.cmuxterm" tty=ttys010
+        ├── surface surface:75 1C9219EF-7D2F-4E4C-BE1B-1E5519C9B96C [filepreview] "events.jsonl"
+        ├── surface surface:73 C4AE81D2-89D6-4697-BDBD-BF46E4B642B1 [filepreview] "claude-hook-sessions.json" [selected]
+        └── surface surface:72 33C660C2-848F-423A-A716-A0CBEA01A12C [filepreview] "workstream.jsonl"
+window window:2 5CA42FE0-B1E1-4983-8FA9-0FA855F2A2BA
+└── workspace workspace:22 F47FC2A4-6815-4316-93D4-CCE72622336F "…/agents/conductors/cmux-advisor" [selected]
+    └── pane pane:28 86E120D2-200E-4E2B-AF09-7F389EDD3D8C [focused]
+        ├── surface surface:76 E265F2D0-3BBA-4E48-991B-93B5BDA003D5 [terminal] "…/agents/conductors/cmux-advisor" [selected] tty=ttys002
+        └── surface surface:77 1B32D538-7DE6-487F-9B52-45BD83E46B01 [terminal] "…/agents/conductors/cmux-advisor" tty=ttys016

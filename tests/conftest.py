@@ -89,3 +89,14 @@ def cli_env(cmux_stub, tmp_path):
     env["CMUX_HOOKSTORE_DIR"] = str(hookstore)  # keep _pid_for_surface off the host's real ~/.cmuxterm
     env["PYTHONPATH"] = REPO + os.pathsep + env.get("PYTHONPATH", "")
     return env
+
+
+@pytest.fixture(autouse=True)
+def _hermetic_ps_sweep(monkeypatch):
+    """resolve.pids_ps (the never-orphan union source) shells one `ps axeww` per call. A REAL sweep
+    inside the suite is slow, box-dependent, and — when the suite runs inside a live fleet agent —
+    can see the dev's own agents' environments. Hermetic default: an empty sweep, patched at the raw
+    text seam so pids_ps's PARSING stays real code under test. Tests that exercise the union inject
+    `ps_out` explicitly or re-patch resolve.pids_ps (tests/test_resolve.py)."""
+    import cmux_fleet.resolve as _resolve
+    monkeypatch.setattr(_resolve, "_ps_axeww", lambda: "")
