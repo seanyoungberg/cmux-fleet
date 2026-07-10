@@ -64,7 +64,14 @@ CODEX_STALE_S = 3600            # a codex profile whose newest rollout is older 
 
 
 class ProviderError(Exception):
-    """A launch-time provider resolution failure (unknown provider, missing token file, bad type)."""
+    """A launch-time provider resolution failure (unknown provider, missing token file, bad type). Also
+    the GENUINELY-REVOKED signal for a token refresh (the endpoint rejected the refresh_token)."""
+
+
+class ProviderTransientError(ProviderError):
+    """A TRANSIENT failure — network down/slow/unreachable, or a 5xx. NOT an offline account: the health
+    monitor maps this to 'error' and never alerts on it (retries next tick). A subclass of ProviderError
+    so the launch guard (which catches ProviderError) still aborts a launch that can't refresh right now."""
 
 
 # --- config parse -------------------------------------------------------------------------------
@@ -293,11 +300,13 @@ def codex_health_check():
         try:
             codex_ensure_fresh(name)
             rec["status"], rec["detail"] = "healthy", ""
-        except ProviderError as e:
+        except ProviderTransientError as e:          # network blip / 5xx — NOT offline; retry next tick, no alert
+            rec["status"], rec["detail"] = "error", str(e)
+        except ProviderError as e:                   # a genuine rejection (revoked) or an unseeded account
             msg = str(e)
             rec["status"] = "unseeded" if "not seeded" in msg else "revoked"
             rec["detail"] = msg
-        except Exception as e:                       # never let one account sink the sweep
+        except Exception as e:                        # unknown — never cry wolf
             rec["status"], rec["detail"] = "error", f"{type(e).__name__}"
         out.append(rec)
     return out
@@ -376,19 +385,32 @@ def codex_provision_config(acct, config_path="~/.codex/config.toml"):
 
 
 def _oauth_refresh(refresh_token):
-    """POST the OAuth refresh. Returns {access_token, refresh_token, expires_at} or raises. The response
-    commonly ROTATES the refresh_token — the caller MUST persist the returned one (refinement 2)."""
-    import urllib.request, urllib.error, urllib.parse
+    """POST the OAuth refresh. Returns {access_token, refresh_token, expires_at}. CRITICAL for the health
+    monitor's no-cry-wolf guarantee: distinguish a genuine REJECTION from a TRANSIENT failure.
+      - HTTP 400/401/403 (the endpoint rejected the refresh_token = invalid_grant) -> ProviderError (REVOKED).
+      - any other HTTP (5xx), a URLError/timeout/socket error, or a malformed/empty response -> a network
+        blip or server issue, NOT an offline account -> ProviderTransientError (health maps to 'error').
+    The response commonly ROTATES the refresh_token — the caller MUST persist the returned one (refinement 2)."""
+    import urllib.request, urllib.error, urllib.parse, socket
     body = urllib.parse.urlencode({
         "grant_type": "refresh_token", "client_id": CODEX_OAUTH_CLIENT_ID,
         "refresh_token": refresh_token, "scope": "openid profile email offline_access"}).encode()
     req = urllib.request.Request(CODEX_OAUTH_TOKEN_URL, data=body,
                                  headers={"Content-Type": "application/x-www-form-urlencoded"})
-    with urllib.request.urlopen(req, timeout=20) as r:
-        d = json.loads(r.read().decode())
+    try:
+        with urllib.request.urlopen(req, timeout=20) as r:
+            d = json.loads(r.read().decode())
+    except urllib.error.HTTPError as e:
+        if e.code in (400, 401, 403):                # the endpoint REJECTED the token -> genuinely revoked
+            raise ProviderError(f"oauth refresh rejected (HTTP {e.code}); refresh_token revoked/invalid")
+        raise ProviderTransientError(f"oauth refresh server error (HTTP {e.code})")   # 5xx etc. -> transient
+    except (urllib.error.URLError, socket.timeout, OSError) as e:
+        raise ProviderTransientError(f"oauth refresh unreachable ({type(e).__name__})")   # network -> transient
+    except (ValueError, json.JSONDecodeError) as e:
+        raise ProviderTransientError(f"oauth refresh bad response ({type(e).__name__})")  # garbage -> transient
     at = d.get("access_token")
     if not at:
-        raise ProviderError("oauth refresh: response had no access_token")
+        raise ProviderTransientError("oauth refresh: response had no access_token")   # not a clear revocation
     return {"access_token": at,
             "refresh_token": d.get("refresh_token") or refresh_token,   # keep old only if not rotated
             "expires_at": _jwt_exp(at) or (int(time.time()) + int(d.get("expires_in") or 0))}
@@ -413,10 +435,9 @@ def codex_ensure_fresh(acct, force=False):
     try:
         new = _oauth_refresh(cred["refresh_token"])
     except ProviderError:
-        raise
+        raise                                        # ProviderError (revoked) / ProviderTransientError both propagate typed
     except Exception as e:
-        raise ProviderError(f"codex account '{acct}' token refresh failed ({type(e).__name__}); the "
-                            f"account may be revoked — re-run `codex login` and re-seed.")
+        raise ProviderTransientError(f"codex account '{acct}' refresh failed unexpectedly ({type(e).__name__})")
     cred.update(new)                                 # persist the ROTATED refresh_token + new expiry
     _atomic_write_secret(cpath, json.dumps(cred))
     _atomic_write_secret(_codex_token_path(acct), cred["access_token"])

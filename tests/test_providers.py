@@ -433,13 +433,19 @@ def test_codex_ensure_fresh_refreshes_and_persists_rotated_refresh_token(tmp_pat
     assert open(pv._codex_token_path("acctx")).read() == new_at  # .token file updated for the launch $(cat)
 
 
-def test_codex_ensure_fresh_unseeded_and_revoked_error(tmp_path, monkeypatch):
+def test_codex_ensure_fresh_unseeded_revoked_and_transient(tmp_path, monkeypatch):
     with pytest.raises(pv.ProviderError, match="not seeded"):
         pv.codex_ensure_fresh("ghost")
     now = int(time.time())
-    pv.codex_seed_from_authjson("dead", _seed_authjson(tmp_path, now + 60))
-    monkeypatch.setattr(pv, "_oauth_refresh", lambda rt: (_ for _ in ()).throw(RuntimeError("401")))
-    with pytest.raises(pv.ProviderError, match="revoked"):
+    pv.codex_seed_from_authjson("dead", _seed_authjson(tmp_path, now + 60))         # near expiry -> refreshes
+    # a genuine rejection propagates as ProviderError (revoked), NOT transient
+    monkeypatch.setattr(pv, "_oauth_refresh", lambda rt: (_ for _ in ()).throw(pv.ProviderError("revoked")))
+    with pytest.raises(pv.ProviderError) as ei:
+        pv.codex_ensure_fresh("dead")
+    assert not isinstance(ei.value, pv.ProviderTransientError)
+    # an UNEXPECTED error is treated as TRANSIENT (never cry wolf), not revoked
+    monkeypatch.setattr(pv, "_oauth_refresh", lambda rt: (_ for _ in ()).throw(RuntimeError("boom")))
+    with pytest.raises(pv.ProviderTransientError):
         pv.codex_ensure_fresh("dead")
 
 
@@ -501,6 +507,41 @@ def test_codex_health_scan_edge_triggers_and_rearms(tmp_path, monkeypatch):
     pv.codex_health_scan(notify); assert calls == ["a"]          # still revoked -> deduped (no storm)
     st["v"] = "healthy"; pv.codex_health_scan(notify); assert calls == ["a"]   # recovered -> re-arm, no alert
     st["v"] = "revoked"; pv.codex_health_scan(notify); assert calls == ["a", "a"]  # revoked again -> alert again
+
+
+def test_oauth_refresh_rejection_is_revoked_network_is_transient(monkeypatch):
+    import urllib.error
+    def raiser(exc):
+        def _f(req, timeout=None):
+            raise exc
+        return _f
+    # HTTP 401 invalid_grant = the endpoint REJECTED the token -> REVOKED (ProviderError, not Transient)
+    monkeypatch.setattr("urllib.request.urlopen", raiser(urllib.error.HTTPError("u", 401, "no", None, None)))
+    with pytest.raises(pv.ProviderError) as ei:
+        pv._oauth_refresh("rt")
+    assert not isinstance(ei.value, pv.ProviderTransientError)
+    # HTTP 503 (server) and a network error = TRANSIENT (ProviderTransientError)
+    monkeypatch.setattr("urllib.request.urlopen", raiser(urllib.error.HTTPError("u", 503, "busy", None, None)))
+    with pytest.raises(pv.ProviderTransientError):
+        pv._oauth_refresh("rt")
+    monkeypatch.setattr("urllib.request.urlopen", raiser(urllib.error.URLError("connection refused")))
+    with pytest.raises(pv.ProviderTransientError):
+        pv._oauth_refresh("rt")
+
+
+def test_health_transient_refresh_is_error_no_alert_revoked_alerts(tmp_path, monkeypatch):
+    # a near-expiry token so ensure_fresh actually attempts a refresh; the two refresh outcomes must diverge.
+    _codex_health_toml(tmp_path, monkeypatch, ["a"])
+    pv.codex_seed_from_authjson("a", _seed_authjson(tmp_path, int(time.time()) + 60))   # near expiry -> refreshes
+    calls = []
+    # network blip -> transient -> status 'error', NO alert (the cry-wolf Berg wanted avoided)
+    monkeypatch.setattr(pv, "_oauth_refresh", lambda rt: (_ for _ in ()).throw(pv.ProviderTransientError("net")))
+    h = {r["acct"]: r["status"] for r in pv.codex_health_scan(lambda *a: calls.append(a))}
+    assert h["a"] == "error" and calls == []
+    # genuine rejection -> revoked -> alert
+    monkeypatch.setattr(pv, "_oauth_refresh", lambda rt: (_ for _ in ()).throw(pv.ProviderError("rejected; revoked")))
+    h = {r["acct"]: r["status"] for r in pv.codex_health_scan(lambda *a: calls.append(a))}
+    assert h["a"] == "revoked" and len(calls) == 1
 
 
 def test_codex_health_scan_unseeded_never_alerts(tmp_path, monkeypatch):
