@@ -26,9 +26,16 @@ def _sync(monkeypatch):
     global fs, features
     import cmux_fleet.features as _features
     import cmux_fleet.state as _state
+    import cmux_fleet.resolve as _resolve
     fs, features = _state, _features
     monkeypatch.setattr(router, "fs", _state)
     monkeypatch.setattr(fh, "fs", _state)
+    monkeypatch.setattr(router, "rs", _resolve)  # the resolver (step 1), same consistency dance
+    monkeypatch.setattr(_resolve, "fs", _state)
+    # hermetic attachment inputs for the sweep (same rationale as test_fleet_doctor's _sync)
+    monkeypatch.setattr(_resolve, "surface_ws_map", lambda ttl=2.0: {})
+    monkeypatch.setattr(_resolve, "_env_workspace", lambda pid: "")
+    monkeypatch.setattr(_resolve, "_transcript_age", lambda rec, now: None)
     router._doctor_fired.clear()
     router._conductor_live_seen.clear()
     yield

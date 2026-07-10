@@ -377,9 +377,11 @@ def _open_gate_uuids():
 
 def _infer_state(entry, session, open_gates=frozenset()):
     """state for one agent: read live signals, then classify (the impure edge over _classify). `open_gates`
-    is the set of session uuids with an unreplied Feed gate (computed once per snapshot)."""
+    is the set of session uuids with an unreplied Feed gate (computed once per snapshot). Lifecycle reads
+    route through resolve (the one resolver; step 1 of the v2 migration)."""
+    from . import resolve as rs
     sid = fs.bare_uuid(session.get("sessionId", ""))
-    return _classify(fs.lifecycle(entry.get("surface", "")), bool(entry.get("session")),
+    return _classify(rs.lifecycle(entry.get("surface", "")), bool(entry.get("session")),
                      fs.last_agent_text(session.get("transcriptPath", ""), cap=400),
                      open_gate=bool(sid) and sid in open_gates)
 
@@ -388,7 +390,11 @@ def snapshot():
     """The whole live fleet as a list of view-rows, cheapest signals first. One row per live agent:
         label role kind tool parent surface ws state rank ctx_used ctx_pct_remaining window
         model effort cwd last_text last_age_s
-    Pure derive: registry + hook store + transcripts. No cmux screen reads (keeps it cheap)."""
+    Pure derive: registry + hook store + transcripts. No cmux screen reads (keeps it cheap).
+    Record selection and the attachment fields route through resolve (step 1 of the v2 migration);
+    `attached` False = invariant I4's present-but-detached (hooks dead while the process works), the
+    state the sidebar renders distinctly and the doctor alerts on."""
+    from . import resolve as rs
     store = fs.read_hook_store()
     open_gates = _open_gate_uuids()                           # one Feed query per snapshot (not per agent)
     ws_map = _surface_ws_map()                                # one cmux tree per snapshot (not per agent)
@@ -396,8 +402,9 @@ def snapshot():
     rows = []
     for label, e in fs.live_all().items():
         surf = e.get("surface", "")
-        sess = _freshest_session(store, surf)
+        sess = rs.freshest(surf, st=store)
         state = _infer_state(e, sess, open_gates)
+        att = rs.attachment(surf, st=store, ws_map=ws_map, now=now)
         used, tmodel = _context_used(sess.get("transcriptPath", ""))
         # Fix 1: the LAUNCHED model carries the window flavor ([1m]); the transcript model doesn't.
         # Prefer it, fall back to the transcript's, then the tool keyword — window is derived from it.
@@ -420,6 +427,10 @@ def snapshot():
             "cwd": e.get("cwd", "") or sess.get("cwd", ""), "muted": bool(e.get("muted")),
             "last_text": fs.last_agent_text(sess.get("transcriptPath", ""), cap=120),
             "last_age_s": (now - updated) if updated else None,
+            # invariant I4: attached=False means present-but-DETACHED (record frozen while the agent
+            # demonstrably works, or an env/pointer mismatch proves the hook channel dead). None =
+            # not present / unjudgeable. An idle agent reads attached=True (both clocks frozen equally).
+            "attached": att["attached"], "attach_reasons": att["reasons"],
         })
     # cheapest-first triage: most-urgent state first, then longest-idle (oldest activity) within a state
     rows.sort(key=lambda r: (r["rank"], -(r["last_age_s"] or 0)))

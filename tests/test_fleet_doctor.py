@@ -38,8 +38,18 @@ def _sync(monkeypatch):
     global fs, features
     import cmux_fleet.state as _state
     import cmux_fleet.features as _features
+    import cmux_fleet.resolve as _resolve
     fs, features = _state, _features
     monkeypatch.setattr(router, "fs", _state)   # the sweep reads router.fs -> make it the module we patch
+    monkeypatch.setattr(router, "rs", _resolve)  # ...and router.rs (the resolver, step 1) the same way
+    monkeypatch.setattr(_resolve, "fs", _state)  # resolve delegates to state: keep it on the same module
+    # Hermetic attachment inputs: the sweep's detached condition (step 1) reads the tree, ps env, and
+    # transcript mtimes. None of this file's fixtures model attachment, so silence all three signals —
+    # otherwise a fixture with a frozen record plus a just-written transcript file would fire a spurious
+    # 'detached' row and skew the fired-count assertions (test_resolve.py owns the detached cases).
+    monkeypatch.setattr(_resolve, "surface_ws_map", lambda ttl=2.0: {})
+    monkeypatch.setattr(_resolve, "_env_workspace", lambda pid: "")
+    monkeypatch.setattr(_resolve, "_transcript_age", lambda rec, now: None)
     router._doctor_fired.clear()
     router._conductor_live_seen.clear()         # process-local transition guard; reset per test like _doctor_fired
     yield

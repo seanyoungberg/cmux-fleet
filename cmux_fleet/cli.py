@@ -881,9 +881,42 @@ def _send_launch_and_confirm(ws, surf, send_cmd, lazy, timeout):
     return ""
 
 
+def _exec_send_and_confirm(ws, surf, send_cmd, lazy, timeout):
+    """Step-2 delivery for `cmd_launch`: the launch is the PANE PROCESS (adapter.exec_deliver, the
+    same mechanism that killed recycle's paste class), then the same bind poll as the paste path
+    MINUS the whole re-kick machinery — there is no Enter to lose, so there is nothing to re-kick.
+    PATH-guarded like recycle (harmless with -c shells; byte-parity with the recycle path). Returns
+    the bound sid, or '' (normal for a lazy tool, or when claude's resume-summary menu is up — the
+    caller gates/dismisses that, exactly as with the paste path)."""
+    from . import adapter
+    _exec_launch(surf, adapter.path_guard(send_cmd), lambda m: print(f"[fleet] {m}"))
+    end = time.time() + timeout
+    while time.time() < end:
+        sid = poll_session(surf, timeout=1)
+        if sid:
+            return sid                                       # claude bound -> definitively started
+        if _resume_menu_visible(surf):
+            return ""                # resume-summary menu is up -- caller must gate/dismiss it, not us
+        if lazy and _agent_surfaced(surf):
+            return ""                                        # lazy tool is up; it binds on its 1st turn
+        time.sleep(1)
+    return ""
+
+
+def _deliver_launch(ws, surf, send_cmd):
+    """The raw one-shot delivery used by `cmd_revive`: exec (default; the launch is the pane process)
+    or paste (CMUX_FLEET_EXEC_LAUNCH=0, the soak fallback — one flag reverts launch, revive, AND
+    recycle together). The caller owns all verification (revive's resume gate + bind poll)."""
+    from . import adapter
+    if _exec_launch_enabled():
+        _exec_launch(surf, adapter.path_guard(send_cmd), lambda m: print(f"[fleet] {m}"))
+    else:
+        cmuxq("send", "--workspace", ws, "--surface", surf, send_cmd + "\n")
+
+
 def _bind_launched_session(ws, surf, send_cmd, tool, label, abs_cwd, caller, lazy, timeout):
-    """The resume-aware bind step for `cmd_launch`. Confirms/re-kicks the enter-race as before
-    (_send_launch_and_confirm), then, when the caller passthrough carries a claude `--resume <id>`, gates
+    """The resume-aware bind step for `cmd_launch`. Delivers via exec (default; step 2) or the paste
+    path (CMUX_FLEET_EXEC_LAUNCH=0 soak fallback), then, when the caller passthrough carries a claude `--resume <id>`, gates
     the bind on the SAME dismiss sequence `cmd_revive` uses (_resume_and_gate -> picks 'full session
     as-is', never the lossy cursor-default 'resume from summary') instead of trusting a blind re-kick to
     land correctly on the menu. Aborts via sys.exit on a resume-gate timeout, same as cmd_revive: NOT
@@ -894,7 +927,10 @@ def _bind_launched_session(ws, surf, send_cmd, tool, label, abs_cwd, caller, laz
     workspace is re-resolved too, so a swapped surface never leaves a mismatched (surface, workspace)
     pair in the registry). Returns (ws, surf, sid); sid is '' if unresolved (the caller decides whether
     that's fatal, e.g. lazy tools expect it)."""
-    sid = _send_launch_and_confirm(ws, surf, send_cmd, lazy, timeout)
+    if _exec_launch_enabled():
+        sid = _exec_send_and_confirm(ws, surf, send_cmd, lazy, timeout)
+    else:
+        sid = _send_launch_and_confirm(ws, surf, send_cmd, lazy, timeout)
     resume_flag = _flag_val(caller, "--resume") if tool == "claude" else None
     if not sid and resume_flag not in (None, False):
         resume_sid = resume_flag if isinstance(resume_flag, str) else ""
@@ -1088,15 +1124,16 @@ def cmd_launch(argv):
     # for "I KNOW the old surface is already dead by other means"; same spirit as cmd_register's
     # already-live-under-a-different-surface refusal.
     from . import state as fs
+    from . import resolve as rs
     prior = fs.live_get(spec["label"])
     if prior and prior.get("surface"):
         prior_surf = prior["surface"]
         # stale = the prior row's surface holds NO genuinely-live agent (lifecycle terminal, OR frozen
         # non-terminal on a DEAD pid -- the SessionEnd-less brick, 2026-07-06) AND it once bound a session.
-        # Via surface_has_live_agent a dead-pid ghost now reads stale -> we overwrite the row (no bogus
-        # "already LIVE" refusal); a genuinely-live surface (live pid) still refuses (fail-closed: the
-        # orphan-a-live-surface guard this exists for). A pending row (no session) refuses as before.
-        stale = not fs.surface_has_live_agent(prior_surf) and bool(prior.get("session"))
+        # Via the liveness rule (rs.present) a dead-pid ghost now reads stale -> we overwrite the row (no
+        # bogus "already LIVE" refusal); a genuinely-live surface (live pid) still refuses (fail-closed:
+        # the orphan-a-live-surface guard this exists for). A pending row (no session) refuses as before.
+        stale = not rs.present(prior_surf) and bool(prior.get("session"))
         if stale:
             print(f"[fleet] note: label '{spec['label']}' had a STALE registry row (surface "
                   f"{prior_surf[:8]} gone); overwriting it")
@@ -1771,25 +1808,44 @@ def _surface_pids(surface):
     twin of _live_bound_sid's rule (a dead pid cannot be the agent). Contrast _pid_for_surface, which
     returns the FIRST record's pid in dict order with no aliveness check: on a surface with several
     lingering records that is usually a dead ghost (the 2026-07-10 wedge: SIGINTs hit corpses 76035
-    and 70208 while the real agent, 76142 on the 4th record, survived orphaned)."""
-    from . import state as fs
-    return {s.get("pid") for s in (_store().get("sessions") or {}).values()
-            if s.get("surfaceId") == surface and fs.pid_alive(s.get("pid"))}
+    and 70208 while the real agent, 76142 on the 4th record, survived orphaned).
+    Canonical body: resolve.pids (step 1 of the v2 migration); this name stays as the kill-path
+    call-site seam until step 3, and the store still flows through cli._store (the seam the kill-path
+    tests inject fixture stores through)."""
+    from . import resolve as rs
+    return rs.pids(surface, st=_store())
+
+
+def _identifies_as(cmdline, tool):
+    """PURE identity rule for kill targets: the process's argv0 BASENAME equals the tool. The old
+    rule was a substring over the whole command line, which passed `python3
+    .../claude-marketplace/.../hook.py` (path contains 'claude') — harmless while targets came only
+    from the hook store (real agents), but pids_ps now feeds every surface-env process through this
+    check, so a substring rule would SIGINT plugin hook scripts (cmux-advisor blocker, 2026-07-10).
+    Basename-of-argv0 keeps `~/.local/bin/claude` and the cmux shim `.../cmux-cli-shims/<S>/claude`,
+    and excludes the daemon python and any marketplace path. A `claude -p` subprocess (the memsearch
+    summarizer) passes THIS check by argv0 — but it is NOT reachable through the live kill/close
+    path: pids_ps filters to the seat agent first via the exact CMUX_CLAUDE_PID self-pid rule (the
+    summarizer carries its parent's pid), and store pids are real agents by construction. This check
+    is the per-pid backstop for store pids and the codex path; do not re-add a summarizer carve-out
+    here, there is no residual to fix (cmux-advisor verification, 2026-07-10)."""
+    toks = (cmdline or "").split()
+    return bool(toks) and os.path.basename(toks[0]) == (tool or "claude")
 
 
 def _agent_pid_check(pid, tool):
-    """True iff `pid` is a live process whose command line looks like this agent `tool` — the same
-    ps-identity pattern _is_live_router/_is_daemon_supervisor use, applied to KILL targets immediately
-    before signalling. The pid-reuse guard: the 2026-07-10 direct-kill fired SIGINT x2 at bare pid
-    70208, which by then belonged to no claude at all — had the OS recycled that pid, we'd have
-    signalled an unrelated process. Fails CLOSED (unreadable ps -> False): never signal a process we
-    can't identify; the verify then refuses and the recycle aborts safely instead."""
+    """True iff `pid` is a live process that identifies as this agent `tool` (_identifies_as over its
+    ps command line), applied to KILL targets immediately before signalling. The pid-reuse guard: the
+    2026-07-10 direct-kill fired SIGINT x2 at bare pid 70208, which by then belonged to no claude at
+    all — had the OS recycled that pid, we'd have signalled an unrelated process. Fails CLOSED
+    (unreadable ps -> False): never signal a process we can't identify; the verify then refuses and
+    the recycle aborts safely instead."""
     try:
         out = subprocess.run(["ps", "-o", "command=", "-p", str(int(pid))],
                              capture_output=True, text=True, timeout=5).stdout or ""
     except Exception:
         return False
-    return (tool or "claude") in out
+    return _identifies_as(out, tool)
 
 
 def _signal_agent_pids(surf, tool, log, tag):
@@ -1799,10 +1855,16 @@ def _signal_agent_pids(surf, tool, log, tag):
     this surface — never the first record, never a dead one), and each is re-verified as this tool's
     live process at signal time (_agent_pid_check, the pid-reuse guard). A dead pid is a no-op by
     construction; a live pid that fails the identity check is SKIPPED loudly (better to abort the
-    recycle than SIGINT a foreign process)."""
+    recycle than SIGINT a foreign process). Targets = store pids UNION seat-agent ps pids: the ps
+    side exists because SessionEnd reaps the record ~0.3s BEFORE the process exits (cmux-advisor
+    finding 2), and it is filtered to the SEAT AGENT at the source (rs.pids_ps applies the
+    CMUX_CLAUDE_PID self-referential rule), so a conductor's legitimately-inherited env carriers
+    (daemon, router, node servers, the `claude -p` summarizer) are never candidates at all — the
+    unfiltered union wedged every conductor close (the 2026-07-10 blocker)."""
     import signal
+    from . import resolve as rs
     signalled = []
-    for pid in sorted(_surface_pids(surf)):
+    for pid in sorted(set(_surface_pids(surf)) | rs.pids_ps(surf, tool=tool)):
         if not _agent_pid_check(pid, tool):
             log(f"{tag}: pid {pid} is alive but does not identify as a live {tool} process "
                 f"(reused/foreign pid?); NOT signalling it")
@@ -1855,16 +1917,35 @@ def _stop_agent_for_close(surf, tool, label, verb):
     kept running with no pane, no `fleet ls` row, no way for anyone to find it (four live 1M-ctx
     orphans found on the box, two from that day's rms). A surface left OPEN over a live agent stays
     visible and recoverable; a surface CLOSED over one hides it forever — so on any doubt the caller
-    must refuse the close (even under --force, which forces past the quiet gate, not past this)."""
+    must refuse the close (even under --force, which forces past the quiet gate, not past this).
+
+    Death is observed on the SIGNALLED pids themselves plus the per-source block set, never on store
+    emptiness: SessionEnd removes the hook-store record ~0.3s before the process exits (measured,
+    cmux-advisor finding 2), so `while _surface_pids(surf)` returned empty while the agent still ran —
+    for a hung shutdown, forever. `fleet rm ptrprobe` live-corroborated it: 'removed (closed +
+    archived)' printed with pid 98942 still alive.
+
+    The block set: a STORE pid blocks if alive (the store claims it is the agent — fail closed); a
+    ps-side pid blocks because it IS the seat agent (rs.pids_ps applies the CMUX_CLAUDE_PID
+    self-referential rule at the source: the wrapper exports its own pid into the agent's env, so
+    only the agent satisfies env pid == own pid; descendants inherit the value with different pids).
+    A conductor's surface env is legitimately inherited by never-dying processes (daemon, router,
+    `cmux events`, node servers — measured 3-5 per live conductor), so the earlier unfiltered ps-env
+    union made rm/archive refuse to close ANY conductor, permanently (the 2026-07-10 blocker). It
+    shipped because the suite stubs the ps sweep and the live probe was an ad-hoc seat with no
+    daemons; the regression test now injects a mixed ps table through the REAL parse."""
     from . import state as fs
+    from . import resolve as rs
     def log(m):
         print(f"[fleet] {verb} {label}: {m}")
     signalled = _signal_agent_pids(surf, tool, log, f"{verb} stop")
     if signalled:
         end = time.time() + _STOP_WAIT_S                  # SIGINT x2 exits a claude TUI in ~0.5s; 4s is generous
-        while time.time() < end and _surface_pids(surf):
+        while time.time() < end and any(fs.pid_alive(p) for p in signalled):
             time.sleep(0.3)
-    still = sorted(_surface_pids(surf))
+    still = sorted({p for p in signalled if fs.pid_alive(p)}
+                   | set(_surface_pids(surf))
+                   | rs.pids_ps(surf, tool=tool))
     if not still:
         return True, ""
     return False, (f"live agent pid(s) {still} still on the surface "
@@ -1896,6 +1977,7 @@ def cmd_ls(argv):
     rows (live + archived, with the computed status/lifecycle) as machine output."""
     from . import state as fs
     from . import features as ff
+    from . import resolve as rs
     as_json = "--json" in argv
     argv = [a for a in argv if a != "--json"]
     scope_arg, _ = fs.pop_scope(argv, default=None)
@@ -1907,19 +1989,21 @@ def cmd_ls(argv):
     store = fs.read_hook_store()
     open_gates = ff._open_gate_uuids()                        # feed-gated needs-input (once for the listing)
     # reconcile ONCE -> render as JSON or the text table (identical status/lifecycle either way).
+    # Reads route through resolve (step 1 of the v2 migration): rs.lifecycle/present/freshest are the
+    # one resolver's names for the same canonical predicates (delegation keeps the fs.* test seams live).
     live_rows = []
     for label, v in sorted(live.items()):
         surf = v.get("surface", "")
-        life = fs.lifecycle(surf)
+        life = rs.lifecycle(surf)
         # classified fleet state (coarse - no transcript read here, so no review/done refine): an open Feed
         # gate -> needs-input; needsInput-no-gate -> ready; running -> working; else idle/pending/stale.
-        _sid = fs.bare_uuid(ff._freshest_session(store, surf).get("sessionId", ""))
+        _sid = fs.bare_uuid(rs.freshest(surf, st=store).get("sessionId", ""))
         state = ff._classify(life or "", bool(v.get("session")), "", open_gate=bool(_sid) and _sid in open_gates)
         # STALE if NO genuinely-live agent holds the surface: lifecycle terminal, OR frozen non-terminal
         # on a DEAD pid (the SessionEnd-less brick, root-caused 2026-07-06). Routed through the shared
-        # surface_has_live_agent predicate so the pid -- not the lifecycle string -- is the authority: a
+        # liveness rule (rs.present) so the pid -- not the lifecycle string -- is the authority: a
         # dead 'running' ghost now reads STALE here (the "ls lies" symptom), consistent with bulk-recycle.
-        if not fs.surface_has_live_agent(surf):
+        if not rs.present(surf):
             # no live agent on the surface: PENDING = lazily-registered, not bound yet (codex binds
             # on its 1st turn -> drive it); STALE = had a session but the tab/process is gone.
             status = "pending" if not v.get("session") else "STALE"
@@ -1979,6 +2063,7 @@ def cmd_rm(argv):
     branch gone). WITHOUT --with-group, only this agent's own workspace goes and remaining members are
     left ungrouped."""
     from . import state as fs; import signal
+    from . import resolve as rs
     kill = "--kill" in argv
     detach = "--detach" in argv
     force = "--force" in argv
@@ -2012,7 +2097,7 @@ def cmd_rm(argv):
     # work to interrupt -- so it must NOT block a plain `rm` (Berg's gap: a dead ghost forced --force). The
     # string==running specificity is kept (idle/needsInput/unknown already proceed as safe per _quiet_gate's
     # vocabulary); surface_has_live_pid just strips the dead-ghost false-positive.
-    if closing and not force and fs.lifecycle(surf) == "running" and fs.surface_has_live_pid(surf):
+    if closing and not force and rs.lifecycle(surf) == "running" and rs.has_live_pid(surf):
         sys.exit(f"[fleet] rm: '{label}' is mid-turn (lifecycle=running on surface {surf[:8]}). "
                  f"Use --force to close it anyway, or --detach to drop the registry row and leave "
                  f"the surface running.")
@@ -2093,7 +2178,7 @@ def cmd_rm(argv):
             # it would take down LIVE collateral -- any live agent OTHER than the named target -- unless
             # --yes. A solo/target-only or all-dead group proceeds with no gate (no surprise to confirm).
             def _live(v):
-                return fs.surface_has_live_agent(v.get("surface", ""))
+                return rs.present(v.get("surface", ""))
             live_collateral = sorted(lbl for lbl, v in members.items() if _live(v))
             if live_collateral and not yes:
                 print(f"[fleet] CONFIRM --with-group: dissolving '{gname}' ({gref}) is a MASS-CLOSE -- it "
@@ -2501,7 +2586,7 @@ def cmd_revive(argv):
     ws, surf = create_surface(spec, a.parent, "down")
     if not ws or not surf:
         sys.exit(1)
-    cmuxq("send", "--workspace", ws, "--surface", surf, send_cmd + "\n")
+    _deliver_launch(ws, surf, send_cmd)          # exec by default (step 2); paste under the soak flag
     # full-resume: dismiss the summary menu, and GATE the bind on it clearing. The menu blocks the
     # session bind, so binding behind an undismissed menu would register nothing and leave the agent
     # live-but-UNREGISTERED (invisible to `fleet ls`, still shown archived). On timeout we abort BEFORE
@@ -3307,17 +3392,17 @@ def _quiet_gate(surf, timeout, force):
     Stop hook yet -> never reaches 'idle') sits at 'unknown' awaiting input. Excluding it made a
     just-resumed agent un-recyclable (the gate would block until the ABORT) -- so back-to-back resume
     recycles deadlocked."""
-    from . import state as fs
+    from . import resolve as rs
     if force:
         return True          # --force = respawn now, no wait (consistent with rm --force). See docstring.
     def quiet():
-        lc = fs.lifecycle(surf)
+        lc = rs.lifecycle(surf)
         # A 'running' record on a DEAD process is a frozen ghost (SessionEnd-less death), NOT a live
         # turn -- there is nothing to interrupt, so it counts as quiet. Without this a self-bricked
         # agent (the 2026-07-06 dead-agent class: lifecycle frozen 'running', pid dead) could never be
         # recovered by a plain `fleet recycle` -- the gate would block the full 180s and ABORT, forcing
         # --force. The pid, not the string, is the authority (see _confirmed_gone).
-        if lc == "running" and not fs.surface_has_live_pid(surf):
+        if lc == "running" and not rs.has_live_pid(surf):
             return True
         return lc in ("idle", "needsInput", "unknown") and not _input_draft_nonempty(surf)
     end = time.time() + timeout
@@ -3348,18 +3433,11 @@ def _live_bound_sid(surf):
     ghost forever while the real fresh agent sits unconfirmed (the 2026-07-09 berg-sandbox recycle
     misdetect: four recycles in a row 'no fresh session bound' with a live claude on the seat). A dead
     pid cannot host a TUI, so filtering to live pids and taking the freshest is the record that IS the
-    running agent."""
-    from . import state as fs
-    best, best_ts = "", -1.0
-    for s in (fs.read_hook_store().get("sessions") or {}).values():
-        if (s.get("surfaceId") or "").upper() != (surf or "").upper():
-            continue
-        if not fs.pid_alive(s.get("pid")):
-            continue
-        ts = s.get("updatedAt") or 0
-        if ts >= best_ts:
-            best, best_ts = s.get("sessionId", ""), ts
-    return best
+    running agent.
+    Canonical body: resolve.live_sid (step 1 of the v2 migration); this name stays as the recycle
+    confirm's call-site seam until step 3."""
+    from . import resolve as rs
+    return rs.live_sid(surf)
 
 
 def _poll_session_back(surf, old_sid, mode, timeout=90):
@@ -3383,7 +3461,7 @@ def _poll_session_back(surf, old_sid, mode, timeout=90):
                 surface_has_live_agent (non-terminal AND live-pid) gate — a frozen dead-pid ghost
                 (SessionEnd-less brick, 2026-07-06) must not false-confirm the re-bind.
     Returns the bound sid, or '' on timeout."""
-    from . import state as fs
+    from . import resolve as rs
     end = time.time() + timeout
     while time.time() < end:
         if mode == "fresh":
@@ -3392,7 +3470,7 @@ def _poll_session_back(surf, old_sid, mode, timeout=90):
                 return sid
         else:
             sid = poll_session(surf, timeout=1)
-            if sid and fs.surface_has_live_agent(surf):
+            if sid and rs.present(surf):
                 return sid
         time.sleep(1)
     return ""
@@ -3678,6 +3756,7 @@ def _bulk_targets(target, from_surface, from_label, include_muted):
     surface from its own turn). Muted / human-driven agents (homelab, resume-research) are SKIPPED by
     default; --include-muted keeps them. Returns (selected [(label,entry)], skipped [(label,reason)])."""
     from . import state as fs
+    from . import resolve as rs
     sel, skipped = [], []
     for label, v in fs.live_all().items():
         surf = v.get("surface")
@@ -3694,11 +3773,11 @@ def _bulk_targets(target, from_surface, from_label, include_muted):
             skipped.append((label, "muted/human-driven")); continue
         # STALE/non-live (same signal `fleet ls` shows): NO genuinely-live agent on the surface -> skip in
         # a bulk sweep (respawn-pane would target a gone seat / the quiet-gate would burn its timeout).
-        # Routed through surface_has_live_agent so a frozen dead-pid 'running' ghost (SessionEnd-less brick,
-        # 2026-07-06) reads STALE here too, CONSISTENT with cmd_ls (both now pid-aware). The skip is
-        # REPORTED, so the brick surfaces to the operator for an explicit `fleet recycle <label>` (itself
-        # now pid-aware and able to recover it) rather than being silently retried inside the sweep.
-        if not fs.surface_has_live_agent(surf) and v.get("session"):
+        # Routed through the liveness rule (rs.present) so a frozen dead-pid 'running' ghost (SessionEnd-
+        # less brick, 2026-07-06) reads STALE here too, CONSISTENT with cmd_ls (both pid-aware). The skip
+        # is REPORTED, so the brick surfaces to the operator for an explicit `fleet recycle <label>`
+        # (itself pid-aware and able to recover it) rather than being silently retried inside the sweep.
+        if not rs.present(surf) and v.get("session"):
             skipped.append((label, "stale/non-live")); continue
         sel.append((label, v))
     sel.sort()
@@ -3891,69 +3970,23 @@ def _count_plugin_dirs(send_cmd):
 
 
 def _resume_menu_timeout(plugin_count, base=60, per_plugin=8, ceiling=120):
-    """Ceiling for the resume-menu watch. The PRIMARY fix is event-driven polling (below), not a bigger
-    number; this is only the generous upper bound. Base is already generous (heavy loadouts take 30-40s
-    to boot, not 2s); plugin count is a SECONDARY heuristic that stretches the ceiling for the heaviest
-    loadouts (e.g. homelab's 6 plugins) without over-waiting light ones."""
-    return min(ceiling, base + per_plugin * max(0, plugin_count))
+    """Loadout-scaled resume-menu ceiling. Canonical body: adapter.resume_menu_timeout (step 2); this
+    name stays as the call-site seam until step 3."""
+    from . import adapter
+    return adapter.resume_menu_timeout(plugin_count, base=base, per_plugin=per_plugin, ceiling=ceiling)
 
 
-# tri-state outcomes of the resume-menu watch (see _dismiss_resume_summary_prompt)
-RESUME_DISMISSED = "dismissed"   # the summary menu rendered and we picked 'full session as-is'
-RESUME_READY = "ready"           # resumed straight to a running prompt (no menu; nothing to do)
-RESUME_TIMEOUT = "timeout"       # neither appeared within the ceiling -> the caller MUST NOT bind
+# tri-state outcomes of the resume-menu watch — canonical values live in adapter.py (step 2);
+# re-exported here because tests and callers reference the cli names.
+from .adapter import RESUME_DISMISSED, RESUME_READY, RESUME_TIMEOUT  # noqa: E402
 
 
 def _dismiss_resume_summary_prompt(surf, log, timeout=None, plugin_count=0):
-    """`claude --resume` on an OLD/LARGE session shows an interactive menu before resuming:
-         1. Resume from summary (recommended)   2. Resume full session as-is   3. Don't ask me again
-    A respawn/recycle has NO human to choose, so the agent HANGS at the menu (and the resume-confirm
-    false-passes on the bound-but-stuck session). Policy: ALWAYS resume FULL, never summarize/compact.
-    No claude flag/setting/env var exists to suppress this or force full (GitHub #46751, verified), so a
-    keystroke is the only lever: the cursor defaults to option 1, so DOWN -> option 2 ('full as-is'),
-    then ENTER.
-
-    This is a PURE TIMING gate, not a detection problem: the menu renders fine, but a heavy loadout can
-    take 30-40s to boot, so a fixed window closed before it appeared (WARN + revive left at the shell —
-    homelab's symptom). We poll the pane for ONE of three states until a GENEROUS, loadout-scaled ceiling
-    (never a single fixed sleep):
-      - RESUME_DISMISSED: the menu is up -> pick 'full session as-is'
-      - RESUME_READY:     already at a running prompt -> nothing to dismiss
-      - RESUME_TIMEOUT:   still booting past the ceiling -> the CALLER MUST treat this as a failed resume
-                          and NOT proceed to bind/register (the menu is a GATE that blocks the session
-                          bind; binding behind an undismissed menu leaves the agent running UNREGISTERED)."""
-    if timeout is None:
-        timeout = _resume_menu_timeout(plugin_count)
-    end = time.time() + timeout
-    resuming = False                    # saw the POST-selection 'Resuming ...' state (menu already gone)
-    while time.time() < end:
-        pane = cmuxq("capture-pane", "--surface", surf) or ""
-        # ONLY the LIVE menu is actionable — it shows BOTH option labels at once
-        # ('1. Resume from summary' AND '2. Resume full session as-is'). The old check also fired on
-        # "Resuming the full session", but that is the POST-selection / in-progress banner: the menu is
-        # already gone, so a down/enter there lands a STRAY keystroke on a no-longer-menu surface. Match
-        # only the real menu; treat 'Resuming the full session' as in-progress and keep polling.
-        if "Resume from summary" in pane and "Resume full session as-is" in pane:
-            log("resume-summary menu detected -> picking 'Resume full session as-is' (full, never compact)")
-            cmuxq("send-key", "--surface", surf, "down")
-            time.sleep(0.5)
-            cmuxq("send-key", "--surface", surf, "enter")
-            return RESUME_DISMISSED
-        # small session resumed straight to a running prompt -> no menu, nothing to dismiss
-        if "Context Remaining" in pane or "bypass permissions" in pane:
-            return RESUME_READY
-        if "Resuming the full session" in pane:
-            resuming = True             # menu was already resolved -> resume is underway; don't touch keys
-        time.sleep(1)
-    if resuming:
-        # the resume got past the menu on its own (a human, or a prior dismiss) and is loading the full
-        # session; it just hadn't reached a running prompt before the ceiling. Safe to bind.
-        log("resume in progress (summary menu already cleared); proceeding to bind")
-        return RESUME_READY
-    log(f"WARN: resume launched but neither the summary-menu nor a running prompt appeared within "
-        f"{timeout:.0f}s (plugin_count={plugin_count}); NOT binding -- surface is still booting or "
-        f"wedged behind the menu. Re-run once it settles.")
-    return RESUME_TIMEOUT
+    """The resume-summary menu dismisser (ALWAYS 'full session as-is', never the lossy summary).
+    Canonical body: adapter.dismiss_resume_menu (step 2 relocated it; the adapter owns the one
+    sanctioned screen interaction). This name stays as the call-site/test seam until step 3."""
+    from . import adapter
+    return adapter.dismiss_resume_menu(surf, log, cmux=cmuxq, timeout=timeout, plugin_count=plugin_count)
 
 
 def _resume_and_gate(surf, send_cmd, tool, sess, log):
@@ -4036,17 +4069,15 @@ def _exec_launch(surf, guarded, log):
     firing it over a live agent that appeared between the verify and this call (a cmux restart-resume)
     would destroy it — refuse instead; the A confirm then recognizes the live seat or the WARN
     escalates. A respawn-pane ERROR falls back to the proven paste path rather than leaving a bare
-    shell with no launch at all. Returns True iff a launch was delivered by either mechanism."""
-    if _agent_surfaced(surf) or _resume_menu_visible(surf):
-        log("SKIP exec-launch: an agent TUI is already up on this surface — never respawn over a live agent")
-        return False
-    log("exec-launch: respawning the pane with the launch as its process (no paste)")
-    cmd = "/bin/zsh -ilc " + shlex.quote(guarded + "; exec /bin/zsh -il")
-    out = cmuxq("respawn-pane", "--surface", surf, "--command", cmd)
-    if "error" in (out or "").lower():
-        log(f"exec-launch: respawn-pane -> {(out or '').strip()!r}; falling back to the paste path")
-        return _fire_launch(surf, guarded, log)
-    return True
+    shell with no launch at all. Returns True iff a launch was delivered by either mechanism.
+
+    Canonical body: adapter.exec_deliver (step 2 generalized this to launch and revive; this name
+    stays as the recycle call-site/test seam, injecting cli's own guards and paste fallback)."""
+    from . import adapter
+    return adapter.exec_deliver(
+        surf, guarded, log, cmux=cmuxq,
+        tui_up=lambda: _agent_surfaced(surf) or _resume_menu_visible(surf),
+        paste_fallback=lambda: _fire_launch(surf, guarded, log))
 
 
 def _escalate_recycle_failure(label, surf, mode, reason, detail):
@@ -4118,7 +4149,8 @@ def _recycle_exec_one(p):
     # (~/.local/bin/claude, added by ~/.zshenv). If the send lands before the shell finished building
     # PATH, the wrapper exits 127 'claude not found in PATH'. Prepending the standard dirs makes the
     # binary resolvable regardless of shell-init timing (harmless no-op for codex/other tools).
-    guarded = 'export PATH="$HOME/.local/bin:/opt/homebrew/bin:$PATH"; ' + send_cmd
+    from . import adapter as _adapter
+    guarded = _adapter.path_guard(send_cmd)
 
     tool_name = p.get("tool", "claude") or "claude"      # kill-target identity check (_agent_pid_check)
 
@@ -4133,9 +4165,10 @@ def _recycle_exec_one(p):
         safe. Including the pre-respawn snapshot is the SAFETY FLOOR: if the ORIGINAL claude survived the
         respawn (wedged cmux), its pid is STILL ALIVE -> not gone -> we correctly refuse and never type
         into a live TUI (the exact failure the verify shipped to prevent)."""
-        if fs.lifecycle(surf) in ("", "-", "ended"):
+        from . import resolve as rs
+        if rs.lifecycle(surf) in ("", "-", "ended"):
             return True
-        return not fs.surface_has_live_pid(surf) and not any(fs.pid_alive(p) for p in old_pids)
+        return not rs.has_live_pid(surf) and not any(fs.pid_alive(p) for p in old_pids)
 
     def _respawn_and_verify(kill_first=False):
         """One respawn-pane attempt, verified by polling for the OLD claude session's death instead of
