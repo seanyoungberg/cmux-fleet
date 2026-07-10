@@ -355,7 +355,7 @@ def test_poller_registry_is_pluggable(providers_toml, monkeypatch):
     """)
     monkeypatch.setattr(pv, "FLEET_TOML", toml)
     monkeypatch.setattr(pv, "_read_oauth_token", lambda a: None)
-    pv.register_poller("gemini-fake", lambda spec: {
+    pv.register_poller("gemini-fake", lambda spec, name: {
         "ok": True, "windows": {"one_day": {"pct": 42.0, "resets_at": None, "window_minutes": 1440}}})
     try:
         snap = pv.poll_all()
@@ -377,6 +377,132 @@ def test_poll_all_skips_track_none(providers_toml, monkeypatch):
     """)
     monkeypatch.setattr(pv, "FLEET_TOML", toml)
     assert pv.poll_all() == {}                                # vertex (track none) is not polled
+
+
+# --- codex env-token: fleet-owned refresh (mocked HTTP; never a live refresh) --------------------
+import base64
+
+
+def _jwt(claims):
+    body = base64.urlsafe_b64encode(json.dumps(claims).encode()).decode().rstrip("=")
+    return f"aaa.{body}.bbb"
+
+
+def _seed_authjson(tmp_path, access_exp, rt="refresh-1", email="a@b.com", plan="team"):
+    aj = tmp_path / "auth.json"
+    aj.write_text(json.dumps({"tokens": {
+        "access_token": _jwt({"exp": access_exp}),
+        "id_token": _jwt({"email": email, "https://api.openai.com/auth": {"chatgpt_plan_type": plan}}),
+        "refresh_token": rt, "account_id": "acc-1"}}))
+    return str(aj)
+
+
+def test_codex_seed_from_authjson_writes_cred_token_identity(tmp_path):
+    now = int(time.time())
+    cred = pv.codex_seed_from_authjson("acctx", _seed_authjson(tmp_path, now + 999999))
+    assert cred["refresh_token"] == "refresh-1" and cred["identity"]["email"] == "a@b.com"
+    # both files exist, 0600, and the .token holds JUST the access token
+    import os as _os, stat
+    tokp, credp = pv._codex_token_path("acctx"), pv._codex_cred_path("acctx")
+    assert open(tokp).read() == cred["access_token"]
+    assert stat.S_IMODE(_os.stat(tokp).st_mode) == 0o600 and stat.S_IMODE(_os.stat(credp).st_mode) == 0o600
+    assert pv._codex_token_identity("acctx")["plan"] == "team"
+
+
+def test_codex_ensure_fresh_skips_refresh_when_valid(tmp_path, monkeypatch):
+    now = int(time.time())
+    pv.codex_seed_from_authjson("acctx", _seed_authjson(tmp_path, now + 999999))   # far-future exp
+    monkeypatch.setattr(pv, "_oauth_refresh", lambda rt: (_ for _ in ()).throw(AssertionError("must not refresh")))
+    assert pv.codex_ensure_fresh("acctx")                                          # returns without refreshing
+
+
+def test_codex_ensure_fresh_refreshes_and_persists_rotated_refresh_token(tmp_path, monkeypatch):
+    now = int(time.time())
+    pv.codex_seed_from_authjson("acctx", _seed_authjson(tmp_path, now + 60, rt="refresh-OLD"))  # near expiry
+    new_at = _jwt({"exp": now + 999999})
+    calls = {}
+    def fake_refresh(rt):
+        calls["sent"] = rt
+        return {"access_token": new_at, "refresh_token": "refresh-NEW-rotated", "expires_at": now + 999999}
+    monkeypatch.setattr(pv, "_oauth_refresh", fake_refresh)
+    got = pv.codex_ensure_fresh("acctx")
+    assert got == new_at and calls["sent"] == "refresh-OLD"
+    cred = json.load(open(pv._codex_cred_path("acctx")))
+    assert cred["refresh_token"] == "refresh-NEW-rotated"        # refinement 2: rotated token persisted
+    assert cred["access_token"] == new_at
+    assert open(pv._codex_token_path("acctx")).read() == new_at  # .token file updated for the launch $(cat)
+
+
+def test_codex_ensure_fresh_unseeded_and_revoked_error(tmp_path, monkeypatch):
+    with pytest.raises(pv.ProviderError, match="not seeded"):
+        pv.codex_ensure_fresh("ghost")
+    now = int(time.time())
+    pv.codex_seed_from_authjson("dead", _seed_authjson(tmp_path, now + 60))
+    monkeypatch.setattr(pv, "_oauth_refresh", lambda rt: (_ for _ in ()).throw(RuntimeError("401")))
+    with pytest.raises(pv.ProviderError, match="revoked"):
+        pv.codex_ensure_fresh("dead")
+
+
+def test_poll_codex_filters_by_model_provider(tmp_path):
+    home = str(tmp_path / "unified")
+    now = int(time.time())
+    d = os.path.join(home, "sessions", "2026", "07", "10")
+    os.makedirs(d)
+    def rollout(fn, mp, pct):
+        ev = {"payload": {"model_provider": mp, "rate_limits": {
+            "primary": {"used_percent": pct, "window_minutes": 300, "resets_at": now + 60},
+            "secondary": None}}}
+        p = os.path.join(d, fn)
+        open(p, "w").write(json.dumps({"model_provider": mp}) + "\n" + json.dumps(ev) + "\n")
+        return p
+    older = rollout("rollout-2026-07-10T09-00-00-a.jsonl", "acctx", 11.0)
+    newer = rollout("rollout-2026-07-10T10-00-00-b.jsonl", "other", 99.0)
+    os.utime(newer, (now, now))              # newer mtime
+    os.utime(older, (now - 100, now - 100))
+    r = pv.poll_codex(home, model_provider="acctx")
+    assert r["ok"] and r["windows"]["five_hour"]["pct"] == 11.0   # picked acctx's older rollout, not other's
+    assert pv.poll_codex(home, model_provider="missing")["ok"] is False
+
+
+# --- config.toml fenced provisioning (never clobber Berg's manual config) ------------------------
+def test_codex_provision_config_fenced_and_idempotent(tmp_path):
+    cfg = tmp_path / "config.toml"
+    cfg.write_text('model = "gpt-5.5"\n\n[mcp_servers.x]\nurl = "http://y"\n')   # Berg's manual config
+    pv.codex_provision_config("acctx", str(cfg))
+    t = cfg.read_text()
+    assert 'model = "gpt-5.5"' in t and "[mcp_servers.x]" in t                 # manual config preserved
+    assert pv.CODEX_FENCE_BEGIN in t and "[model_providers.acctx]" in t
+    assert 'env_key = "CMUX_FLEET_CODEX_TOKEN"' in t and "requires_openai_auth = false" in t
+    # idempotent + multi-account: re-run with a 2nd acct, both present, fence appears ONCE
+    pv.codex_provision_config("accty", str(cfg))
+    t2 = cfg.read_text()
+    assert t2.count(pv.CODEX_FENCE_BEGIN) == 1
+    assert "[model_providers.acctx]" in t2 and "[model_providers.accty]" in t2
+    # re-running the same acct doesn't duplicate it
+    pv.codex_provision_config("acctx", str(cfg))
+    assert cfg.read_text().count("[model_providers.acctx]") == 1
+
+
+def test_codex_provision_refuses_manual_duplicate(tmp_path):
+    cfg = tmp_path / "config.toml"
+    cfg.write_text('[model_providers.acctx]\nname = "OpenAI"\n')                 # Berg defined it by hand
+    with pytest.raises(pv.ProviderError, match="OUTSIDE the fleet fence"):
+        pv.codex_provision_config("acctx", str(cfg))
+
+
+def test_codex_setup_cli_end_to_end(cli_env, tmp_path):
+    aj = tmp_path / "auth.json"
+    aj.write_text(json.dumps({"tokens": {
+        "access_token": _jwt({"exp": int(time.time()) + 999999}),
+        "id_token": _jwt({"email": "acct@x.com", "https://api.openai.com/auth": {"chatgpt_plan_type": "team"}}),
+        "refresh_token": "r1", "account_id": "a1"}}))
+    # --no-provision keeps the test off the host's real ~/.codex/config.toml; seed goes to the throwaway STATE.
+    p = subprocess.run([sys.executable, "-m", "cmux_fleet", "codex-setup", "acctx",
+                        "--auth-json", str(aj), "--no-provision"],
+                       env=dict(cli_env), capture_output=True, text=True)
+    assert p.returncode == 0, p.stderr
+    assert "seeded codex account 'acctx'" in p.stdout and "acct@x.com" in p.stdout
+    assert "codex-token:providers/codex-acctx.token" in p.stdout               # the fleet.toml hint
 
 
 # --- render_send_cmd raw_env (secret stays out of the command string) -----------------------------

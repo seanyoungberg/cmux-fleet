@@ -44,8 +44,10 @@
 import glob
 import json
 import os
+import re
 import shlex
 import subprocess
+import tempfile
 import time
 
 try:
@@ -185,6 +187,176 @@ def resolve_launch(tool, name):
 # per-launch `[model_providers.<acct>]` block in ~/.codex/config.toml declares `env_key = "<this>"`.
 CODEX_TOKEN_ENV = "CMUX_FLEET_CODEX_TOKEN"
 
+# Codex/ChatGPT OAuth (discovered read-only from a live token's claims + the codex binary, 2026-07-10):
+CODEX_OAUTH_TOKEN_URL = "https://auth.openai.com/oauth/token"
+CODEX_OAUTH_CLIENT_ID = "app_EMoamEEZ73f0CkXaXp7hrann"
+CODEX_REFRESH_MARGIN_S = 1800          # refresh when the access token expires within 30 min
+
+
+def _codex_token_path(acct):
+    """The 0600 file a launch reads via $(cat): JUST the access token."""
+    return os.path.join(STATE, "providers", f"codex-{acct}.token")
+
+
+def _codex_cred_path(acct):
+    """The 0600 credential store: {access_token, refresh_token, expires_at, account_id}. Holds the
+    refresh_token the fleet owns; separate from the .token file so a launch's $(cat) never sees it."""
+    return os.path.join(STATE, "providers", f"codex-{acct}.cred.json")
+
+
+def _atomic_write_secret(path, data):
+    """Write-temp-then-rename at 0600 (refinement 1: a concurrent spawn-time $(cat) can never read a
+    half-written token). mkstemp is 0600; os.replace is atomic within a filesystem."""
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    fd, tmp = tempfile.mkstemp(dir=os.path.dirname(path))
+    try:
+        with os.fdopen(fd, "w") as f:
+            f.write(data)
+        os.chmod(tmp, 0o600)
+        os.replace(tmp, path)
+    except Exception:
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
+        raise
+
+
+def _jwt_exp(token):
+    """The `exp` (unix seconds) from a JWT access token, or None."""
+    import base64
+    try:
+        p = token.split(".")[1]
+        p += "=" * (-len(p) % 4)
+        return json.loads(base64.urlsafe_b64decode(p)).get("exp")
+    except Exception:
+        return None
+
+
+def codex_seed_from_authjson(acct, authjson_path):
+    """Seed the fleet cred store for `acct` from a `codex login` auth.json (the ONE interactive step per
+    account). Extracts {access_token, refresh_token, account_id, expires_at} and writes both the cred store
+    and the launch .token file (atomically, 0600). Returns the cred dict. Raises ProviderError on a bad file."""
+    try:
+        d = json.load(open(os.path.expanduser(authjson_path)))
+        t = d.get("tokens") or {}
+        at, rt = t.get("access_token"), t.get("refresh_token")
+        if not at or not rt:
+            raise ValueError("auth.json has no access_token/refresh_token")
+    except Exception as e:
+        raise ProviderError(f"codex seed for '{acct}': cannot read {authjson_path} ({e})")
+    # capture identity from the id_token now (env-token accounts are NOT ~/.codex/auth.json, so the poller
+    # can't read it later). Best-effort.
+    ident = {}
+    try:
+        import base64
+        p = (t.get("id_token") or "").split(".")[1]
+        p += "=" * (-len(p) % 4)
+        c = json.loads(base64.urlsafe_b64decode(p))
+        ident = {"email": c.get("email"), "display": c.get("email"),
+                 "plan": (c.get("https://api.openai.com/auth") or {}).get("chatgpt_plan_type")}
+    except Exception:
+        pass
+    cred = {"access_token": at, "refresh_token": rt, "account_id": t.get("account_id"),
+            "expires_at": _jwt_exp(at), "identity": ident}
+    _atomic_write_secret(_codex_cred_path(acct), json.dumps(cred))
+    _atomic_write_secret(_codex_token_path(acct), at)
+    return cred
+
+
+def _codex_token_identity(acct):
+    """Identity for an env-token codex account, from the fleet cred store (seeded at login). {} if absent."""
+    try:
+        return json.load(open(_codex_cred_path(acct))).get("identity") or {}
+    except Exception:
+        return {}
+
+
+# --- config.toml provisioning (fleet-managed, FENCED, idempotent — refinement 4) -----------------
+CODEX_FENCE_BEGIN = "# >>> cmux-fleet managed (codex providers) — do not edit inside"
+CODEX_FENCE_END = "# <<< cmux-fleet managed"
+
+
+def _codex_provider_block(acct):
+    return (f"[model_providers.{acct}]\n"
+            f'name = "OpenAI"\n'
+            f'base_url = "https://chatgpt.com/backend-api/codex"\n'
+            f'env_key = "{CODEX_TOKEN_ENV}"\n'
+            f'wire_api = "responses"\n'
+            f"requires_openai_auth = false\n")
+
+
+def codex_provision_config(acct, config_path="~/.codex/config.toml"):
+    """Idempotently add a `[model_providers.<acct>]` block to ~/.codex/config.toml, INSIDE a fleet-owned
+    fence so Berg's hand-written config is never clobbered (refinement 4). Re-running is a no-op-ish merge
+    (the fence is regenerated from the union of managed accounts). Refuses if the same block already exists
+    OUTSIDE the fence (a manual definition) rather than create a duplicate. Returns the config path."""
+    path = os.path.expanduser(config_path)
+    text = open(path).read() if os.path.exists(path) else ""
+    b, e = text.find(CODEX_FENCE_BEGIN), text.find(CODEX_FENCE_END)
+    managed = set()
+    outside = text
+    if b != -1 and e != -1 and e > b:
+        managed = set(re.findall(r'\[model_providers\.([^\]]+)\]', text[b:e]))
+        outside = (text[:b] + text[e + len(CODEX_FENCE_END):])
+    if acct in set(re.findall(r'\[model_providers\.([^\]]+)\]', outside)):
+        raise ProviderError(f"[model_providers.{acct}] already exists OUTSIDE the fleet fence in {path}; "
+                            f"remove it or rename the provider (the fleet will not clobber your config).")
+    managed.add(acct)
+    fence = CODEX_FENCE_BEGIN + "\n" + "\n".join(_codex_provider_block(a) for a in sorted(managed)) + CODEX_FENCE_END + "\n"
+    body = outside.strip()
+    new = (body + "\n\n" + fence) if body else fence
+    _atomic_write_secret(path, new)                  # ~/.codex/config.toml is 0600 already
+    return path
+
+
+def _oauth_refresh(refresh_token):
+    """POST the OAuth refresh. Returns {access_token, refresh_token, expires_at} or raises. The response
+    commonly ROTATES the refresh_token — the caller MUST persist the returned one (refinement 2)."""
+    import urllib.request, urllib.error, urllib.parse
+    body = urllib.parse.urlencode({
+        "grant_type": "refresh_token", "client_id": CODEX_OAUTH_CLIENT_ID,
+        "refresh_token": refresh_token, "scope": "openid profile email offline_access"}).encode()
+    req = urllib.request.Request(CODEX_OAUTH_TOKEN_URL, data=body,
+                                 headers={"Content-Type": "application/x-www-form-urlencoded"})
+    with urllib.request.urlopen(req, timeout=20) as r:
+        d = json.loads(r.read().decode())
+    at = d.get("access_token")
+    if not at:
+        raise ProviderError("oauth refresh: response had no access_token")
+    return {"access_token": at,
+            "refresh_token": d.get("refresh_token") or refresh_token,   # keep old only if not rotated
+            "expires_at": _jwt_exp(at) or (int(time.time()) + int(d.get("expires_in") or 0))}
+
+
+def codex_ensure_fresh(acct, force=False):
+    """Pre-launch guard (refinement 3): ensure `acct`'s access token is valid, refreshing if it expires
+    within the margin. On success the .token file holds a fresh token (atomically written). Raises
+    ProviderError if the account is not seeded or the refresh fails (dead/revoked) — so a launch surfaces
+    the break loudly and NEVER spawns into a broken account. Returns the fresh access token."""
+    cpath = _codex_cred_path(acct)
+    try:
+        cred = json.load(open(cpath))
+    except Exception:
+        raise ProviderError(f"codex account '{acct}' is not seeded ({cpath} missing); run the one-time "
+                            f"`codex login` for it, then seed the fleet cred store.")
+    exp = cred.get("expires_at") or 0
+    if not force and exp and exp - time.time() > CODEX_REFRESH_MARGIN_S:
+        # still valid; make sure the .token file matches the cred (idempotent, cheap)
+        _atomic_write_secret(_codex_token_path(acct), cred["access_token"])
+        return cred["access_token"]
+    try:
+        new = _oauth_refresh(cred["refresh_token"])
+    except ProviderError:
+        raise
+    except Exception as e:
+        raise ProviderError(f"codex account '{acct}' token refresh failed ({type(e).__name__}); the "
+                            f"account may be revoked — re-run `codex login` and re-seed.")
+    cred.update(new)                                 # persist the ROTATED refresh_token + new expiry
+    _atomic_write_secret(cpath, json.dumps(cred))
+    _atomic_write_secret(_codex_token_path(acct), cred["access_token"])
+    return cred["access_token"]
+
 
 def _resolve_codex(base, acct, method, arg):
     """Codex per-launch account selection. Two methods (verdict settled 2026-07-07; env-token validated
@@ -208,6 +380,7 @@ def _resolve_codex(base, acct, method, arg):
                                 f"(the fleet-owned token; provision + refresh it there)")
         base["raw_env"][CODEX_TOKEN_ENV] = f'"$(cat {shlex.quote(path)})"'
         base["args"] = ["-c", f"model_provider={acct}"]
+        base["needs_refresh"] = acct                 # cmd_launch calls codex_ensure_fresh(acct) before spawn
         base["note"] = (f"codex account '{acct}' via env-token (unified home; needs "
                         f"[model_providers.{acct}] in ~/.codex/config.toml with env_key={CODEX_TOKEN_ENV})")
         return base
@@ -342,9 +515,23 @@ def _codex_identity(home):
         return {}
 
 
-def _newest_rollout(home):
+def _newest_rollout(home, model_provider=None):
+    """Newest rollout file in `home`. With `model_provider` set (unified-home attribution), the newest
+    rollout TAGGED with that provider — the home interleaves every account's rollouts, so the globally
+    newest may belong to a different account. Scans newest-first and returns the first match."""
     paths = glob.glob(os.path.join(os.path.expanduser(home), "sessions", "*", "*", "*", "rollout-*.jsonl"))
-    return max(paths, key=os.path.getmtime) if paths else None
+    if not paths:
+        return None
+    if not model_provider:
+        return max(paths, key=os.path.getmtime)
+    for p in sorted(paths, key=os.path.getmtime, reverse=True):
+        try:
+            txt = open(p, encoding="utf-8").read()
+        except OSError:
+            continue
+        if f'"model_provider": "{model_provider}"' in txt or f'"model_provider":"{model_provider}"' in txt:
+            return p
+    return None
 
 
 def _find_rate_limits(obj):
@@ -384,13 +571,15 @@ def _window_label(minutes):
     return f"{m}min"
 
 
-def poll_codex(home):
+def poll_codex(home, model_provider=None):
     """Newest rollout's last rate_limits event → normalized windows (zero-auth, file-only). Windows are
     labelled by `window_minutes` (5h / 7day / 30day / …), NOT by their primary/secondary slot, because the
-    slot meaning varies by plan. Marks `stale` if the newest rollout is old. Never raises."""
-    path = _newest_rollout(home)
+    slot meaning varies by plan. `model_provider` filters to one account's rollouts in a unified home.
+    Marks `stale` if the newest rollout is old. Never raises."""
+    path = _newest_rollout(home, model_provider)
     if not path:
-        return {"ok": False, "error": "no rollout sessions found in this CODEX_HOME"}
+        which = f" for model_provider={model_provider}" if model_provider else ""
+        return {"ok": False, "error": f"no rollout sessions found{which} in this CODEX_HOME"}
     rl = None
     try:
         lines = open(path, encoding="utf-8").read().splitlines()
@@ -427,18 +616,24 @@ def poll_codex(home):
 
 # --- poller registry (the pluggability seam) ----------------------------------------------------
 # Adding a provider family (Vertex-metered, Gemini, a direct inference API with a usage endpoint) is:
-#   1. write a poller  fn(spec) -> {ok, error?, windows{...}, plan?, extra_usage?, scoped?, budget?}
+#   1. write a poller  fn(spec, name) -> {ok, error?, windows{...}, plan?, extra_usage?, scoped?, budget?}
 #   2. register_poller("<kind>", fn)
 #   3. config: [providers.<tool>.<acct>] poller = "<kind>"   (defaults to the tool name)
 # No change to poll_all, the state shape, or the paint accessor. `windows` is length-labelled
 # (see _window_label), so any provider's window cadence renders through the same contract.
-def _poll_claude_provider(spec):
+def _poll_claude_provider(spec, name):
     return poll_claude(spec["auth"])
 
 
-def _poll_codex_provider(spec):
+def _poll_codex_provider(spec, name):
     method, arg = _parse_auth(spec["auth"])
-    return poll_codex(arg if method == "codex-home" else "~/.codex")
+    if method == "codex-token":
+        # unified ~/.codex home: filter rollouts by this account's model_provider (= the provider name),
+        # and take identity from the fleet cred store (env-token accounts are not ~/.codex/auth.json).
+        r = poll_codex("~/.codex", model_provider=name)
+        r["identity"] = _codex_token_identity(name)
+        return r
+    return poll_codex(arg or "~/.codex")             # codex-home: its own home, no filter
 
 
 _POLLERS = {"claude": _poll_claude_provider, "codex": _poll_codex_provider}
@@ -464,7 +659,7 @@ def poll_all():
             continue                                 # trackless / no poller for this kind — nothing to record
         rec = {"tool": tool, "name": name, "type": spec["type"], "is_default": is_default}
         try:
-            rec.update(poller(spec))
+            rec.update(poller(spec, name))
         except Exception as e:                       # defensive: a provider must never sink poll_all
             rec.update({"ok": False, "error": f"{type(e).__name__}"})
         rec["checked_at"] = int(time.time())

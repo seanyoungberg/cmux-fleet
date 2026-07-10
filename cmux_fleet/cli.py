@@ -1290,6 +1290,13 @@ def cmd_launch(argv):
         raw_env.update(pr["raw_env"])
         args = args + list(pr.get("args") or [])         # provider CLI tokens (codex `-c model_provider=<acct>`)
         spec["provider"] = pr["label"]
+        # pre-launch token guard (codex env-token): refresh if near expiry, ABORT loudly on a dead/revoked
+        # account so an agent never spawns into a 401 (never a silent wrong-account fallback). Skip on dry-run.
+        if pr.get("needs_refresh") and not a.dry_run:
+            try:
+                pv.codex_ensure_fresh(pr["needs_refresh"])
+            except pv.ProviderError as e:
+                sys.exit(f"[fleet] ABORT: {e}")
         print(f"[fleet] provider: {pr['label']}" + (f"  ({pr['note']})" if pr.get("note") else ""))
         if pr.get("provisional"):
             print(f"[fleet] WARN: {pr['label']} account selection is PROVISIONAL (codex mechanism "
@@ -5059,6 +5066,41 @@ def cmd_profile(argv):
     return 0
 
 
+def cmd_codex_setup(argv):
+    """fleet codex-setup <acct> [--auth-json PATH] [--no-provision]   provision a codex env-token account.
+    Run ONCE per account, AFTER `codex login` for it: seeds the fleet cred store (access+refresh token,
+    identity) from the login's auth.json, and adds a fenced [model_providers.<acct>] block to
+    ~/.codex/config.toml. Then add `[providers.codex.<acct>] auth = "codex-token:providers/codex-<acct>.token"`
+    to fleet.toml and launch with `--provider codex:<acct>`."""
+    import argparse
+    from . import providers as pv
+    ap = argparse.ArgumentParser(prog="fleet codex-setup")
+    ap.add_argument("acct", help="the account name (becomes the model_provider id + the fleet.toml provider)")
+    ap.add_argument("--auth-json", default="~/.codex/auth.json",
+                    help="the `codex login` auth.json to seed from (default ~/.codex/auth.json — log the "
+                         "target account in first)")
+    ap.add_argument("--no-provision", action="store_true", help="seed only; skip the config.toml block")
+    a = ap.parse_args(argv)
+    try:
+        cred = pv.codex_seed_from_authjson(a.acct, a.auth_json)
+    except pv.ProviderError as e:
+        sys.exit(f"[fleet] codex-setup: {e}")
+    ident = cred.get("identity") or {}
+    print(f"[fleet] seeded codex account '{a.acct}': {ident.get('email') or '(no email)'} "
+          f"plan={ident.get('plan') or '?'} -> {pv._codex_token_path(a.acct)} (0600)")
+    if not a.no_provision:
+        try:
+            path = pv.codex_provision_config(a.acct)
+            print(f"[fleet] provisioned [model_providers.{a.acct}] in {path} (fenced, idempotent)")
+        except pv.ProviderError as e:
+            sys.exit(f"[fleet] codex-setup: {e}")
+    print(f"[fleet] next: add to fleet.toml ->\n"
+          f"    [providers.codex.{a.acct}]\n    type = \"subscription\"\n"
+          f"    auth = \"codex-token:providers/codex-{a.acct}.token\"\n"
+          f"  then: fleet launch <role> --tool codex --provider codex:{a.acct}")
+    return 0
+
+
 def main():
     if len(sys.argv) < 2 or sys.argv[1] in ("-h", "--help"):
         print("usage: fleet <launch|config|ls|plugins|archive|revive|register|recycle|move|group|unstick|sessions|broadcast|mute|unmute|rm|vitals|usage|find|graph|serve|paint|worktree|profile|daemon|drive-child|peer-msg|child-digest|inbox|inbox-ack> ...\n"
@@ -5088,6 +5130,7 @@ def main():
               "                                                    close + archive a label (revivable; refuses mid-turn, --force overrides); --detach drops the row only; --kill adds worktree teardown; --with-group dissolves its workspace-group\n"
               "  vitals [--scope mine|all|conductors|children] [--json] [--paint] [--watch [--interval N]] cheapest-first triage table + ctx-remaining % (default mine)\n"
               "  usage [--json]                                    per-provider subscription windows (5h + weekly bars, reset countdowns, metered/Fable flags, live attribution) from the daemon poller\n"
+              "  codex-setup <acct> [--auth-json PATH] [--no-provision]  provision a codex env-token account (seed cred store + fenced ~/.codex/config.toml block); run once after `codex login`\n"
               "  find <query> [--turns N] [--json]                 content-aware session lookup (label/role/cwd or transcript)\n"
               "  graph [--scope mine|all|<label>] [--json] [--html] [--out FILE]  fleet parentage tree (text/JSON/HTML); default mine = your subtree; --scope all = full tree\n"
               "  serve [--port N]                                  thin read-only localhost view (graph HTML + vitals.json); no daemon\n"
@@ -5120,6 +5163,7 @@ def main():
            "mute": lambda a: cmd_mute(a, mute=True), "unmute": lambda a: cmd_mute(a, mute=False),
            "rm": cmd_rm, "worktree": cmd_worktree, "profile": cmd_profile, "daemon": fd.cmd_daemon,
            "vitals": ff.cmd_vitals, "usage": ff.cmd_usage, "find": ff.cmd_find, "graph": ff.cmd_graph,
+           "codex-setup": cmd_codex_setup,
            "serve": ff.cmd_serve, "paint": ff.cmd_paint,
            "drive-child": fh.cmd_drive_child, "peer-msg": fh.cmd_peer_msg,
            "child-digest": fh.cmd_child_digest, "inbox": fh.cmd_inbox, "inbox-ack": fh.cmd_inbox_ack}
