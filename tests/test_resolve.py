@@ -15,6 +15,7 @@
    (idle, NOT detached), usage-ops (env mismatch), the fresh-bind grace, and the pointer age gate.
 """
 import json
+import json
 import os
 import time
 
@@ -168,6 +169,22 @@ def test_side_by_side_synthetic_matrix(monkeypatch):
 
 
 # --- 2. the attachment axis (invariant I4) --------------------------------------------------------------
+def _turn_transcript(path, now, age_s):
+    """Write a REAL-SHAPED transcript whose last TURN is `age_s` old, plus fresh bookkeeping lines.
+
+    The activity signal is the last assistant/user turn, NOT the file mtime: Claude Code appends
+    `system` / `permission-mode` lines to an idle agent's transcript long after its last turn. This
+    fixture reproduces that text shape deliberately (judgment 23: un-stubbing a seam is not enough,
+    the fixture must reproduce the real shape of the boundary), so an mtime-based rule cannot pass.
+    """
+    import calendar as _cal
+    ts = time.strftime("%Y-%m-%dT%H:%M:%S", time.gmtime(now - age_s)) + ".000Z"
+    path.write_text(json.dumps({"type": "assistant", "timestamp": ts}) + "\n"
+                    + json.dumps({"type": "system", "timestamp": ts}) + "\n")
+    os.utime(path, (now, now))          # mtime deliberately FRESH — only the turn ts should matter
+    return str(path)
+
+
 def _attach_env(monkeypatch, tmp_path, *, record_age, transcript_age, env_ws="", active="",
                 pid=None, ws_tree="WS-TREE"):
     """One seat with controllable clocks. Returns (surface, store, ws_map, now)."""
@@ -175,10 +192,7 @@ def _attach_env(monkeypatch, tmp_path, *, record_age, transcript_age, env_ws="",
     pid = os.getpid() if pid is None else pid
     tpath = ""
     if transcript_age is not None:
-        p = tmp_path / "t.jsonl"
-        p.write_text("{}")
-        os.utime(p, (now - transcript_age, now - transcript_age))
-        tpath = str(p)
+        tpath = _turn_transcript(tmp_path / "t.jsonl", now, transcript_age)
     rec = _rec("S-ATT", "sid-att", pid, "unknown", now - record_age, transcript=tpath)
     st = _store_of({"sid-att": rec}, {"S-ATT": {"sessionId": active or "sid-att"}})
     monkeypatch.setattr(fs, "read_hook_store", lambda: st)
@@ -363,8 +377,7 @@ def _doctor_world(monkeypatch, tmp_path, *, record_age, transcript_age):
     monkeypatch.setattr(router, "rs", rs)
     now = time.time()
     tpath = tmp_path / "t.jsonl"
-    tpath.write_text("{}")
-    os.utime(tpath, (now - transcript_age, now - transcript_age))
+    _turn_transcript(tpath, now, transcript_age)
     rec = _rec("S-CH", "sid-ch", os.getpid(), "unknown", now - record_age, transcript=str(tpath))
     st = _store_of({"sid-ch": rec}, {"S-CH": {"sessionId": "sid-ch"}})
     monkeypatch.setattr(fs, "read_hook_store", lambda: st)
@@ -393,3 +406,49 @@ def test_doctor_never_flags_an_idle_child_detached(monkeypatch, tmp_path):
     router, now = _doctor_world(monkeypatch, tmp_path, record_age=12800, transcript_age=12800)
     assert router.fleet_doctor_sweep(now=now) == 0
     assert [r for r in fs.inbox_read() if r.get("kind") == "doctor"] == []
+
+
+# --- the activity signal is the last TURN, never the file mtime -------------------------------------
+def test_idle_agent_with_bookkeeping_writes_is_attached_not_detached(tmp_path, monkeypatch):
+    """The step-1 detector used the transcript's MTIME. Claude Code appends `system` /
+    `permission-mode` / `bridge-session` lines to an idle agent's transcript long after its last turn,
+    so mtime advanced while the agent sat at the prompt. On the live fleet that read usage-ops
+    (record 177.9m, mtime 59.0m) and sidebar-build (record 47.4m, mtime 13.4m) as DETACHED while both
+    were merely idle. Only the last real TURN distinguishes idle from detached."""
+    import json as _json, os as _os, time as _time
+    from cmux_fleet import resolve as rs
+
+    now = _time.time()
+    def iso(age_s):
+        return _time.strftime("%Y-%m-%dT%H:%M:%S", _time.gmtime(now - age_s)) + ".000Z"
+
+    # an IDLE agent: last real turn 60 min ago, bookkeeping appended 1 min ago (mtime is fresh)
+    idle = tmp_path / "idle.jsonl"
+    idle.write_text(
+        _json.dumps({"type": "assistant", "timestamp": iso(3600)}) + "\n" +
+        _json.dumps({"type": "system", "timestamp": iso(60)}) + "\n" +
+        _json.dumps({"type": "permission-mode"}) + "\n")
+    _os.utime(idle, (now - 60, now - 60))
+
+    # a DETACHED agent: a real turn 1 min ago, but cmux's record froze 60 min ago
+    det = tmp_path / "det.jsonl"
+    det.write_text(_json.dumps({"type": "assistant", "timestamp": iso(60)}) + "\n")
+
+    idle_age = rs._transcript_age({"transcriptPath": str(idle)}, now)
+    det_age = rs._transcript_age({"transcriptPath": str(det)}, now)
+
+    assert 3500 < idle_age < 3700, f"idle agent's activity age must be its last TURN (~3600s), got {idle_age}"
+    assert det_age < 120, f"detached agent's last turn is recent, got {det_age}"
+
+    record_age = 3600.0
+    assert (record_age - idle_age) <= rs.ATTACH_SKEW_S      # idle -> attached
+    assert (record_age - det_age) > rs.ATTACH_SKEW_S        # working, unheard -> detached
+
+
+def test_transcript_age_is_none_when_no_turn_found(tmp_path):
+    """Fail safe: an unparseable / turn-less transcript must abstain, never manufacture a detach."""
+    from cmux_fleet import resolve as rs
+    p = tmp_path / "junk.jsonl"
+    p.write_text('{"type":"system"}\nnot json at all\n')
+    assert rs._transcript_age({"transcriptPath": str(p)}, __import__("time").time()) is None
+    assert rs._transcript_age({"transcriptPath": "/nope/missing.jsonl"}, 0) is None

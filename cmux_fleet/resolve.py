@@ -30,9 +30,13 @@
 # (a frozen record alone describes every idle agent — live-measured: it flags 4 of 11, all merely
 # idle; an idle agent must never read detached). The evidence, correctly weighted after
 # cmux-advisor's independent test (findings-v2-independent-test-2026-07-10):
-#   behavioral — THE detector: transcript mtime advances while the record's updatedAt is frozen (a
-#                working agent cmux is deaf to; live-proven on berg-sandbox: record 213.8 min,
-#                transcript 0.2 min; zero false positives across 11 agents);
+#   behavioral — THE detector: the agent's last TURN is recent while the record's updatedAt is frozen
+#                (a working agent cmux is deaf to; live-proven on berg-sandbox: record 358.9 min,
+#                last turn 0.1 min). NOT the transcript's mtime: Claude Code appends bookkeeping
+#                lines (`system`, `permission-mode`, `bridge-session`) to an IDLE agent's transcript
+#                long after its last turn, so mtime advances while the agent sits at the prompt. The
+#                mtime rule shipped in step 1 and read usage-ops and sidebar-build as detached while
+#                both were merely idle; the turn timestamp is the signal, the mtime is noise;
 #   env        — the one nameable deterministic CAUSE: ps eww shows a CMUX_WORKSPACE_ID different
 #                from the tree's workspace (Gap A, the moved-live-process mechanism; conclusive at
 #                any idleness).
@@ -49,6 +53,7 @@
 # ~0.3s BEFORE the process exits, so "no record" does NOT imply "no process" — the converse of the
 # liveness rule is false, and teardown depends on the converse. Kill-target and safe-to-close sets
 # therefore come from kill_targets() (store pids UNION ps-env pids), never from store pids alone.
+import calendar
 import json
 import os
 import re
@@ -297,16 +302,59 @@ def _env_workspace(pid):
     return m.group(1) if m else ""
 
 
+_TURN_TYPES = ("assistant", "user")     # a real turn; everything else is bookkeeping
+_TAIL_BYTES = 262144                    # transcripts reach megabytes; the last turn is always near the end
+
+
+def _last_turn_epoch(path, tail_bytes=_TAIL_BYTES):
+    """Epoch of the newest real TURN in a transcript, None if unreadable or no turn is in the tail.
+
+    NOT the file mtime. Claude Code appends bookkeeping lines (`system`, `permission-mode`,
+    `bridge-session`) to an idle agent's transcript long after its last turn, so mtime advances while
+    the agent sits at the prompt. Using mtime made every idle agent read DETACHED: on the live fleet,
+    usage-ops (record 177.9m, mtime 59.0m) and sidebar-build (record 47.4m, mtime 13.4m) both tripped
+    the behavioral rule while genuinely idle, and only berg-sandbox (record 356.9m, last turn 0.3m)
+    was truly detached. The turn timestamp is the signal; the mtime is noise."""
+    try:
+        size = os.path.getsize(path)
+        with open(path, "rb") as f:
+            if size > tail_bytes:
+                f.seek(size - tail_bytes)
+                f.readline()                                 # drop the partial first line
+            chunk = f.read().decode("utf-8", "replace")
+    except OSError:
+        return None
+    best = None
+    for line in chunk.splitlines():
+        if '"timestamp"' not in line:                        # cheap reject before json.loads
+            continue
+        try:
+            d = json.loads(line)
+        except Exception:
+            continue
+        if d.get("type") not in _TURN_TYPES:
+            continue
+        ts = d.get("timestamp") or ""
+        try:                                                 # transcripts stamp UTC ('...Z'); timegm
+            t = calendar.timegm(time.strptime(ts[:19], "%Y-%m-%dT%H:%M:%S"))   # reads the struct AS utc
+        except Exception:                                    # (mktime would apply local time + miss DST)
+            continue
+        if best is None or t > best:
+            best = t
+    return best
+
+
 def _transcript_age(rec, now):
-    """Seconds since the record's transcript file last advanced, None if unknowable. The one
-    activity signal that trusts no cmux state."""
+    """Seconds since the agent last took a TURN, None if unknowable. The one activity signal that
+    trusts no cmux state. None makes `attachment` abstain from the behavioral check (fail safe: an
+    unparseable transcript must never manufacture a `detached` alert)."""
     path = rec.get("transcriptPath") or ""
     if not path:
         return None
-    try:
-        return max(0.0, now - os.stat(path).st_mtime)
-    except OSError:
+    t = _last_turn_epoch(path)
+    if t is None:
         return None
+    return max(0.0, now - t)
 
 
 def attachment(surface, st=None, ws_map=None, now=None):
