@@ -52,11 +52,13 @@ rewrites that workspace's record with the bit flipped (`workspace.action` / `set
 reads it back and carries it forward, so a repaint never clobbers the choice.
 
 **Subscription usage footer.** Fleet-global usage (`fleet usage`) has no per-workspace channel to bind, so
-`fleet paint` rides it on every conductor's description after a `⧗` separator (`…⧗acct~label~pct~stale⧗…`,
-one line per subscription); the sidebar reads it off the first conductor and draws a compact panel — one bar
-per subscription, `pct` = consumed % of the most-constrained window, a `stale` flag when the poll can't be
-trusted. The data comes from the stable `providers.usage_for_paint()` accessor (schema 1), so the poller can
-evolve without breaking the render. `⧗` is stripped from record text, so it never collides with a field.
+`fleet paint` rides it on every conductor's description after a `⧗` separator
+(`…⧗label~stale~5h~44~7d~34~2h⧗…`, one line per subscription); the sidebar reads it off the first conductor.
+Each line shows the REAL account (the accessor's `label` = oauth display/email, not the config-id `account`),
+each rolling window's consumed % (`5h`, `7d`), and when the soonest window resets. A poll that failed or went
+stale renders as one clean "usage stale" line, never confident-looking numbers. The data comes from the
+stable `providers.usage_for_paint()` accessor (schema 1), so the poller can evolve without breaking the
+render. `⧗` is stripped from record text, so it never collides with a field.
 
 Feed it: `fleet paint --sidebar` (or `FLEET_SIDEBAR_BLOB=1`). OFF by default. To keep it **live without a shell
 loop**, set `[fleet].sidebar_paint = true` and the daemon repaints on-change (~every 4s).

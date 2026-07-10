@@ -12,8 +12,8 @@
 // repaint never clobbers the choice.
 //
 // USAGE FOOTER: fleet-global subscription usage has no per-workspace channel, so it rides every conductor's
-// description after a `⧗` (`…⧗acct~label~pct~stale⧗…`, one line per subscription); the footer reads it off
-// the first conductor. `⧗` is stripped from record text, so the record parse above is never affected.
+// description after a `⧗` (`…⧗label~stale~5h~44~7d~34~2h⧗…`, one line per subscription); the footer reads it
+// off the first conductor. `⧗` is stripped from record text, so the record parse above is never affected.
 //
 // INTERPRETER RULES (each fails SILENTLY — a wrong guard just renders nothing, no error anywhere):
 //   • reach optionals with `if let`, never `== nil` / `!= nil` (those evaluate to nothing);
@@ -98,7 +98,7 @@ func iconFor(_ s) -> String {
   if s == "review" { return "eye.fill" }
   if s == "working" { return "gearshape.fill" }
   if s == "done" { return "checkmark.circle.fill" }
-  if s == "ready" { return "circle.dashed" }
+  if s == "ready" { return "circle.fill" }                    // teal presence dot — finished & available
   if s == "detached" { return "antenna.radiowaves.left.and.right.slash" }
   if s == "idle" { return "moon.zzz.fill" }
   return "questionmark.circle"
@@ -183,8 +183,9 @@ func extraBadge(_ w) -> some View {                          // "+N" when agents
 
 // ── fleet-global subscription usage ────────────────────────────────────────────────────────────
 // cmux gives a custom sidebar NO global channel, so `fleet paint` rides the usage panel on every
-// conductor's description after a ⧗: "FLEET4;<rec>⧗acct~5h~63~0⧗acct2~-~-~1". One line per subscription,
-// pct = CONSUMED %; a '1' stale flag means the poll can't be trusted (never render a confident number).
+// conductor's description after a ⧗: "FLEET4;<rec>⧗label~stale~5h~44~7d~34~2h⧗…". ONE line per
+// subscription: the REAL account, each rolling window's CONSUMED %, and when the soonest window resets.
+// A '1' stale flag renders one clean "usage stale" line instead of confident-looking garbage.
 func hasUsage(_ w) -> Bool { return descOf(w).contains("⧗") }
 func usageField(_ s, _ i) -> String {
   let t = s.split(separator: "~")
@@ -196,27 +197,37 @@ func usageColor(_ used) -> String {                           // by CONSUMED sha
   if used > 60 { return "#F5A623" }
   return "#30A46C"
 }
+// one window as "5h 44%" — the label dim, the % colored by consumption. EmptyView when the window is absent.
+func usageWindow(_ label, _ pctS) -> some View {
+  if label == "-" || label == "" || pctS == "-" { return AnyView(EmptyView()) }
+  let used = Double(pctS)
+  return AnyView(HStack(spacing: 3) {
+    Text(label).font(.system(size: 11, design: .monospaced)).foregroundColor("#8B8D98")
+    Text("\(Int(used))%").font(.system(size: 12, design: .monospaced)).foregroundColor(usageColor(used))
+  })
+}
+func resetView(_ reset) -> some View {                       // "↻ 2h" — when the soonest window refreshes
+  if reset == "-" || reset == "" { return AnyView(EmptyView()) }
+  return AnyView(HStack(spacing: 2) {
+    Image(systemName: "arrow.clockwise").font(.system(size: 8)).foregroundColor("#6F6E77")
+    Text(reset).font(.system(size: 11, design: .monospaced)).foregroundColor("#6F6E77")
+  })
+}
 func usageLine(_ s) -> some View {
-  let acct = usageField(s, 0)
-  if usageField(s, 3) == "1" {                                // untrusted -> say so, don't fake a number
+  let label = usageField(s, 0)
+  if usageField(s, 1) == "1" {                                // untrusted -> one clean line, no fake numbers
     return AnyView(HStack(spacing: 6) {
-      Text(acct).font(.system(size: 10, design: .monospaced)).foregroundColor("#8B8D98").lineLimit(1)
-      Text("· usage stale").font(.system(size: 10)).foregroundColor("#6F6E77")
+      Text(label).font(.system(size: 12, design: .monospaced)).foregroundColor("#B8B8C0").lineLimit(1)
+      Text("· usage stale").font(.system(size: 12)).foregroundColor("#6F6E77")
       Spacer()
     })
   }
-  let used = Double(usageField(s, 2))
-  return AnyView(HStack(spacing: 7) {
-    Text(acct).font(.system(size: 10, design: .monospaced)).foregroundColor("#B8B8C0").lineLimit(1)
-    Text(usageField(s, 1)).font(.system(size: 9, design: .monospaced)).foregroundColor("#6F6E77")
-    HStack(spacing: 0) {
-      RoundedRectangle(cornerRadius: 2).foregroundColor(usageColor(used)).frame(width: 56 * used / 100.0, height: 5)
-      Spacer()
-    }
-    .frame(width: 56, height: 5)
-    .background { RoundedRectangle(cornerRadius: 2).foregroundColor("#2A2E37") }
-    Text("\(Int(used))%").font(.system(size: 10, design: .monospaced)).foregroundColor(.secondary)
+  return AnyView(HStack(spacing: 9) {
+    Text(label).font(.system(size: 12, design: .monospaced)).foregroundColor("#D8D8E0").lineLimit(1)
+    usageWindow(usageField(s, 2), usageField(s, 3))          // 5h
+    usageWindow(usageField(s, 4), usageField(s, 5))          // 7d
     Spacer()
+    resetView(usageField(s, 6))
   })
 }
 

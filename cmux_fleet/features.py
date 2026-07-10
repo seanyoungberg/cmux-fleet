@@ -99,12 +99,17 @@ STATE_STYLE = {
     "detached":    ("#A45CDB", "antenna.radiowaves.left.and.right.slash", 3),
     "working":     ("#30A46C", "gearshape.fill",                4),
     "done":        ("#46A758", "checkmark.circle.fill",         5),
-    "ready":       ("#3DB9A0", "circle.dashed",                 6),   # calm teal — turn finished, available
-    "idle":        ("#8B8D98", "moon.zzz.fill",                 7),
+    "ready":       ("#3DB9A0", "circle.fill",                   6),   # teal presence dot — finished, available
+    "idle":        ("#8B8D98", "moon.zzz.fill",                 7),   # asleep — only after QUIET_S of no activity
     "pending":     ("#8B8D98", "hourglass",                     8),
     "stale":       ("#6F6E77", "questionmark.circle",           9),
     "gone":        ("#6F6E77", "xmark.circle",                  9),
 }
+
+# A finished agent stays 'ready' (available, present) until it has been quiet this long, then reads 'idle'
+# (dormant). The distinction is TIME-since-last-activity, not cmux's needsInput/idle strings (which don't
+# encode "recently finished" vs "long dormant"). Keeps a just-finished agent from looking asleep.
+QUIET_S = 900   # 15 min
 
 
 def _freshest_session(store, surf):
@@ -269,24 +274,16 @@ def _context_used(path):
 # else at needsInput — a completed turn idling >~60s at the prompt (which cmux also stamps needsInput via
 # Claude's idle Notification hook), the feedback survey, a max-tokens stop — is a done-idle NON-gate.
 _INPUT_GATE_TOOLS = frozenset({"AskUserQuestion", "ExitPlanMode"})
-_GATE_TAIL_BYTES = 262144   # read only the transcript tail: a gate is always the last thing written
+_GATE_TAIL_BYTES = 262144   # read only the transcript tail: a turn boundary is always the last thing written
+_TERMINAL_STOP = frozenset({"end_turn", "stop", "stop_sequence", "max_tokens"})   # the turn CLOSED here
 
 
-def pending_interactive_gate(transcript_path):
-    """True iff the transcript's LAST assistant turn ends on an UNANSWERED interactive gate
-    (AskUserQuestion / ExitPlanMode) with nothing after it — the one 'agent is blocked on the human'
-    state a needsInput lifecycle can mean. This is the discriminator the needs-input predicate needs:
-    cmux stamps needsInput for BOTH a real gate AND an ordinary done-idle turn (>~60s at the prompt), so
-    the lifecycle string alone can't tell them apart, but the transcript can — a done-idle turn ends with
-    stop_reason=end_turn, a gate ends on the tool_use.
-
-    Reads only the tail (a gate is always the last write). FAILS CLOSED to False on any ambiguity —
-    absent/unreadable transcript, end_turn, an answered gate, codex (no transcript) — so the predicate
-    SUPPRESSES rather than alerts when it can't prove a gate. The needs-input FP flood is what we are
-    killing, and the genuine gate still has the completion backstop + a human eventually noticing; a
-    false SUPPRESS is strictly safer than the 100%-FP status quo."""
+def _last_assistant_turn(transcript_path):
+    """(last_assistant_message, has_user_after) parsed from the transcript TAIL, or None on any ambiguity
+    (absent/unreadable transcript, codex with no transcript, no assistant row). Shared by the gate and
+    turn-end predicates so they read/parse the tail once each with identical, tested logic."""
     if not transcript_path or not os.path.exists(transcript_path):
-        return False
+        return None
     try:
         with open(transcript_path, "rb") as f:
             f.seek(0, 2)
@@ -294,7 +291,7 @@ def pending_interactive_gate(transcript_path):
             f.seek(max(0, size - _GATE_TAIL_BYTES), 0)
             chunk = f.read().decode("utf-8", "ignore")
     except Exception:
-        return False
+        return None
     rows = []
     for line in chunk.splitlines():
         line = line.strip()
@@ -306,16 +303,44 @@ def pending_interactive_gate(transcript_path):
             continue
     last = next((i for i in range(len(rows) - 1, -1, -1) if rows[i].get("type") == "assistant"), None)
     if last is None:
+        return None
+    has_user_after = any(r.get("type") == "user" for r in rows[last + 1:])   # a tool_result / new turn follows
+    return (rows[last].get("message") or {}), has_user_after
+
+
+def pending_interactive_gate(transcript_path):
+    """True iff the transcript's LAST assistant turn ends on an UNANSWERED interactive gate
+    (AskUserQuestion / ExitPlanMode) with nothing after it — the one 'agent is blocked on the human'
+    state a needsInput lifecycle can mean. cmux stamps needsInput for BOTH a real gate AND an ordinary
+    done-idle turn, so the lifecycle string can't tell them apart, but the transcript can — a done-idle
+    turn ends with stop_reason=end_turn, a gate ends on the tool_use. FAILS CLOSED to False on any
+    ambiguity, so the predicate SUPPRESSES rather than alerts when it can't prove a gate."""
+    parsed = _last_assistant_turn(transcript_path)
+    if not parsed:
         return False
-    # anything AFTER the last assistant answered it (a tool_result / a new user turn) -> not pending
-    if any(r.get("type") == "user" for r in rows[last + 1:]):
+    msg, has_user_after = parsed
+    if has_user_after:                                         # answered (tool_result / new user turn) -> not pending
         return False
-    msg = rows[last].get("message") or {}
     if msg.get("stop_reason") not in ("tool_use", None):       # end_turn / max_tokens / stop -> done-idle
         return False
     return any(isinstance(c, dict) and c.get("type") == "tool_use"
                and c.get("name") in _INPUT_GATE_TOOLS
                for c in (msg.get("content") or []))
+
+
+def turn_ended(transcript_path):
+    """True iff the transcript's LAST assistant turn CLOSED (a terminal stop_reason with nothing after it) —
+    a REAL-TIME turn-completion signal. cmux's agentLifecycle keeps reading 'running' for ~60s after a turn
+    ends (its idle timer lags), so a just-finished agent shows 'working' far too long; the transcript flips
+    the instant the turn closes. FAILS CLOSED to False (absent/unreadable/codex/mid-turn/gate) so an
+    unprovable case keeps whatever cmux's lifecycle says — this only ever CLEARS a lagged 'working'."""
+    parsed = _last_assistant_turn(transcript_path)
+    if not parsed:
+        return False
+    msg, has_user_after = parsed
+    if has_user_after:                                         # a tool_result / new turn follows -> not ended
+        return False
+    return msg.get("stop_reason") in _TERMINAL_STOP
 
 
 def _refine(last_text, default):
@@ -332,24 +357,26 @@ def _refine(last_text, default):
     return default
 
 
-def _classify(life, has_session, last_text, open_gate=False):
+def _classify(life, has_session, last_text, open_gate=False, turn_done=False, quiet=False):
     """PURE state classifier, NO LLM (unit-testable). An open Feed GATE (unreplied AskUserQuestion /
-    permission / ExitPlan) is the authoritative 'needs-input' signal — it means the agent truly cannot
-    proceed. cmux's agentLifecycle is authoritative for live work; when cmux says `needsInput` but NO gate
-    is open, that's just a FINISHED TURN, so we fall through to the keyword-refine and land on review / done
-    / 'ready' (the calm just-finished-and-available state) instead of a false 'needs-input'. Stateless."""
-    if life == "running":
-        return "working"                                      # mid-turn: cannot be blocked on the human,
+    permission / ExitPlan) is the authoritative 'needs-input' signal — the agent truly cannot proceed.
+    `turn_done` is the transcript's real-time end-of-turn signal: cmux's agentLifecycle lags ~60s at
+    'running' after a turn closes, so when the transcript proves the turn ended we treat it as finished at
+    once instead of showing a stale 'working'. `quiet` = last activity older than QUIET_S: a just-finished
+    agent reads 'ready' (present, available); only a long-dormant one reads 'idle' (asleep). Stateless."""
+    if life == "running" and not turn_done:
+        return "working"                                      # genuinely mid-turn (cmux running, turn open),
         # so `running` OUTRANKS an open gate. cmux stamps needsInput for a REAL gate, never running, so a
-        # gate seen alongside `running` is a stale non-terminal Feed row (e.g. a resume picker answered by
-        # a key-send, which never marks the row terminal) -- honoring it resurrects the needs-input FP.
-    if open_gate:
+        # gate seen alongside a still-open `running` turn is a stale non-terminal Feed row (e.g. a resume
+        # picker answered by a key-send, which never marks the row terminal) -- honoring it resurrects the FP.
+    if open_gate and not turn_done:
         return "needs-input"                                  # unreplied Feed gate -> genuinely blocked
-    if life in ("", "ended", "unknown"):
+        # (a proven end_turn can't be a live gate, so `turn_done` also retires a lingering stale gate row).
+    if life in ("", "ended", "unknown") and not turn_done:
         return "pending" if not has_session else "stale"
-    # life == "needsInput" (turn ended, no open gate) OR "idle": refine from last words. A just-ended turn
-    # defaults to 'ready' (recently active, available); a long-dormant agent stays 'idle'.
-    return _refine(last_text, "ready" if life == "needsInput" else "idle")
+    # turn ended (cmux needsInput/idle, OR cmux lags at 'running' but the transcript closed the turn):
+    # refine from last words; default 'ready' (recently active, available) unless quiet a while -> 'idle'.
+    return _refine(last_text, "idle" if quiet else "ready")
 
 
 _GATE_KINDS = ("question", "permission", "exitplan", "exit_plan", "askuser", "askuserquestion")
@@ -402,15 +429,21 @@ def detached_or(state, attached):
     return state
 
 
-def _infer_state(entry, session, open_gates=frozenset()):
+def _infer_state(entry, session, open_gates=frozenset(), now=None):
     """state for one agent: read live signals, then classify (the impure edge over _classify). `open_gates`
     is the set of session uuids with an unreplied Feed gate (computed once per snapshot). Lifecycle reads
-    route through resolve (the one resolver; step 1 of the v2 migration)."""
+    route through resolve (the one resolver; step 1 of the v2 migration). Also reads the transcript's
+    end-of-turn signal (beats cmux's ~60s lifecycle lag) and how long the agent has been quiet (ready vs
+    idle)."""
     from . import resolve as rs
     sid = fs.bare_uuid(session.get("sessionId", ""))
+    tpath = session.get("transcriptPath", "")
+    updated = session.get("updatedAt") or 0
+    quiet = bool(updated) and ((now or time.time()) - updated) > QUIET_S
     return _classify(rs.lifecycle(entry.get("surface", "")), bool(entry.get("session")),
-                     fs.last_agent_text(session.get("transcriptPath", ""), cap=400),
-                     open_gate=bool(sid) and sid in open_gates)
+                     fs.last_agent_text(tpath, cap=400),
+                     open_gate=bool(sid) and sid in open_gates,
+                     turn_done=turn_ended(tpath), quiet=quiet)
 
 
 def snapshot():
@@ -430,7 +463,7 @@ def snapshot():
     for label, e in fs.live_all().items():
         surf = e.get("surface", "")
         sess = rs.freshest(surf, st=store)
-        state = _infer_state(e, sess, open_gates)
+        state = _infer_state(e, sess, open_gates, now=now)
         att = rs.attachment(surf, st=store, ws_map=ws_map, now=now)
         state = detached_or(state, att["attached"])
         used, tmodel = _context_used(sess.get("transcriptPath", ""))
@@ -1148,13 +1181,28 @@ def _is_descriptor(desc):
     return any(f"{DESC_SEP}{g}" in d for g in (DESC_CHILD, DESC_OPEN, DESC_SHUT))
 
 
+def _fmt_reset(secs):
+    """Compact 'resets in' string: '45m' / '4h' / '5d' (largest whole unit). '-' when unknown."""
+    if secs is None:
+        return "-"
+    secs = int(secs)
+    if secs < 3600:
+        return f"{max(0, secs) // 60}m"
+    if secs < 86400:
+        return f"{secs // 3600}h"
+    return f"{secs // 86400}d"
+
+
 def _usage_lines():
     """Compact per-SUBSCRIPTION usage for the sidebar footer, from the STABLE `usage_for_paint()` accessor
-    (schema 1). One record per subscription provider, `account~label~pct~stale`, where `pct` is the CONSUMED
-    % of the most-constrained window (the accessor's `headline`). An untrusted row (poll failed / stale /
-    no pct) serializes pct '-' and stale '1', so a number is never rendered as confident. Provider-agnostic:
-    skips non-subscription rows (api/vertex have no windows). Returns [] on no snapshot OR a schema mismatch
-    — an unknown schema must render nothing, never mis-parse a future shape."""
+    (schema 1). ONE record per subscription provider, rendered on ONE line:
+        label~stale~w1label~w1pct~w2label~w2pct~reset
+    `label` is the REAL account (accessor's `label` = oauth display/email, falling back to the config id),
+    never the config-id `account`. The first two NON-scoped windows (shortest first — typically 5h + 7d)
+    carry their CONSUMED %; `reset` is the shortest window's 'resets in' (the soonest-refreshing limit).
+    A poll that FAILED or is STALE serializes stale '1' and no numbers, so it renders as one clean line
+    instead of confident-looking garbage. Provider-agnostic (skips api/vertex rows with no windows).
+    Returns [] on no snapshot OR a schema mismatch — an unknown schema renders nothing, never mis-parses."""
     try:
         from . import providers as pv
         view = pv.usage_for_paint()
@@ -1162,16 +1210,27 @@ def _usage_lines():
         return []
     if view.get("schema") != 1:                              # gate on the shape THIS code was written against
         return []
+
+    def pct(x):
+        return str(int(x)) if isinstance(x, (int, float)) else "-"
+
     lines = []
     for p in view.get("providers", []):
         if p.get("kind") != "subscription":
             continue
-        acct = _blob_clean(p.get("account") or p.get("id") or "?", 16)
-        h = p.get("headline") or {}
-        if (not p.get("ok")) or p.get("stale") or h.get("pct") is None:
-            lines.append("~".join([acct, "-", "-", "1"]))     # untrusted -> no confident number
-        else:
-            lines.append("~".join([acct, _blob_clean(h.get("label") or "", 6), str(int(h["pct"])), "0"]))
+        label = _blob_clean(p.get("label") or p.get("account") or "?", 32)   # fits a full email; swift truncates
+        wins = [w for w in (p.get("windows") or []) if not w.get("scoped")]   # rolling windows, not scoped (Fable)
+        if (not p.get("ok")) or p.get("stale") or not wins:
+            lines.append("~".join([label, "1", "-", "-", "-", "-", "-"]))     # untrusted -> one clean stale line
+            continue
+        w1 = wins[0]
+        w2 = wins[1] if len(wins) > 1 else {}
+        lines.append("~".join([
+            label, "0",
+            _blob_clean(w1.get("label") or "", 6), pct(w1.get("pct")),
+            _blob_clean(w2.get("label") or "", 6) if w2 else "-", pct(w2.get("pct")) if w2 else "-",
+            _fmt_reset(w1.get("resets_in_s")),
+        ]))
     return lines
 
 

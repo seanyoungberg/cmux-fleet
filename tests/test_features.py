@@ -45,7 +45,8 @@ def _ff():
 def test_classify_lifecycle_authoritative():
     ff = _ff()
     assert ff._classify("running", True, "anything") == "working"
-    assert ff._classify("idle", True, "") == "idle"
+    assert ff._classify("idle", True, "", quiet=True) == "idle"       # long-quiet -> idle
+    assert ff._classify("idle", True, "") == "ready"                  # recently active -> ready, not asleep
 
 
 def test_classify_needs_input_only_on_open_gate():
@@ -75,11 +76,11 @@ def test_classify_keyword_refines_finished_turn_and_idle():
     assert ff._classify("needsInput", True, "opened pull request #42") == "review"
     assert ff._classify("needsInput", True, "all tests passed ✓ done") == "done"
     assert ff._classify("needsInput", True, "wrapped up, standing by") == "ready"
-    # idle refines the same way but defaults to 'idle' (long-dormant), not 'ready'
-    assert ff._classify("idle", True, "opened pull request #42") == "review"
-    assert ff._classify("idle", True, "still chugging along on the refactor") == "idle"
+    # keywords refine the same way whether recent or quiet; the DEFAULT is ready (recent) vs idle (quiet)
+    assert ff._classify("idle", True, "opened pull request #42", quiet=True) == "review"
+    assert ff._classify("idle", True, "still chugging on the refactor", quiet=True) == "idle"
     # a stale block-phrase in the transcript NO LONGER forces needs-input (Feed gate is authoritative)
-    assert ff._classify("idle", True, "Do you want to proceed? [y/n]") == "idle"
+    assert ff._classify("idle", True, "Do you want to proceed? [y/n]", quiet=True) == "idle"
     assert ff._classify("needsInput", True, "approve? [y/n]") == "ready"
 
 
@@ -87,6 +88,27 @@ def test_classify_keywords_only_apply_when_not_working():
     ff = _ff()
     # a running agent that happens to print "error" mid-work stays working (lifecycle wins)
     assert ff._classify("running", True, "error: transient") == "working"
+
+
+def test_classify_turn_done_clears_the_lagged_running():
+    # Fix 1: cmux's lifecycle lags ~60s at 'running' after a turn closes; the transcript's end_turn flips
+    # at once. turn_done retires the stale 'working' -> the just-finished agent reads 'ready' immediately.
+    ff = _ff()
+    assert ff._classify("running", True, "wrapped up", turn_done=True) == "ready"
+    assert ff._classify("running", True, "opened pull request #42", turn_done=True) == "review"
+    # turn_done also retires a lingering stale Feed gate (a proven end_turn can't be a live gate)
+    assert ff._classify("running", True, "", open_gate=True, turn_done=True) == "ready"
+    # still mid-turn when the transcript hasn't closed the turn
+    assert ff._classify("running", True, "", turn_done=False) == "working"
+
+
+def test_classify_ready_vs_idle_is_time_based():
+    # Fix 2: a finished agent reads 'ready' (present) until QUIET_S of no activity, then 'idle' (asleep) —
+    # NOT cmux's needsInput/idle strings, which don't encode "just finished" vs "long dormant".
+    ff = _ff()
+    assert ff._classify("needsInput", True, "") == "ready"           # recent -> ready
+    assert ff._classify("needsInput", True, "", quiet=True) == "idle"  # dormant -> idle
+    assert ff._classify("idle", True, "") == "ready"                 # even cmux 'idle', if recently active
 
 
 def test_open_gate_uuids_only_unreplied_gates(monkeypatch):
@@ -106,13 +128,33 @@ def test_open_gate_uuids_only_unreplied_gates(monkeypatch):
 
 def test_infer_state_open_gate_forces_needs_input(monkeypatch):
     ff = _ff()
+    import time as _t
     u = "2502f0f3-fd17-4370-9709-7f0417d188eb"
     monkeypatch.setattr(ff.fs, "lifecycle", lambda surf: "idle")
     monkeypatch.setattr(ff.fs, "last_agent_text", lambda p, cap=400: "wrapped up cleanly")
     entry = {"surface": "S1", "session": True}
-    sess = {"sessionId": u, "transcriptPath": ""}
+    sess = {"sessionId": u, "transcriptPath": "", "updatedAt": _t.time()}   # fresh activity
     assert ff._infer_state(entry, sess, {u}) == "needs-input"      # open gate -> genuinely blocked
-    assert ff._infer_state(entry, sess, frozenset()) == "idle"     # no gate -> refine default (idle)
+    assert ff._infer_state(entry, sess, frozenset()) == "ready"    # no gate, recent -> ready (present)
+    sess_old = {"sessionId": u, "transcriptPath": "", "updatedAt": _t.time() - ff.QUIET_S - 60}
+    assert ff._infer_state(entry, sess_old, frozenset()) == "idle" # no gate, long-quiet -> idle (asleep)
+
+
+def test_turn_ended_reads_the_transcript_close(tmp_path):
+    # Fix 1's real-time signal: a terminal stop_reason with nothing after it = the turn CLOSED.
+    ff = _ff()
+    def w(rows):
+        p = tmp_path / "t.jsonl"; p.write_text("\n".join(json.dumps(x) for x in rows)); return str(p)
+    ended = w([{"type": "user", "message": {}},
+               {"type": "assistant", "message": {"stop_reason": "end_turn", "content": []}}])
+    assert ff.turn_ended(ended) is True
+    working = w([{"type": "assistant", "message": {"stop_reason": "tool_use",
+                  "content": [{"type": "tool_use", "name": "Bash"}]}}])
+    assert ff.turn_ended(working) is False                        # mid-turn tool call -> not ended
+    answered = w([{"type": "assistant", "message": {"stop_reason": "end_turn", "content": []}},
+                  {"type": "user", "message": {}}])               # a new user turn follows
+    assert ff.turn_ended(answered) is False
+    assert ff.turn_ended("") is False                             # codex / no transcript -> fail closed
 
 
 # ── context-token reading ─────────────────────────────────────────────────────────────────────
@@ -746,23 +788,41 @@ def test_paint_clears_the_blob_when_the_sidebar_is_disabled(monkeypatch):
 
 # ── subscription-usage panel (per subscription, NOT per agent) — from the stable usage_for_paint() ──
 def test_usage_lines_from_the_accessor(monkeypatch):
+    # ONE line per subscription: the REAL account (label), each rolling window's %, and the soonest reset.
     ff = _ff()
     from cmux_fleet import providers as pv
     monkeypatch.setattr(pv, "usage_for_paint", lambda: {"schema": 1, "providers": [
-        {"kind": "subscription", "account": "berg-max", "ok": True, "stale": False,
-         "headline": {"label": "7d", "pct": 37.0}},
-        {"kind": "subscription", "account": "berg-team", "ok": True, "stale": True,      # stale -> untrusted
-         "headline": {"label": "5h", "pct": 1.0}},
-        {"kind": "api", "account": "vertex-x", "ok": True, "stale": False, "headline": None},   # not a sub -> skip
+        {"kind": "subscription", "account": "berg-max", "label": "Berg", "ok": True, "stale": False,
+         "windows": [{"label": "5h", "pct": 44.0, "resets_in_s": 7200},
+                     {"label": "7d", "pct": 34.0, "resets_in_s": 500000},
+                     {"label": "Fable", "pct": 90, "scoped": True}]},           # scoped -> skipped
+        {"kind": "subscription", "account": "berg-team", "label": "sean@x.com", "ok": True, "stale": True,
+         "windows": [{"label": "5h", "pct": 1.0, "resets_in_s": 900}]},         # stale -> one clean line
+        {"kind": "api", "account": "vertex-x", "ok": True, "stale": False, "windows": []},   # not a sub -> skip
     ]})
-    assert ff._usage_lines() == ["berg-max~7d~37~0", "berg-team~-~-~1"]   # one line per SUBSCRIPTION; stale -> '-','1'
+    assert ff._usage_lines() == [
+        "Berg~0~5h~44~7d~34~2h",           # label from `label`, 5h+7d %, reset of the shortest window
+        "sean@x.com~1~-~-~-~-~-",          # stale -> stale flag, no numbers (renders one clean line)
+    ]
+
+
+def test_usage_lines_use_label_not_config_id_and_one_window(monkeypatch):
+    # display the REAL account (label), never the config-id `account`; a single-window provider is fine.
+    ff = _ff()
+    from cmux_fleet import providers as pv
+    monkeypatch.setattr(pv, "usage_for_paint", lambda: {"schema": 1, "providers": [
+        {"kind": "subscription", "account": "berg-team", "label": "sean.youngberg@gmail.com",
+         "ok": True, "stale": False, "windows": [{"label": "30d", "pct": 12.0, "resets_in_s": 200000}]},
+    ]})
+    assert ff._usage_lines() == ["sean.youngberg@gmail.com~0~30d~12~-~-~2d"]   # label shown; 2nd window '-'
 
 
 def test_usage_lines_gate_on_schema(monkeypatch):
     ff = _ff()
     from cmux_fleet import providers as pv
     monkeypatch.setattr(pv, "usage_for_paint", lambda: {"schema": 2, "providers": [
-        {"kind": "subscription", "account": "x", "ok": True, "stale": False, "headline": {"label": "5h", "pct": 5}}]})
+        {"kind": "subscription", "account": "x", "label": "X", "ok": True, "stale": False,
+         "windows": [{"label": "5h", "pct": 5, "resets_in_s": 100}]}]})
     assert ff._usage_lines() == []                                       # unknown schema -> render nothing, never mis-parse
 
 
@@ -772,12 +832,12 @@ def test_paint_rides_usage_on_conductor_blobs_only(monkeypatch):
     ff = _ff()
     monkeypatch.setenv("FLEET_SIDEBAR_BLOB", "1")
     monkeypatch.setattr(ff, "_ws_descriptions", lambda: {})
-    monkeypatch.setattr(ff, "_usage_lines", lambda: ["berg-max~7d~37~0", "berg-team~-~-~1"])
+    monkeypatch.setattr(ff, "_usage_lines", lambda: ["Berg~0~5h~44~7d~34~2h", "sean@x.com~1~-~-~-~-~-"])
     calls = _capture_cmux(ff, monkeypatch)
     rows = [dict(_row("boss", state="ready", ctx_pct_remaining=40), ws="ws-A", kind="conductor", surface="s1"),
             dict(_row("kid", state="working", ctx_pct_remaining=50), ws="ws-B", kind="child", parent="boss", surface="s2")]
     ff._paint(rows)
     desc = {c[-1]: c[c_index(c)] for c in calls if c[0] == "workspace-action" and "set-description" in c}
-    assert desc["ws-A"].endswith("⧗berg-max~7d~37~0⧗berg-team~-~-~1")    # conductor carries the panel
+    assert desc["ws-A"].endswith("⧗Berg~0~5h~44~7d~34~2h⧗sean@x.com~1~-~-~-~-~-")    # conductor carries the panel
     assert desc["ws-A"].split("⧗")[0] == "FLEET4;s1~boss~ready~40~-~conductor~claude~-~-~-~0~-"  # record intact
     assert "⧗" not in desc["ws-B"]                                       # a child never carries it
