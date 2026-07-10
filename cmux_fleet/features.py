@@ -623,6 +623,10 @@ def _watch_vitals(paint, interval, scope="all", caller=""):
 
 
 # ─── usage: per-provider subscription windows (the providers feature) ───────────────────────────
+_WIN_PRETTY = {"five_hour": "5h", "seven_day": "7day", "thirty_day": "30day"}
+_WIN_MINUTES = {"five_hour": 300, "seven_day": 10080, "thirty_day": 43200}   # sort fallback
+
+
 def _bar(pct, width=10):
     """A |####------| utilization bar. None/unparseable → an empty rail."""
     try:
@@ -681,12 +685,15 @@ def cmd_usage(argv):
         if not r.get("ok"):
             lines.append(f"    !! not readable: {r.get('error', 'unknown')}")
             continue
+        # windows are plan-dependent (claude: 5h+7day; codex Team: 5h+7day; codex Free: 30day only), so
+        # render whatever the poller found, shortest window first. `<` marks the currently-binding limit.
         w = r.get("windows") or {}
-        fh, sd = w.get("five_hour") or {}, w.get("seven_day") or {}
-        act5 = " <" if r.get("active_limit") == "session" else ""
-        actw = " <" if str(r.get("active_limit", "")).startswith("weekly") else ""
-        lines.append(f"    5h    {_bar(fh.get('pct'))}  {_countdown(fh.get('resets_at'))}{act5}")
-        lines.append(f"    7day  {_bar(sd.get('pct'))}  {_countdown(sd.get('resets_at'))}{actw}")
+        act = str(r.get("active_limit", ""))
+        for name, win in sorted(w.items(), key=lambda kv: (kv[1].get("window_minutes") or _WIN_MINUTES.get(kv[0], 0))):
+            mark = " <" if ((name == "five_hour" and act == "session")
+                            or (name == "seven_day" and act.startswith("weekly"))) else ""
+            lines.append(f"    {_WIN_PRETTY.get(name, name):<6}{_bar(win.get('pct'))}  "
+                         f"{_countdown(win.get('resets_at'))}{mark}")
         for sc in (r.get("scoped") or []):
             lines.append(f"    {sc.get('label', 'scoped'):<5} {_bar(sc.get('pct'))}  {_countdown(sc.get('resets_at'))} (scoped)")
         xu = r.get("extra_usage") or {}

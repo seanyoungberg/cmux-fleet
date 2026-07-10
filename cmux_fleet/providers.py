@@ -299,9 +299,30 @@ def _find_rate_limits(obj):
     return None
 
 
+_WINDOW_LABELS = {300: "five_hour", 10080: "seven_day", 43200: "thirty_day"}
+
+
+def _window_label(minutes):
+    """Canonical window name from its LENGTH, never from its slot. Codex's `primary`/`secondary` slots are
+    plan-dependent: a Team plan sends primary=300min (5h) + secondary=10080min (7d), but a Free plan sends
+    primary=43200min (30d) and secondary=null. Keying off the slot mislabels a 30-day window as "5h"."""
+    try:
+        m = int(minutes)
+    except (TypeError, ValueError):
+        return None
+    if m in _WINDOW_LABELS:
+        return _WINDOW_LABELS[m]
+    if m % 1440 == 0:
+        return f"{m // 1440}day"
+    if m % 60 == 0:
+        return f"{m // 60}hour"
+    return f"{m}min"
+
+
 def poll_codex(home):
-    """Newest rollout's last rate_limits event → normalized windows (zero-auth, file-only). primary =
-    5h window, secondary = weekly (10080 min). Marks `stale` if the newest rollout is old. Never raises."""
+    """Newest rollout's last rate_limits event → normalized windows (zero-auth, file-only). Windows are
+    labelled by `window_minutes` (5h / 7day / 30day / …), NOT by their primary/secondary slot, because the
+    slot meaning varies by plan. Marks `stale` if the newest rollout is old. Never raises."""
     path = _newest_rollout(home)
     if not path:
         return {"ok": False, "error": "no rollout sessions found in this CODEX_HOME"}
@@ -321,14 +342,18 @@ def poll_codex(home):
         return {"ok": False, "error": f"{type(e).__name__}"}
     if not rl:
         return {"ok": False, "error": "no rate_limits event in newest rollout"}
-    p, s = rl.get("primary") or {}, rl.get("secondary") or {}
+    windows = {}
+    for slot in ("primary", "secondary"):
+        w = rl.get(slot)
+        if not isinstance(w, dict):              # a plan may send only one window (Free: secondary=null)
+            continue
+        label = _window_label(w.get("window_minutes")) or slot
+        windows[label] = {"pct": w.get("used_percent"), "resets_at": w.get("resets_at"),
+                          "window_minutes": w.get("window_minutes")}
     stale = (time.time() - os.path.getmtime(path)) > CODEX_STALE_S
     return {
-        "ok": True, "error": None, "stale": stale,
-        "windows": {
-            "five_hour": {"pct": p.get("used_percent"), "resets_at": p.get("resets_at")},
-            "seven_day": {"pct": s.get("used_percent"), "resets_at": s.get("resets_at")},
-        },
+        "ok": True, "error": None, "stale": stale, "windows": windows,
+        "plan": rl.get("plan_type") or "",
         "scoped": [], "extra_usage": {"enabled": False, "pct": None}, "active_limit": "",
     }
 

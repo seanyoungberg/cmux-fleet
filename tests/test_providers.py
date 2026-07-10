@@ -150,6 +150,49 @@ def test_poll_codex_no_sessions(tmp_path):
     assert not r["ok"] and "no rollout" in r["error"]
 
 
+def _write_rollout_raw(home, rate_limits):
+    d = os.path.join(home, "sessions", "2026", "07", "10")
+    os.makedirs(d, exist_ok=True)
+    ev = {"type": "event_msg", "payload": {"type": "token_count", "rate_limits": rate_limits}}
+    with open(os.path.join(d, "rollout-2026-07-10T09-00-00-zzz.jsonl"), "w") as f:
+        f.write(json.dumps(ev) + "\n")
+
+
+def test_poll_codex_free_plan_single_30day_window(tmp_path):
+    """Regression: a Free plan sends primary=43200min (30 DAYS) and secondary=null. Keying windows off the
+    primary/secondary SLOT mislabelled that 30-day window as the 5h window (observed live 2026-07-10)."""
+    home = str(tmp_path / "free-home")
+    now = int(time.time())
+    _write_rollout_raw(home, {"limit_id": "codex", "plan_type": None,
+                              "primary": {"used_percent": 18.0, "window_minutes": 43200,
+                                          "resets_at": now + 20 * 86400},
+                              "secondary": None})
+    r = pv.poll_codex(home)
+    assert r["ok"]
+    assert "thirty_day" in r["windows"] and r["windows"]["thirty_day"]["pct"] == 18.0
+    assert "five_hour" not in r["windows"]        # the bug: 30d was reported as 5h
+    assert "seven_day" not in r["windows"]        # null secondary must not appear
+
+
+def test_poll_codex_labels_by_window_length_not_slot(tmp_path):
+    """Even if the plan swaps the slots, the label follows window_minutes."""
+    home = str(tmp_path / "swapped")
+    now = int(time.time())
+    _write_rollout_raw(home, {"primary": {"used_percent": 5.0, "window_minutes": 10080, "resets_at": now + 1},
+                              "secondary": {"used_percent": 9.0, "window_minutes": 300, "resets_at": now + 2}})
+    w = pv.poll_codex(home)["windows"]
+    assert w["seven_day"]["pct"] == 5.0 and w["five_hour"]["pct"] == 9.0
+
+
+def test_window_label_mapping():
+    assert pv._window_label(300) == "five_hour"
+    assert pv._window_label(10080) == "seven_day"
+    assert pv._window_label(43200) == "thirty_day"
+    assert pv._window_label(120) == "2hour"
+    assert pv._window_label(2880) == "2day"
+    assert pv._window_label(None) is None
+
+
 def test_poll_all_writes_snapshot(providers_toml, monkeypatch):
     # point codex acct2's home at a temp home with a rollout; claude poll will fail (no token) -> ok:false,
     # but the record must still be present. poll_all writes provider-usage.json in the throwaway STATE.
