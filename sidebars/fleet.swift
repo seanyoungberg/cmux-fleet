@@ -128,40 +128,52 @@ func toolIcon(_ w) -> some View {
   return AnyView(EmptyView())
 }
 
+// INTERPRETER RULE (the whole point of this file's shape): a `some View` func is a view BUILDER — it
+// COLLECTS every view expression whose conditional is satisfied and IGNORES `return`. So the guard must be
+// POSITIVE: put the real view inside `if <have data>`, and let the function fall through to a single
+// `EmptyView`. The inverse (`if <missing> { return EmptyView }` then a real fall-through) COLLECTS BOTH and
+// renders the real view over an empty slot — that is the "stale usage line drew twice" bug.
+//
 // ctx bar (field 3), hand-rolled: `ProgressView` renders its own VALUE as a label, and a bare shape has no
 // intrinsic size, so both containers need an explicit .frame clamp. Bar + percent + meta share ONE line.
 func ctxRow(_ w) -> some View {
-  if ctxOf(w) == "-" { return AnyView(EmptyView()) }        // no ctx (e.g. codex/pending) -> no bar
-  let remain = Double(ctxOf(w))
-  let frac = remain / 100.0
-  return AnyView(HStack(spacing: 7) {
-    HStack(spacing: 0) {
-      RoundedRectangle(cornerRadius: 2).foregroundColor(ctxColor(remain))
-        .frame(width: 78 * frac, height: 5)
+  if ctxOf(w) != "-" {                                      // have a ctx reading -> draw the bar
+    let remain = Double(ctxOf(w))
+    let frac = remain / 100.0
+    return AnyView(HStack(spacing: 7) {
+      HStack(spacing: 0) {
+        RoundedRectangle(cornerRadius: 2).foregroundColor(ctxColor(remain))
+          .frame(width: 78 * frac, height: 5)
+        Spacer()
+      }
+      .frame(width: 78, height: 5)
+      .background { RoundedRectangle(cornerRadius: 2).foregroundColor("#2A2E37") }
+      Text("\(Int(remain))%").font(.system(size: 10, design: .monospaced)).foregroundColor(.secondary)
       Spacer()
-    }
-    .frame(width: 78, height: 5)
-    .background { RoundedRectangle(cornerRadius: 2).foregroundColor("#2A2E37") }
-    Text("\(Int(remain))%").font(.system(size: 10, design: .monospaced)).foregroundColor(.secondary)
-    Spacer()
-    Text(metaText(w)).font(.system(size: 10, design: .monospaced)).foregroundColor("#7A7A85").lineLimit(1)
-  }.frame(height: 12))
+      Text(metaText(w)).font(.system(size: 10, design: .monospaced)).foregroundColor("#7A7A85").lineLimit(1)
+    }.frame(height: 12))
+  }
+  return AnyView(EmptyView())                               // codex / pending -> no bar
 }
 func cwdLine(_ w) -> some View {                             // cwd (field 9) — already the repo/…/leaf tail
   let p = cwdOf(w)
-  if p == "-" || p == "" { return AnyView(EmptyView()) }
-  return AnyView(HStack(spacing: 4) {
-    Image(systemName: "folder").font(.system(size: 8)).foregroundColor("#5A5A63")
-    Text(p).font(.system(size: 9, design: .monospaced))
-      .foregroundColor("#6F6E77").lineLimit(1).truncationMode(.middle)
-    Spacer()
-  })
+  if p != "-" && p != "" {
+    return AnyView(HStack(spacing: 4) {
+      Image(systemName: "folder").font(.system(size: 8)).foregroundColor("#5A5A63")
+      Text(p).font(.system(size: 9, design: .monospaced))
+        .foregroundColor("#6F6E77").lineLimit(1).truncationMode(.middle)
+      Spacer()
+    })
+  }
+  return AnyView(EmptyView())
 }
 func lastLine(_ w) -> some View {                            // last message (field 11) — from the snapshot
   let m = lastOf(w)
-  if m == "-" || m == "" { return AnyView(EmptyView()) }
-  return AnyView(Text(m).font(.system(size: 11)).foregroundColor(.tertiary)
-    .lineLimit(2).truncationMode(.tail))
+  if m != "-" && m != "" {
+    return AnyView(Text(m).font(.system(size: 11)).foregroundColor(.tertiary)
+      .lineLimit(2).truncationMode(.tail))
+  }
+  return AnyView(EmptyView())
 }
 // POSITIVE condition first, fall through to EmptyView. The .frame clamp is mandatory: the background shape
 // has no intrinsic size and inflates the row without it. `unread` is a native cmux field, not fleet data.
@@ -197,37 +209,56 @@ func usageColor(_ used) -> String {                           // by CONSUMED sha
   if used > 60 { return "#F5A623" }
   return "#30A46C"
 }
-// one window as "5h 44%" — the label dim, the % colored by consumption. EmptyView when the window is absent.
+// one window as "5h 44%" — the label dim, the % colored by consumption. POSITIVE guard: render only when
+// the window is present, fall through to EmptyView (an absent window must add NOTHING to the row).
 func usageWindow(_ label, _ pctS) -> some View {
-  if label == "-" || label == "" || pctS == "-" { return AnyView(EmptyView()) }
-  let used = Double(pctS)
-  return AnyView(HStack(spacing: 3) {
-    Text(label).font(.system(size: 11, design: .monospaced)).foregroundColor("#8B8D98")
-    Text("\(Int(used))%").font(.system(size: 12, design: .monospaced)).foregroundColor(usageColor(used))
-  })
+  if label != "-" && label != "" && pctS != "-" {
+    let used = Double(pctS)
+    return AnyView(HStack(spacing: 3) {
+      Text(label).font(.system(size: 11, design: .monospaced)).foregroundColor("#8B8D98")
+      Text("\(Int(used))%").font(.system(size: 12, design: .monospaced)).foregroundColor(usageColor(used))
+    })
+  }
+  return AnyView(EmptyView())
 }
 func resetView(_ reset) -> some View {                       // "↻ 2h" — when the soonest window refreshes
-  if reset == "-" || reset == "" { return AnyView(EmptyView()) }
-  return AnyView(HStack(spacing: 2) {
-    Image(systemName: "arrow.clockwise").font(.system(size: 8)).foregroundColor("#6F6E77")
-    Text(reset).font(.system(size: 11, design: .monospaced)).foregroundColor("#6F6E77")
-  })
+  if reset != "-" && reset != "" {
+    return AnyView(HStack(spacing: 2) {
+      Image(systemName: "arrow.clockwise").font(.system(size: 8)).foregroundColor("#6F6E77")
+      Text(reset).font(.system(size: 11, design: .monospaced)).foregroundColor("#6F6E77")
+    })
+  }
+  return AnyView(EmptyView())
 }
-func usageLine(_ s) -> some View {
-  let label = usageField(s, 0)
-  if usageField(s, 1) == "1" {                                // untrusted -> one clean line, no fake numbers
+// A STALE/failed provider and a FRESH one render on ONE line each. Split into two POSITIVE-guarded views so
+// exactly one is collected per provider (the other is EmptyView) — NOT `if stale { staleLine } freshLine`,
+// which the builder collects BOTH of, drawing "usage stale" over a phantom "-% -%" row.
+func usageStale(_ s) -> some View {
+  if usageField(s, 1) == "1" {
     return AnyView(HStack(spacing: 6) {
-      Text(label).font(.system(size: 12, design: .monospaced)).foregroundColor("#B8B8C0").lineLimit(1)
+      Text(usageField(s, 0)).font(.system(size: 12, design: .monospaced)).foregroundColor("#B8B8C0").lineLimit(1)
       Text("· usage stale").font(.system(size: 12)).foregroundColor("#6F6E77")
       Spacer()
     })
   }
-  return AnyView(HStack(spacing: 9) {
-    Text(label).font(.system(size: 12, design: .monospaced)).foregroundColor("#D8D8E0").lineLimit(1)
-    usageWindow(usageField(s, 2), usageField(s, 3))          // 5h
-    usageWindow(usageField(s, 4), usageField(s, 5))          // 7d
-    Spacer()
-    resetView(usageField(s, 6))
+  return AnyView(EmptyView())
+}
+func usageFresh(_ s) -> some View {
+  if usageField(s, 1) != "1" {
+    return AnyView(HStack(spacing: 9) {
+      Text(usageField(s, 0)).font(.system(size: 12, design: .monospaced)).foregroundColor("#D8D8E0").lineLimit(1)
+      usageWindow(usageField(s, 2), usageField(s, 3))        // 5h
+      usageWindow(usageField(s, 4), usageField(s, 5))        // 7d
+      Spacer()
+      resetView(usageField(s, 6))
+    })
+  }
+  return AnyView(EmptyView())
+}
+func usageLine(_ s) -> some View {                            // exactly one of the two shows (the other = EmptyView)
+  return AnyView(VStack(alignment: .leading, spacing: 0) {
+    usageStale(s)
+    usageFresh(s)
   })
 }
 
