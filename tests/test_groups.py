@@ -268,3 +268,93 @@ def test_rm_with_group_confirm_alias_also_bypasses(monkeypatch):
     fleet.cmd_rm(["cond", "--with-group", "--confirm"])             # --confirm is the --yes alias
     assert ("workspace-group", "delete", "workspace_group:7") in calls
     assert fs.live_get("cond") is None and fs.live_get("child") is None
+
+
+# --- with-group dissolve adopts the kill path (the last leak site): stop EVERY member, all-or-nothing.
+# `workspace-group delete` closes every member surface and close-surface does not kill the pane's agent,
+# so a dissolve without stops leaked every live member at once. The invariant: any member whose live
+# agent won't die (or can't be identified) refuses the WHOLE dissolve — never strand one agent while
+# tearing down its neighbours.
+def _seed_group(fs):
+    fs.live_put("cond", {"role": "c", "kind": "conductor", "tool": "claude", "group": "g",
+                         "surface": "SC", "workspace": "WS-C", "status": "live"})
+    fs.live_put("child", {"role": "w", "kind": "child", "tool": "claude", "group": "g",
+                          "parent": "cond", "surface": "SW", "workspace": "WS-W", "status": "live"})
+
+
+def _stub_group_cmux(monkeypatch, calls):
+    def fake_cmuxq(*a):
+        calls.append(a)
+        if a[:2] == ("workspace-group", "list"):
+            return ('{"groups":[{"ref":"workspace_group:1",'
+                    '"member_workspace_refs":["workspace:c","workspace:w"]}]}')
+        return ""
+    monkeypatch.setattr(fleet, "cmuxq", fake_cmuxq)
+    monkeypatch.setattr(fleet, "_group_ref", lambda g: "workspace_group:1")
+    monkeypatch.setattr(fleet, "_ref_to_uuid",
+                        lambda kind, ref: {"workspace:c": "WS-C", "workspace:w": "WS-W"}[ref])
+    monkeypatch.setattr(fleet, "_resume_binding", lambda surf: {})
+    monkeypatch.setattr(fleet.time, "sleep", lambda *_: None)
+    monkeypatch.setattr(fleet, "_STOP_WAIT_S", 0.05)
+
+
+def test_with_group_all_dead_members_dissolves(fs, monkeypatch):
+    # (a) nothing live anywhere (only dead-pid ghosts on the member surfaces) -> the dissolve proceeds.
+    _seed_group(fs)
+    calls = []
+    _stub_group_cmux(monkeypatch, calls)
+    monkeypatch.setattr(fleet, "_surface_pids", lambda s: set())          # ghosts are dead = no targets
+    assert fleet.cmd_rm(["cond", "--with-group"]) == 0
+    assert any(c[:2] == ("workspace-group", "delete") for c in calls)     # dissolved
+    assert fs.live_get("cond") is None and fs.live_get("child") is None   # swept
+
+
+def test_with_group_one_survivor_refuses_whole_dissolve(fs, monkeypatch):
+    # (b) the cond's agent dies on SIGINT; the child's SURVIVES -> the WHOLE dissolve refuses: no group
+    # delete, zero surfaces closed, registry intact, and the blocking member is named for the operator.
+    _seed_group(fs)
+    calls = []
+    _stub_group_cmux(monkeypatch, calls)
+    alive = {111: True, 222: True}                                        # cond pid 111, child pid 222
+    monkeypatch.setattr(fleet, "_surface_pids",
+                        lambda s: ({111} if s == "SC" and alive[111] else set()) |
+                                  ({222} if s == "SW" and alive[222] else set()))
+    monkeypatch.setattr(fleet, "_agent_pid_check", lambda pid, tool: True)
+    def fake_kill(pid, sig):
+        if pid == 111:
+            alive[111] = False                                            # cond exits cleanly
+    monkeypatch.setattr(fleet.os, "kill", fake_kill)                      # 222 SURVIVES the SIGINTs
+    rc = fleet.cmd_rm(["cond", "--with-group", "--force"])                # --force must NOT bypass
+    assert rc == 1
+    assert not any(c[:2] == ("workspace-group", "delete") for c in calls)  # group intact
+    assert not any(c[0] == "close-surface" for c in calls)                 # zero surfaces closed
+    assert fs.live_get("cond") is not None and fs.live_get("child") is not None   # registry untouched
+
+
+def test_with_group_one_survivor_names_the_blocker(fs, monkeypatch, capsys):
+    _seed_group(fs)
+    calls = []
+    _stub_group_cmux(monkeypatch, calls)
+    monkeypatch.setattr(fleet, "_surface_pids", lambda s: {222} if s == "SW" else set())
+    monkeypatch.setattr(fleet, "_agent_pid_check", lambda pid, tool: True)
+    monkeypatch.setattr(fleet.os, "kill", lambda pid, sig: None)          # the child never dies
+    assert fleet.cmd_rm(["cond", "--with-group"]) == 1
+    out = capsys.readouterr().out
+    assert "REFUSED" in out and "child:" in out                           # the operator knows which seat
+
+
+def test_with_group_unidentifiable_pid_refuses_with_zero_signals(fs, monkeypatch):
+    # (c) PRE-FLIGHT: a live pid on ANY member that doesn't identify as its tool refuses the whole
+    # dissolve before a single SIGINT is fired anywhere in the group (never half-kill then discover).
+    _seed_group(fs)
+    calls = []
+    _stub_group_cmux(monkeypatch, calls)
+    monkeypatch.setattr(fleet, "_surface_pids", lambda s: {333} if s == "SW" else set())
+    monkeypatch.setattr(fleet, "_agent_pid_check", lambda pid, tool: False)
+    killed = []
+    monkeypatch.setattr(fleet.os, "kill", lambda pid, sig: killed.append(pid))
+    assert fleet.cmd_rm(["cond", "--with-group"]) == 1
+    assert killed == []                                                    # ZERO signals fired
+    assert not any(c[:2] == ("workspace-group", "delete") for c in calls)
+    assert not any(c[0] == "close-surface" for c in calls)
+    assert fs.live_get("cond") is not None and fs.live_get("child") is not None

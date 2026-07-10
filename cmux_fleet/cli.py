@@ -2049,6 +2049,56 @@ def cmd_rm(argv):
         gname, gref = grp["gname"], grp["gref"]
         if gref:
             members, registry_all, wt_kept = grp["members"], grp["registry_all"], grp["wt_kept"]
+            # STOP every member's agent BEFORE the dissolve — ALL-OR-NOTHING (never-orphan at group
+            # scale): `workspace-group delete` closes EVERY member surface, and close-surface does not
+            # kill the pane's agent, so a dissolve without stops leaks every live member at once (the
+            # 2026-07-10 single-seat leak, multiplied — and a group dissolve is exactly when several
+            # live agents go at once with nobody watching each one). Two phases:
+            #   1. PRE-FLIGHT identity check across the WHOLE group: any live pid that doesn't identify
+            #      as its member's tool (pid reuse / ps failure) refuses the dissolve with ZERO signals
+            #      fired — we never SIGINT half a group and then discover a foreign pid.
+            #   2. Stop each member (live-only, identity-checked, death-verified). Any survivor refuses
+            #      the WHOLE dissolve: no group delete, no sibling closes, no registry change. A partial
+            #      dissolve that strands one agent while tearing down its neighbours is the worst
+            #      outcome — the survivor loses its group context AND stays invisible. Members already
+            #      stopped by phase 2 are dead processes on OPEN surfaces: visible, revivable, nothing
+            #      lost. --force does not bypass any of this (it forces the quiet gate, never
+            #      never-orphan).
+            unidentifiable = []
+            for lbl in sorted(registry_all):
+                v = registry_all[lbl]
+                ms = v.get("surface", "")
+                for mp in sorted(_surface_pids(ms)) if ms else []:
+                    if not _agent_pid_check(mp, v.get("tool") or "claude"):
+                        unidentifiable.append((lbl, mp))
+            if unidentifiable:
+                who = ", ".join(f"{lbl} (pid {mp})" for lbl, mp in unidentifiable)
+                print(f"[fleet] rm --with-group REFUSED: live pid(s) on '{gname}' member surface(s) do "
+                      f"not identify as their agent tool — {who}. NOT dissolving (zero signals fired, "
+                      f"no surface closed, registry untouched). Check the pid(s), then re-run.")
+                fs.log_event("rm_refused", label=label, group=gname,
+                             reason="group-member-pid-unidentifiable",
+                             blocked=[lbl for lbl, _ in unidentifiable])
+                return 1
+            blocked = []
+            for lbl in sorted(registry_all):
+                v = registry_all[lbl]
+                ms = v.get("surface", "")
+                if not ms:
+                    continue                             # archived row with no seat -> nothing to stop
+                ok, note = _stop_agent_for_close(ms, v.get("tool") or "claude", lbl, "rm --with-group")
+                if not ok:
+                    blocked.append((lbl, note))
+            if blocked:
+                print(f"[fleet] rm --with-group REFUSED: {len(blocked)} member(s) of '{gname}' still "
+                      f"have a live agent after SIGINT x2; NOT dissolving (no group delete, no surface "
+                      f"closed, registry untouched — already-stopped members sit dead on OPEN surfaces, "
+                      f"revivable). Blocking member(s):")
+                for lbl, note in blocked:
+                    print(f"[fleet]     {lbl}: {note}")
+                fs.log_event("rm_refused", label=label, group=gname,
+                             reason="group-member-would-orphan", blocked=[lbl for lbl, _ in blocked])
+                return 1
             group_note = f"\n[fleet] group '{gname}' dissolved ({gref}); closed + cleared {1 + len(members)} member(s)"
             if members:
                 group_note += f" (also removed: {', '.join(sorted(members))})"

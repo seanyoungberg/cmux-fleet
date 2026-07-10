@@ -23,6 +23,14 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Fixed
 
+- **`fleet rm --with-group` no longer leaks live members** — the dissolve stops EVERY member's agent
+  (live-only, identity-checked, death-verified) BEFORE `workspace-group delete`, all-or-nothing: a
+  group-wide pre-flight identity check refuses with ZERO signals fired if any live pid can't be
+  identified (never half-kill a group, then discover a foreign pid), and any member whose agent survives
+  SIGINT x2 refuses the WHOLE dissolve — no group delete, no sibling closes, no registry change, the
+  blocking member named for the operator. A partial dissolve that strands one agent while tearing down
+  its neighbours would leave the survivor invisible AND groupless. `--force` does not bypass. This was
+  the last kill site not on the live-pid truth.
 - **`fleet rm` / `fleet archive` no longer leak live agents** — both verbs now stop the agent via the
   recycle tail's live-only, identity-checked kill selector (`_signal_agent_pids`) and VERIFY death before
   closing the surface; if a live agent on the surface won't die or can't be identified, the verb REFUSES
