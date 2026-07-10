@@ -1,159 +1,209 @@
-// ⚓ cmux-fleet sidebar — the live fleet as conductor→worker groups.
+// ⚓ cmux-fleet sidebar — the live fleet as collapsible conductor→worker groups.
 //
-// The sidebar can only read cmux's own data, so the board rides in through a workspace DESCRIPTION:
-// `fleet paint` serializes the fleet into  "FLEET3;label~state~ctx~parent~kind~surface~tool~model~effort~cwd~last;..."  and
-// writes it to one marker workspace; this file finds it by prefix, parses it, and draws the board.
-// Layout is ours; data is pushed. Rows tap to focus the agent. Hot-reloads on save.
+// NATIVE-FIRST. Each agent owns a workspace, so almost everything comes from cmux's own fields:
+//     label  w.title      ctx bar  w.progress      last message  w.latestMessage
+//     tap    workspace.select(w.id)
+// Only STATE, PARENT and the COLLAPSE bit are pushed by `fleet paint --sidebar`, riding in a short
+// workspace description that reads as prose in the built-in sidebar instead of clobbering it:
+//     child      "working · ↳berg-sandbox"     (↳ = my parent conductor)
+//     conductor  "ready · ▾berg-sandbox"       (▾ expanded / ▸ collapsed; carries its OWN label,
+//                                               because a conductor's TITLE is decorated)
+//     shared ws  "… · +2"                      (agents still sharing one workspace)
+//
+// COLLAPSE without @State: the chevron rewrites this workspace's description with the glyph flipped;
+// `fleet paint` carries the glyph forward, so a repaint never clobbers the choice.
+//
+// STRUCTURE follows Examples/CustomSidebars/status-board.swift: no top-level `let`, no array-returning
+// funcs. Arrays are bound with `let` INSIDE the view body and passed into view helpers.
 
-func hasBlob(_ w) -> Bool {
-    if w.description == nil { return false }
-    return w.description.hasPrefix("FLEET3;")
+func descOf(_ w) -> String {
+  if w.description != nil && w.description != "" { return w.description }
+  return ""
 }
-func blobOf(_ w) -> String {
-    if w.description == nil { return "" }
-    return w.description
+func isOurs(_ w) -> Bool {
+  let d = descOf(w)
+  return d.contains(" · ↳") || d.contains(" · ▾") || d.contains(" · ▸")
 }
-func fleetRaw() -> String {
-    let hits = workspaces.filter { hasBlob($0) }
-    if hits.count == 0 { return "" }
-    return blobOf(hits[0])
+func isConductor(_ w) -> Bool {
+  let d = descOf(w)
+  return d.contains(" · ▾") || d.contains(" · ▸")
 }
-func agentList() -> [[String]] {
-    let raw = fleetRaw()
-    if raw == "" { return [] }
-    let recs = raw.split(separator: ";")
-    return Array(recs.dropFirst(1)).map { r in r.split(separator: "~").map { f in String(f) } }
+func isCollapsed(_ w) -> Bool { return descOf(w).contains(" · ▸") }
+
+func stateOf(_ w) -> String {
+  let p = descOf(w).split(separator: " ")
+  if p.count == 0 { return "idle" }
+  return String(p[0])
 }
-func conductors() -> [[String]] {
-    return agentList().filter { $0.count >= 5 && $0[4] == "conductor" }.sorted { $0[0] < $1[0] }
+// first token after a glyph — the label (conductor) or parent (child) it introduces
+func labelOf(_ w) -> String {
+  let d = descOf(w)
+  if d.contains("▾") {
+    let a = d.split(separator: "▾")
+    if a.count < 2 { return "" }
+    return String(a[1].split(separator: " ")[0])
+  }
+  let b = d.split(separator: "▸")
+  if b.count < 2 { return "" }
+  return String(b[1].split(separator: " ")[0])
 }
-func childrenOf(_ parent) -> [[String]] {
-    return agentList().filter { $0.count >= 5 && $0[3] == parent && $0[4] != "conductor" }.sorted { $0[0] < $1[0] }
+func parentOf(_ w) -> String {
+  let d = descOf(w)
+  let a = d.split(separator: "↳")
+  if a.count < 2 { return "" }
+  return String(a[1].split(separator: " ")[0])
+}
+func isChildOf(_ w, _ key) -> Bool {
+  return isOurs(w) && !isConductor(w) && parentOf(w) == key
+}
+
+// flip the collapse glyph in place — the whole toggle, no @State needed
+func toggled(_ w) -> String {
+  let d = descOf(w)
+  if d.contains("▾") {
+    let a = d.split(separator: "▾")
+    return "\(a[0])▸\(a[1])"
+  }
+  let b = d.split(separator: "▸")
+  return "\(b[0])▾\(b[1])"
 }
 
 func colorFor(_ s) -> String {
-    if s == "error" { return "#E5484D" }
-    if s == "needs-input" { return "#F5A623" }
-    if s == "review" { return "#3E63DD" }
-    if s == "working" { return "#30A46C" }
-    if s == "done" { return "#46A758" }
-    if s == "ready" { return "#3DB9A0" }
-    if s == "idle" { return "#8B8D98" }
-    return "#6F6E77"
+  if s == "error" { return "#E5484D" }
+  if s == "needs-input" { return "#F5A623" }
+  if s == "review" { return "#3E63DD" }
+  if s == "working" { return "#30A46C" }
+  if s == "done" { return "#46A758" }
+  if s == "ready" { return "#3DB9A0" }
+  if s == "idle" { return "#8B8D98" }
+  return "#6F6E77"
 }
 func iconFor(_ s) -> String {
-    if s == "error" { return "exclamationmark.triangle.fill" }
-    if s == "needs-input" { return "hand.raised.fill" }
-    if s == "review" { return "eye.fill" }
-    if s == "working" { return "gearshape.fill" }
-    if s == "done" { return "checkmark.circle.fill" }
-    if s == "ready" { return "circle.dashed" }
-    if s == "idle" { return "moon.zzz.fill" }
-    return "questionmark.circle"
+  if s == "error" { return "exclamationmark.triangle.fill" }
+  if s == "needs-input" { return "hand.raised.fill" }
+  if s == "review" { return "eye.fill" }
+  if s == "working" { return "gearshape.fill" }
+  if s == "done" { return "checkmark.circle.fill" }
+  if s == "ready" { return "circle.dashed" }
+  if s == "idle" { return "moon.zzz.fill" }
+  return "questionmark.circle"
+}
+func ctxColor(_ remain) -> String {
+  if remain > 50 { return "#30A46C" }
+  if remain > 30 { return "#F5A623" }
+  return "#E5484D"
 }
 
-func ctxColor(_ c) -> String {                              // by REMAINING context threshold
-    let d = Double(c)
-    if d == nil { return "#6F6E77" }
-    if d > 50 { return "#30A46C" }                          // green  — plenty
-    if d > 30 { return "#F5A623" }                          // amber  — watch
-    return "#E5484D"                                        // red    — recycle soon
+func hasProgress(_ w) -> Bool {
+  return w.progress != nil && w.progress.value != nil
 }
-func metaText(_ a) -> String {                              // model · effort (fields 7,8)
-    if a.count < 9 { return "" }
-    let m = (a[7] == "-" || a[7] == "") ? "" : a[7]
-    let e = a[8]
-    if m == "" { return e }
-    if e == "" { return m }
-    return "\(m) · \(e)"
+// ctx bar straight off the native progress field (paint writes value = fraction USED)
+func ctxRow(_ w) -> some View {
+  if !hasProgress(w) { return AnyView(EmptyView()) }
+  let remain = (1.0 - w.progress.value) * 100.0
+  return AnyView(HStack(spacing: 6) {
+    ProgressView(value: 1.0 - w.progress.value, total: 1.0).tint(ctxColor(remain)).frame(width: 84)
+    Text("\(Int(remain))%").font(.system(size: 10, design: .monospaced)).foregroundColor(.secondary)
+    Spacer()
+  })
 }
-func ctxRow(_ a) -> some View {
-    if a[2] == "-" { return AnyView(EmptyView()) }           // no ctx (e.g. codex/pending) -> no bar
-    let d = Double(a[2])
-    if d == nil { return AnyView(EmptyView()) }
-    let frac = d / 100.0
-    return AnyView(HStack(spacing: 7) {
-        HStack(spacing: 0) {                                // fill pushed RIGHT by the Spacer -> drains left→right
-            Spacer()
-            RoundedRectangle(cornerRadius: 3).foregroundColor(ctxColor(a[2])).frame(width: 88 * frac, height: 6)
+func lastLine(_ w) -> some View {
+  if w.latestMessage == nil { return AnyView(EmptyView()) }
+  return AnyView(Text(w.latestMessage).font(.system(size: 12)).foregroundColor(.tertiary)
+    .lineLimit(2).truncationMode(.tail))
+}
+func unreadDot(_ w) -> some View {
+  if w.unread == 0 { return AnyView(EmptyView()) }
+  return AnyView(Text("\(w.unread)").font(.system(size: 10, design: .monospaced))
+    .foregroundColor("#0A0C10").padding(.horizontal, 5).padding(.vertical, 1)
+    .background { RoundedRectangle(cornerRadius: 6).foregroundColor("#F5A623") })
+}
+
+func agentRow(_ w, _ isCon) -> some View {
+  return Button(action: { cmux("workspace.select", workspace_id: w.id) }) {
+    HStack(alignment: .top, spacing: 7) {
+      VStack(alignment: .leading, spacing: 2) {
+        HStack(spacing: 6) {
+          Image(systemName: iconFor(stateOf(w))).font(.system(size: isCon ? 13 : 11))
+            .foregroundColor(colorFor(stateOf(w)))
+          Text(w.title)
+            .font(.system(size: isCon ? 14 : 13))
+            .fontWeight(isCon ? .bold : .semibold)
+            .foregroundColor(isCon ? colorFor(stateOf(w)) : "#E8E8EC")
+            .lineLimit(1).truncationMode(.tail)
+          unreadDot(w)
         }
-        .frame(width: 88, height: 6)                         // hard-clamp height — the shape's intrinsic size inflates the row
-        .background { RoundedRectangle(cornerRadius: 3).foregroundColor("#2A2E37") }
-        Text("\(a[2])%").font(.system(size: 11, design: .monospaced)).foregroundColor(.secondary)
-        Spacer()
-        Text(metaText(a)).font(.system(size: 10, design: .monospaced)).foregroundColor("#7A7A85").lineLimit(1)
-    }.frame(height: 13))
-}
-func cwdLine(_ a) -> some View {                             // working dir (field 9)
-    if a.count < 10 { return AnyView(EmptyView()) }
-    if a[9] == "-" || a[9] == "" { return AnyView(EmptyView()) }
-    return AnyView(HStack(spacing: 4) {
-        Image(systemName: "folder").font(.system(size: 9)).foregroundColor("#6F6E77")
-        Text(a[9]).font(.system(size: 10, design: .monospaced)).foregroundColor("#7A7A85").lineLimit(1).truncationMode(.middle)
-    })
-}
-func toolIcon(_ a) -> some View {                            // tool (field 6) — small SF Symbol, no box.
-    if a.count < 7 { return AnyView(EmptyView()) }           // only mark non-claude (claude is the default)
-    if a[6] == "codex" {
-        return AnyView(Image(systemName: "chevron.left.forwardslash.chevron.right")
-            .font(.system(size: 10)).foregroundColor("#D0A46C"))
+        ctxRow(w)
+        lastLine(w)
+      }
+      Spacer()
     }
-    return AnyView(EmptyView())
-}
-func lastLine(_ a) -> some View {                            // latest message (field 10)
-    if a.count < 11 { return AnyView(EmptyView()) }
-    if a[10] == "" { return AnyView(EmptyView()) }
-    return AnyView(Text(a[10]).font(.system(size: 12)).foregroundColor(.tertiary).lineLimit(3).truncationMode(.tail))
+    .padding(5)
+    .background { RoundedRectangle(cornerRadius: 6).foregroundColor(w.selected ? "#1B2029" : (isCon ? "#14171E" : "#00000000")) }
+  }
 }
 
-func agentRow(_ a, _ isCon) -> some View {
-    return Button(action: { cmux("surface.focus", surface_id: a[5]) }) {
-        HStack(alignment: .top, spacing: 7) {
-            VStack(alignment: .leading, spacing: 2) {
-                HStack(spacing: 6) {
-                    Image(systemName: iconFor(a[1])).font(.system(size: isCon ? 13 : 11)).foregroundColor(colorFor(a[1]))
-                    Text(a[0])
-                        .font(.system(size: isCon ? 15 : 13))
-                        .fontWeight(isCon ? .bold : .semibold)
-                        .foregroundColor(isCon ? colorFor(a[1]) : "#E8E8EC")
-                        .lineLimit(1).truncationMode(.tail)
-                    toolIcon(a)
-                }
-                ctxRow(a)
-                cwdLine(a)
-                lastLine(a)
-            }
-            Spacer()
+// the chevron is its own button: flips the glyph in this workspace's description
+func chevron(_ w) -> some View {
+  return Button(action: {
+    cmux("workspace.action", workspace_id: w.id, action: "set-description", description: toggled(w))
+  }) {
+    Image(systemName: isCollapsed(w) ? "chevron.right" : "chevron.down")
+      .font(.system(size: 10)).foregroundColor("#8B8D98").frame(width: 14, height: 14)
+  }
+}
+
+// `kids` is passed in — helpers never RETURN arrays (unsupported), they only take them
+func groupView(_ c, _ kids) -> some View {
+  return VStack(alignment: .leading, spacing: 3) {
+    HStack(alignment: .top, spacing: 2) {
+      chevron(c).padding(.top, 8)
+      agentRow(c, true)
+    }
+    if isCollapsed(c) {
+      Text("\(kids.count) hidden")
+        .font(.system(size: 10, design: .monospaced)).foregroundColor("#6F6E77")
+        .padding(.leading, 26)
+    }
+    if !isCollapsed(c) {
+      VStack(alignment: .leading, spacing: 3) {
+        ForEach(kids) { k in
+          agentRow(k, false)
         }
-        .padding(5)
-        .background { RoundedRectangle(cornerRadius: 6).foregroundColor(isCon ? "#14171E" : "#00000000") }
+      }.padding(.leading, 22)
     }
-}
-
-func groupView(_ c) -> some View {
-    return VStack(alignment: .leading, spacing: 3) {
-        agentRow(c, true)
-        VStack(alignment: .leading, spacing: 3) {
-            ForEach(Array(childrenOf(c[0]).enumerated()), id: \.offset) { j, kid in
-                agentRow(kid, false)
-            }
-        }.padding(.leading, 10)
-    }
+  }
 }
 
 VStack(alignment: .leading, spacing: 8) {
-    HStack {
-        Text("⚓ Fleet").font(.system(size: 16)).bold()
-        Spacer()
-        Text("\(agentList().count)").font(.system(size: 11, design: .monospaced)).foregroundColor(.secondary)
-        Text(clock.time).font(.system(size: 11, design: .monospaced)).foregroundColor(.secondary)
+  // arrays are bound HERE, in the view body — not returned from funcs
+  let mine = workspaces.filter { isOurs($0) }
+  let leads = mine.filter { isConductor($0) }.sorted { labelOf($0) < labelOf($1) }
+
+  HStack {
+    Text("⚓ Fleet").font(.system(size: 16)).bold()
+    Spacer()
+    Text("\(mine.count)").font(.system(size: 11, design: .monospaced)).foregroundColor(.secondary)
+    Text(clock.time).font(.system(size: 11, design: .monospaced)).foregroundColor(.secondary)
+  }
+  Divider()
+
+  // self-diagnosing empty state: says WHICH stage failed instead of a bare "no data"
+  if mine.count == 0 {
+    let described = workspaces.filter { descOf($0) != "" }
+    Text("no fleet rows matched").font(.system(size: 11)).foregroundColor("#F5A623")
+    Text("workspaces: \(workspaces.count)")
+      .font(.system(size: 10, design: .monospaced)).foregroundColor("#6F6E77")
+    Text("with description: \(described.count)")
+      .font(.system(size: 10, design: .monospaced)).foregroundColor("#6F6E77")
+    ForEach(described.prefix(3)) { d in
+      Text(descOf(d)).font(.system(size: 9, design: .monospaced)).foregroundColor("#6F6E77").lineLimit(1)
     }
-    Divider()
-    if agentList().count == 0 {
-        Text("no fleet data (run: fleet paint)").font(.system(size: 12)).foregroundColor(.secondary)
-    }
-    ForEach(Array(conductors().enumerated()), id: \.offset) { i, c in
-        groupView(c)
-    }
-    Spacer().frame(height: 20)
+  }
+
+  ForEach(leads) { c in
+    groupView(c, mine.filter { isChildOf($0, labelOf(c)) }.sorted { $0.title < $1.title })
+  }
+
+  Spacer()
 }.padding(8)
