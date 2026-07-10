@@ -240,3 +240,22 @@ def test_ws_uuid_for_surface_prefers_the_live_record_over_stale_ghosts(fs, monke
     assert fleet.ws_uuid_for_surface("S") == DEAD_WS
     # surface absent entirely -> ''
     assert fleet.ws_uuid_for_surface("NOPE") == ""
+
+
+def test_poll_session_prefers_live_record_but_still_binds_a_pidless_fresh_one(fs, monkeypatch):
+    # the LAST of the six first-match reads (2026-07-10). Dict order puts the corpse first on purpose.
+    store = {"activeSessionsBySurface": {},
+             "sessions": {
+                 "ghost": {"surfaceId": "S", "sessionId": "GHOST", "updatedAt": 99, "pid": 999999},
+                 "live":  {"surfaceId": "S", "sessionId": "LIVE",  "updatedAt": 10, "pid": os.getpid()},
+             }}
+    monkeypatch.setattr(fleet, "_store", lambda: store)
+    assert fleet.poll_session("S", timeout=1) == "LIVE"        # alive beats a NEWER dead ghost
+
+    # the fallback MUST survive: a just-bound session has no pid yet. Requiring liveness would hang launch.
+    store["sessions"] = {"fresh": {"surfaceId": "S2", "sessionId": "FRESH", "updatedAt": 1, "pid": None}}
+    assert fleet.poll_session("S2", timeout=1) == "FRESH"
+
+    # the active-index pointer still short-circuits everything (unchanged contract)
+    store["activeSessionsBySurface"] = {"S2": {"sessionId": "PINNED"}}
+    assert fleet.poll_session("S2", timeout=1) == "PINNED"

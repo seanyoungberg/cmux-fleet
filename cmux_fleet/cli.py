@@ -672,15 +672,35 @@ def create_surface(spec, parent_surf, direction):
 
 
 def poll_session(surf, timeout=60):
+    """Wait for cmux to bind ANY session to `surf`, returning its id ('' on timeout).
+
+    The sessions[] fallback prefers the freshest record with an ALIVE pid, and only then falls back to
+    the freshest record of any liveness. The old form returned the FIRST surface-matching record in dict
+    order — cmux never drops a surface's dead records, so on a reseated surface that is usually a corpse,
+    and the caller binds the registry to a ghost session (the last of the six first-match reads; the
+    other five were fixed 2026-07-10).
+
+    The fallback must stay: this is the "has anything bound yet?" probe, and a just-bound session may not
+    have written its pid yet — requiring a live pid outright would hang every launch. Prefer-alive gives
+    us the ghost fix with no liveness precondition. Callers needing certainty that the bind is a LIVE
+    agent use `_live_bound_sid` (recycle's confirm), not this."""
+    from . import state as fs
     end = time.time() + timeout
     while time.time() < end:
         d = _store()
         e = (d.get("activeSessionsBySurface") or {}).get(surf) or {}
         sid = e.get("sessionId")
         if not sid:
+            live_sid, live_ts, any_sid, any_ts = "", -1.0, "", -1.0
             for s in (d.get("sessions") or {}).values():
-                if (s.get("surfaceId") or "").upper() == surf.upper():
-                    sid = s.get("sessionId"); break
+                if (s.get("surfaceId") or "").upper() != (surf or "").upper():
+                    continue
+                ts = s.get("updatedAt") or 0
+                if ts >= any_ts:
+                    any_sid, any_ts = s.get("sessionId", ""), ts
+                if fs.pid_alive(s.get("pid")) and ts >= live_ts:
+                    live_sid, live_ts = s.get("sessionId", ""), ts
+            sid = live_sid or any_sid
         if sid:
             return sid
         time.sleep(1)
