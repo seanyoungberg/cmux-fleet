@@ -1,64 +1,75 @@
-# Design note: exec the recycle launch as the pane process (kill the paste class)
+# Exec-style recycle launch (the paste class, killed)
 
-Status: **DESIGN ONLY** (cmux-advisor 2026-07-09: prove A+B first). No code implements this yet.
+Status: **IMPLEMENTED** (2026-07-09, `dev/exec-launch`), default **ON** for `fleet recycle`.
+Kill switch: `CMUX_FLEET_EXEC_LAUNCH=0|false|off` falls back to the paste path.
 
-## Problem
+## Problem (history)
 
-The recycle relaunch is a **paste**: `respawn-pane` starts a bare login shell, then we `cmux send`
-the composed launch command into it and press Enter. Everything fragile about the recycle tail lives
-in that paste:
+The recycle relaunch was a **paste**: `respawn-pane` started a bare login shell, then the launch
+command was `cmux send`-ed into it and submitted with Enter. Everything fragile about the recycle
+tail lived in that paste, and it was patched four times without removing the mechanism
+(launch-verify + never-bound sweep v0.7.0; pid-aware confirm rounds 1 and 2; the A+B+D live-pid
+confirm + TUI guard + escalation) — plus `drive-child` is an entire CLI verb invented to route
+around the same enter-race:
 
-- **Large-paste collapse.** The composed command is huge (a full inline `--settings` JSON plus
-  `--plugin-dir` flags — several KB). cmux/claude collapse it into a `[Pasted text #1]` block that can
-  render mangled and never execute. Confirmed live 2026-07-09 on berg-sandbox: fleet's flagged launch
-  (with `--model 'claude-fable-5[1m]' --effort xhigh`) sat inert in the input box while a **flagless**
-  claude (user-default model, no effort pin) filled the seat. The same session it bit a second time on
-  a different surface: a long `drive-child` brief from cmux-advisor vanished the same way.
-- **The enter-race.** The Enter can land before the paste settles; `_fire_launch` re-kicks bare Enters
-  to compensate (bounded, but still a heuristic).
-- **The self-heal.** Because a paste can silently fail, the tail needs a re-fire path — which is
-  exactly what pasted the launch into a live TUI when the confirm misdetected (fixed by B, but the
-  paste class is why the machinery exists at all).
+- **Large-paste collapse.** The composed command is huge (inline `--settings` JSON + `--plugin-dir`
+  flags, several KB). cmux/claude collapse it into a `[Pasted text #1]` block that renders mangled
+  and never executes. Bit live twice on 2026-07-09 alone: four berg-sandbox recycles (a **flagless**
+  claude on the default model filled the seat while fleet's `--model 'claude-fable-5[1m]'` launch sat
+  inert in the input box) and a vanished `drive-child` brief.
+- **The enter-race.** The Enter can land before the paste settles; `_fire_launch` re-kicks bare
+  Enters to compensate.
+- **The self-heal.** Because a paste can silently fail, the tail needed a re-fire path — which is
+  what pasted the launch into a live TUI when the confirm misdetected (B's guard now refuses that).
 
-## Proposal
+## Implementation
 
-Make the launch the **pane process itself** — no paste, no Enter, no settle race:
+The launch is delivered as the **pane process** via a **second** `respawn-pane` (`cli._exec_launch`):
 
+```python
+cmd = "/bin/zsh -ilc " + shlex.quote(guarded + "; exec /bin/zsh -il")
+cmuxq("respawn-pane", "--surface", surf, "--command", cmd)
 ```
-cmux respawn-pane --surface <S> --command "/bin/zsh -ilc '<guarded launch>'"
-```
 
-- `zsh -il` keeps the interactive login shell semantics the current design already requires (cmux
-  exposes `claude` as a zsh function via its shell integration, sourced from `~/.zshrc`; the PATH
-  guard prefix stays for the wrapper's `find_real_claude`).
-- `-c '<launch>'` executes the composed command directly. The command arrives as ONE argv element
-  through cmux's API — never rendered into a TUI input box, so there is nothing to collapse, settle,
-  or re-kick.
-- `_poll_session_back` (live-pid confirm, fix A) remains the bind verification unchanged.
+- **One `shlex.quote` layer, one argv element end-to-end** (OQ1 — live-probed SOLVED): cmuxq passes
+  argv, cmux hands `--command` verbatim to the pane spawner. `--model 'claude-fable-5[1m]'
+  --effort xhigh` and inline `{"enabledPlugins":[...]}` arrive **verbatim**; a **2898-byte** argv
+  element carrying 2810 bytes of inline JSON executed byte-exact. No second shell expansion, nothing
+  a TUI can collapse.
+- **The chained `; exec /bin/zsh -il` is NON-NEGOTIABLE** (OQ2 — live-probed, and the original
+  design note had this **wrong**): a bare `zsh -ilc '<launch>'` pane **dies with its command** — when
+  the process exits, cmux **destroys the whole surface** (`not_found: Surface not found`), so a
+  launch that crashes at startup would vaporize the seat and its surface UUID, strictly worse than
+  the paste path's recoverable bare shell. With the chain, a crashed launch degrades to exactly the
+  old bare-shell husk (`reap-surfaces` handles it) and the surface survives.
+- **Why a second respawn, not the launch on the verify respawn:** `_respawn_and_verify` must confirm
+  the OLD agent dead **before** any launch exists. If the launch rode the first respawn, the new
+  agent's live pid would poison `_confirmed_gone`'s no-live-pid check — the verify would time out and
+  the direct-kill fallback would SIGINT the agent just launched. The bare-shell respawn stays the
+  verify vehicle; `_exec_launch` replaces only the delivery.
+- **B carries over as defense-in-depth:** `respawn-pane` kills the pane process, so `_exec_launch`
+  refuses to fire when an agent TUI (or resume menu) is already up — same guard, worse blast radius
+  without it. `_fire_launch` remains intact as (a) the `CMUX_FLEET_EXEC_LAUNCH=0` fallback and (b)
+  the automatic degradation when the exec respawn itself errors. `prime`, `drive-child`, and the
+  resume-menu keystrokes still `send` — unchanged.
+- **A is untouched:** `_poll_session_back`'s live-pid confirm remains the bind verification.
+- **No self-heal on the exec path, by design:** `-c` runs after shell init completes, so the
+  PATH-not-ready crash class can't happen; a no-bind after an exec'd launch is a real failure that
+  escalates (D) rather than being papered over by a re-exec.
 
-## What it deletes
+## Remaining open questions (watch on first live runs)
 
-`_fire_launch` (paste + enter + re-kick loop), the self-heal re-fire, and the whole
-launch-as-inert-draft failure class the 07-04/07-07/07-09 incidents share. The B guard stays as
-defense-in-depth for the resume-menu path and any residual send-based flows (prime, drive-child).
+- **OQ3 — shell-init timing:** `-ilc` should *eliminate* the PATH-not-ready class (the command runs
+  after `.zshrc`); the PATH-guard prefix is kept anyway. Verify on a cold machine.
+- **OQ4 — the `--resume` summary-vs-full menu on an exec'd pane:** `_resume_and_gate` drives it via
+  send-keys after the launch; capture-pane is proven on exec'd panes and send-keys is the same
+  primitive family, but **watch the first live berg-sandbox resume-recycle with `recycle.log`
+  tailing** — this is the one that matters.
+- **OQ5 — codex lazy-bind:** the exec path is tool-agnostic (same composed command); the lazy branch
+  never polls. Validate on the first codex recycle.
 
-## Open questions to validate live before adoption
+## Retirement plan
 
-1. **Quoting.** The composed `send_cmd` contains single quotes (`--model 'claude-fable-5[1m]'`) and
-   inline JSON. Embedding it in `zsh -ilc '<...>'` needs one shlex-quote layer; cmux passes
-   `--command` verbatim to the pane spawner, so validate no second shell expansion happens en route.
-2. **Exit semantics.** Today the shell survives a crashed launch (the self-heal re-fires into it).
-   With exec-style launch, a crash ends the pane process — confirm cmux leaves a respawnable pane
-   (and that `_escalate_recycle_failure` fires on the no-bind WARN as the recovery signal).
-3. **Shell-init timing.** `-c` runs after `.zshrc` completes, which should *eliminate* the
-   PATH-not-ready class the guard prefix works around — verify on a cold machine.
-4. **Resume menu.** `--resume <id>` boots into the summary-vs-full menu; `_resume_and_gate` drives it
-   via send-keys today and is unaffected, but re-test the interaction with an exec'd pane.
-5. **Codex/other tools.** Same exec shape should work (`codex resume <id> ...`); validate the lazy
-   bind path still registers on first turn.
-
-## Migration sketch
-
-Feature-flag it (`CMUX_FLEET_EXEC_LAUNCH=1`) in `_recycle_exec_one` only; A/B machinery stays as the
-fallback path. Promote to default after a week of live recycles across claude + codex seats; then
-delete the paste path.
+After a week of live recycles across claude + codex seats with no `CMUX_FLEET_EXEC_LAUNCH=0`
+fallback needed: delete `_fire_launch`'s recycle callsites + the paste self-heal (the launch verb's
+`_send_launch_and_confirm` is a separate path and out of scope here).

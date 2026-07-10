@@ -3746,6 +3746,51 @@ def _fire_launch(surf, guarded, log):
     return True
 
 
+def _exec_launch_enabled():
+    """C feature flag, default ON for recycle: the launch is delivered as the pane PROCESS
+    (_exec_launch), not a paste. Set CMUX_FLEET_EXEC_LAUNCH=0|false|off to fall back to the paste path
+    (_fire_launch) — kept as the fallback while OQ3/OQ4/OQ5 (shell-init timing, the resume menu on an
+    exec'd pane, codex lazy-bind) accumulate live proof."""
+    return os.environ.get("CMUX_FLEET_EXEC_LAUNCH", "1").strip().lower() not in ("0", "false", "off")
+
+
+def _exec_launch(surf, guarded, log):
+    """C: deliver the launch as the PANE PROCESS via a SECOND respawn-pane — no paste, no Enter, no
+    settle race, no re-kick, no self-heal. The command travels as ONE argv element end-to-end (cmuxq
+    passes argv; cmux hands --command to the pane spawner verbatim; live probe 2026-07-09: a 2898-byte
+    element with 2810 bytes of inline JSON executed byte-exact), so there is nothing a TUI can collapse
+    — the '[Pasted text #1]' class that ate four berg-sandbox recycles and a drive-child brief in one
+    day is structurally gone.
+
+    WHY A SECOND RESPAWN (not the launch on the verify respawn): _respawn_and_verify must confirm the
+    OLD agent dead before any launch exists. If the launch rode the first respawn, the NEW agent's live
+    pid would poison _confirmed_gone's no-live-pid check — the verify would time out and the direct-kill
+    fallback would SIGINT the agent we just launched. The bare-shell respawn stays the verify vehicle;
+    this call then replaces only the delivery of the launch into it.
+
+    TRAP (live-reproduced by cmux-advisor): a bare `zsh -ilc '<launch>'` pane DIES WITH ITS COMMAND —
+    cmux destroys the whole SURFACE on exit ('not_found: Surface not found'), so a launch that crashes
+    at startup would vaporize the seat and its surface UUID. The chained `; exec /bin/zsh -il` is
+    NON-NEGOTIABLE: an exiting launch degrades to exactly the old recoverable bare-shell husk
+    (reap-surfaces knows it), never a destroyed surface.
+
+    Same TUI-up guard as _fire_launch (B, defense-in-depth): respawn-pane KILLS the pane process, so
+    firing it over a live agent that appeared between the verify and this call (a cmux restart-resume)
+    would destroy it — refuse instead; the A confirm then recognizes the live seat or the WARN
+    escalates. A respawn-pane ERROR falls back to the proven paste path rather than leaving a bare
+    shell with no launch at all. Returns True iff a launch was delivered by either mechanism."""
+    if _agent_surfaced(surf) or _resume_menu_visible(surf):
+        log("SKIP exec-launch: an agent TUI is already up on this surface — never respawn over a live agent")
+        return False
+    log("exec-launch: respawning the pane with the launch as its process (no paste)")
+    cmd = "/bin/zsh -ilc " + shlex.quote(guarded + "; exec /bin/zsh -il")
+    out = cmuxq("respawn-pane", "--surface", surf, "--command", cmd)
+    if "error" in (out or "").lower():
+        log(f"exec-launch: respawn-pane -> {(out or '').strip()!r}; falling back to the paste path")
+        return _fire_launch(surf, guarded, log)
+    return True
+
+
 def _escalate_recycle_failure(label, surf, mode, reason, detail):
     """Route a recycle failure to an ACTOR, not just the log. The pre-existing 'recycle FAILED' banner
     targets the failed seat's OWN surface — which is a dead shell or an untracked agent at exactly that
@@ -3927,7 +3972,10 @@ def _recycle_exec_one(p):
     # LIVE-PID-resolved (_live_bound_sid via _poll_session_back), so cmux's undropped stale sessions[]
     # entry — a DEAD pid by this point, the respawn was just verified — can never false-confirm, and no
     # exclusion set is needed.)
-    _fire_launch(surf, guarded, log)
+    if _exec_launch_enabled():
+        _exec_launch(surf, guarded, log)                 # C: the launch IS the pane process (no paste)
+    else:
+        _fire_launch(surf, guarded, log)                 # legacy paste path (CMUX_FLEET_EXEC_LAUNCH=0)
 
     # CONFIRM is tool-aware. claude binds a session at BOOT -> poll for it (a NEW sid for fresh, the
     # surface live again for resume). codex (and others) bind LAZILY on their first turn AND fire no
@@ -3963,14 +4011,16 @@ def _recycle_exec_one(p):
                                           "unregistered; re-run fleet recycle once it settles")
                 return 1
         sid = _poll_session_back(surf, old_sid, mode, 90)
-        if not sid and mode == "fresh":
-            # SELF-HEAL: the launch likely crashed into the bare shell (e.g. PATH not ready -> wrapper
-            # 'claude not found'). The shell is fully initialized by now, so re-fire ONCE -- mirrors the
-            # manual recovery (re-running the same command succeeds) instead of leaving a dead pane.
+        if not sid and mode == "fresh" and not _exec_launch_enabled():
+            # SELF-HEAL (PASTE PATH ONLY): the paste can crash into the bare shell (PATH not ready ->
+            # wrapper 'claude not found'); the shell is fully initialized by now, so re-fire ONCE.
             # _fire_launch's TUI-up guard makes this NON-DESTRUCTIVE: if an agent is already live on the
             # seat (a confirm miss, an old-sid zombie, a cmux restart-resume), the re-fire is refused
             # instead of pasting the launch into its input box (berg-sandbox 2026-07-09) — we fall
             # through to WARN + escalation and let an actor decide.
+            # The EXEC path has no self-heal by design: `-c` runs after shell init completes (the
+            # PATH-not-ready class can't happen), and a crashed launch leaves the chained bare shell —
+            # a no-bind there is a REAL failure that should escalate, not be papered over by a re-exec.
             log("no fresh session bound; attempting ONE self-heal re-fire (refused if a TUI is up)")
             if _fire_launch(surf, guarded, log):
                 sid = _poll_session_back(surf, old_sid, mode, 60)

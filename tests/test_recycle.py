@@ -256,19 +256,24 @@ def _base_payload(surf="S", old_sid="OLD"):
             "tool": "claude", "force": True, "prime": None, "old_session": old_sid, "cwd": "/x"}
 
 
+def _exec_respawns(calls):
+    """The respawn-pane calls that CARRY a launch (C's delivery: `/bin/zsh -ilc '<launch>...'`), as
+    opposed to the verify's bare-shell respawn (`exec /bin/zsh -il`, no -c). 'The launch fired' on the
+    default exec path == exactly one of these."""
+    return [c for c in calls if c and c[0] == "respawn-pane" and any("-ilc" in str(x) for x in c)]
+
+
 def test_verify_waits_out_a_slow_kill_before_launching(fs, monkeypatch):
     # lifecycle reads non-terminal (old claude still alive) for two polls, THEN flips to 'ended' -- the
-    # launch must not fire until that flip, proving a poll rather than a fixed sleep.
+    # launch (the exec respawn) must not fire until that flip, proving a poll rather than a fixed sleep.
     from cmux_fleet import state as fleet_state
     fleet_state.live_put("w", {"role": "w", "tool": "claude", "surface": "S", "cwd": "/x",
                                "session": "claude-OLD", "kind": "child"})
     monkeypatch.setattr(fleet.time, "sleep", lambda *_: None)
-    sent = []
+    calls = []
     def fake_cmuxq(*a, **k):
-        if a and a[0] == "respawn-pane":
-            return "OK"
-        sent.append(a)
-        return ""
+        calls.append(a)
+        return "OK" if a and a[0] == "respawn-pane" else ""
     monkeypatch.setattr(fleet, "cmuxq", fake_cmuxq)
     monkeypatch.setattr(fleet, "poll_session", lambda surf, timeout=1: "")
     monkeypatch.setattr(fleet, "_poll_session_back", lambda *a, **k: "NEWSID")
@@ -281,8 +286,9 @@ def test_verify_waits_out_a_slow_kill_before_launching(fs, monkeypatch):
     monkeypatch.setattr(fleet_state, "lifecycle", lambda surf: next(states, "ended"))
     assert fleet._recycle_exec_one(_base_payload()) == 0
     assert next(states, "exhausted") == "exhausted"          # all 3 readings were consumed by the poll
-    assert any(c[0] == "send" for c in sent)                 # the launch DID fire, once confirmed dead
-    assert not any(c[0] == "notify" for c in sent)
+    assert len(_exec_respawns(calls)) == 1                   # the launch DID fire, once confirmed dead
+    assert not any(c[0] == "send" for c in calls)            # ...as the pane process, never a paste
+    assert not any(c[0] == "notify" for c in calls)
 
 
 def test_respawn_error_falls_back_to_direct_kill_then_succeeds(fs, monkeypatch):
@@ -312,9 +318,9 @@ def test_respawn_error_falls_back_to_direct_kill_then_succeeds(fs, monkeypatch):
     killed = []
     monkeypatch.setattr(fleet.os, "kill", lambda pid, sig: killed.append((pid, sig)))
     assert fleet._recycle_exec_one(_base_payload()) == 0
-    assert len(respawn_calls) == 2                            # primary attempt + fallback re-respawn
+    assert len(respawn_calls) == 3                            # verify attempt + fallback re-respawn + the exec LAUNCH
+    assert len(_exec_respawns(respawn_calls)) == 1            # launch fired after the fallback confirmed
     assert killed == [(4242, signal.SIGINT), (4242, signal.SIGINT)]   # SIGINT x2, cmux-independent
-    assert any(c[0] == "send" for c in other_calls)            # launch fired after the fallback confirmed
     assert not any(c[0] == "notify" for c in other_calls)      # not an abort
 
 
@@ -335,7 +341,8 @@ def test_respawn_fails_even_after_fallback_aborts_without_launch(fs, monkeypatch
     logged = []
     monkeypatch.setattr(fleet_state, "log_event", lambda event, **fields: logged.append((event, fields)))
     assert fleet._recycle_exec_one(_base_payload()) == 1
-    assert not any(c[0] == "send" for c in calls)              # launch NEVER sent
+    assert not any(c[0] == "send" for c in calls)              # launch NEVER sent...
+    assert _exec_respawns(calls) == []                         # ...and never exec'd either (abort pre-launch)
     assert any(c[0] == "notify" for c in calls)                # desktop banner fired
     assert logged and logged[0][0] == "recycle_abort"
 
@@ -351,12 +358,10 @@ def test_dead_agent_frozen_running_pid_none_recycles_without_force(fs, monkeypat
     fleet_state.live_put("w", {"role": "w", "tool": "claude", "surface": "S", "cwd": "/x",
                                "session": "claude-OLD", "kind": "child"})
     monkeypatch.setattr(fleet.time, "sleep", lambda *_: None)
-    sent = []
+    calls = []
     def fake_cmuxq(*a, **k):
-        if a and a[0] == "respawn-pane":
-            return "OK"
-        sent.append(a)
-        return ""
+        calls.append(a)
+        return "OK" if a and a[0] == "respawn-pane" else ""
     monkeypatch.setattr(fleet, "cmuxq", fake_cmuxq)
     # THE incident fingerprint: lifecycle frozen NON-terminal 'running', but the process is DEAD.
     monkeypatch.setattr(fleet_state, "lifecycle", lambda surf: "running")
@@ -373,8 +378,8 @@ def test_dead_agent_frozen_running_pid_none_recycles_without_force(fs, monkeypat
     payload = {"label": "w", "surface": "S", "send_cmd": "cd /x && claude", "mode": "fresh",
                "tool": "claude", "force": False, "prime": None, "old_session": "OLD", "cwd": "/x"}
     assert fleet._recycle_exec_one(payload) == 0
-    assert any(c[0] == "send" for c in sent)                  # launch DID fire (confirmed + relaunched)
-    assert not any(c[0] == "notify" for c in sent)            # NOT the abort path
+    assert len(_exec_respawns(calls)) == 1                    # launch DID fire (confirmed + relaunched)
+    assert not any(c[0] == "notify" for c in calls)           # NOT the abort path
     assert not any(e[0] == "recycle_abort" for e in logged)   # never aborted
     assert fleet_state.live_get("w")["session"] == "claude-NEWSID"
 
@@ -404,6 +409,7 @@ def test_dead_agent_recycle_refuses_when_old_pid_still_alive(fs, monkeypatch):
                "tool": "claude", "force": True, "prime": None, "old_session": "OLD", "cwd": "/x"}
     assert fleet._recycle_exec_one(payload) == 1                  # ABORT
     assert not any(c[0] == "send" for c in calls)                # never typed the launch into the live TUI
+    assert _exec_respawns(calls) == []                           # ...and never respawned over it either
     assert any(e[0] == "recycle_abort" for e in logged)
 
 
@@ -429,7 +435,8 @@ def test_direct_kill_skips_quietly_with_no_known_pid(fs, monkeypatch):
     monkeypatch.setattr(fleet.os, "kill", lambda pid, sig: killed.append((pid, sig)))
     assert fleet._recycle_exec_one(_base_payload()) == 0
     assert killed == []                                        # no pid -> no kill attempted
-    assert len(respawn_calls) == 2
+    assert len(respawn_calls) == 3                             # verify attempt + re-respawn + the exec launch
+    assert len(_exec_respawns(respawn_calls)) == 1
 
 
 # --- Part 1: _fire_launch must VERIFY the ENTER submitted -- RE-KICK the Enter, NEVER re-send the paste.
@@ -442,8 +449,11 @@ def _run_recycle_counting_keys(monkeypatch, surfaced_seq):
     """Run ONE fresh recycle to a clean bind, driving _agent_surfaced by `surfaced_seq` (bool per check)
     with _resume_menu_visible always False. A False is PREPENDED for _fire_launch's TUI-up GUARD (the
     pre-paste never-type-into-a-live-agent check), so `surfaced_seq` keeps describing the POST-paste
-    submission checks the kick counts are about. Returns (n_send_text, n_sendkey_enter)."""
+    submission checks the kick counts are about. PINS the exec-launch flag OFF: this harness tests the
+    PASTE path's enter-race machinery, which C keeps as the explicit fallback.
+    Returns (n_send_text, n_sendkey_enter)."""
     from cmux_fleet import state as fleet_state
+    monkeypatch.setenv("CMUX_FLEET_EXEC_LAUNCH", "0")
     fleet_state.live_put("w", {"role": "w", "tool": "claude", "surface": "S", "cwd": "/x",
                                "session": "claude-OLD", "kind": "child"})
     monkeypatch.setattr(fleet.time, "sleep", lambda *_: None)
@@ -521,9 +531,11 @@ def test_no_session_after_launch_escalates_and_never_pastes_into_live_tui(fs, mo
 
 
 def test_no_session_after_launch_self_heal_preserved_on_bare_shell(fs, monkeypatch):
-    # the self-heal's legit case is intact: seat stays a BARE SHELL (nothing surfaced) -> initial fire
-    # + exactly ONE re-fire (the PATH-not-ready crash recovery), then WARN + escalate.
+    # the PASTE path's self-heal stays intact (flag pinned off — on the exec path there is no self-heal
+    # by design): seat stays a BARE SHELL (nothing surfaced) -> initial fire + exactly ONE re-fire (the
+    # PATH-not-ready crash recovery), then WARN + escalate.
     from cmux_fleet import state as fleet_state
+    monkeypatch.setenv("CMUX_FLEET_EXEC_LAUNCH", "0")
     fleet_state.live_put("w", {"role": "w", "tool": "claude", "surface": "S", "cwd": "/x",
                                "session": "claude-OLD", "kind": "child"})
     monkeypatch.setattr(fleet.time, "sleep", lambda *_: None)
@@ -701,3 +713,109 @@ def test_recycle_resume_ok_when_checkpoint_present(monkeypatch):
     monkeypatch.setattr(fleet.subprocess, "Popen", lambda *a, **k: None)    # don't actually spawn
     rc = fleet.cmd_recycle(["w"])                                           # must NOT fail-loud
     assert rc == 0
+
+
+# --- C: exec-style launch — the launch IS the pane process; the paste class is structurally dead -----
+def test_exec_launch_command_shape_and_no_paste(monkeypatch):
+    # the exact live-probed shape: ONE argv element, "/bin/zsh -ilc " + shlex.quote(inner), with the
+    # NON-NEGOTIABLE chained `; exec /bin/zsh -il` (a bare -ilc pane DIES WITH ITS COMMAND and cmux
+    # destroys the whole surface — live-reproduced). Zero send/send-key: nothing to collapse or settle.
+    import shlex
+    calls = []
+    monkeypatch.setattr(fleet, "cmuxq", lambda *a, **k: calls.append(a) or "OK")
+    monkeypatch.setattr(fleet, "_agent_surfaced", lambda surf: False)
+    monkeypatch.setattr(fleet, "_resume_menu_visible", lambda surf: False)
+    assert fleet._exec_launch("S", "cd /x && claude --model 'claude-fable-5[1m]'", lambda m: None) is True
+    respawns = [c for c in calls if c[0] == "respawn-pane"]
+    assert len(respawns) == 1
+    cmd = respawns[0][respawns[0].index("--command") + 1]
+    assert cmd == "/bin/zsh -ilc " + shlex.quote(
+        "cd /x && claude --model 'claude-fable-5[1m]'; exec /bin/zsh -il")
+    assert not any(c[0] in ("send", "send-key") for c in calls)   # no paste, no Enter, no re-kick
+
+
+def test_exec_launch_guard_refuses_over_live_tui(monkeypatch):
+    # B carries over: respawn-pane KILLS the pane process, so exec-launch over a live agent (a cmux
+    # restart-resume appearing between verify and launch) would DESTROY it. Refuse before any call.
+    calls = []
+    monkeypatch.setattr(fleet, "cmuxq", lambda *a, **k: calls.append(a) or "OK")
+    monkeypatch.setattr(fleet, "_agent_surfaced", lambda surf: True)
+    monkeypatch.setattr(fleet, "_resume_menu_visible", lambda surf: False)
+    assert fleet._exec_launch("S", "cd /x && claude", lambda m: None) is False
+    assert calls == []                                            # not one keystroke, not one respawn
+
+
+def test_exec_launch_falls_back_to_paste_on_respawn_error(monkeypatch):
+    # an erroring respawn-pane (wedged cmux) degrades to the PROVEN paste path rather than leaving a
+    # bare shell with no launch at all.
+    monkeypatch.setattr(fleet, "cmuxq", lambda *a, **k: "Error: Command timed out")
+    monkeypatch.setattr(fleet, "_agent_surfaced", lambda surf: False)
+    monkeypatch.setattr(fleet, "_resume_menu_visible", lambda surf: False)
+    fired = []
+    monkeypatch.setattr(fleet, "_fire_launch", lambda surf, guarded, log: fired.append(guarded) or True)
+    assert fleet._exec_launch("S", "cd /x && claude", lambda m: None) is True
+    assert fired == ["cd /x && claude"]                           # paste fallback carried the launch
+
+
+def test_exec_launch_enabled_flag_values(monkeypatch):
+    for off in ("0", "false", "OFF", " False "):
+        monkeypatch.setenv("CMUX_FLEET_EXEC_LAUNCH", off)
+        assert fleet._exec_launch_enabled() is False
+    for on in ("1", "true", "", "yes"):
+        monkeypatch.setenv("CMUX_FLEET_EXEC_LAUNCH", on)
+        assert fleet._exec_launch_enabled() is True
+    monkeypatch.delenv("CMUX_FLEET_EXEC_LAUNCH")
+    assert fleet._exec_launch_enabled() is True                   # default ON
+
+
+def test_exec_path_no_self_heal_refire_but_still_escalates(fs, monkeypatch):
+    # the exec path has NO self-heal by design: a no-bind after an exec'd launch is a REAL failure ->
+    # exactly ONE exec respawn (no re-exec, no paste), then WARN + escalation to the parent.
+    from cmux_fleet import state as fleet_state
+    fleet_state.live_put("parent", {"role": "c", "kind": "conductor", "surface": "PARENT"})
+    fleet_state.live_put("w", {"role": "w", "tool": "claude", "surface": "S", "cwd": "/x",
+                               "session": "claude-OLD", "kind": "child", "parent": "parent"})
+    monkeypatch.setattr(fleet.time, "sleep", lambda *_: None)
+    calls = []
+    def fake_cmuxq(*a, **k):
+        calls.append(a)
+        return "OK" if a and a[0] == "respawn-pane" else ""
+    monkeypatch.setattr(fleet, "cmuxq", fake_cmuxq)
+    monkeypatch.setattr(fleet, "_quiet_gate", lambda *a, **k: True)
+    monkeypatch.setattr(fleet_state, "lifecycle", lambda surf: "ended")
+    monkeypatch.setattr(fleet, "_poll_session_back", lambda *a, **k: "")      # nothing ever binds
+    monkeypatch.setattr(fleet, "_agent_surfaced", lambda surf: False)         # bare shell (crashed launch)
+    monkeypatch.setattr(fleet, "_resume_menu_visible", lambda surf: False)
+    monkeypatch.setattr(fleet_state, "wake_if_idle", lambda surf, msg: False)
+    logged = []
+    monkeypatch.setattr(fleet_state, "log_event", lambda event, **f: logged.append((event, f)))
+    assert fleet._recycle_exec_one(_base_payload()) == 0
+    assert len(_exec_respawns(calls)) == 1                        # ONE exec launch, never a re-exec
+    assert not any(c[0] == "send" for c in calls)                 # and never a paste
+    assert any(e == "recycle_abort" and f["reason"] == "no-session-after-launch" for e, f in logged)
+    rows = fleet_state.inbox_pending("PARENT", kind="doctor")
+    assert rows and rows[0]["failure"] == "no-session-after-launch"   # the actor was told (D)
+
+
+def test_recycle_uses_exec_launch_by_default_end_to_end(fs, monkeypatch):
+    # default ON: a clean fresh recycle delivers the launch via the exec respawn (2 respawn-pane calls:
+    # the verify bare-shell + the launch) with ZERO pastes, and binds the registry off A's confirm.
+    from cmux_fleet import state as fleet_state
+    fleet_state.live_put("w", {"role": "w", "tool": "claude", "surface": "S", "cwd": "/x",
+                               "session": "claude-OLD", "kind": "child"})
+    monkeypatch.setattr(fleet.time, "sleep", lambda *_: None)
+    calls = []
+    def fake_cmuxq(*a, **k):
+        calls.append(a)
+        return "OK" if a and a[0] == "respawn-pane" else ""
+    monkeypatch.setattr(fleet, "cmuxq", fake_cmuxq)
+    monkeypatch.setattr(fleet, "_quiet_gate", lambda *a, **k: True)
+    monkeypatch.setattr(fleet_state, "lifecycle", lambda surf: "ended")
+    monkeypatch.setattr(fleet, "_agent_surfaced", lambda surf: False)
+    monkeypatch.setattr(fleet, "_resume_menu_visible", lambda surf: False)
+    monkeypatch.setattr(fleet, "_poll_session_back", lambda *a, **k: "NEWSID")
+    assert fleet._recycle_exec_one(_base_payload()) == 0
+    respawns = [c for c in calls if c[0] == "respawn-pane"]
+    assert len(respawns) == 2 and len(_exec_respawns(respawns)) == 1
+    assert not any(c[0] in ("send",) for c in calls)              # the paste class is dead on this path
+    assert fleet_state.live_get("w")["session"] == "claude-NEWSID"

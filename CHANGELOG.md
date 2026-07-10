@@ -6,6 +6,21 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Changed
+
+- **Recycle launch is exec-style — the paste class is dead.** The relaunch is now delivered as the pane
+  PROCESS via a second `respawn-pane` (`/bin/zsh -ilc '<launch>; exec /bin/zsh -il'`), not a paste into
+  a shell: the command travels as one argv element end-to-end, so the `[Pasted text #1]` large-paste
+  collapse, the enter-race, and the self-heal re-fire cannot happen on this path (live probe: a
+  2898-byte command executed byte-exact). The chained trailing shell is load-bearing — a bare `-ilc`
+  pane dies WITH its command and cmux destroys the whole surface, so the chain makes a crashed launch
+  degrade to the old recoverable bare-shell husk instead. The old agent is still verified dead on a
+  bare-shell respawn BEFORE the launch exists (keeping the live-pid confirm semantics intact), and the
+  TUI-up guard carries over (a respawn over a live agent would destroy it — refuse + escalate). Default
+  ON for `fleet recycle`; `CMUX_FLEET_EXEC_LAUNCH=0` falls back to the paste path, which also remains
+  the automatic degradation on a respawn-pane error. `prime`/`drive-child`/resume-menu keystrokes still
+  `send`. See `docs/design-exec-launch.md` (now IMPLEMENTED, with the corrected exit-semantics finding).
+
 ### Fixed
 
 - **Recycle: fresh confirm is live-pid-resolved** — `_poll_session_back` fresh mode now confirms on the
@@ -36,11 +51,6 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   reminder) has surfaced within `HEARTBEAT_REMIND_S`, and a genuinely-ignored unacked row still gets a
   reminder once the window elapses. Kills the heartbeat re-waking a row a direct peer/doctor/completion
   wake or a drain block already put in front of the agent. (audit fix-order #4)
-
-### Added
-
-- **Design note: exec the recycle launch as the pane process** (`docs/design-exec-launch.md`) — kill the
-  paste class (`respawn-pane --command "/bin/zsh -ilc '<launch>'"`); design-only pending A+B field proof.
 
 ## [0.9.0] - 2026-07-08
 
