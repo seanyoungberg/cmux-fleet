@@ -1145,6 +1145,17 @@ def _is_descriptor(desc):
     return any(f"{DESC_SEP}{g}" in d for g in (DESC_CHILD, DESC_OPEN, DESC_SHUT))
 
 
+def _progress_label(r, pct, shared=False):
+    """The ctx bar's caption. Carries model·effort, which are NOT native cmux fields — they'd otherwise
+    have to lengthen the workspace subtitle. Reads as prose under the bar: 'fable-5 · xhigh · 63% left'.
+    The agent's name is prepended only on a SHARED workspace, where the title can't disambiguate it."""
+    model = _short_model(r.get("model") or "")
+    effort = r.get("effort") or ""
+    meta = " · ".join(x for x in (model, effort) if x and x != "-")
+    who = f"{r['label']} · " if shared else ""
+    return f"{who}{meta} · {pct}% left" if meta else f"{who}{pct}% left"
+
+
 def _paint(rows, sidebar_blob=False):
     """Push the live fleet onto the cmux BUILT-IN sidebar as native widgets:
       • one status PILL PER AGENT, keyed by the agent's label — so children that SHARE a conductor's
@@ -1167,7 +1178,7 @@ def _paint(rows, sidebar_blob=False):
             continue
         ws_count[ws] = ws_count.get(ws, 0) + 1
         if pct is not None and (ws not in worst or pct < worst[ws][0]):
-            worst[ws] = (pct, r["label"])
+            worst[ws] = (pct, r)                              # keep the row -> the bar caption reads its model·effort
     # per-agent status pills — unique key per (workspace, label) so they coexist instead of clobbering.
     for r in rows:
         ws = r["ws"]
@@ -1191,14 +1202,20 @@ def _paint(rows, sidebar_blob=False):
         _cmux("set-status", r["label"], val, "--icon", icon, "--color", color,
               "--priority", str(100 - rank), "--workspace", ws)
         painted += 1
-    # one ctx bar per workspace = its worst agent (paint once per ws, keyed apart from pills).
-    for ws, (pct, lbl) in worst.items():
+    # one ctx bar per workspace = its worst agent (paint once per ws, keyed apart from pills). The bar's
+    # LABEL is a SECOND free-text channel: it renders as the caption under the bar in the built-in sidebar
+    # (and binds as w.progress.label in a custom one), so model·effort ride HERE rather than lengthening
+    # the workspace subtitle. The fingerprint covers the label too, or an effort change at unchanged ctx%
+    # would never repaint.
+    for ws, (pct, r) in worst.items():
         key = f"prog{_SEP}{ws}"
         prog = f"{(100 - pct) / 100:.2f}"
-        cur[key] = prog
-        if prev.get(key) == prog:
+        label = _progress_label(r, pct, shared=ws_count.get(ws, 1) > 1)
+        fp = f"{prog}|{label}"
+        cur[key] = fp
+        if prev.get(key) == fp:
             continue
-        _cmux("set-progress", prog, "--label", f"{lbl} {pct}% left", "--workspace", ws)
+        _cmux("set-progress", prog, "--label", label, "--workspace", ws)
         painted += 1
     # emit the fleet board for the custom sidebar (fleet.swift) — it can't read pills, only workspace
     # fields, so the board rides in workspace DESCRIPTIONS as a full CLI-derived record (`_fleet_blobs`):
