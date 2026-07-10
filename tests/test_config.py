@@ -16,7 +16,7 @@ from conftest import REPO
 _DUMP = textwrap.dedent("""
     import json
     from cmux_fleet import config
-    keys = ["ROOT","STATE","CMUX","FLOOR","HOOKSTORE","ADHOC_SUBDIR","FLEET_TOML","TOML_DIR"]
+    keys = ["ROOT","STATE","CMUX","FLOOR","HOOKSTORE","ADHOC_SUBDIR","FLEET_TOML","TOML_DIR","SIDEBAR_PAINT"]
     print(json.dumps({k: getattr(config, k) for k in keys}))
 """)
 
@@ -128,3 +128,19 @@ def test_absent_toml_is_silent(tmp_path):
 def test_cmux_bin_bare_name_not_anchored(tmp_path):
     c, _ = _resolve(env={"CMUX_BIN": "mycmux"}, toml_text="[fleet]\n", toml_dir=str(tmp_path))
     assert c["CMUX"] == "mycmux"  # _resolve (not _resolve_path): no TOML_DIR join
+
+
+# --- sidebar_paint: the daemon auto-repaint gate (OFF by default; never pollutes a public install) ---
+def test_sidebar_paint_default_off():
+    c, _ = _resolve()
+    assert c["SIDEBAR_PAINT"] is False              # no config -> daemon must not write blob descriptions
+
+def test_sidebar_paint_env_on_and_off():
+    c, _ = _resolve(env={"CMUX_FLEET_SIDEBAR_PAINT": "1"})
+    assert c["SIDEBAR_PAINT"] is True
+    c, _ = _resolve(env={"CMUX_FLEET_SIDEBAR_PAINT": "0"})
+    assert c["SIDEBAR_PAINT"] is False              # a falsey value stays off
+
+def test_sidebar_paint_toml_true(tmp_path):
+    c, _ = _resolve(toml_text='[fleet]\nsidebar_paint = true\n', toml_dir=str(tmp_path))
+    assert c["SIDEBAR_PAINT"] is True

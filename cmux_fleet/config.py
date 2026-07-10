@@ -102,6 +102,13 @@ ADHOC_SUBDIR = _resolve("CMUX_FLEET_ADHOC_SUBDIR",   "adhoc_subdir",   "_meta/ag
 # (a fleet usually runs one window, so one knob is right; the model string can't tell 200k from 1M).
 CONTEXT_WINDOW = int(_resolve("CMUX_FLEET_CONTEXT_WINDOW", "context_window", "0") or "0")
 
+# Daemon sidebar auto-repaint: when truthy, the daemon periodically runs `fleet paint --sidebar` so the
+# custom fleet.swift sidebar stays live (state/ctx/model/last don't go stale between manual paints). OFF by
+# default — it writes a FLEET record into each agent workspace's DESCRIPTION, which shows as a subtitle in
+# the BUILT-IN sidebar, so only opt in when you actually run the custom sidebar. env > [fleet].sidebar_paint.
+SIDEBAR_PAINT = str(_resolve("CMUX_FLEET_SIDEBAR_PAINT", "sidebar_paint", "")).strip().lower() in (
+    "1", "true", "yes", "on")
+
 # The plugin INDEX (plugins.toml): env > [fleet].plugin_index > <toml-dir>/plugins.toml. Absent file ->
 # empty index (never an error). This is a SEPARATE file from the roster fleet.toml so the machine-
 # reconciled index and the hand-authored roster own themselves (design §2d). Resolution reads both.

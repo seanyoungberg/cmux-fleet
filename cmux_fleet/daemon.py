@@ -29,7 +29,7 @@ import subprocess
 import sys
 import time
 
-from .config import STATE
+from .config import STATE, SIDEBAR_PAINT
 
 # The router is spawned as a module (`python -m cmux_fleet.router`) so it resolves THIS install's
 # package no matter where the tool venv lives — a plain file path wouldn't survive the package move.
@@ -47,6 +47,8 @@ HEARTBEAT_REMIND_S = 1800    # presentation cooldown (audit fix #4): a row a dir
                              # this long. ~3 default ticks: a genuinely-ignored row still gets a reminder,
                              # but the heartbeat stops re-nudging every tick for rows the agent has seen.
 USAGE_POLL_S = 180                                   # providers feature: refresh subscription-usage snapshot ~every 3 min
+PAINT_POLL_S = 4             # sidebar feature: repaint the fleet board ~every 4s when [fleet].sidebar_paint is set
+                             # (on-change-only via features.PAINT_STATE, so an idle fleet costs a snapshot + diff)
 HEALTH_STALE_S = 60          # a live router silent on the bus longer than this (bus HB ~15s) is WEDGED
 HEALTH_CHECK_S = 30          # how often the supervisor re-checks the router is still consuming the bus
 
@@ -300,6 +302,7 @@ def _run_daemon(heartbeat_secs):
     next_tick = time.time() + heartbeat_secs if heartbeat_secs else None
     next_health = time.time() + HEALTH_CHECK_S        # router-wedge check runs regardless of --heartbeat
     next_usage = time.time() + 5                       # first usage poll shortly after boot, then every USAGE_POLL_S
+    next_paint = time.time() + 3 if SIDEBAR_PAINT else None   # sidebar auto-repaint (opt-in: [fleet].sidebar_paint)
     while proc.poll() is None and not stopping["v"]:
         time.sleep(1)
         now = time.time()
@@ -318,6 +321,14 @@ def _run_daemon(heartbeat_secs):
             except Exception as e:                    # a bad poll must never kill the daemon
                 print(f"[usage] poll error: {e}", flush=True)
             next_usage = now + USAGE_POLL_S
+        if next_paint and now >= next_paint:          # sidebar feature: keep the custom fleet board live
+            try:
+                painted = _sidebar_paint_tick()       # on-change-only; snapshot + diff, then set-description
+                if painted:
+                    print(f"[sidebar] repainted {painted} update(s)", flush=True)
+            except Exception as e:                    # a bad paint must never kill the daemon (nor the router)
+                print(f"[sidebar] paint error: {e}", flush=True)
+            next_paint = now + PAINT_POLL_S
         if now >= next_health:
             try:
                 _check_router_health(proc.pid)       # surface an alive-but-wedged router (silent-loss class)
@@ -335,6 +346,16 @@ def _run_daemon(heartbeat_secs):
             proc.kill()
     print(f"[daemon] exiting (stopping={stopping['v']}, router rc={proc.poll()})", flush=True)
     _clear_files(pid)                                # only OUR pid/meta — never a successor daemon's
+
+
+def _sidebar_paint_tick():
+    """Repaint the custom fleet sidebar (fleet.swift) from the LIVE snapshot so state/ctx/model/last don't
+    go stale between manual `fleet paint` runs — the sidebar has no auto-refresh of its own, and native
+    fields (latestMessage) update themselves, so a snapshot-derived board drifts without this. On-change-
+    only via features.PAINT_STATE (an idle fleet is a snapshot + a diff, no writes). Runs ONLY when
+    [fleet].sidebar_paint is set; the caller isolates it so a bad paint can never kill the daemon/router."""
+    from . import features as ft
+    return ft._paint(ft.snapshot(), sidebar_blob=True)
 
 
 def _heartbeat_tick():

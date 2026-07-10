@@ -100,6 +100,24 @@ def test_heartbeat_muted_when_passive(monkeypatch):
     assert attempted == []                          # muted -> never even reaches the gate
 
 
+# --- sidebar auto-repaint tick (keeps the custom fleet.swift board live) -------------------------
+def test_sidebar_paint_tick_repaints_the_board_from_the_live_snapshot(monkeypatch):
+    # the daemon's paint tick must feed the CUSTOM-sidebar record (sidebar_blob=True), off the live
+    # snapshot, so model/effort/ctx/last stay fresh — not just the built-in pills.
+    from cmux_fleet import features as ff
+    seen = {}
+    monkeypatch.setattr(ff, "snapshot", lambda: [{"label": "a", "ws": "w1"}])
+    def fake_paint(rows, sidebar_blob=False):
+        seen["rows"] = rows
+        seen["blob"] = sidebar_blob
+        return 3
+    monkeypatch.setattr(ff, "_paint", fake_paint)
+    n = fd._sidebar_paint_tick()
+    assert n == 3
+    assert seen["rows"] == [{"label": "a", "ws": "w1"}]   # the live snapshot, not a cached board
+    assert seen["blob"] is True                           # the FLEET record is emitted, not only pills
+
+
 # --- router bus-consumption health / wedge detection (Phase 4) -----------------------------------
 def test_router_wedged_detects_stale_live_router(monkeypatch):
     # the fleet-wide silent-completion-loss class: router process ALIVE but not consuming the bus.

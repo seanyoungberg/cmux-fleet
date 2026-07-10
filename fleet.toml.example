@@ -18,6 +18,11 @@
 #                                   #   The index powers the `plugins = [...]` roster key.  env: CMUX_FLEET_PLUGIN_INDEX
 # floor_claudemd = ""               # CLAUDE.md symlinked into freshly-created ad-hoc cwds; "" = none.  env: CMUX_FLEET_FLOOR
 # adhoc_subdir = "agents/ad-hoc"    # where `--adhoc <name>` agents get a cwd (relative to root).  env: CMUX_FLEET_ADHOC_SUBDIR
+# sidebar_paint = false             # daemon auto-repaints the custom fleet.swift sidebar (~every 4s, on-change)
+#                                   #   so state/ctx/model/last stay live. OFF by default: it writes a FLEET
+#                                   #   record into each agent workspace's DESCRIPTION (a subtitle in the
+#                                   #   BUILT-IN sidebar), so only enable it when you run the custom sidebar.
+#                                   #   env: CMUX_FLEET_SIDEBAR_PAINT
 
 # ----------------------------------------------------------------------------------------------
 # ROSTER: role-first, tool-nested. A role owns its tool-agnostic ORCHESTRATION (cwd/place/group/
