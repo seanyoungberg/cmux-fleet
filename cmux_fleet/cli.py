@@ -881,9 +881,42 @@ def _send_launch_and_confirm(ws, surf, send_cmd, lazy, timeout):
     return ""
 
 
+def _exec_send_and_confirm(ws, surf, send_cmd, lazy, timeout):
+    """Step-2 delivery for `cmd_launch`: the launch is the PANE PROCESS (adapter.exec_deliver, the
+    same mechanism that killed recycle's paste class), then the same bind poll as the paste path
+    MINUS the whole re-kick machinery — there is no Enter to lose, so there is nothing to re-kick.
+    PATH-guarded like recycle (harmless with -c shells; byte-parity with the recycle path). Returns
+    the bound sid, or '' (normal for a lazy tool, or when claude's resume-summary menu is up — the
+    caller gates/dismisses that, exactly as with the paste path)."""
+    from . import adapter
+    _exec_launch(surf, adapter.path_guard(send_cmd), lambda m: print(f"[fleet] {m}"))
+    end = time.time() + timeout
+    while time.time() < end:
+        sid = poll_session(surf, timeout=1)
+        if sid:
+            return sid                                       # claude bound -> definitively started
+        if _resume_menu_visible(surf):
+            return ""                # resume-summary menu is up -- caller must gate/dismiss it, not us
+        if lazy and _agent_surfaced(surf):
+            return ""                                        # lazy tool is up; it binds on its 1st turn
+        time.sleep(1)
+    return ""
+
+
+def _deliver_launch(ws, surf, send_cmd):
+    """The raw one-shot delivery used by `cmd_revive`: exec (default; the launch is the pane process)
+    or paste (CMUX_FLEET_EXEC_LAUNCH=0, the soak fallback — one flag reverts launch, revive, AND
+    recycle together). The caller owns all verification (revive's resume gate + bind poll)."""
+    from . import adapter
+    if _exec_launch_enabled():
+        _exec_launch(surf, adapter.path_guard(send_cmd), lambda m: print(f"[fleet] {m}"))
+    else:
+        cmuxq("send", "--workspace", ws, "--surface", surf, send_cmd + "\n")
+
+
 def _bind_launched_session(ws, surf, send_cmd, tool, label, abs_cwd, caller, lazy, timeout):
-    """The resume-aware bind step for `cmd_launch`. Confirms/re-kicks the enter-race as before
-    (_send_launch_and_confirm), then, when the caller passthrough carries a claude `--resume <id>`, gates
+    """The resume-aware bind step for `cmd_launch`. Delivers via exec (default; step 2) or the paste
+    path (CMUX_FLEET_EXEC_LAUNCH=0 soak fallback), then, when the caller passthrough carries a claude `--resume <id>`, gates
     the bind on the SAME dismiss sequence `cmd_revive` uses (_resume_and_gate -> picks 'full session
     as-is', never the lossy cursor-default 'resume from summary') instead of trusting a blind re-kick to
     land correctly on the menu. Aborts via sys.exit on a resume-gate timeout, same as cmd_revive: NOT
@@ -894,7 +927,10 @@ def _bind_launched_session(ws, surf, send_cmd, tool, label, abs_cwd, caller, laz
     workspace is re-resolved too, so a swapped surface never leaves a mismatched (surface, workspace)
     pair in the registry). Returns (ws, surf, sid); sid is '' if unresolved (the caller decides whether
     that's fatal, e.g. lazy tools expect it)."""
-    sid = _send_launch_and_confirm(ws, surf, send_cmd, lazy, timeout)
+    if _exec_launch_enabled():
+        sid = _exec_send_and_confirm(ws, surf, send_cmd, lazy, timeout)
+    else:
+        sid = _send_launch_and_confirm(ws, surf, send_cmd, lazy, timeout)
     resume_flag = _flag_val(caller, "--resume") if tool == "claude" else None
     if not sid and resume_flag not in (None, False):
         resume_sid = resume_flag if isinstance(resume_flag, str) else ""
@@ -2521,7 +2557,7 @@ def cmd_revive(argv):
     ws, surf = create_surface(spec, a.parent, "down")
     if not ws or not surf:
         sys.exit(1)
-    cmuxq("send", "--workspace", ws, "--surface", surf, send_cmd + "\n")
+    _deliver_launch(ws, surf, send_cmd)          # exec by default (step 2); paste under the soak flag
     # full-resume: dismiss the summary menu, and GATE the bind on it clearing. The menu blocks the
     # session bind, so binding behind an undismissed menu would register nothing and leave the agent
     # live-but-UNREGISTERED (invisible to `fleet ls`, still shown archived). On timeout we abort BEFORE
@@ -3905,69 +3941,23 @@ def _count_plugin_dirs(send_cmd):
 
 
 def _resume_menu_timeout(plugin_count, base=60, per_plugin=8, ceiling=120):
-    """Ceiling for the resume-menu watch. The PRIMARY fix is event-driven polling (below), not a bigger
-    number; this is only the generous upper bound. Base is already generous (heavy loadouts take 30-40s
-    to boot, not 2s); plugin count is a SECONDARY heuristic that stretches the ceiling for the heaviest
-    loadouts (e.g. homelab's 6 plugins) without over-waiting light ones."""
-    return min(ceiling, base + per_plugin * max(0, plugin_count))
+    """Loadout-scaled resume-menu ceiling. Canonical body: adapter.resume_menu_timeout (step 2); this
+    name stays as the call-site seam until step 3."""
+    from . import adapter
+    return adapter.resume_menu_timeout(plugin_count, base=base, per_plugin=per_plugin, ceiling=ceiling)
 
 
-# tri-state outcomes of the resume-menu watch (see _dismiss_resume_summary_prompt)
-RESUME_DISMISSED = "dismissed"   # the summary menu rendered and we picked 'full session as-is'
-RESUME_READY = "ready"           # resumed straight to a running prompt (no menu; nothing to do)
-RESUME_TIMEOUT = "timeout"       # neither appeared within the ceiling -> the caller MUST NOT bind
+# tri-state outcomes of the resume-menu watch — canonical values live in adapter.py (step 2);
+# re-exported here because tests and callers reference the cli names.
+from .adapter import RESUME_DISMISSED, RESUME_READY, RESUME_TIMEOUT  # noqa: E402
 
 
 def _dismiss_resume_summary_prompt(surf, log, timeout=None, plugin_count=0):
-    """`claude --resume` on an OLD/LARGE session shows an interactive menu before resuming:
-         1. Resume from summary (recommended)   2. Resume full session as-is   3. Don't ask me again
-    A respawn/recycle has NO human to choose, so the agent HANGS at the menu (and the resume-confirm
-    false-passes on the bound-but-stuck session). Policy: ALWAYS resume FULL, never summarize/compact.
-    No claude flag/setting/env var exists to suppress this or force full (GitHub #46751, verified), so a
-    keystroke is the only lever: the cursor defaults to option 1, so DOWN -> option 2 ('full as-is'),
-    then ENTER.
-
-    This is a PURE TIMING gate, not a detection problem: the menu renders fine, but a heavy loadout can
-    take 30-40s to boot, so a fixed window closed before it appeared (WARN + revive left at the shell —
-    homelab's symptom). We poll the pane for ONE of three states until a GENEROUS, loadout-scaled ceiling
-    (never a single fixed sleep):
-      - RESUME_DISMISSED: the menu is up -> pick 'full session as-is'
-      - RESUME_READY:     already at a running prompt -> nothing to dismiss
-      - RESUME_TIMEOUT:   still booting past the ceiling -> the CALLER MUST treat this as a failed resume
-                          and NOT proceed to bind/register (the menu is a GATE that blocks the session
-                          bind; binding behind an undismissed menu leaves the agent running UNREGISTERED)."""
-    if timeout is None:
-        timeout = _resume_menu_timeout(plugin_count)
-    end = time.time() + timeout
-    resuming = False                    # saw the POST-selection 'Resuming ...' state (menu already gone)
-    while time.time() < end:
-        pane = cmuxq("capture-pane", "--surface", surf) or ""
-        # ONLY the LIVE menu is actionable — it shows BOTH option labels at once
-        # ('1. Resume from summary' AND '2. Resume full session as-is'). The old check also fired on
-        # "Resuming the full session", but that is the POST-selection / in-progress banner: the menu is
-        # already gone, so a down/enter there lands a STRAY keystroke on a no-longer-menu surface. Match
-        # only the real menu; treat 'Resuming the full session' as in-progress and keep polling.
-        if "Resume from summary" in pane and "Resume full session as-is" in pane:
-            log("resume-summary menu detected -> picking 'Resume full session as-is' (full, never compact)")
-            cmuxq("send-key", "--surface", surf, "down")
-            time.sleep(0.5)
-            cmuxq("send-key", "--surface", surf, "enter")
-            return RESUME_DISMISSED
-        # small session resumed straight to a running prompt -> no menu, nothing to dismiss
-        if "Context Remaining" in pane or "bypass permissions" in pane:
-            return RESUME_READY
-        if "Resuming the full session" in pane:
-            resuming = True             # menu was already resolved -> resume is underway; don't touch keys
-        time.sleep(1)
-    if resuming:
-        # the resume got past the menu on its own (a human, or a prior dismiss) and is loading the full
-        # session; it just hadn't reached a running prompt before the ceiling. Safe to bind.
-        log("resume in progress (summary menu already cleared); proceeding to bind")
-        return RESUME_READY
-    log(f"WARN: resume launched but neither the summary-menu nor a running prompt appeared within "
-        f"{timeout:.0f}s (plugin_count={plugin_count}); NOT binding -- surface is still booting or "
-        f"wedged behind the menu. Re-run once it settles.")
-    return RESUME_TIMEOUT
+    """The resume-summary menu dismisser (ALWAYS 'full session as-is', never the lossy summary).
+    Canonical body: adapter.dismiss_resume_menu (step 2 relocated it; the adapter owns the one
+    sanctioned screen interaction). This name stays as the call-site/test seam until step 3."""
+    from . import adapter
+    return adapter.dismiss_resume_menu(surf, log, cmux=cmuxq, timeout=timeout, plugin_count=plugin_count)
 
 
 def _resume_and_gate(surf, send_cmd, tool, sess, log):
@@ -4050,17 +4040,15 @@ def _exec_launch(surf, guarded, log):
     firing it over a live agent that appeared between the verify and this call (a cmux restart-resume)
     would destroy it — refuse instead; the A confirm then recognizes the live seat or the WARN
     escalates. A respawn-pane ERROR falls back to the proven paste path rather than leaving a bare
-    shell with no launch at all. Returns True iff a launch was delivered by either mechanism."""
-    if _agent_surfaced(surf) or _resume_menu_visible(surf):
-        log("SKIP exec-launch: an agent TUI is already up on this surface — never respawn over a live agent")
-        return False
-    log("exec-launch: respawning the pane with the launch as its process (no paste)")
-    cmd = "/bin/zsh -ilc " + shlex.quote(guarded + "; exec /bin/zsh -il")
-    out = cmuxq("respawn-pane", "--surface", surf, "--command", cmd)
-    if "error" in (out or "").lower():
-        log(f"exec-launch: respawn-pane -> {(out or '').strip()!r}; falling back to the paste path")
-        return _fire_launch(surf, guarded, log)
-    return True
+    shell with no launch at all. Returns True iff a launch was delivered by either mechanism.
+
+    Canonical body: adapter.exec_deliver (step 2 generalized this to launch and revive; this name
+    stays as the recycle call-site/test seam, injecting cli's own guards and paste fallback)."""
+    from . import adapter
+    return adapter.exec_deliver(
+        surf, guarded, log, cmux=cmuxq,
+        tui_up=lambda: _agent_surfaced(surf) or _resume_menu_visible(surf),
+        paste_fallback=lambda: _fire_launch(surf, guarded, log))
 
 
 def _escalate_recycle_failure(label, surf, mode, reason, detail):
@@ -4132,7 +4120,8 @@ def _recycle_exec_one(p):
     # (~/.local/bin/claude, added by ~/.zshenv). If the send lands before the shell finished building
     # PATH, the wrapper exits 127 'claude not found in PATH'. Prepending the standard dirs makes the
     # binary resolvable regardless of shell-init timing (harmless no-op for codex/other tools).
-    guarded = 'export PATH="$HOME/.local/bin:/opt/homebrew/bin:$PATH"; ' + send_cmd
+    from . import adapter as _adapter
+    guarded = _adapter.path_guard(send_cmd)
 
     tool_name = p.get("tool", "claude") or "claude"      # kill-target identity check (_agent_pid_check)
 

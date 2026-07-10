@@ -86,6 +86,7 @@ def test_bind_launched_session_resume_gate_picks_full_not_summary(monkeypatch):
     # a --resume <id> passthrough must dismiss via DOWN then ENTER (picks option 2, 'full as-is'), never
     # a bare/blind ENTER (which lands on the menu's cursor-default 'Resume from summary').
     monkeypatch.setattr(fleet.time, "sleep", lambda *_: None)
+    monkeypatch.setenv("CMUX_FLEET_EXEC_LAUNCH", "0")   # pin the paste branch: its confirm is stubbed below
     monkeypatch.setattr(fleet, "_send_launch_and_confirm", lambda *a, **k: "")
     calls = []
 
@@ -111,6 +112,7 @@ def test_bind_launched_session_resume_timeout_aborts_without_register(monkeypatc
     # cmd_revive's no-teardown-on-timeout contract. _resume_and_gate returning False IS the RESUME_TIMEOUT
     # outcome (see test_recycle.py for its own unit coverage); this test proves cmd_launch's integration
     # point respects that and never reaches register().
+    monkeypatch.setenv("CMUX_FLEET_EXEC_LAUNCH", "0")   # pin the paste branch: its confirm is stubbed below
     monkeypatch.setattr(fleet, "_send_launch_and_confirm", lambda *a, **k: "")
     monkeypatch.setattr(fleet, "_resume_and_gate", lambda *a, **k: False)
     registered = []

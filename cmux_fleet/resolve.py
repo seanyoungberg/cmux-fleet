@@ -36,11 +36,11 @@
 #   env        — the one nameable deterministic CAUSE: ps eww shows a CMUX_WORKSPACE_ID different
 #                from the tree's workspace (Gap A, the moved-live-process mechanism; conclusive at
 #                any idleness).
-# The active-session pointer is NOT a signal: it is written by the Stop hook (measured: absent on a
-# fresh launch until the first completed turn), so "pointer stale" is the same bit as "no
-# post-SessionStart hook ever fired" — a lagging SYMPTOM of hook death with a false-positive window
-# on every fresh seat and a systematic false-negative on any agent that turned once before dying.
-# It is exposed as a diagnostic (`ever_heard`), never as proof. Consequence, stated honestly: a
+# The active-session pointer is NOT a signal in either direction (cmux-advisor, measured twice,
+# self-corrected once): its write is PATH-DEPENDENT — absent on a fresh-surface launch until the
+# first completed turn, yet replaced at SessionStart on an exec respawn — so it can be legitimately
+# absent on a healthy fresh agent (false positive) and legitimately correct on a fully detached one
+# (false negative). It is exposed as a forensic breadcrumb (`ever_heard`), never as proof. Consequence, stated honestly: a
 # genuinely idle, genuinely detached, env-correct agent is PASSIVELY UNDETECTABLE; settling it needs
 # a driven probe, which belongs to the agent's PARENT (dispatch doctrine applies to diagnostics).
 # Remedy for detached is a reseat (recycle resume); the fleet never auto-reseats.
@@ -285,10 +285,10 @@ def attachment(surface, st=None, ws_map=None, now=None):
         behavioral: record frozen while the transcript advances (skew > ATTACH_SKEW_S), OR
         env:        process env workspace != tree workspace (conclusive, any idleness).
     An idle agent (both clocks frozen together) can never trip the behavioral path by construction,
-    and the env check is the only sound confirm for one. The active pointer is DIAGNOSTIC only
-    (`ever_heard`: has cmux heard any post-SessionStart hook from this session?) — it is written by
-    the Stop hook, so treating a stale pointer as proof would false-positive every fresh seat and
-    false-negative every agent that turned once before dying (cmux-advisor finding 1). A genuinely
+    and the env check is the only sound confirm for one. The active pointer is a forensic
+    breadcrumb only (`ever_heard`: does the pointer name the live record's session?) — its write is
+    path-dependent (first-turn on fresh surfaces, SessionStart on exec respawns), so it is unsound
+    as a detector in both directions (cmux-advisor finding 1, self-corrected). A genuinely
     idle, env-correct, detached agent is passively undetectable; its PARENT settles it with a driven
     probe."""
     now = time.time() if now is None else now
