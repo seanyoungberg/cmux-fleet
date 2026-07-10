@@ -1719,13 +1719,10 @@ def _store():
     return fs.read_hook_store()
 
 
-def _pid_for_surface(surface):
-    for s in (_store().get("sessions") or {}).values():
-        if s.get("surfaceId") == surface:
-            return s.get("pid")
-    return None
-
-
+# (_pid_for_surface — the first-record, no-aliveness-check pid lookup — was DELETED 2026-07-10 with
+# zero callers left. It fed every kill site the wrong target on multi-record surfaces: the recycle
+# wedge AND the rm/archive live-agent leak. Kill targets come from _signal_agent_pids/_surface_pids
+# only; do not reintroduce a first-record pid lookup.)
 def _surface_pids(surface):
     """The set of pids currently ALIVE on `surface` per the hook store — the pre-respawn safety
     snapshot for the recycle verify AND the kill-path target set: any of these still alive AFTER the
@@ -1801,6 +1798,39 @@ def _graceful_close(surf, tool, log, timeout=6):
             return
         time.sleep(0.5)
     log("graceful close: no terminal lifecycle within window; proceeding to respawn (pid-verify decides)")
+
+
+_STOP_WAIT_S = 4      # post-SIGINT death-wait ceiling for the rm/archive stop (a clean TUI exit is ~0.5s)
+
+
+def _stop_agent_for_close(surf, tool, label, verb):
+    """Stop the agent(s) on `surf` and answer whether it is SAFE to close the surface. Returns
+    (ok_to_close, note). Safe = every live agent pid on the surface was identity-checked, signalled,
+    and observed DEAD within a bounded wait — or there was nothing live to stop. NOT safe = a live pid
+    was skipped (unidentifiable: pid reuse / ps failure) or survived the SIGINTs.
+
+    THE never-orphan invariant for the deliberate teardown verbs (rm/archive), the same live-pid truth
+    as the recycle tail: the 2026-07-10 leak was `fleet rm` SIGINTing a stale first-record pid
+    (_pid_for_surface) and then closing the surface anyway — the REAL agent survived close-surface and
+    kept running with no pane, no `fleet ls` row, no way for anyone to find it (four live 1M-ctx
+    orphans found on the box, two from that day's rms). A surface left OPEN over a live agent stays
+    visible and recoverable; a surface CLOSED over one hides it forever — so on any doubt the caller
+    must refuse the close (even under --force, which forces past the quiet gate, not past this)."""
+    from . import state as fs
+    def log(m):
+        print(f"[fleet] {verb} {label}: {m}")
+    signalled = _signal_agent_pids(surf, tool, log, f"{verb} stop")
+    if signalled:
+        end = time.time() + _STOP_WAIT_S                  # SIGINT x2 exits a claude TUI in ~0.5s; 4s is generous
+        while time.time() < end and _surface_pids(surf):
+            time.sleep(0.3)
+    still = sorted(_surface_pids(surf))
+    if not still:
+        return True, ""
+    return False, (f"live agent pid(s) {still} still on the surface "
+                   f"({'survived SIGINT x2' if signalled else f'not identifiable as a live {tool} process — reused/foreign pid?'}); "
+                   f"NOT closing the surface — closing would strand a live agent with no pane and no "
+                   f"registry row (invisible orphan). Check the pid(s), stop the agent, then re-run.")
 
 
 def _direct_kill(surf, tool, log):
@@ -2039,6 +2069,16 @@ def cmd_rm(argv):
             group_note = f"\n[fleet] group '{gname}' not found live; nothing to dissolve"
     archived = False
     if closing:
+        # STOP the agent(s) FIRST — live-only, identity-checked targets (_stop_agent_for_close), and
+        # REFUSE the whole removal if a live agent won't die or can't be identified: close-surface does
+        # NOT reliably kill the pane's agent, so closing over a survivor strands it invisibly (the
+        # 2026-07-10 leak — the old code SIGINT'd a stale _pid_for_surface pick and closed anyway).
+        # Refusing BEFORE any registry mutation keeps the seat live, visible, and re-runnable.
+        ok, note = _stop_agent_for_close(surf, e.get("tool") or "claude", label, "rm")
+        if not ok:
+            print(f"[fleet] rm {label} REFUSED: {note}")
+            fs.log_event("rm_refused", label=label, surface=surf, reason="live-agent-would-orphan")
+            return 1
         # close+archive is now the DEFAULT removal path (was --kill-only): capture the binding + write
         # the archive row BEFORE tearing the surface down, so a removed agent degrades to "recorded but
         # maybe-unresumable" rather than vanishing ("prune freely, agents are recoverable"). An
@@ -2050,12 +2090,6 @@ def cmd_rm(argv):
         fs.log_event("archived", label=label, role=e.get("role"), session=e.get("session"),
                      via="kill" if kill else "rm")
         archived = True
-        pid = _pid_for_surface(surf)
-        if pid:
-            try:
-                os.kill(pid, signal.SIGINT); time.sleep(0.4); os.kill(pid, signal.SIGINT)
-            except (ProcessLookupError, PermissionError):
-                pass
         cmuxq("close-surface", "--surface", surf)
     wt_note = ""
     if kill and e.get("worktree"):
@@ -2198,9 +2232,11 @@ def _build_archive_entry(e, b):
 
 
 def cmd_archive(argv):
-    """Park a live agent: stop its process (SIGINT x2 = clean TUI exit), close the tab, move it to the
-    archive shelf with enough to `claude --resume` it later."""
-    from . import state as fs; import signal
+    """Park a live agent: stop its process(es) (SIGINT x2 to every live identity-checked pid = clean
+    TUI exit), close the tab, move it to the archive shelf with enough to `claude --resume` it later.
+    REFUSES — registry untouched, surface left open — if a live agent on the surface won't die or can't
+    be identified: closing over a survivor strands it invisibly (the 2026-07-10 leak class)."""
+    from . import state as fs
     if not argv:
         sys.exit("usage: fleet archive <label>")
     label = argv[0]
@@ -2214,15 +2250,14 @@ def cmd_archive(argv):
     # on the surface; once close-surface runs it's gone, so read it first.
     b = _resume_binding(surf) if surf else {}
     if surf:
+        ok, note = _stop_agent_for_close(surf, e.get("tool") or "claude", label, "archive")
+        if not ok:
+            print(f"[fleet] archive {label} REFUSED: {note}")
+            fs.log_event("archive_refused", label=label, surface=surf, reason="live-agent-would-orphan")
+            return 1
         fs.expected_close_put(surf)                     # deliberate archive: shield the router's
                                                         # surface.closed handler from a spurious stale alert
-    pid = _pid_for_surface(surf)
-    if pid:
-        try:
-            os.kill(pid, signal.SIGINT); time.sleep(0.5); os.kill(pid, signal.SIGINT)
-        except (ProcessLookupError, PermissionError):
-            pass
-    cmuxq("close-surface", "--surface", surf)
+        cmuxq("close-surface", "--surface", surf)
     fs.archive_put(label, _build_archive_entry(e, b))
     fs.live_del(label)
     fs.log_event("archived", label=label, role=e.get("role"), session=e.get("session"))

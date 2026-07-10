@@ -23,6 +23,15 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Fixed
 
+- **`fleet rm` / `fleet archive` no longer leak live agents** — both verbs now stop the agent via the
+  recycle tail's live-only, identity-checked kill selector (`_signal_agent_pids`) and VERIFY death before
+  closing the surface; if a live agent on the surface won't die or can't be identified, the verb REFUSES
+  (registry untouched, seat left open + reachable) instead of closing over the survivor — even under
+  `--force`. The old form SIGINT'd the first hook-store record's pid (no aliveness check) and closed
+  unconditionally: on a multi-record surface that stranded the real agent alive with no pane, no `fleet
+  ls` row, and no way to find it (four live 1M-ctx orphans found on the box 2026-07-10, two from that
+  day's rms). `_pid_for_surface` — the first-record lookup that fed every kill site the wrong target —
+  is deleted with zero callers left.
 - **Recycle kill path targets live pids, identity-checked** — the graceful close and the direct-kill
   fallback now SIGINT every ALIVE agent pid whose hook-store record maps to the surface, each re-verified
   as this tool's live process via `ps` immediately before signalling (the pid-reuse guard). The old form

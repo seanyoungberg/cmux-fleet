@@ -5,7 +5,7 @@
 # zombie incident), --detach is the explicit opt-in for the old soft drop-row-only behavior, a
 # mid-turn ('running') surface refuses without --force, and --kill remains the alias that also tears
 # down a worktree. Pure units against the throwaway $CMUX_STATE_DIR; cmux reads (cmuxq /
-# _resume_binding / _pid_for_surface / fs.lifecycle) are stubbed.
+# _resume_binding / fs.lifecycle) are stubbed.
 import json
 
 import pytest
@@ -20,7 +20,6 @@ def _stub_cmux(monkeypatch, fs, lifecycle="idle", binding=None, calls=None, has_
     model the frozen dead-pid 'running' ghost that must NOT block a plain `rm`."""
     monkeypatch.setattr(fleet, "cmuxq",
                         (lambda *a: (calls.append(a) or "")) if calls is not None else (lambda *a: ""))
-    monkeypatch.setattr(fleet, "_pid_for_surface", lambda s: None)
     monkeypatch.setattr(fleet, "_resume_binding", lambda surf: binding or {})
     monkeypatch.setattr(fs, "lifecycle", lambda s: lifecycle)
     monkeypatch.setattr(fs, "surface_has_live_pid", lambda s: has_pid)
@@ -198,8 +197,97 @@ def test_rm_detach_does_not_tombstone(fs, monkeypatch):
 def test_archive_writes_expected_close_tombstone(fs, monkeypatch):
     _seed(fs, "wt4", "SURF-WT4")
     _stub_cmux(monkeypatch, fs)
-    monkeypatch.setattr(fleet, "_pid_for_surface", lambda s: None)
     monkeypatch.setattr(fleet, "_resume_binding", lambda surf: {})
     fleet.cmd_archive(["wt4"])
     assert fs.live_get("wt4") is None                            # archived...
     assert fs.expected_close_recent("SURF-WT4") is True          # ...and tombstoned first
+
+
+# --- kill-path adoption (the 2026-07-10 live-agent LEAK): rm/archive stop LIVE identity-checked pids
+# and NEVER close a surface over a survivor. Four live orphaned claudes were found on the box — two
+# from that day's `fleet rm --force` runs: rm SIGINT'd a stale first-record pid, closed the surface
+# anyway, and left a 1M-ctx agent running with no pane, no ls row, no way to find it. The invariant:
+# a reachable open seat ALWAYS beats an invisible orphan, even under --force.
+def test_rm_signals_live_pid_then_closes(fs, monkeypatch):
+    import signal
+    _seed(fs, "w9", "S9")
+    calls = []
+    _stub_cmux(monkeypatch, fs, binding={"checkpoint_id": "CKPT"}, calls=calls)
+    state = {"alive": True}
+    monkeypatch.setattr(fleet, "_surface_pids", lambda s: {76142} if state["alive"] else set())
+    monkeypatch.setattr(fleet, "_agent_pid_check", lambda pid, tool: True)
+    killed = []
+    def fake_kill(pid, sig):
+        killed.append((pid, sig)); state["alive"] = False              # the SIGINT lands cleanly
+    monkeypatch.setattr(fleet.os, "kill", fake_kill)
+    monkeypatch.setattr(fleet.time, "sleep", lambda *_: None)
+    assert fleet.cmd_rm(["w9"]) == 0
+    assert killed == [(76142, signal.SIGINT), (76142, signal.SIGINT)]  # the LIVE pid, x2
+    assert ("close-surface", "--surface", "S9") in calls               # then (and only then) closed
+    assert fs.live_get("w9") is None and fs.archive_get("w9") is not None
+
+
+def test_rm_refuses_close_when_live_agent_survives(fs, monkeypatch):
+    _seed(fs, "w10", "S10")
+    calls = []
+    _stub_cmux(monkeypatch, fs, calls=calls)
+    monkeypatch.setattr(fleet, "_STOP_WAIT_S", 0.05)
+    monkeypatch.setattr(fleet, "_surface_pids", lambda s: {76142})     # survives the SIGINTs
+    monkeypatch.setattr(fleet, "_agent_pid_check", lambda pid, tool: True)
+    monkeypatch.setattr(fleet.os, "kill", lambda pid, sig: None)
+    monkeypatch.setattr(fleet.time, "sleep", lambda *_: None)
+    assert fleet.cmd_rm(["w10", "--force"]) == 1                       # REFUSED, --force notwithstanding
+    assert not any(c[0] == "close-surface" for c in calls)             # the seat stays OPEN + reachable
+    assert fs.live_get("w10") is not None                              # registry untouched
+    assert fs.archive_get("w10") is None                               # no half-written archive row
+
+
+def test_rm_refuses_on_unidentifiable_live_pid(fs, monkeypatch):
+    # pid-reuse guard: a live pid that doesn't identify as the agent tool is never signalled AND blocks
+    # the close — better a reachable seat than a foreign SIGINT or an invisible orphan.
+    _seed(fs, "w11", "S11")
+    calls = []
+    _stub_cmux(monkeypatch, fs, calls=calls)
+    monkeypatch.setattr(fleet, "_surface_pids", lambda s: {80000})
+    monkeypatch.setattr(fleet, "_agent_pid_check", lambda pid, tool: False)
+    killed = []
+    monkeypatch.setattr(fleet.os, "kill", lambda pid, sig: killed.append(pid))
+    monkeypatch.setattr(fleet.time, "sleep", lambda *_: None)
+    assert fleet.cmd_rm(["w11"]) == 1
+    assert killed == []                                                # not one signal fired
+    assert not any(c[0] == "close-surface" for c in calls)
+    assert fs.live_get("w11") is not None
+
+
+def test_archive_signals_live_pid_then_closes(fs, monkeypatch):
+    import signal
+    _seed(fs, "w12", "S12")
+    calls = []
+    _stub_cmux(monkeypatch, fs, binding={"checkpoint_id": "CKPT"}, calls=calls)
+    state = {"alive": True}
+    monkeypatch.setattr(fleet, "_surface_pids", lambda s: {76142} if state["alive"] else set())
+    monkeypatch.setattr(fleet, "_agent_pid_check", lambda pid, tool: True)
+    killed = []
+    def fake_kill(pid, sig):
+        killed.append((pid, sig)); state["alive"] = False
+    monkeypatch.setattr(fleet.os, "kill", fake_kill)
+    monkeypatch.setattr(fleet.time, "sleep", lambda *_: None)
+    assert fleet.cmd_archive(["w12"]) == 0
+    assert killed == [(76142, signal.SIGINT), (76142, signal.SIGINT)]
+    assert ("close-surface", "--surface", "S12") in calls
+    assert fs.live_get("w12") is None and fs.archive_get("w12") is not None
+
+
+def test_archive_refuses_close_when_live_agent_survives(fs, monkeypatch):
+    _seed(fs, "w13", "S13")
+    calls = []
+    _stub_cmux(monkeypatch, fs, calls=calls)
+    monkeypatch.setattr(fleet, "_STOP_WAIT_S", 0.05)
+    monkeypatch.setattr(fleet, "_surface_pids", lambda s: {76142})     # survives
+    monkeypatch.setattr(fleet, "_agent_pid_check", lambda pid, tool: True)
+    monkeypatch.setattr(fleet.os, "kill", lambda pid, sig: None)
+    monkeypatch.setattr(fleet.time, "sleep", lambda *_: None)
+    assert fleet.cmd_archive(["w13"]) == 1                             # REFUSED
+    assert not any(c[0] == "close-surface" for c in calls)             # seat stays open + reachable
+    assert fs.live_get("w13") is not None                              # still live in the registry
+    assert fs.archive_get("w13") is None

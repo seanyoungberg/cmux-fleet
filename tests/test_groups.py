@@ -115,7 +115,6 @@ def test_rm_with_group_sweeps_all_members(monkeypatch):
 
     monkeypatch.setattr(fleet, "cmuxq", fake_cmuxq)
     monkeypatch.setattr(fleet, "_group_ref", lambda g: "workspace_group:1")
-    monkeypatch.setattr(fleet, "_pid_for_surface", lambda s: None)
     monkeypatch.setattr(fleet, "_ref_to_uuid",
                         lambda kind, ref: {"workspace:c": "WS-C", "workspace:w": "WS-W"}[ref])
     fleet.cmd_rm(["cond", "--with-group"])
@@ -204,7 +203,6 @@ def _dissolve_stubs(monkeypatch, live_surfaces, member_refs, gref="workspace_gro
     monkeypatch.setattr(fleet, "cmuxq", fake_cmuxq)
     monkeypatch.setattr(fleet, "_group_ref", lambda g: gref)
     monkeypatch.setattr(fleet, "_ref_to_uuid", lambda kind, ref: member_refs[ref])
-    monkeypatch.setattr(fleet, "_pid_for_surface", lambda s: None)
     monkeypatch.setattr(fleet, "_resume_binding", lambda s: {})
     monkeypatch.setattr(fs, "surface_has_live_agent", lambda s: s in live_surfaces)
     return calls

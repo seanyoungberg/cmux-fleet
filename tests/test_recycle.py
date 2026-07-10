@@ -281,7 +281,6 @@ def test_verify_waits_out_a_slow_kill_before_launching(fs, monkeypatch):
     # short-circuits — confirmation must come from the terminal lifecycle flip, proving the poll. The
     # graceful-close pre-step is a no-op here (no pid on record to close).
     monkeypatch.setattr(fleet_state, "surface_has_live_pid", lambda surf: True)
-    monkeypatch.setattr(fleet, "_pid_for_surface", lambda surf: None)
     states = iter(["idle", "idle", "ended"])
     monkeypatch.setattr(fleet_state, "lifecycle", lambda surf: next(states, "ended"))
     assert fleet._recycle_exec_one(_base_payload()) == 0
@@ -338,7 +337,6 @@ def test_respawn_fails_even_after_fallback_aborts_without_launch(fs, monkeypatch
         return ""
     monkeypatch.setattr(fleet.time, "sleep", lambda *_: None)
     monkeypatch.setattr(fleet, "cmuxq", fake_cmuxq)
-    monkeypatch.setattr(fleet, "_pid_for_surface", lambda surf: 4242)
     monkeypatch.setattr(fleet.os, "kill", lambda pid, sig: None)
     logged = []
     monkeypatch.setattr(fleet_state, "log_event", lambda event, **fields: logged.append((event, fields)))
@@ -369,7 +367,6 @@ def test_dead_agent_frozen_running_pid_none_recycles_without_force(fs, monkeypat
     monkeypatch.setattr(fleet_state, "lifecycle", lambda surf: "running")
     monkeypatch.setattr(fleet_state, "surface_has_live_pid", lambda surf: False)   # pid dead/None -> gone
     monkeypatch.setattr(fleet, "_surface_pids", lambda surf: set())                # no live pid snapshot
-    monkeypatch.setattr(fleet, "_pid_for_surface", lambda surf: None)              # nothing to gracefully close
     monkeypatch.setattr(fleet, "poll_session", lambda surf, timeout=1: "")
     monkeypatch.setattr(fleet, "_poll_session_back", lambda *a, **k: "NEWSID")
     logged = []
@@ -403,7 +400,6 @@ def test_dead_agent_recycle_refuses_when_old_pid_still_alive(fs, monkeypatch):
     monkeypatch.setattr(fleet_state, "surface_has_live_pid", lambda surf: True)     # old claude SURVIVED
     monkeypatch.setattr(fleet, "_surface_pids", lambda surf: {4242})                # pid still alive
     monkeypatch.setattr(fleet_state, "pid_alive", lambda pid: True)
-    monkeypatch.setattr(fleet, "_pid_for_surface", lambda surf: None)               # graceful close no-op
     monkeypatch.setattr(fleet.os, "kill", lambda pid, sig: None)
     logged = []
     monkeypatch.setattr(fleet_state, "log_event", lambda event, **f: logged.append((event, f)))
@@ -432,7 +428,6 @@ def test_direct_kill_skips_quietly_with_no_known_pid(fs, monkeypatch):
     monkeypatch.setattr(fleet, "poll_session", lambda surf, timeout=1: "")
     monkeypatch.setattr(fleet, "_poll_session_back", lambda *a, **k: "NEWSID")
     monkeypatch.setattr(fleet_state, "lifecycle", lambda surf: "ended")
-    monkeypatch.setattr(fleet, "_pid_for_surface", lambda surf: None)
     killed = []
     monkeypatch.setattr(fleet.os, "kill", lambda pid, sig: killed.append((pid, sig)))
     assert fleet._recycle_exec_one(_base_payload()) == 0
