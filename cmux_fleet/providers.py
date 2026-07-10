@@ -243,9 +243,23 @@ def _iso_to_epoch(s):
         return None
 
 
+def _claude_identity(tok):
+    """The REAL account behind a token (email + display name) via /api/oauth/account — token-authed, so it
+    works for the keychain default AND an injected file token. Best-effort; {} on any failure."""
+    import urllib.request
+    try:
+        r = urllib.request.urlopen(urllib.request.Request(
+            "https://api.anthropic.com/api/oauth/account",
+            headers={"Authorization": f"Bearer {tok}", **_OAUTH_HEADERS}), timeout=15)
+        d = json.loads(r.read().decode())
+        return {"email": d.get("email_address"), "display": d.get("display_name") or d.get("full_name")}
+    except Exception:
+        return {}
+
+
 def poll_claude(auth):
-    """GET /api/oauth/usage with the account's token → normalized windows/scoped/extra_usage. Returns a
-    result dict with ok/error; never raises."""
+    """GET /api/oauth/usage with the account's token → normalized windows/scoped/extra_usage + the real
+    account identity. Returns a result dict with ok/error; never raises."""
     import urllib.request, urllib.error
     tok = _read_oauth_token(auth)
     if not tok:
@@ -270,6 +284,7 @@ def poll_claude(auth):
     xu = data.get("extra_usage") or {}
     return {
         "ok": True, "error": None,
+        "identity": _claude_identity(tok),
         "windows": {
             "five_hour": {"pct": fh.get("utilization"), "resets_at": _iso_to_epoch(fh.get("resets_at")),
                           "window_minutes": 300},
@@ -281,6 +296,21 @@ def poll_claude(auth):
         "extra_usage": {"enabled": bool(xu.get("is_enabled")), "pct": xu.get("utilization")},
         "active_limit": active,
     }
+
+
+def _codex_identity(home):
+    """The REAL codex account (email + plan) from the home's auth.json id_token. Best-effort; {} on failure."""
+    import base64
+    try:
+        d = json.load(open(os.path.join(os.path.expanduser(home), "auth.json")))
+        idt = (d.get("tokens") or {}).get("id_token", "")
+        p = idt.split(".")[1]
+        p += "=" * (-len(p) % 4)
+        c = json.loads(base64.urlsafe_b64decode(p))
+        return {"email": c.get("email"), "display": c.get("email"),
+                "plan": (c.get("https://api.openai.com/auth") or {}).get("chatgpt_plan_type")}
+    except Exception:
+        return {}
 
 
 def _newest_rollout(home):
@@ -357,9 +387,11 @@ def poll_codex(home):
         windows[label] = {"pct": w.get("used_percent"), "resets_at": w.get("resets_at"),
                           "window_minutes": w.get("window_minutes")}
     stale = (time.time() - os.path.getmtime(path)) > CODEX_STALE_S
+    ident = _codex_identity(home)
     return {
         "ok": True, "error": None, "stale": stale, "windows": windows,
-        "plan": rl.get("plan_type") or "",
+        "identity": ident,
+        "plan": rl.get("plan_type") or ident.get("plan") or "",
         "scoped": [], "extra_usage": {"enabled": False, "pct": None}, "active_limit": "",
     }
 
@@ -478,8 +510,14 @@ def usage_for_paint():
         r = snap[pid]
         windows = _paint_windows(r) if r.get("ok") else []
         ca = r.get("checked_at")
+        ident = r.get("identity") or {}
+        # `account` = config id (stable key, e.g. "berg-max"); `identity`/`label` = the REAL account for
+        # display (email + name), so the sidebar shows "Berg (seanyoungberg@gmail.com)" not "berg-max".
+        label = ident.get("display") or ident.get("email") or r.get("name", "")
         provs.append({
             "id": pid, "tool": r.get("tool", ""), "account": r.get("name", ""),
+            "identity": {"email": ident.get("email"), "display": ident.get("display")},
+            "label": label,
             "kind": r.get("type", ""), "plan": r.get("plan", ""),
             "is_default": bool(r.get("is_default")),
             "ok": bool(r.get("ok")), "error": r.get("error"), "stale": bool(r.get("stale")),

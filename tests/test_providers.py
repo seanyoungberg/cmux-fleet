@@ -252,6 +252,42 @@ def test_usage_for_paint_shape_and_ordering():
     assert z["stale"] is True and z["headline"]["label"] == "30d"
 
 
+def test_usage_for_paint_surfaces_real_identity():
+    now = int(time.time())
+    fs.provider_usage_write({
+        "claude:berg-max": {"tool": "claude", "name": "berg-max", "type": "subscription", "ok": True,
+                            "checked_at": now, "windows": {}, "scoped": [],
+                            "identity": {"email": "seanyoungberg@gmail.com", "display": "Berg"}},
+        "codex:acct2": {"tool": "codex", "name": "acct2", "type": "subscription", "ok": True,
+                        "checked_at": now, "windows": {}, "scoped": [],
+                        "identity": {"email": "other@example.com", "display": None}},
+        "claude:noident": {"tool": "claude", "name": "noident", "type": "subscription", "ok": True,
+                           "checked_at": now, "windows": {}, "scoped": []},
+    })
+    p = {x["id"]: x for x in pv.usage_for_paint()["providers"]}
+    # `account` stays the config id (stable key); `label`/`identity` carry the REAL account for display
+    assert p["claude:berg-max"]["account"] == "berg-max"
+    assert p["claude:berg-max"]["label"] == "Berg"                          # display preferred
+    assert p["claude:berg-max"]["identity"]["email"] == "seanyoungberg@gmail.com"
+    assert p["codex:acct2"]["label"] == "other@example.com"                 # email when no display
+    assert p["claude:noident"]["label"] == "noident"                        # falls back to config id
+
+
+def test_codex_identity_decodes_id_token(tmp_path):
+    import base64
+    def jwt(claims):
+        body = base64.urlsafe_b64encode(json.dumps(claims).encode()).decode().rstrip("=")
+        return f"aaa.{body}.bbb"
+    home = tmp_path / "h"
+    home.mkdir()
+    (home / "auth.json").write_text(json.dumps({"tokens": {"id_token": jwt({
+        "email": "sean.youngberg@gmail.com",
+        "https://api.openai.com/auth": {"chatgpt_plan_type": "team"}})}}))
+    idn = pv._codex_identity(str(home))
+    assert idn["email"] == "sean.youngberg@gmail.com" and idn["plan"] == "team"
+    assert pv._codex_identity(str(tmp_path / "missing")) == {}              # no auth.json -> {}
+
+
 def test_usage_for_paint_empty_and_errored():
     assert pv.usage_for_paint()["providers"] == []            # no snapshot -> empty, no raise
     now = int(time.time())
