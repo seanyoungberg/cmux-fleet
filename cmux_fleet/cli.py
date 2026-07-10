@@ -2011,7 +2011,45 @@ def cmd_rm(argv):
                     f"[fleet]   cmux reports group '{gref}' member workspaces = {real_display}\n"
                     f"[fleet] no dissolve, no sweep happened. Investigate before retrying "
                     f"(`fleet ls`, `cmux workspace-group list --json`).")
-            # AGREEMENT confirmed. CONFIRM GATE: a dissolve is a mass-close. Refuse (preview only) whenever
+            # AGREEMENT confirmed. HARD GUARDS next — ABSOLUTE refusals (rc 1, zero signals, nothing
+            # closed, registry untouched), deliberately BEFORE the --yes confirm gate so no preview
+            # ever implies these can proceed, and NOT bypassable by --force/--yes (those force the
+            # quiet gate and the mass-close preview; never never-orphan, never these). Post-G the stop
+            # loop SIGNALS every member, so a group containing the caller or a bystander conductor
+            # turned the old leak into a KILL — live shape 2026-07-10: berg-sandbox (conductor) shares
+            # a group with homelab + resume-research, so `rm homelab --with-group --yes` would have
+            # SIGINT'd the conductor; run FROM berg-sandbox it would have SIGINT'd its OWN pid
+            # mid-dissolve (the fleet process is a grandchild — it survives the caller and completes
+            # the teardown with no refusal and no clean error). The confirm-gate preview does show
+            # [CONDUCTOR, live], but seeing is not stopping, and it never reveals that the CALLER is
+            # among the dead. Bulk recycle already skips self; these close the same hole here.
+            caller_surf = (os.environ.get("CMUX_SURFACE_ID") or "").upper()
+            if caller_surf:
+                selfhit = sorted(lbl for lbl, v in registry_all.items()
+                                 if (v.get("surface") or "").upper() == caller_surf)
+                if selfhit:
+                    who = ", ".join("{} (kind={})".format(l, registry_all[l].get("kind") or "?")
+                                    for l in selfhit)
+                    print(f"[fleet] rm --with-group REFUSED: group '{gname}' contains the CALLER's own "
+                          f"surface — {who}. A dissolve never signals or tears down its own caller "
+                          f"(zero signals fired, nothing closed, registry untouched). Run this from "
+                          f"OUTSIDE the group (a peer conductor or a plain shell).")
+                    fs.log_event("rm_refused", label=label, group=gname,
+                                 reason="group-contains-caller", blocked=selfhit)
+                    return 1
+            bystanders = sorted(lbl for lbl, v in registry_all.items()
+                                if lbl != label and v.get("kind") == "conductor")
+            if bystanders:
+                who = ", ".join(f"{l} (kind=conductor)" for l in bystanders)
+                print(f"[fleet] rm --with-group REFUSED: group '{gname}' contains a CONDUCTOR that is "
+                      f"not the named target — {who}. A child's group dissolve never takes a conductor "
+                      f"as collateral (zero signals fired, nothing closed, registry untouched). To "
+                      f"retire a conductor's whole group, name the CONDUCTOR as the target: "
+                      f"fleet rm {bystanders[0]} --with-group")
+                fs.log_event("rm_refused", label=label, group=gname,
+                             reason="group-conductor-collateral", blocked=bystanders)
+                return 1
+            # CONFIRM GATE: a dissolve is a mass-close. Refuse (preview only) whenever
             # it would take down LIVE collateral -- any live agent OTHER than the named target -- unless
             # --yes. A solo/target-only or all-dead group proceeds with no gate (no surprise to confirm).
             def _live(v):

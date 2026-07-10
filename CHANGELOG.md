@@ -23,6 +23,16 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Fixed
 
+- **`fleet rm --with-group` never signals its own caller or a bystander conductor** — two hard guards
+  run before the confirm gate and are NOT bypassable by `--force`/`--yes`: (1) if the group contains the
+  CALLER's own surface (self-ID via `$CMUX_SURFACE_ID`), refuse — the member-stop loop would otherwise
+  SIGINT the caller's own pid mid-dissolve and complete the teardown with no clean error; (2) if the
+  group contains a conductor that is not the named target, refuse — a child's group dissolve never takes
+  a conductor as collateral (retire a conductor's group by naming the conductor as the target, from
+  outside the group). Both refusals fire with zero signals, nothing closed, registry untouched, and name
+  the blocking agent by label and kind. Live shape that motivated it: a conductor sharing its group with
+  two children meant `rm <child> --with-group --yes` would have SIGINT'd the conductor. Bulk recycle
+  already skipped self; the dissolve was the outlier.
 - **`fleet rm --with-group` no longer leaks live members** — the dissolve stops EVERY member's agent
   (live-only, identity-checked, death-verified) BEFORE `workspace-group delete`, all-or-nothing: a
   group-wide pre-flight identity check refuses with ZERO signals fired if any live pid can't be

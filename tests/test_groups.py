@@ -358,3 +358,84 @@ def test_with_group_unidentifiable_pid_refuses_with_zero_signals(fs, monkeypatch
     assert not any(c[:2] == ("workspace-group", "delete") for c in calls)
     assert not any(c[0] == "close-surface" for c in calls)
     assert fs.live_get("cond") is not None and fs.live_get("child") is not None
+
+
+# --- H: the dissolve never takes its own caller, or a bystander conductor, with it -------------------
+# G's stop loop SIGNALS every member — so a group containing the caller or a non-target conductor
+# turned the old leak into a KILL (live shape: berg-sandbox kind=conductor shared group 'AD - Berg
+# Sandbox' with homelab + resume-research; `rm homelab --with-group --yes` would have SIGINT'd the
+# conductor, and run FROM berg-sandbox, its own pid). Hard refusals, before the confirm gate, not
+# bypassable by --force/--yes (they force the quiet gate and the preview — never these).
+def test_with_group_refuses_when_caller_is_a_member(fs, monkeypatch, capsys):
+    _seed_group(fs)                                                        # cond(SC) + child(SW), group g
+    calls = []
+    _stub_group_cmux(monkeypatch, calls)
+    monkeypatch.setenv("CMUX_SURFACE_ID", "SC")                            # the CALLER is cond
+    killed = []
+    monkeypatch.setattr(fleet.os, "kill", lambda pid, sig: killed.append(pid))
+    assert fleet.cmd_rm(["child", "--with-group", "--force", "--yes"]) == 1   # flags do NOT bypass
+    assert killed == []                                                    # zero signals fired
+    assert not any(c[:2] == ("workspace-group", "delete") for c in calls)  # group intact
+    assert not any(c[0] == "close-surface" for c in calls)                 # nothing closed
+    assert fs.live_get("cond") is not None and fs.live_get("child") is not None
+    out = capsys.readouterr().out
+    assert "REFUSED" in out and "CALLER" in out and "cond (kind=conductor)" in out
+
+
+def test_with_group_refuses_caller_even_as_the_named_target(fs, monkeypatch):
+    # self-teardown: a conductor dissolving ITS OWN group would SIGINT its own pid mid-stop-loop.
+    # Refuse; the dissolve must come from outside the group.
+    _seed_group(fs)
+    calls = []
+    _stub_group_cmux(monkeypatch, calls)
+    monkeypatch.setenv("CMUX_SURFACE_ID", "SC")
+    killed = []
+    monkeypatch.setattr(fleet.os, "kill", lambda pid, sig: killed.append(pid))
+    assert fleet.cmd_rm(["cond", "--with-group", "--yes"]) == 1
+    assert killed == [] and not any(c[:2] == ("workspace-group", "delete") for c in calls)
+    assert fs.live_get("cond") is not None
+
+
+def test_with_group_refuses_bystander_conductor(fs, monkeypatch, capsys):
+    # an EXTERNAL caller dissolving a child's group must never take a conductor as collateral; naming
+    # the conductor as the target is the sanctioned way to retire its whole group.
+    _seed_group(fs)
+    calls = []
+    _stub_group_cmux(monkeypatch, calls)
+    monkeypatch.delenv("CMUX_SURFACE_ID", raising=False)                   # plain shell, not in the group
+    killed = []
+    monkeypatch.setattr(fleet.os, "kill", lambda pid, sig: killed.append(pid))
+    assert fleet.cmd_rm(["child", "--with-group", "--force", "--yes"]) == 1   # flags do NOT bypass
+    assert killed == []                                                    # zero signals fired
+    assert not any(c[:2] == ("workspace-group", "delete") for c in calls)
+    assert not any(c[0] == "close-surface" for c in calls)
+    assert fs.live_get("cond") is not None and fs.live_get("child") is not None
+    out = capsys.readouterr().out
+    assert "cond (kind=conductor)" in out and "fleet rm cond --with-group" in out   # the sanctioned path
+
+
+def test_with_group_all_children_still_dissolves(fs, monkeypatch):
+    # no regression on G: a conductor-free group with an external caller dissolves cleanly.
+    fs.live_put("c1", {"role": "w", "kind": "child", "tool": "claude", "group": "g",
+                       "surface": "SC", "workspace": "WS-C", "status": "live"})
+    fs.live_put("c2", {"role": "w", "kind": "child", "tool": "claude", "group": "g",
+                       "surface": "SW", "workspace": "WS-W", "status": "live"})
+    calls = []
+    _stub_group_cmux(monkeypatch, calls)
+    monkeypatch.delenv("CMUX_SURFACE_ID", raising=False)
+    monkeypatch.setattr(fleet, "_surface_pids", lambda s: set())           # nothing live to stop
+    assert fleet.cmd_rm(["c1", "--with-group"]) == 0
+    assert any(c[:2] == ("workspace-group", "delete") for c in calls)      # dissolved
+    assert fs.live_get("c1") is None and fs.live_get("c2") is None         # swept
+
+
+def test_with_group_conductor_as_target_from_outside_still_dissolves(fs, monkeypatch):
+    # the sanctioned conductor-retirement path stays open: external caller, conductor named as target.
+    _seed_group(fs)
+    calls = []
+    _stub_group_cmux(monkeypatch, calls)
+    monkeypatch.delenv("CMUX_SURFACE_ID", raising=False)
+    monkeypatch.setattr(fleet, "_surface_pids", lambda s: set())
+    assert fleet.cmd_rm(["cond", "--with-group", "--yes"]) == 0
+    assert any(c[:2] == ("workspace-group", "delete") for c in calls)
+    assert fs.live_get("cond") is None and fs.live_get("child") is None
