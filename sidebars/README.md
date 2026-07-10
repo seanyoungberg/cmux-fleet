@@ -31,37 +31,37 @@ It's on-change-only (no churn). Run it on a loop to keep it live: `while true; d
 ## 3. Custom rich sidebar — `fleet.swift`  (opt-in; Custom Sidebars beta)
 
 A SwiftUI-style sidebar that renders the board as **collapsible conductor→worker groups**: a state icon/color,
-a threshold-colored context bar (green >50 / amber 30–50 / red <30), the latest message, an unread badge, and
-tap-to-focus.
+a threshold-colored context bar (green >50 / amber 30–50 / red <30), **model · effort**, a tool marker, the cwd,
+the latest message, an unread badge, and tap-to-focus.
 
-**Native-first.** Now that each agent owns a workspace, nearly everything comes from cmux's own fields —
-`w.title` (label), `w.progress` (ctx bar), `w.latestMessage`, `workspace.select(w.id)` (tap). The only things
-fleet has to push are **state, parent and the collapse bit**, and they ride in a short workspace `description`
-that reads as prose in the built-in sidebar instead of clobbering it:
+**CLI-derived.** Every value comes from the same `snapshot()` that `fleet vitals` reads — model, effort, tool,
+state, ctx and the last message included. (An earlier *native-first* rewrite leaned on cmux's own fields and
+**dropped** model/effort/tool while re-sourcing ctx/last from native fields that don't match vitals; the fix put
+the CLI record back.) The board rides in each agent workspace's `description` as one **FLEET4** record — 12
+`~`-delimited fields, `-` for an empty one:
 
-| workspace | description |
-|---|---|
-| child     | `working · ↳berg-sandbox` |
-| conductor | `ready · ▾berg-sandbox`  (`▸` = collapsed) |
-| shared ws | `… · +2`  (agents still sharing one workspace) |
+    surface~label~state~ctx~parent~kind~tool~model~effort~cwd~col~last
 
-A conductor carries **its own label**, not the word `conductor`: a conductor's workspace *title* is decorated
-(`Conductor - cmux-advisor`), so a child can never match its parent by title. Title is a display string, not an
-identity. The glyph alone encodes kind.
+One record per workspace, keyed by the agent's stable **surface** uuid; the sidebar unions them across every
+workspace and groups by `parent`/`kind`, so the render is identical whether agents are tabs or per-agent
+workspaces. A conductor carries **its own label**, not the word `conductor`: its workspace *title* is decorated
+(`Conductor - cmux-advisor`), so a child can never match its parent by title — the `kind` field encodes that.
 
-**Collapse without `@State`** (the interpreter has none): the chevron rewrites that workspace's description with
-the glyph flipped (`workspace.action` / `set-description`); `fleet paint` reads the glyph back and carries it
-forward, so a repaint never clobbers the choice.
+**Collapse without `@State`** (the interpreter has none): `col` is the conductor's collapse bit. The chevron
+rewrites that workspace's record with the bit flipped (`workspace.action` / `set-description`); `fleet paint`
+reads it back and carries it forward, so a repaint never clobbers the choice.
 
-Feed it: `fleet paint --sidebar` (or `FLEET_SIDEBAR_BLOB=1`). OFF by default.
+Feed it: `fleet paint --sidebar` (or `FLEET_SIDEBAR_BLOB=1`). OFF by default. To keep it **live without a shell
+loop**, set `[fleet].sidebar_paint = true` and the daemon repaints on-change (~every 4s).
 
 ```sh
 # Settings → Beta features → Custom sidebars  (once)
 cmux sidebar validate fleet && cmux sidebar select fleet
-while true; do fleet paint --sidebar; sleep 3; done
+fleet paint --sidebar                       # once, or set [fleet].sidebar_paint = true so the daemon
+                                            # keeps it live (restart the daemon to pick the setting up)
 ```
 
-> `fleet paint` **without** `--sidebar` CLEARS the descriptors, and `fleet paint --help` is unhandled so it
+> `fleet paint` **without** `--sidebar` CLEARS the records, and `fleet paint --help` is unhandled so it
 > falls through to a real paint. Don't run a bare paint while the custom sidebar is live.
 
 ## Deploy — the repo is the single source of truth
