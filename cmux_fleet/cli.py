@@ -1823,9 +1823,12 @@ def _identifies_as(cmdline, tool):
     from the hook store (real agents), but pids_ps now feeds every surface-env process through this
     check, so a substring rule would SIGINT plugin hook scripts (cmux-advisor blocker, 2026-07-10).
     Basename-of-argv0 keeps `~/.local/bin/claude` and the cmux shim `.../cmux-cli-shims/<S>/claude`,
-    and excludes the daemon python and any marketplace path. Known residual, accepted: a `claude -p`
-    subprocess (the memsearch summarizer) IS argv0 claude and still passes; it is ephemeral, so it
-    can transiently block a close but can never wedge one."""
+    and excludes the daemon python and any marketplace path. A `claude -p` subprocess (the memsearch
+    summarizer) passes THIS check by argv0 — but it is NOT reachable through the live kill/close
+    path: pids_ps filters to the seat agent first via the exact CMUX_CLAUDE_PID self-pid rule (the
+    summarizer carries its parent's pid), and store pids are real agents by construction. This check
+    is the per-pid backstop for store pids and the codex path; do not re-add a summarizer carve-out
+    here, there is no residual to fix (cmux-advisor verification, 2026-07-10)."""
     toks = (cmdline or "").split()
     return bool(toks) and os.path.basename(toks[0]) == (tool or "claude")
 

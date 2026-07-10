@@ -240,12 +240,12 @@ def test_missing_transcript_falls_back_to_deterministic_only(monkeypatch, tmp_pa
 
 
 # --- 4. never-orphan: the teardown set is store UNION ps-env (cmux-advisor finding 2) -----------------
-PS_FIXTURE = """  PID COMMAND
-  501 /sbin/launchd HOME=/ SHELL=/bin/zsh
-98942 claude --resume abc CMUX_SURFACE_ID=S-ORPH CMUX_WORKSPACE_ID=WS-1 CMUX_CLAUDE_PID=98942 TERM=xterm
-98999 claude -p summarize CMUX_SURFACE_ID=S-ORPH CMUX_CLAUDE_PID=98942 TERM=xterm
-77001 claude CMUX_SURFACE_ID=S-OTHER CMUX_CLAUDE_PID=77001 TERM=xterm
-66001 codex resume abc CMUX_SURFACE_ID=S-CDX TERM=xterm
+PS_FIXTURE = """  PID   TT  STAT      TIME COMMAND
+  501   ??  Ss     0:12.00 /sbin/launchd HOME=/ SHELL=/bin/zsh
+98942 s003  S+     0:01.38 claude --resume abc CMUX_SURFACE_ID=S-ORPH CMUX_WORKSPACE_ID=WS-1 CMUX_CLAUDE_PID=98942 TERM=xterm
+98999   ??  S      0:00.20 claude -p summarize CMUX_SURFACE_ID=S-ORPH CMUX_CLAUDE_PID=98942 TERM=xterm
+77001 s004  S+     0:00.10 claude CMUX_SURFACE_ID=S-OTHER CMUX_CLAUDE_PID=77001 TERM=xterm
+66001 s018  S+     0:01.38 codex --dangerously-bypass-approvals-and-sandbox CMUX_SURFACE_ID=S-CDX TERM=xterm
 """
 
 
@@ -257,7 +257,9 @@ def test_pids_ps_returns_only_the_seat_agent(monkeypatch):
     # (this was the accepted residual under the basename rule; the self-referential rule closes it)
     assert 98999 not in rs.pids_ps("S-ORPH", ps_out=PS_FIXTURE)
     assert rs.pids_ps("S-OTHER", ps_out=PS_FIXTURE) == set()   # 77001 not alive
-    # codex has no wrapper env: argv0-basename fallback
+    # codex has no wrapper env: argv0-basename fallback — argv0 is FIELD 5 of a real ps axeww line
+    # (PID TT STAT TIME COMMAND); parsing field 2 returns the TTY ('s018') and made this set
+    # permanently empty for codex (the shipped bug this real-shaped fixture exists to catch)
     assert rs.pids_ps("S-CDX", ps_out=PS_FIXTURE, tool="codex") == {66001}
     assert rs.pids_ps("S-CDX", ps_out=PS_FIXTURE, tool="claude") == set()
     assert rs.pids_ps("", ps_out=PS_FIXTURE) == set()
@@ -312,10 +314,10 @@ def test_conductor_close_never_blocked_by_foreign_env_carriers(monkeypatch):
     AGENT, DAEMON, ROUTER = 55001, 55002, 55003
     # daemon/router carry the surface env AND a CMUX_CLAUDE_PID naming some OTHER (even dead prior)
     # agent pid — the live shape on all three real conductors. Only the agent is self-referential.
-    ps_table = (f"  PID COMMAND\n"
-                f"{AGENT} /Users/b/.local/bin/claude --resume abc CMUX_SURFACE_ID=S-COND CMUX_CLAUDE_PID={AGENT} X=1\n"
-                f"{DAEMON} /x/.venv/bin/python -m cmux_fleet.daemon CMUX_SURFACE_ID=S-COND CMUX_CLAUDE_PID={AGENT}\n"
-                f"{ROUTER} /x/.venv/bin/python -m cmux_fleet.router --live CMUX_SURFACE_ID=S-COND CMUX_CLAUDE_PID=99999\n")
+    ps_table = (f"  PID   TT  STAT      TIME COMMAND\n"
+                f"{AGENT} s001  S+     0:05.00 /Users/b/.local/bin/claude --resume abc CMUX_SURFACE_ID=S-COND CMUX_CLAUDE_PID={AGENT} X=1\n"
+                f"{DAEMON}   ??  Ss     1:00.00 /x/.venv/bin/python -m cmux_fleet.daemon CMUX_SURFACE_ID=S-COND CMUX_CLAUDE_PID={AGENT}\n"
+                f"{ROUTER}   ??  Ss     1:00.00 /x/.venv/bin/python -m cmux_fleet.router --live CMUX_SURFACE_ID=S-COND CMUX_CLAUDE_PID=99999\n")
     monkeypatch.setattr(rs, "_ps_axeww", lambda: ps_table)              # real parse, mixed table
     alive = {AGENT: False, DAEMON: True, ROUTER: True}                   # agent counterfactually DEAD
     monkeypatch.setattr(fs, "pid_alive", lambda pid: alive.get(pid, False))

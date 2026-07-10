@@ -177,12 +177,19 @@ def _line_is_seat_agent(pid, line, tool):
     a different pid, including the summarizer (parent's pid) and any daemon (a dead prior agent's
     pid). A hung post-SessionEnd agent still satisfies it (env never changes), so the invisible
     orphan this sweep exists for is still caught. codex has no wrapper and therefore no
-    CMUX_CLAUDE_PID: fall back to argv0-basename == tool, the best available identity there."""
+    CMUX_CLAUDE_PID: fall back to argv0-basename == tool, the best available identity there.
+
+    LINE SHAPE MATTERS: default `ps axeww` columns are PID TT STAT TIME COMMAND, so argv0 is field 5
+    (maxsplit=4), NOT field 2 — field 2 is the TTY, and parsing it made pids_ps permanently empty for
+    every codex seat (cmux-advisor, live-proven: a `fleet rm` closed over a live codex having
+    signalled nothing). The bug shipped behind a fake two-column test fixture; the fixtures are now
+    real-shaped. The obvious alternative (`ps -o pid=,command=`) is NOT usable here: it drops the
+    environment this sweep matches on."""
     if (tool or "claude") == "claude":
         return f"CMUX_CLAUDE_PID={pid}" in line.split()
-    toks = line.split(None, 1)
-    argv0 = (toks[1].split() or [""])[0] if len(toks) > 1 else ""
-    return os.path.basename(argv0) == tool
+    parts = line.split(None, 4)                       # PID TT STAT TIME COMMAND...
+    cmd = parts[4].split() if len(parts) > 4 else []
+    return bool(cmd) and os.path.basename(cmd[0]) == tool
 
 
 def pids_ps(surface, ps_out=None, tool="claude"):
