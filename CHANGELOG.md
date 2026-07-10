@@ -6,8 +6,19 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [0.10.0] - 2026-07-10
+
 ### Added
 
+- **Custom fleet sidebar restored and made live.** `fleet.swift` renders model·effort, tool, ctx,
+  status, and last message per agent again, all sourced from the same `snapshot()` the CLI uses (the
+  earlier native-first rewrite had dropped them for cmux native fields that did not match `fleet vitals`).
+  Model·effort also rides the built-in ctx-bar caption. A compact per-subscription usage footer reads
+  `usage_for_paint()`. The daemon now auto-repaints the board (~4s, on-change, opt-in via
+  `[fleet].sidebar_paint`) so it self-refreshes instead of drifting stale between manual `fleet paint` runs.
+- **`usage_for_paint()` accessor + pluggable poller registry** (`providers.py`). A stable, versioned
+  (`schema:1`), provider-agnostic view of subscription usage for the sidebar or any consumer; adding a
+  provider (Vertex, Gemini, a direct API) is a `register_poller` plus config, not a rewrite.
 - **`cmux_fleet/resolve.py` — the one resolver** (agent-management v2, step 1). `seat(surface)` answers
   presence, live pids, workspace, pane and attachment for a surface; `snapshot()` batches that across
   the registry in one store read plus one tree read; `group_members()` reads membership from cmux, never
@@ -50,6 +61,13 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Fixed
 
+- **`fleet usage` labeled codex windows by slot, not by duration.** The poller mapped `primary`/`secondary`
+  positionally (5h/7d), but a free-plan account returns a 30-day `primary` and a null `secondary`, so a
+  "5h" window showed "resets in 719h". Windows are now labeled by `window_minutes`.
+- **The `_agent_pid_check` real-`ps` test hardcoded `"python"` and was red in the canonical checkout.** Its
+  interpreter reports argv0 basename `Python` (Homebrew framework) vs `python` (a uv venv); the positive
+  assertion now derives the expected name from `ps` instead of hardcoding it. The negative cases (not
+  `claude`, dead pid, garbage) stay fixed.
 - **An idle agent read `detached`, because the activity signal was the transcript's file mtime.** Step 1's
   behavioral detector compared the hook-store record's `updatedAt` against the transcript file's mtime.
   claude appends `system` / `permission-mode` / `bridge-session` bookkeeping lines to an idle agent's
