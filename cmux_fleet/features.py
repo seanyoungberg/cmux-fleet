@@ -990,41 +990,93 @@ def cmd_serve(argv):
 _SEP = "\x1f"                                                 # key delimiter (never appears in a label)
 
 
-def _fleet_blob(rows):
-    """Serialize the whole fleet board into ONE delimited string for the custom sidebar (fleet.swift),
-    which can read only cmux workspace fields — so the board rides in a workspace DESCRIPTION and the
-    .swift splits it. Format (11 fields):
-      'FLEET3;label~state~ctx~parent~kind~surface~tool~model~effort~cwd~last;...'
-    The ~ and ; delimiters are stripped from free text so a stray char can't break the parse. Rows are
-    emitted in a STABLE order (conductors by label, each followed by its children by label) so the sidebar
-    doesn't reshuffle every repaint."""
-    def clean(s, n):
-        return str(s or "").replace("~", "-").replace(";", ",").replace("\n", " ").strip()[:n]
-    def cwd_tail(p):                                            # last 3 path segments (repo/…/worktree) so the repo shows
+BLOB_TAG = "FLEET4"                                           # bump when the record shape changes
+BLOB_FIELDS = 12                                              # surface label state ctx parent kind tool model effort cwd col last
+
+
+def _blob_clean(s, n):
+    """Free text -> one safe blob field. Strips the ~ and ; delimiters so a stray char can't break the
+    parse, and NEVER returns empty: Swift's `split(separator:)` DROPS empty components, which would shift
+    every later field's index in the sidebar. '-' is the empty sentinel."""
+    v = str(s or "").replace("~", "-").replace(";", ",").replace("\n", " ").replace("#", "").strip()[:n]
+    return v or "-"
+
+
+def _fleet_blobs(rows, collapsed=None):
+    """{workspace_uuid: 'FLEET4;rec;rec;…'} — ONE blob per workspace, carrying only that workspace's agents.
+
+    Deliberately NOT coupled to a single marker workspace: each record is keyed by the agent's stable
+    SURFACE uuid and the sidebar unions the blobs across every workspace, then groups by parent. That
+    survives any placement model — agents-as-tabs put N records on one workspace; agents-as-workspaces put
+    1 record on each; the render is identical either way, so a future placement change can't invalidate it.
+
+    Record (12 fields, surface FIRST as the identity key):
+      surface~label~state~ctx~parent~kind~tool~model~effort~cwd~col~last
+    `col` is the collapse bit for a conductor ('1' collapsed). It round-trips: a sidebar tap rewrites the
+    description with the bit flipped, and `collapsed` (surface -> '1'/'0') carries it back in here so a
+    repaint never clobbers the user's choice. Records are emitted in a STABLE order (conductors by label,
+    each followed by its children) so the sidebar never reshuffles."""
+    collapsed = collapsed or {}
+
+    def cwd_tail(p):                                            # last 3 path segments (repo/…/worktree)
         segs = [x for x in str(p or "").split("/") if x]
         return "/".join(segs[-3:])
+
     def rec(r):
         pct = r["ctx_pct_remaining"]
+        surf = r.get("surface", "") or "-"
+        col = collapsed.get(surf, "0") if r.get("kind") == "conductor" else "0"
         return "~".join([
-            clean(r["label"], 24), r["state"], (str(pct) if pct is not None else "-"),
-            clean(r.get("parent"), 24), r.get("kind", "child"), r.get("surface", ""),
-            clean(r.get("tool"), 8), clean(_short_model(r.get("model") or ""), 16),
-            clean(r.get("effort"), 6), clean(cwd_tail(r.get("cwd")), 40),
-            clean(r.get("last_text"), 160),
+            surf, _blob_clean(r["label"], 24), r["state"], (str(pct) if pct is not None else "-"),
+            _blob_clean(r.get("parent"), 24), r.get("kind", "child") or "child",
+            _blob_clean(r.get("tool"), 8), _blob_clean(_short_model(r.get("model") or ""), 16),
+            _blob_clean(r.get("effort"), 6), _blob_clean(cwd_tail(r.get("cwd")), 40),
+            col, _blob_clean(r.get("last_text"), 160),
         ])
+
     by_label = sorted(rows, key=lambda r: r["label"])
     conductors = [r for r in by_label if r.get("kind") == "conductor"]
-    recs = ["FLEET3"]
-    seen = set()
-    for c in conductors:                                       # each conductor, then its children (stable)
-        recs.append(rec(c)); seen.add(c["label"])
+    ordered, seen = [], set()
+    for c in conductors:                                        # each conductor, then its children (stable)
+        ordered.append(c); seen.add(c["label"])
         for r in by_label:
             if r.get("parent") == c["label"] and r.get("kind") != "conductor" and r["label"] not in seen:
-                recs.append(rec(r)); seen.add(r["label"])
-    for r in by_label:                                          # any orphans (parent not a conductor)
+                ordered.append(r); seen.add(r["label"])
+    for r in by_label:                                          # orphans (parent isn't a live conductor)
         if r["label"] not in seen:
-            recs.append(rec(r)); seen.add(r["label"])
-    return ";".join(recs)
+            ordered.append(r); seen.add(r["label"])
+
+    blobs = {}
+    for r in ordered:                                           # bucket each agent onto ITS workspace
+        ws = r.get("ws")
+        if not ws:
+            continue
+        blobs.setdefault(ws, [BLOB_TAG]).append(rec(r))
+    return {ws: ";".join(recs) for ws, recs in blobs.items()}
+
+
+def _ws_descriptions():
+    """{workspace_uuid: description} as the custom sidebar sees them. Used to read back the collapse bits
+    a sidebar tap wrote, so a repaint carries them forward instead of clobbering them."""
+    try:
+        d = json.loads(_cmux("rpc", "extension.sidebar.snapshot", "{}") or "{}")
+        return {w.get("id"): (w.get("description") or "") for w in d.get("workspaces", []) if w.get("id")}
+    except Exception:
+        return {}
+
+
+def _collapsed_map(descs):
+    """{surface_uuid: '1'|'0'} — the collapse bit each conductor record currently carries, parsed out of
+    the live workspace descriptions. Tolerant: any malformed record is skipped, never raises."""
+    out = {}
+    for desc in (descs or {}).values():
+        if not desc.startswith(BLOB_TAG + ";"):
+            continue
+        for r in desc.split(";")[1:]:
+            f = r.split("~")
+            if len(f) == BLOB_FIELDS and f[10] in ("0", "1"):
+                out[f[0]] = f[10]
+    return out
 
 
 def _paint(rows, sidebar_blob=False):
@@ -1082,26 +1134,37 @@ def _paint(rows, sidebar_blob=False):
             continue
         _cmux("set-progress", prog, "--label", f"{lbl} {pct}% left", "--workspace", ws)
         painted += 1
-    # emit the whole fleet board as one delimited blob into a MARKER workspace's description, for the
-    # custom sidebar (fleet.swift) — it can't read pills, only workspace fields. OFF by default: the blob
-    # is visible as the workspace's SUBTITLE in the built-in sidebar (ugly), so plain `fleet paint` /
-    # `vitals --paint` never write it. Opt in with FLEET_SIDEBAR_BLOB=1 when the custom sidebar is active.
-    # Marker = the first conductor's workspace (deterministic); on-change only; sidebar finds it by prefix.
-    blob = _fleet_blob(rows)
-    marker_ws = (next((r["ws"] for r in rows if r.get("kind") == "conductor" and r["ws"]), "")
-                 or next((r["ws"] for r in rows if r["ws"]), ""))
-    old_mark = prev.get(f"blob{_SEP}mark")
-    if (sidebar_blob or os.environ.get("FLEET_SIDEBAR_BLOB")) and marker_ws:
-        cur[f"blob{_SEP}mark"] = marker_ws
-        cur[f"blob{_SEP}val"] = blob
-        if prev.get(f"blob{_SEP}val") != blob or old_mark != marker_ws:
-            _cmux("workspace-action", "--action", "set-description", "--description", blob,
-                  "--workspace", marker_ws)
-            painted += 1
-        if old_mark and old_mark != marker_ws:                 # marker moved -> clear the stale blob
-            _cmux("workspace-action", "--action", "clear-description", "--workspace", old_mark)
-    elif old_mark:                                             # blob just disabled -> wipe the lingering one
-        _cmux("workspace-action", "--action", "clear-description", "--workspace", old_mark)
+    # emit the fleet board for the custom sidebar (fleet.swift) — it can't read pills, only workspace
+    # fields, so the board rides in workspace DESCRIPTIONS. One blob PER WORKSPACE (never a single marker):
+    # each record is keyed by the agent's stable surface uuid and the sidebar unions them, so whatever
+    # placement model the fleet lands on (tabs vs per-agent workspaces) the render is unchanged.
+    # OFF by default: a blob shows as that workspace's SUBTITLE in the built-in sidebar (ugly), so plain
+    # `fleet paint` / `vitals --paint` never write it. Opt in via `--sidebar` / FLEET_SIDEBAR_BLOB=1.
+    want_blob = bool(sidebar_blob or os.environ.get("FLEET_SIDEBAR_BLOB"))
+    old_blob_ws = {k.split(_SEP, 1)[1] for k in prev if k.startswith(f"blob{_SEP}")} - {"mark", "val"}
+    legacy_mark = prev.get(f"blob{_SEP}mark")                 # pre-FLEET4 single-marker layout
+    if legacy_mark:
+        old_blob_ws.add(legacy_mark)                          # so its stale blob is overwritten or cleared
+    if want_blob:
+        # carry the sidebar's collapse bits forward — a tap wrote them into the description, and a naive
+        # regenerate would wipe the user's choice on the very next repaint.
+        descs = _ws_descriptions()
+        collapsed = _collapsed_map(descs)
+        blobs = _fleet_blobs(rows, collapsed)
+        for ws, blob in blobs.items():
+            cur[f"blob{_SEP}{ws}"] = blob
+            # diff against the LIVE description, not our cached fingerprint: that makes the write
+            # self-healing (an externally corrupted blob is repaired) AND still churn-free — a tap's bit is
+            # already baked into `blob` via `collapsed`, so an untouched workspace compares equal and is a no-op.
+            if descs.get(ws) != blob:
+                _cmux("workspace-action", "--action", "set-description", "--description", blob,
+                      "--workspace", ws)
+                painted += 1
+        for ws in old_blob_ws - set(blobs):                    # workspace lost its agents -> wipe its blob
+            _cmux("workspace-action", "--action", "clear-description", "--workspace", ws)
+    else:
+        for ws in old_blob_ws:                                 # blob disabled -> wipe every lingering one
+            _cmux("workspace-action", "--action", "clear-description", "--workspace", ws)
     # retire pills for agents (and legacy single-'fleet' pills) that are no longer present.
     for stale in set(prev) - set(cur):
         parts = stale.split(_SEP)

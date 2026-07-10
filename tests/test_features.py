@@ -547,38 +547,72 @@ def test_paint_on_change_only_and_retires_vanished_pills(monkeypatch):
     assert ("clear-status", "b", "--workspace", "workspace:2") in clears
 
 
-def test_fleet_blob_serializes_and_sanitizes():
+def test_fleet_blobs_are_per_workspace_and_keyed_by_surface():
+    # NOT one marker workspace: a blob per workspace, each record keyed by the agent's stable surface uuid.
+    # That's what makes the render survive a placement change (tabs -> per-agent workspaces).
     ff = _ff()
-    rows = [dict(_row("lead", state="working", ctx_pct_remaining=41), kind="conductor", surface="s1"),
+    rows = [dict(_row("lead", state="working", ctx_pct_remaining=41), kind="conductor", surface="s1", ws="ws-A"),
             dict(_row("w~one;x", state="idle", ctx_pct_remaining=None), kind="child", parent="lead",
-                 surface="s2", last_text="did a ~thing; ok")]
-    blob = ff._fleet_blob(rows)
-    assert blob.startswith("FLEET3;")
-    recs = blob.split(";")
-    assert recs[0] == "FLEET3"
-    lead = recs[1].split("~")                                 # conductor emitted first (stable order)
-    assert lead[0] == "lead" and lead[1] == "working" and lead[2] == "41"
-    assert lead[4] == "conductor" and lead[5] == "s1" and lead[6] == "claude"
-    child = recs[2].split("~")                                # its child next
-    assert child[0] == "w-one,x"                              # ~ and ; stripped from the label
-    assert child[2] == "-"                                    # no ctx -> '-'
-    assert child[4] == "child" and child[3] == "lead"
-    assert child[10] == "did a -thing, ok"                   # last-text (field 10) delimiters neutralized
+                 surface="s2", ws="ws-B", last_text="did a ~thing; ok")]
+    blobs = ff._fleet_blobs(rows)
+    assert set(blobs) == {"ws-A", "ws-B"}
+    assert blobs["ws-A"].startswith("FLEET4;")
+    lead = blobs["ws-A"].split(";")[1].split("~")
+    assert len(lead) == ff.BLOB_FIELDS
+    assert lead[0] == "s1"                                    # surface uuid FIRST — the identity key
+    assert lead[1] == "lead" and lead[2] == "working" and lead[3] == "41"
+    assert lead[5] == "conductor" and lead[10] == "0"         # conductor, not collapsed
+    child = blobs["ws-B"].split(";")[1].split("~")
+    assert child[0] == "s2" and child[1] == "w-one,x"         # ~ and ; stripped from the label
+    assert child[3] == "-"                                    # no ctx -> '-'
+    assert child[4] == "lead" and child[5] == "child"
+    assert child[11] == "did a -thing, ok"                    # last-text delimiters neutralized
 
 
-def test_paint_emits_blob_to_first_conductor_workspace(monkeypatch):
+def test_blob_never_emits_an_empty_field():
+    # Swift's split(separator:) DROPS empty components, which would shift every later field's index in the
+    # sidebar and silently mis-render. Every empty must serialize as '-'.
+    ff = _ff()
+    rows = [dict(_row("solo", state="idle", ctx_pct_remaining=None), kind="child", parent="",
+                 surface="s1", ws="ws-A", last_text="")]
+    f = ff._fleet_blobs(rows)["ws-A"].split(";")[1].split("~")
+    assert len(f) == ff.BLOB_FIELDS                           # nothing dropped
+    assert "" not in f                                        # every empty became the '-' sentinel
+
+
+def test_collapse_bit_round_trips_and_survives_a_repaint():
+    ff = _ff()
+    rows = [dict(_row("lead", state="working", ctx_pct_remaining=41), kind="conductor", surface="s1", ws="ws-A")]
+    tapped = ff._fleet_blobs(rows, collapsed={"s1": "1"})["ws-A"]   # a sidebar tap flipped the bit
+    assert tapped.split(";")[1].split("~")[10] == "1"
+    carried = ff._collapsed_map({"ws-A": tapped})                   # paint reads it back out of the live desc
+    assert carried == {"s1": "1"}
+    assert ff._fleet_blobs(rows, carried)["ws-A"] == tapped         # repaint preserves the user's choice
+    # only conductors carry a collapse bit — a child's is always '0'
+    kid = [dict(_row("w", state="idle"), kind="child", parent="lead", surface="s2", ws="ws-A")]
+    assert ff._fleet_blobs(kid, {"s2": "1"})["ws-A"].split(";")[1].split("~")[10] == "0"
+
+
+def test_collapsed_map_tolerates_malformed_records():
+    ff = _ff()
+    assert ff._collapsed_map({"w": "not a blob"}) == {}
+    assert ff._collapsed_map({"w": "FLEET4;too~few~fields"}) == {}
+    assert ff._collapsed_map({}) == {}
+
+
+def test_paint_writes_a_blob_to_every_agent_workspace(monkeypatch):
     ff = _ff()
     monkeypatch.setenv("FLEET_SIDEBAR_BLOB", "1")             # blob is opt-in (off by default)
     calls = _capture_cmux(ff, monkeypatch)
-    rows = [dict(_row("worker", state="working", ctx_pct_remaining=50), ws="workspace:9", kind="child"),
-            dict(_row("boss", state="working", ctx_pct_remaining=40), ws="workspace:1", kind="conductor")]
+    rows = [dict(_row("worker", state="working", ctx_pct_remaining=50), ws="ws-B", kind="child",
+                 parent="boss", surface="s2"),
+            dict(_row("boss", state="working", ctx_pct_remaining=40), ws="ws-A", kind="conductor", surface="s1")]
     ff._paint(rows)
     desc = [c for c in calls if c[0] == "workspace-action" and "set-description" in c]
-    assert len(desc) == 1
-    assert desc[0][-1] == "workspace:1"                       # marker = the conductor's ws
-    assert "--description" in desc[0]
-    blob = desc[0][desc[0].index("--description") + 1]
-    assert blob.startswith("FLEET3;") and "boss~working~40" in blob and "worker~working~50" in blob
+    assert len(desc) == 2                                     # one per workspace — no single marker
+    assert {c[-1] for c in desc} == {"ws-A", "ws-B"}
+    for c in desc:
+        assert c[c.index("--description") + 1].startswith("FLEET4;")
 
 
 def test_surface_ws_map_parses_the_tree_and_snapshot_prefers_it_over_stale_caches(fs, monkeypatch):
@@ -604,3 +638,47 @@ def test_surface_ws_map_parses_the_tree_and_snapshot_prefers_it_over_stale_cache
     ff._WS_MAP.update({"at": 0.0, "map": {}})
     monkeypatch.setattr(ff, "_cmux", lambda *a: "")
     assert ff._surface_ws_map(ttl=0) == {}
+
+
+def test_paint_without_optin_writes_no_blob(monkeypatch):
+    ff = _ff()
+    monkeypatch.delenv("FLEET_SIDEBAR_BLOB", raising=False)
+    calls = _capture_cmux(ff, monkeypatch)
+    ff._paint([dict(_row("boss", state="working"), ws="ws-A", kind="conductor", surface="s1")])
+    assert not [c for c in calls if c[0] == "workspace-action" and "set-description" in c]
+
+
+def _boss_rows():
+    return [dict(_row("boss", state="working", ctx_pct_remaining=40), ws="ws-A", kind="conductor", surface="s1")]
+
+
+def test_paint_is_a_noop_when_the_live_description_already_matches(monkeypatch):
+    # churn guard: diffing against the LIVE description (not our fingerprint) must still skip a clean ws.
+    ff = _ff()
+    monkeypatch.setenv("FLEET_SIDEBAR_BLOB", "1")
+    rows = _boss_rows()
+    live = ff._fleet_blobs(rows)["ws-A"]
+    monkeypatch.setattr(ff, "_ws_descriptions", lambda: {"ws-A": live})
+    calls = _capture_cmux(ff, monkeypatch)
+    ff._paint(rows)
+    assert not [c for c in calls if c[0] == "workspace-action" and "set-description" in c]
+
+
+def test_paint_self_heals_an_externally_corrupted_blob(monkeypatch):
+    # a stale PAINT_STATE fingerprint must NOT stop us repairing a description someone else clobbered.
+    ff = _ff()
+    monkeypatch.setenv("FLEET_SIDEBAR_BLOB", "1")
+    rows = _boss_rows()
+    good = ff._fleet_blobs(rows)["ws-A"]
+    monkeypatch.setattr(ff, "_ws_descriptions", lambda: {"ws-A": "FLEET4;SENTINEL"})
+    os.makedirs(os.path.dirname(ff.PAINT_STATE), exist_ok=True)
+    json.dump({f"blob{ff._SEP}ws-A": good}, open(ff.PAINT_STATE, "w"))   # fingerprint says "already correct"
+    calls = _capture_cmux(ff, monkeypatch)
+    ff._paint(rows)
+    desc = [c for c in calls if c[0] == "workspace-action" and "set-description" in c]
+    assert len(desc) == 1                                     # repaired anyway
+    assert desc[0][c_index(desc[0])] == good
+
+
+def c_index(call):
+    return call.index("--description") + 1
