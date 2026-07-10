@@ -600,21 +600,6 @@ def test_collapsed_map_tolerates_malformed_records():
     assert ff._collapsed_map({}) == {}
 
 
-def test_paint_writes_a_blob_to_every_agent_workspace(monkeypatch):
-    ff = _ff()
-    monkeypatch.setenv("FLEET_SIDEBAR_BLOB", "1")             # blob is opt-in (off by default)
-    calls = _capture_cmux(ff, monkeypatch)
-    rows = [dict(_row("worker", state="working", ctx_pct_remaining=50), ws="ws-B", kind="child",
-                 parent="boss", surface="s2"),
-            dict(_row("boss", state="working", ctx_pct_remaining=40), ws="ws-A", kind="conductor", surface="s1")]
-    ff._paint(rows)
-    desc = [c for c in calls if c[0] == "workspace-action" and "set-description" in c]
-    assert len(desc) == 2                                     # one per workspace — no single marker
-    assert {c[-1] for c in desc} == {"ws-A", "ws-B"}
-    for c in desc:
-        assert c[c.index("--description") + 1].startswith("FLEET4;")
-
-
 def test_surface_ws_map_parses_the_tree_and_snapshot_prefers_it_over_stale_caches(fs, monkeypatch):
     # 2026-07-10 (found by sidebar-build): snapshot read the hook store's workspaceId, which is never
     # updated when a surface MOVES — so two agents moved into their own workspaces both reported the
@@ -640,45 +625,107 @@ def test_surface_ws_map_parses_the_tree_and_snapshot_prefers_it_over_stale_cache
     assert ff._surface_ws_map(ttl=0) == {}
 
 
-def test_paint_without_optin_writes_no_blob(monkeypatch):
-    ff = _ff()
-    monkeypatch.delenv("FLEET_SIDEBAR_BLOB", raising=False)
-    calls = _capture_cmux(ff, monkeypatch)
-    ff._paint([dict(_row("boss", state="working"), ws="ws-A", kind="conductor", surface="s1")])
-    assert not [c for c in calls if c[0] == "workspace-action" and "set-description" in c]
+def c_index(call):
+    return call.index("--description") + 1
 
 
 def _boss_rows():
     return [dict(_row("boss", state="working", ctx_pct_remaining=40), ws="ws-A", kind="conductor", surface="s1")]
 
 
-def test_paint_is_a_noop_when_the_live_description_already_matches(monkeypatch):
-    # churn guard: diffing against the LIVE description (not our fingerprint) must still skip a clean ws.
+# ── the DESCRIPTOR surface: a short subtitle, not a serialized record ─────────────────────────
+def test_descriptor_reads_as_prose_not_as_a_record():
+    ff = _ff()
+    assert ff._descriptor("working", "child", "berg-sandbox") == "working · ↳berg-sandbox"
+    assert ff._descriptor("ready", "conductor") == "ready · ▾conductor"
+    assert ff._descriptor("ready", "conductor", collapsed=True) == "ready · ▸conductor"
+    assert ff._descriptor("idle", "child", "") == "idle"                  # orphan -> just the state
+    assert ff._descriptor("idle", "child", "-") == "idle"                 # '-' sentinel is not a parent
+    assert ff._descriptor("working", "conductor", extra=2) == "working · ▾conductor · +2"
+
+
+def test_is_descriptor_only_claims_subtitles_we_wrote():
+    ff = _ff()
+    assert ff._is_descriptor("working · ↳berg-sandbox")
+    assert ff._is_descriptor("ready · ▸conductor")
+    assert not ff._is_descriptor("my own notes about this workspace")     # never clobber the user's text
+    assert not ff._is_descriptor("")
+
+
+def test_descriptor_collapsed_reads_the_glyph_back():
+    ff = _ff()
+    m = ff._descriptor_collapsed({"ws-A": "ready · ▸conductor", "ws-B": "ready · ▾conductor",
+                                  "ws-C": "hand-written note"})
+    assert m == {"ws-A": True}                                # only the collapsed conductor
+
+
+def test_paint_writes_one_short_descriptor_per_agent_workspace(monkeypatch):
+    ff = _ff()
+    monkeypatch.setenv("FLEET_SIDEBAR_BLOB", "1")             # opt-in (off by default)
+    monkeypatch.setattr(ff, "_ws_descriptions", lambda: {})
+    calls = _capture_cmux(ff, monkeypatch)
+    rows = [dict(_row("worker", state="working", ctx_pct_remaining=50), ws="ws-B", kind="child",
+                 parent="boss", surface="s2"),
+            dict(_row("boss", state="ready", ctx_pct_remaining=40), ws="ws-A", kind="conductor", surface="s1")]
+    ff._paint(rows)
+    desc = {c[-1]: c[c_index(c)] for c in calls if c[0] == "workspace-action" and "set-description" in c}
+    assert desc == {"ws-A": "ready · ▾conductor", "ws-B": "working · ↳boss"}
+    assert not any("FLEET" in v for v in desc.values())       # no serialized blob in the built-in view
+
+
+def test_paint_marks_a_shared_workspace_with_the_extra_count(monkeypatch):
+    # transitional: while several agents still resolve to one workspace, say so instead of lying.
     ff = _ff()
     monkeypatch.setenv("FLEET_SIDEBAR_BLOB", "1")
-    rows = _boss_rows()
-    live = ff._fleet_blobs(rows)["ws-A"]
-    monkeypatch.setattr(ff, "_ws_descriptions", lambda: {"ws-A": live})
+    monkeypatch.setattr(ff, "_ws_descriptions", lambda: {})
     calls = _capture_cmux(ff, monkeypatch)
+    rows = [dict(_row("kid", state="idle"), ws="ws-A", kind="child", parent="boss", surface="s2"),
+            dict(_row("boss", state="ready"), ws="ws-A", kind="conductor", surface="s1")]
     ff._paint(rows)
+    desc = [c[c_index(c)] for c in calls if c[0] == "workspace-action" and "set-description" in c]
+    assert desc == ["ready · ▾conductor · +1"]                # conductor represents its workspace
+
+
+def test_paint_carries_the_collapse_glyph_forward(monkeypatch):
+    ff = _ff()
+    monkeypatch.setenv("FLEET_SIDEBAR_BLOB", "1")
+    monkeypatch.setattr(ff, "_ws_descriptions", lambda: {"ws-A": "ready · ▸conductor"})  # user collapsed it
+    calls = _capture_cmux(ff, monkeypatch)
+    ff._paint([dict(_row("boss", state="ready"), ws="ws-A", kind="conductor", surface="s1")])
+    # regenerated identical -> no write at all, so the user's choice survives untouched
     assert not [c for c in calls if c[0] == "workspace-action" and "set-description" in c]
 
 
-def test_paint_self_heals_an_externally_corrupted_blob(monkeypatch):
-    # a stale PAINT_STATE fingerprint must NOT stop us repairing a description someone else clobbered.
+def test_paint_never_clobbers_a_description_it_did_not_write(monkeypatch):
+    ff = _ff()
+    monkeypatch.delenv("FLEET_SIDEBAR_BLOB", raising=False)
+    monkeypatch.setattr(ff, "_ws_descriptions", lambda: {"ws-A": "berg's own note"})
+    os.makedirs(os.path.dirname(ff.PAINT_STATE), exist_ok=True)
+    json.dump({f"desc{ff._SEP}ws-A": "working · ↳boss"}, open(ff.PAINT_STATE, "w"))
+    calls = _capture_cmux(ff, monkeypatch)
+    ff._paint([])
+    assert not [c for c in calls if "clear-description" in c]  # hands off
+
+
+def test_paint_self_heals_a_corrupted_descriptor(monkeypatch):
+    # a stale PAINT_STATE fingerprint must NOT stop us repairing a subtitle someone else clobbered.
     ff = _ff()
     monkeypatch.setenv("FLEET_SIDEBAR_BLOB", "1")
-    rows = _boss_rows()
-    good = ff._fleet_blobs(rows)["ws-A"]
-    monkeypatch.setattr(ff, "_ws_descriptions", lambda: {"ws-A": "FLEET4;SENTINEL"})
+    monkeypatch.setattr(ff, "_ws_descriptions", lambda: {"ws-A": "working · ↳WRONG"})
     os.makedirs(os.path.dirname(ff.PAINT_STATE), exist_ok=True)
-    json.dump({f"blob{ff._SEP}ws-A": good}, open(ff.PAINT_STATE, "w"))   # fingerprint says "already correct"
+    json.dump({f"desc{ff._SEP}ws-A": "ready · ▾conductor"}, open(ff.PAINT_STATE, "w"))
     calls = _capture_cmux(ff, monkeypatch)
-    ff._paint(rows)
-    desc = [c for c in calls if c[0] == "workspace-action" and "set-description" in c]
-    assert len(desc) == 1                                     # repaired anyway
-    assert desc[0][c_index(desc[0])] == good
+    ff._paint(_boss_rows())
+    desc = [c[c_index(c)] for c in calls if c[0] == "workspace-action" and "set-description" in c]
+    assert desc == ["working · ▾conductor"]                   # repaired despite the fingerprint
 
 
-def c_index(call):
-    return call.index("--description") + 1
+def test_paint_migrates_off_the_old_serialized_blob(monkeypatch):
+    ff = _ff()
+    monkeypatch.delenv("FLEET_SIDEBAR_BLOB", raising=False)
+    monkeypatch.setattr(ff, "_ws_descriptions", lambda: {"ws-A": "FLEET4;s1~boss~ready~40~-~conductor~claude~-~-~-~0~-"})
+    os.makedirs(os.path.dirname(ff.PAINT_STATE), exist_ok=True)
+    json.dump({f"blob{ff._SEP}ws-A": "whatever"}, open(ff.PAINT_STATE, "w"))
+    calls = _capture_cmux(ff, monkeypatch)
+    ff._paint([])
+    assert ("workspace-action", "--action", "clear-description", "--workspace", "ws-A") in calls

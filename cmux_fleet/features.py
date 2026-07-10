@@ -1079,6 +1079,43 @@ def _collapsed_map(descs):
     return out
 
 
+# ─── per-agent DESCRIPTOR (the clean surface: one agent per workspace) ─────────────────────────
+# Once each agent owns a workspace, the custom sidebar needs almost nothing pushed: the label is the
+# native `title`, the ctx bar is the native `progress` (we already write it via set-progress), the last
+# message is the native `latestMessage`, and a tap is `workspace.select(id)`. The ONLY non-native bits are
+# STATE, PARENT (for conductor->worker grouping) and the COLLAPSE bit — which fit in a short, human-readable
+# subtitle that READS as useful in the built-in sidebar instead of clobbering it:
+#     child      -> "working · ↳berg-sandbox"
+#     conductor  -> "ready · ▾conductor"     ('▸' when collapsed)
+#     shared ws  -> "… · +2"                 (transitional: N agents still share one workspace)
+# Parsed with only split/contains — the .swift subset has no trim or regex.
+DESC_CHILD, DESC_OPEN, DESC_SHUT = "↳", "▾", "▸"
+
+
+def _descriptor(state, kind="child", parent="", collapsed=False, extra=0):
+    """The short per-agent workspace subtitle. Deliberately reads as prose, not as a serialized record."""
+    if kind == "conductor":
+        s = f"{state} · {DESC_SHUT if collapsed else DESC_OPEN}conductor"
+    elif parent and parent != "-":
+        s = f"{state} · {DESC_CHILD}{parent}"
+    else:
+        s = state
+    return s + (f" · +{extra}" if extra else "")
+
+
+def _is_descriptor(desc):
+    """True for a subtitle WE wrote. A user's own workspace description must never be parsed or clobbered."""
+    d = desc or ""
+    return (DESC_CHILD in d) or (f"{DESC_OPEN}conductor" in d) or (f"{DESC_SHUT}conductor" in d)
+
+
+def _descriptor_collapsed(descs):
+    """{workspace_uuid: True} for every conductor workspace whose subtitle currently shows the COLLAPSED
+    glyph. That glyph is the only place the user's collapse choice lives, so a repaint must read it back."""
+    return {ws: True for ws, d in (descs or {}).items()
+            if _is_descriptor(d) and f"{DESC_SHUT}conductor" in (d or "")}
+
+
 def _paint(rows, sidebar_blob=False):
     """Push the live fleet onto the cmux BUILT-IN sidebar as native widgets:
       • one status PILL PER AGENT, keyed by the agent's label — so children that SHARE a conductor's
@@ -1140,38 +1177,47 @@ def _paint(rows, sidebar_blob=False):
     # placement model the fleet lands on (tabs vs per-agent workspaces) the render is unchanged.
     # OFF by default: a blob shows as that workspace's SUBTITLE in the built-in sidebar (ugly), so plain
     # `fleet paint` / `vitals --paint` never write it. Opt in via `--sidebar` / FLEET_SIDEBAR_BLOB=1.
-    want_blob = bool(sidebar_blob or os.environ.get("FLEET_SIDEBAR_BLOB"))
-    old_blob_ws = {k.split(_SEP, 1)[1] for k in prev if k.startswith(f"blob{_SEP}")} - {"mark", "val"}
-    legacy_mark = prev.get(f"blob{_SEP}mark")                 # pre-FLEET4 single-marker layout
-    if legacy_mark:
-        old_blob_ws.add(legacy_mark)                          # so its stale blob is overwritten or cleared
-    if want_blob:
-        # carry the sidebar's collapse bits forward — a tap wrote them into the description, and a naive
-        # regenerate would wipe the user's choice on the very next repaint.
-        descs = _ws_descriptions()
-        collapsed = _collapsed_map(descs)
-        blobs = _fleet_blobs(rows, collapsed)
-        for ws, blob in blobs.items():
-            cur[f"blob{_SEP}{ws}"] = blob
-            # diff against the LIVE description, not our cached fingerprint: that makes the write
-            # self-healing (an externally corrupted blob is repaired) AND still churn-free — a tap's bit is
-            # already baked into `blob` via `collapsed`, so an untouched workspace compares equal and is a no-op.
-            if descs.get(ws) != blob:
-                _cmux("workspace-action", "--action", "set-description", "--description", blob,
+    want_sb = bool(sidebar_blob or os.environ.get("FLEET_SIDEBAR_BLOB"))
+    prev_desc_ws = {k.split(_SEP, 1)[1] for k in prev if k.startswith(f"desc{_SEP}")}
+    stale_keys = {k for k in prev if k.startswith(f"blob{_SEP}")}   # pre-descriptor blob layouts
+    descs = _ws_descriptions() if (want_sb or prev_desc_ws or stale_keys) else {}
+
+    def _ours(ws):                                             # never clobber a description we didn't write
+        return _is_descriptor(descs.get(ws, "")) or (descs.get(ws, "") or "").startswith(BLOB_TAG + ";")
+
+    for ws, d in descs.items():                                # migrate: wipe leftover FLEET blob subtitles
+        if (d or "").startswith(BLOB_TAG + ";"):
+            _cmux("workspace-action", "--action", "clear-description", "--workspace", ws)
+    if want_sb:
+        collapsed_ws = _descriptor_collapsed(descs)            # the user's collapse choice lives in the glyph
+        by_ws = {}
+        for r in rows:
+            if r.get("ws"):
+                by_ws.setdefault(r["ws"], []).append(r)
+        for ws, ags in by_ws.items():
+            ags = sorted(ags, key=lambda r: (r.get("kind") != "conductor", r["label"]))
+            p = ags[0]                                         # a conductor represents its workspace
+            d = _descriptor(p["state"], p.get("kind", "child"), p.get("parent") or "",
+                            bool(collapsed_ws.get(ws)), len(ags) - 1)
+            cur[f"desc{_SEP}{ws}"] = d
+            if descs.get(ws) != d:                             # diff the LIVE subtitle -> self-healing, no churn
+                _cmux("workspace-action", "--action", "set-description", "--description", d,
                       "--workspace", ws)
                 painted += 1
-        for ws in old_blob_ws - set(blobs):                    # workspace lost its agents -> wipe its blob
-            _cmux("workspace-action", "--action", "clear-description", "--workspace", ws)
+        for ws in prev_desc_ws - set(by_ws):                   # workspace lost its agent -> retire its subtitle
+            if _ours(ws):
+                _cmux("workspace-action", "--action", "clear-description", "--workspace", ws)
     else:
-        for ws in old_blob_ws:                                 # blob disabled -> wipe every lingering one
-            _cmux("workspace-action", "--action", "clear-description", "--workspace", ws)
+        for ws in prev_desc_ws:                                # disabled -> retire every subtitle we own
+            if _ours(ws):
+                _cmux("workspace-action", "--action", "clear-description", "--workspace", ws)
     # retire pills for agents (and legacy single-'fleet' pills) that are no longer present.
     for stale in set(prev) - set(cur):
         parts = stale.split(_SEP)
         if parts[0] == "pill" and len(parts) == 3:
             _cmux("clear-status", parts[2], "--workspace", parts[1])
-        elif parts[0] == "blob":
-            continue                                           # blob marker handled above, not a pill
+        elif parts[0] in ("blob", "desc"):
+            continue                                           # subtitles are handled above, not pills
         elif _SEP not in stale:                                # old format: bare ws -> the 'fleet' pill
             _cmux("clear-status", "fleet", "--workspace", stale)
     try:
