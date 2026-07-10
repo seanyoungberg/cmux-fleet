@@ -51,6 +51,14 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Fixed
 
+- **Stale usage line no longer draws twice in the sidebar.** A stale/failed provider rendered a
+  "usage stale" line *over* a phantom "-% -%" row (two broken lines). The cmux-sidebar interpreter treats
+  a `some View` func as a view *builder* — it collects every view expression whose guard holds and *ignores*
+  `return`, so `if stale { return staleLine } return freshLine` drew BOTH. `usageLine` now delegates to two
+  positive-guarded sub-views (`usageStale`/`usageFresh`, exactly one is non-`EmptyView`); the same latent
+  pattern in `ctxRow`/`cwdLine`/`lastLine`/`usageWindow`/`resetView` was flipped positive too. Render layer
+  only — the poller's stale state is untouched.
+
 - **`fleet rm --with-group` no longer refuses to dissolve any Model-B group.** The dissolve preflight
   cross-checks the registry's believed group membership against cmux's REAL membership and aborts on
   divergence (the 2026-07-02 registry-integrity guard). Under the new empty-anchor model that check
