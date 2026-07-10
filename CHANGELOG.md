@@ -6,19 +6,32 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
-### Fixed
+### Added
 
-- **`fleet vitals` and `fleet sessions` printed every age as `495464h ago`.** On 2026-07-07 the
-  providers work added a second `def _age(epoch)` to `features.py`, beside the `def _age(secs)` that
-  had been there since 06-29. Python bound the later one, so the two callers that pass a DURATION
-  (`vitals`' idle column, `sessions`' per-session age) silently got the EPOCH formatter and rendered
-  `now - 120s` as ~56 years; `sessions` also doubled the suffix (`495464h ago ago`). Nothing raised —
-  the argument is a plausible int either way — and the suite stayed green for three days. The epoch
-  formatter is now `_ago()`; `_age()` is the duration formatter again. Note which signal this blanked:
-  `sessions`' age column is the operator's only guardrail when choosing a session to revive.
-- **A duplicate `_store()` in `cli.py`** (verbatim, harmless) is deleted, and
-  `tests/test_no_shadowed_defs.py` now fails any module that defines a top-level name twice — the
-  class-level guard for both bugs above.
+- **`cmux_fleet/resolve.py` — the one resolver** (agent-management v2, step 1). `seat(surface)` answers
+  presence, live pids, workspace, pane and attachment for a surface; `snapshot()` batches that across
+  the registry in one store read plus one tree read; `group_members()` reads membership from cmux, never
+  from the registry. Presence is the pid rule, stated once: an agent is present iff its surface holds a
+  hook-store record with a live pid whose `ps` identity matches the agent's tool. Seven ad-hoc predicates
+  that each restated some version of that rule (`surface_has_live_agent`, `surface_has_live_pid`,
+  `_live_bound_sid`, `ws_uuid_for_surface`, `current_ws_for_surface`, `resolve_bound_record`, and
+  `poll_session`'s fallback) now route through it, so `ls`, `vitals`, `doctor`, the wake gate, the launch
+  guards, recycle's confirm and `rm`'s stops all read one truth. Topology (workspace, pane, group) is
+  derived from `cmux tree` at read time; the registry's stored `workspace` / `status` / `place` fields
+  still exist but nothing reads them (removing them is step 3, not yet authorized). Shipped `4b19974`.
+- **The attachment axis and the `detached` doctor condition** (invariant I4, ships with step 1). An agent
+  can be *present but detached*: its process works while its hook channel is dead, so its completions stop
+  reaching its parent, its Feed gates go invisible, and `updatedAt` freezes. Detached is a conjunction —
+  record frozen **and** evidence of activity — never a frozen record alone, because that describes every
+  idle agent. Evidence is behavioral (the agent's last turn is recent while its record is frozen) or
+  deterministic (`ps eww` reports a `CMUX_WORKSPACE_ID` differing from the tree's, which is what a
+  relocation leaves behind). The doctor names the state; the remedy is a reseat (`fleet recycle`). The
+  fleet never auto-heals it.
+- **`cmux_fleet/adapter.py` — exec-delivery for every process start** (agent-management v2, step 2).
+  `launch` and `revive` now deliver the tool as the pane PROCESS via `respawn-pane`, the path `recycle`
+  already used, so all three start a process the same way. The resume-summary menu dismisser moved here
+  and is shared by all three. `CMUX_FLEET_EXEC_LAUNCH=0` reverts every verb together. The paste tower is
+  retained, unused on the default path, for a one-week soak. Shipped `2963dfc`.
 
 ### Changed
 
@@ -37,6 +50,44 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Fixed
 
+- **An idle agent read `detached`, because the activity signal was the transcript's file mtime.** Step 1's
+  behavioral detector compared the hook-store record's `updatedAt` against the transcript file's mtime.
+  claude appends `system` / `permission-mode` / `bridge-session` bookkeeping lines to an idle agent's
+  transcript long after its last turn, so mtime advances while the agent sits at the prompt, and every
+  idle agent tripped the detector. Caught on the live fleet minutes after merge, with the daemon running
+  it: two of three idle agents read detached, and the doctor emits `detached` straight off `attachment()`,
+  so it would have paged a conductor and the desktop for each. The signal is now the newest turn timestamp
+  parsed from a bounded 256KB tail of the transcript, and it **abstains** (returns no reading) when no turn
+  parses, so an unreadable transcript can never manufacture a detach. Turn timestamps are UTC; they are
+  read with `calendar.timegm`, not `mktime`, which was silently an hour off and would have masked any
+  sub-hour skew. The invariant this restores is the one the design ratified: an idle agent must never read
+  detached. Fixed `a51d288`.
+- **`rm` and `archive` would have refused to close any conductor, forever.** The never-orphan pid set took
+  the process-table half unfiltered, and a conductor's surface env is legitimately inherited by three to
+  five never-dying daemons, routers and servers. Every conductor close saw a live "agent" pid that would
+  not die. The substring identity check also matched marketplace hook-script paths. The rule is now applied
+  per source: store pids block as-is; a process-table pid blocks only if it passes the seat-agent test.
+  Fixed `055da1a`, then sharpened in `a3286a7` to the exact discriminator — the claude wrapper exports
+  `CMUX_CLAUDE_PID=$$` and then execs, so the seat agent is the one process whose `CMUX_CLAUDE_PID` equals
+  its own pid; descendants inherit the value under different pids, which also closes the `claude -p`
+  summarizer residual. Both landed with a regression test that deliberately un-stubs the `ps` sweep.
+- **The never-orphan check did not exist at all for codex.** The codex fallback matched argv0 by basename,
+  but parsed the TTY column as argv0: `ps axeww` prints PID, TT, STAT, TIME, COMMAND, and argv0 is field 5.
+  The process-table half of the union was therefore always empty for a codex seat. A fake two-column test
+  fixture had let it ship green. Every `ps` fixture is now copied from real output shape, and the codex
+  assertion fails the old parser by construction. Fixed `0a13eec`. Verified live: a lazy, unbound codex
+  probe with an empty hook store resolved to its pid, and `rm` signalled it.
+- **`fleet vitals` and `fleet sessions` printed every age as `495464h ago`.** On 2026-07-07 the
+  providers work added a second `def _age(epoch)` to `features.py`, beside the `def _age(secs)` that
+  had been there since 06-29. Python bound the later one, so the two callers that pass a DURATION
+  (`vitals`' idle column, `sessions`' per-session age) silently got the EPOCH formatter and rendered
+  `now - 120s` as ~56 years; `sessions` also doubled the suffix (`495464h ago ago`). Nothing raised —
+  the argument is a plausible int either way — and the suite stayed green for three days. The epoch
+  formatter is now `_ago()`; `_age()` is the duration formatter again. Note which signal this blanked:
+  `sessions`' age column is the operator's only guardrail when choosing a session to revive.
+- **A duplicate `_store()` in `cli.py`** (verbatim, harmless) is deleted, and
+  `tests/test_no_shadowed_defs.py` now fails any module that defines a top-level name twice — the
+  class-level guard for both bugs above.
 - **`fleet rm --with-group` never signals its own caller or a bystander conductor** — two hard guards
   run before the confirm gate and are NOT bypassable by `--force`/`--yes`: (1) if the group contains the
   CALLER's own surface (self-ID via `$CMUX_SURFACE_ID`), refuse — the member-stop loop would otherwise

@@ -635,6 +635,16 @@ and `CMUX_STATE_DIR`. These decide whether a symlink/app swap reaches it.
    `~/.local/bin/fleet` is currently a symlink to the checkout, `--force` overwrites
    it with the installed console script (that swap IS the cutover for anything that
    resolves `fleet` via `~/.local/bin`).
+
+   > **`uv tool install` is COPY semantics, not editable.** It snapshots the source
+   > into its own environment. Editing the repo afterwards changes nothing about
+   > what `fleet` runs, and a `git checkout` of a different branch changes nothing
+   > either. Every code change needs a re-install to reach the installed app. This
+   > has already cost one near-miss: an acceptance run against a worktree build
+   > nearly measured the installed copy instead. If you are testing unmerged code,
+   > either run it out of the checkout explicitly (`.venv/bin/python -m cmux_fleet…`,
+   > or a `fleet profile` whose daemon you started from that tree) or re-install
+   > first — and confirm with `fleet daemon status` which `package` path is live.
 2. Install/upgrade the **plugin** separately (the app installer never touches it).
    Confirm the installed hooks are the Phase 3 shims. On a machine whose plugin is a
    marketplace symlink to the repo, this happens by merging the packaged branch to

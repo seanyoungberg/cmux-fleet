@@ -55,14 +55,14 @@ Ran the close test on husk `72C89319` (prior-art-intel; its resume id was record
 
 1. `cmux close-surface --surface <full-uuid>` (global) → `Error: not_found: Surface not found`. The documented "explicit surface UUIDs resolve globally" does NOT hold for a session-restored husk surface; it needs a workspace context to resolve.
 2. `cmux close-surface --surface <uuid> --workspace <ws>` → `Error: invalid_state: Cannot close the last surface`. cmux refuses to close a workspace's only surface. **All three husks today are the sole terminal surface in their own dedicated workspace** (prior-art-intel / recovery-safety / usage-ops), so every one hits this.
-3. There is **no cmux CLI verb to close a single workspace or a last surface**: `close-window` is whole-window (too broad), and `workspace-action` / `tab-action` offer only `close-others` / `close-above|below` / `close-left|right` (never "close THIS one"). `close-others` would close everything else — unusable.
+3. ~~There is **no cmux CLI verb to close a single workspace or a last surface**~~ — **wrong, corrected 2026-07-10.** `cmux close-workspace --workspace <id|ref|index>` exists and closes a specific workspace with its surfaces; it was already present on 0.64.17 when this was written. What remains true: `close-window` is whole-window (too broad), and `workspace-action` / `tab-action` offer only `close-others` / `close-above|below` / `close-left|right`, never "close THIS one". So the last-surface refusal in (2) is real, and `close-workspace` is the way around it.
 4. The husk stays in cmux's session-restore record (`~/Library/Application Support/cmux/session-com.cmuxterm.app.json`) throughout — so on reboot it reopens. Whether a *successful* close clears the record is untestable via this path (close is refused).
 
 Note the topology split: the original hand-swept husks (issue #6) lived in a **shared** workspace (cmux-advisor's) with other surfaces, so `close-surface` worked on them; **dedicated-workspace** husks (an agent's own workspace, which is what today's exited agents leave) are un-closeable.
 
 **Consequences for `--close`:**
 - It can reap SHARED-workspace husks via `close-surface` (with the surface's resolved workspace context, not a bare global UUID).
-- It CANNOT reap dedicated-workspace husks — that needs an upstream cmux verb (see the `forget-surface` / `close-workspace` draft) OR a workaround (move the husk into a scratch workspace with other surfaces, then close-surface — hacky, mutates layout; not recommended).
-- Clearing the restore record is a second, still-open cmux gap folded into the same upstream ask.
+- It CAN reap dedicated-workspace husks, via `cmux close-workspace --workspace <ws>` (corrected 2026-07-10; the verb exists and `cmux_fleet/cli.py` already uses it to reap empty scaffold workspaces). The old text here claimed no such verb existed and pointed at an upstream ask; that was never true on 0.64.17. `--close` has not yet been wired to it — that is open work, not a cmux gap.
+- Clearing the restore record is a second, still-open cmux gap. Whether `close-workspace` clears it is **unverified**; test against a disposable workspace before relying on it.
 
-Upstream draft: [`docs/upstream-cmux-forget-surface.md`](upstream-cmux-forget-surface.md) (DRAFT; the submit is Berg's button).
+Upstream draft: [`docs/upstream-cmux-forget-surface.md`](upstream-cmux-forget-surface.md) (DRAFT, and partly obsolete for exactly this reason; the submit is Berg's button).

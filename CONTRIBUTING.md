@@ -56,6 +56,27 @@ Three layers. State the pass count in your PR.
    exercised via `--dry-run`), plus the `claude --plugin-dir` load when a
    headless `claude` is available.
 
+### A stubbed seam needs one real-seam test
+
+The suite stubs expensive boundaries: the `ps` sweep, the cmux binary, the hook
+store. A stub hides the boundary it stands in for, so every stubbed seam also
+needs at least one test that exercises the real thing, with a fixture that
+reproduces that boundary's **real text shape**.
+
+Both halves are load-bearing, and each was learned from a bug that shipped green:
+
+- The `ps` sweep was stubbed to `""` suite-wide, so the never-orphan pid union
+  was structurally untestable, and a version that would refuse to close any
+  conductor forever shipped and passed.
+- The regression test added for that bug did un-stub the sweep, but fed it a fake
+  two-column table. A parser that read the TTY column as argv0 sailed straight
+  through it. `ps axeww` prints PID, TT, STAT, TIME, COMMAND; argv0 is field 5.
+
+A parser is only tested by input it could actually receive. Copy fixtures from
+real output (`ps axeww` with env appended; a transcript carrying real turn lines
+*and* the bookkeeping lines the tool interleaves between them), and assert that
+the old, broken implementation fails them.
+
 ## Python style
 
 - Standard library only. No external runtime dependencies.

@@ -4,7 +4,7 @@ The spine as-built, by file:
 
 - `cmux_fleet/config.py` resolves every path/setting (env > `[fleet]` toml > XDG default).
 - `cmux_fleet/state.py` owns the state model: the label-keyed registry, the unified inbox, the archive shelf, the hook-store union, the idle-wake gate.
-- `cmux_fleet/resolve.py` is THE resolver (agent-management v2, step 1): seat()/snapshot() derive presence, topology, and the attachment axis (invariant I4: present-but-detached) at read time; kill_targets() is the never-orphan union (store pids + ps-env pids). Lifecycle reads route through it; the state.py predicate bodies it delegates to relocate here in step 3.
+- `cmux_fleet/resolve.py` is THE resolver (agent-management v2, step 1): `seat(surface)` answers presence, pids, workspace, pane and attachment for one surface, `snapshot()` batches that over the whole registry in one store read plus one tree read, and `kill_targets()` is the never-orphan pid set. See **The resolver**, below, for the three rules they enforce. Lifecycle reads route through it; the `state.py` predicate bodies it delegates to relocate here in step 3.
 - `cmux_fleet/adapter.py` owns the risky cmux ACTIONS (v2, step 2): exec-delivery (a process start is the pane process via respawn-pane; launch/revive/recycle all ride it, `CMUX_FLEET_EXEC_LAUNCH=0` reverts all three to the paste path during the soak) and the resume-summary menu dismisser.
 - `cmux_fleet/router.py` is the bus router: child `Stop` -> deliver a completion to the parent. One process serves every conductor.
 - `cmux_fleet/daemon.py` is the daemon manager (`fleet daemon start|stop|status|restart` + `start --foreground` for launchd): it double-forks `router.py --live` into a detached supervisor so the router survives shell exit, Bash-tool cleanup, and a conductor recycle.
@@ -80,7 +80,60 @@ Three wrapper behaviors shape the orchestration built on it:
   **prefer a real cmux child (its own surface and session) over an in-process
   subagent**, so lifecycle stays attributable.
 
+## The resolver: presence, topology, attachment
+
+`resolve.py` is the only module that answers questions about current reality.
+Three rules live in it, each stated once and enforced in one function.
+
+**Presence is the pid.** An agent is present on a surface iff that surface has a
+hook-store record whose pid is alive and whose `ps` command line matches the
+agent's tool. The freshest such record is the agent. A dead pid is absence,
+whatever `agentLifecycle` says. Everything downstream (`ls`, `vitals`, `doctor`,
+the wake gate, the launch guards, recycle's confirm, `rm`'s stops) consumes
+`seat()` rather than restating this.
+
+**Topology is derived, never stored.** Workspace, pane and group membership come
+from `cmux tree` and `workspace-group list` at read time. The registry's stored
+`workspace` / `status` / `place` fields still exist (schema v2 is migration step
+3, not yet authorized) but the resolver does not read them.
+
+**Never-orphan: the kill set is store pids and process-table pids, each filtered
+at its own source.** `kill_targets()` unions two sets because neither is
+sufficient alone. The store misses a process whose record `SessionEnd` already
+reaped — measured at ~0.3s before the process actually exits, and forever for a
+hung shutdown — so "no record" never implies "no process", and a store-only check
+once closed a surface over a live agent. The process table misses nothing that
+still runs as the seat's agent, but a bare `CMUX_SURFACE_ID` sweep is *not* that
+set: a conductor's surface env is legitimately inherited by three to five
+never-dying daemons, routers and servers, and an unfiltered union would refuse to
+close any conductor forever. So `pids_ps()` applies the seat-agent rule at the
+source: the claude wrapper exports `CMUX_CLAUDE_PID=$$` before it execs, so the
+seat agent is the one process whose `CMUX_CLAUDE_PID` equals its own pid
+(descendants inherit the value under different pids, which is what excludes the
+`claude -p` summarizer); codex has no wrapper and falls back to matching argv0's
+basename, which is field 5 of `ps axeww`, not the TTY column.
+
+**Attachment (invariant I4) is a fourth axis, not a flavor of liveness.** An
+agent can be *present but detached*: the process works while its hook channel is
+dead, so completions stop routing to its parent, Feed gates go invisible, and
+`updatedAt` freezes. Detached requires a conjunction — a frozen record **and**
+evidence of activity — because a frozen record alone describes every idle agent,
+and an idle agent must never read detached. The evidence is either behavioral
+(the agent's **last turn** is recent while its record is frozen) or deterministic
+(`ps eww` shows a `CMUX_WORKSPACE_ID` that differs from the tree's workspace,
+which is what a relocation leaves behind). The behavioral signal is the last turn
+parsed out of the transcript, **not the transcript file's mtime**: claude appends
+`system` / `permission-mode` / `bridge-session` bookkeeping lines to an idle
+agent's transcript long after its last turn, so mtime advances while the agent
+sits at the prompt, and an mtime rule reads every idle agent as detached. The
+doctor names the condition; the remedy is a reseat (`fleet recycle`), never an
+auto-heal.
+
 ## Reading `agentLifecycle`
+
+`agentLifecycle` is a **display** signal. It answers "what is this agent doing",
+never "does this agent exist" — presence is the pid rule above. With that
+boundary kept, the field is the right input for busy/idle routing:
 
 cmux runs the session state machine and stores the result, so the plugin never
 recomputes busy/idle from raw events. The field has four values —
