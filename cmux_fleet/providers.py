@@ -55,7 +55,7 @@ try:
 except ModuleNotFoundError:                      # py<3.11 — feature is a no-op without a toml reader
     tomllib = None
 
-from .config import FLEET_TOML, STATE
+from .config import CMUX, FLEET_TOML, STATE
 
 USAGE_ENDPOINT = "https://api.anthropic.com/api/oauth/usage"
 _OAUTH_HEADERS = {"anthropic-beta": "oauth-2025-04-20", "anthropic-version": "2023-06-01",
@@ -270,6 +270,71 @@ def _codex_token_identity(acct):
         return json.load(open(_codex_cred_path(acct))).get("identity") or {}
     except Exception:
         return {}
+
+
+# --- account health monitor (built on the refresh loop) ------------------------------------------
+# The distinction Berg cares about, do NOT conflate:
+#   "usage stale"  = no recent CLI activity. The account is FINE. NEVER an alert (it's a poller/rollout
+#                    concept, tracked separately by poll_codex's `stale`).
+#   "token dead"   = the refresh_token is revoked/expired, so the account cannot be refreshed and will go
+#                    OFFLINE. Needs a human re-login. THIS is the only "account offline" signal to notify.
+def codex_health_check():
+    """Check each configured codex-token account's TOKEN health (not its usage). Runs codex_ensure_fresh
+    (silent refresh only if near expiry — a healthy, not-near-expiry token costs no network), and
+    classifies: 'healthy' | 'revoked' (refresh failed — needs re-login) | 'unseeded' (never set up — not
+    an alert). Returns [{acct, email, status, detail, checked_at}]. Never raises."""
+    out = []
+    for tool, name, spec, _ in iter_providers():
+        method, _m = _parse_auth(spec.get("auth", ""))
+        if tool != "codex" or method != "codex-token":
+            continue
+        rec = {"acct": name, "email": (_codex_token_identity(name) or {}).get("email"),
+               "checked_at": int(time.time())}
+        try:
+            codex_ensure_fresh(name)
+            rec["status"], rec["detail"] = "healthy", ""
+        except ProviderError as e:
+            msg = str(e)
+            rec["status"] = "unseeded" if "not seeded" in msg else "revoked"
+            rec["detail"] = msg
+        except Exception as e:                       # never let one account sink the sweep
+            rec["status"], rec["detail"] = "error", f"{type(e).__name__}"
+        out.append(rec)
+    return out
+
+
+def codex_health_scan(notify=None):
+    """Run codex_health_check and EDGE-TRIGGER `notify(acct, email, message)` only when an account NEWLY
+    transitions into 'revoked' (was not revoked last scan). Recovery re-arms it; a still-revoked account is
+    not re-alerted every hour. 'unseeded'/'healthy'/'error' never alert. Persists per-account status.
+    Returns the health list. Never raises."""
+    from . import state as fs
+    prev = fs.codex_health_read() or {}
+    cur = codex_health_check()
+    new_state = {}
+    for r in cur:
+        acct = r["acct"]
+        was = (prev.get(acct) or {}).get("status")
+        new_state[acct] = {"status": r["status"], "email": r.get("email"), "checked_at": r["checked_at"]}
+        if r["status"] == "revoked" and was != "revoked" and notify:
+            em = r.get("email") or "unknown account"
+            try:
+                notify(acct, r.get("email"),
+                       f"codex account '{acct}' ({em}) needs a re-login — run `codex login` for it, "
+                       f"then `fleet codex-setup {acct}`.")
+            except Exception:
+                pass                                 # a notify failure must not sink the scan/persist
+    fs.codex_health_write(new_state)
+    return cur
+
+
+def _codex_notify(acct, email, message):
+    """Surfaceless desktop banner (reaches Berg regardless of focus) for a revoked codex account."""
+    try:
+        subprocess.run([CMUX, "notify", "--title", f"codex account '{acct}' needs re-login",
+                        "--body", message], capture_output=True, timeout=10)
+    except Exception:
+        pass
 
 
 # --- config.toml provisioning (fleet-managed, FENCED, idempotent — refinement 4) -----------------

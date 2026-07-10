@@ -18,6 +18,12 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   <acct>` verb does the one-time seed + provision. **DORMANT** until a `codex-token:` provider is configured
   in `fleet.toml`; **REQUIRES one interactive `codex login` per account** before it can be relied upon (the
   first live refresh + agent turn are exercised then). `codex-home:<path>` per-profile remains as a fallback.
+- **Codex account health monitor + offline alert.** The daemon checks each configured `codex-token` account
+  hourly and, on the same refresh loop, silently refreshes a near-expiry token. It notifies (a surfaceless
+  desktop banner) ONLY when an account newly goes offline — its refresh_token is revoked/dead and needs a
+  human `codex login` + `fleet codex-setup <acct>`. Edge-triggered (one alert per outage, re-armed on
+  recovery; never a storm). Deliberately distinct from "usage stale" (no recent CLI activity — the account
+  is fine and is never alerted). `unseeded` accounts (configured but not yet set up) are not alerted either.
 - **Real account identity in the usage accessor.** `identity` (`{email, display}`) and a ready-to-render
   `label` per provider, so the sidebar shows the actual oauth account (e.g. "Berg") instead of the config
   id; falls back to the config id when identity is unreadable.

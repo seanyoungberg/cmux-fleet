@@ -47,6 +47,7 @@ HEARTBEAT_REMIND_S = 1800    # presentation cooldown (audit fix #4): a row a dir
                              # this long. ~3 default ticks: a genuinely-ignored row still gets a reminder,
                              # but the heartbeat stops re-nudging every tick for rows the agent has seen.
 USAGE_POLL_S = 180                                   # providers feature: refresh subscription-usage snapshot ~every 3 min
+CODEX_HEALTH_S = 3600                                # providers feature: codex account token-health check ~hourly
 PAINT_POLL_S = 4             # sidebar feature: repaint the fleet board ~every 4s when [fleet].sidebar_paint is set
                              # (on-change-only via features.PAINT_STATE, so an idle fleet costs a snapshot + diff)
 HEALTH_STALE_S = 60          # a live router silent on the bus longer than this (bus HB ~15s) is WEDGED
@@ -302,6 +303,7 @@ def _run_daemon(heartbeat_secs):
     next_tick = time.time() + heartbeat_secs if heartbeat_secs else None
     next_health = time.time() + HEALTH_CHECK_S        # router-wedge check runs regardless of --heartbeat
     next_usage = time.time() + 5                       # first usage poll shortly after boot, then every USAGE_POLL_S
+    next_cxhealth = time.time() + 120                   # first codex health check ~2 min after boot, then hourly
     next_paint = time.time() + 3 if SIDEBAR_PAINT else None   # sidebar auto-repaint (opt-in: [fleet].sidebar_paint)
     while proc.poll() is None and not stopping["v"]:
         time.sleep(1)
@@ -321,6 +323,16 @@ def _run_daemon(heartbeat_secs):
             except Exception as e:                    # a bad poll must never kill the daemon
                 print(f"[usage] poll error: {e}", flush=True)
             next_usage = now + USAGE_POLL_S
+        if now >= next_cxhealth:                       # providers feature: codex account token-health + notify
+            try:
+                from . import providers as pv
+                health = pv.codex_health_scan(pv._codex_notify)   # alerts ONLY on a NEW revocation (edge-triggered)
+                dead = [h["acct"] for h in health if h["status"] == "revoked"]
+                if dead:
+                    print(f"[codex-health] revoked (needs re-login): {', '.join(dead)}", flush=True)
+            except Exception as e:                    # a bad health check must never kill the daemon
+                print(f"[codex-health] check error: {e}", flush=True)
+            next_cxhealth = now + CODEX_HEALTH_S
         if next_paint and now >= next_paint:          # sidebar feature: keep the custom fleet board live
             try:
                 painted = _sidebar_paint_tick()       # on-change-only; snapshot + diff, then set-description

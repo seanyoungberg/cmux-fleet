@@ -464,6 +464,68 @@ def test_poll_codex_filters_by_model_provider(tmp_path):
     assert pv.poll_codex(home, model_provider="missing")["ok"] is False
 
 
+# --- codex account health monitor (built on the refresh loop) ------------------------------------
+def _codex_health_toml(tmp_path, monkeypatch, accts, home_accts=()):
+    lines = ["[providers.codex]", f'default = "{accts[0]}"']
+    for a in accts:
+        lines += [f"[providers.codex.{a}]", 'type = "subscription"', f'auth = "codex-token:{tmp_path}/{a}.token"']
+    for a in home_accts:                              # a codex-HOME (fallback) provider: must NOT be monitored
+        lines += [f"[providers.codex.{a}]", 'type = "subscription"', f'auth = "codex-home:{tmp_path}/{a}"']
+    monkeypatch.setattr(pv, "FLEET_TOML", _toml(tmp_path, "\n".join(lines)))
+
+
+def test_codex_health_check_classifies(tmp_path, monkeypatch):
+    _codex_health_toml(tmp_path, monkeypatch, ["good", "dead", "new"], home_accts=["home1"])
+    def fake_ensure(acct, force=False):
+        if acct == "good":
+            return "tok"
+        if acct == "new":
+            raise pv.ProviderError("codex account 'new' is not seeded (...missing)")
+        raise pv.ProviderError("codex account 'dead' token refresh failed; the account may be revoked")
+    monkeypatch.setattr(pv, "codex_ensure_fresh", fake_ensure)
+    h = {r["acct"]: r["status"] for r in pv.codex_health_check()}
+    assert h == {"good": "healthy", "dead": "revoked", "new": "unseeded"}   # home1 (codex-home) is NOT monitored
+
+
+def test_codex_health_scan_edge_triggers_and_rearms(tmp_path, monkeypatch):
+    _codex_health_toml(tmp_path, monkeypatch, ["a"])
+    st = {"v": "revoked"}
+    def fake_ensure(acct, force=False):
+        if st["v"] == "healthy":
+            return "t"
+        raise pv.ProviderError("refresh failed; may be revoked")
+    monkeypatch.setattr(pv, "codex_ensure_fresh", fake_ensure)
+    calls = []
+    notify = lambda acct, email, msg: calls.append(acct)
+    pv.codex_health_scan(notify); assert calls == ["a"]          # first revocation -> alert
+    pv.codex_health_scan(notify); assert calls == ["a"]          # still revoked -> deduped (no storm)
+    st["v"] = "healthy"; pv.codex_health_scan(notify); assert calls == ["a"]   # recovered -> re-arm, no alert
+    st["v"] = "revoked"; pv.codex_health_scan(notify); assert calls == ["a", "a"]  # revoked again -> alert again
+
+
+def test_codex_health_scan_unseeded_never_alerts(tmp_path, monkeypatch):
+    _codex_health_toml(tmp_path, monkeypatch, ["a"])
+    monkeypatch.setattr(pv, "codex_ensure_fresh",
+                        lambda acct, force=False: (_ for _ in ()).throw(pv.ProviderError("not seeded")))
+    calls = []
+    pv.codex_health_scan(lambda *a: calls.append(a))
+    assert calls == []                                           # unseeded is a setup state, not an offline alert
+    from cmux_fleet import state as fs
+    assert fs.codex_health_read()["a"]["status"] == "unseeded"   # but the state is still persisted
+
+
+def test_codex_health_scan_notify_failure_does_not_sink_scan(tmp_path, monkeypatch):
+    _codex_health_toml(tmp_path, monkeypatch, ["a"])
+    monkeypatch.setattr(pv, "codex_ensure_fresh",
+                        lambda acct, force=False: (_ for _ in ()).throw(pv.ProviderError("revoked")))
+    def boom(*a):
+        raise RuntimeError("cmux gone")
+    h = pv.codex_health_scan(boom)                               # must not raise
+    assert h[0]["status"] == "revoked"
+    from cmux_fleet import state as fs
+    assert fs.codex_health_read()["a"]["status"] == "revoked"    # state still persisted despite notify blowing up
+
+
 # --- config.toml fenced provisioning (never clobber Berg's manual config) ------------------------
 def test_codex_provision_config_fenced_and_idempotent(tmp_path):
     cfg = tmp_path / "config.toml"

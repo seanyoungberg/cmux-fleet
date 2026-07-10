@@ -44,6 +44,7 @@ ACKED = os.path.join(STATE, "inbox-acked.json")          # DURABLE {surface: {ev
 PRESENTED = os.path.join(STATE, "inbox-presented.json")  # {surface: {event_key: {ts,via}}} presentation cooldown
 LEDGER_TTL_S = 14 * 86400   # acked/presented entries older than this are pruned on write (bounded files)
 PROVIDER_USAGE = os.path.join(STATE, "provider-usage.json")  # last usage poll snapshot (providers feature)
+CODEX_HEALTH = os.path.join(STATE, "codex-health.json")      # per-account token health (edge-trigger dedup)
 
 # Agent-helper command hints emitted into conductor context by the awareness/drain hooks. Phase 2
 # folded the four standalone plugin scripts into `fleet <verb>` subcommands, so these are now the app
@@ -107,6 +108,16 @@ def provider_usage_write(data):
 def provider_usage_read():
     """The last usage snapshot, or {} if the poller has never run."""
     return _read_json(PROVIDER_USAGE, {})
+
+
+def codex_health_write(data):
+    """Persist per-account codex token health {acct: {status, email, checked_at}} (edge-trigger dedup)."""
+    _atomic_write(CODEX_HEALTH, json.dumps(data, indent=2))
+
+
+def codex_health_read():
+    """The last codex health map, or {} if never checked."""
+    return _read_json(CODEX_HEALTH, {})
 
 
 # --- the dial (DEMOTED to a mute switch — design 2.1) --------------------------------------
