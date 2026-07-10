@@ -1085,35 +1085,41 @@ def _collapsed_map(descs):
 # message is the native `latestMessage`, and a tap is `workspace.select(id)`. The ONLY non-native bits are
 # STATE, PARENT (for conductor->worker grouping) and the COLLAPSE bit — which fit in a short, human-readable
 # subtitle that READS as useful in the built-in sidebar instead of clobbering it:
-#     child      -> "working · ↳berg-sandbox"
-#     conductor  -> "ready · ▾conductor"     ('▸' when collapsed)
-#     shared ws  -> "… · +2"                 (transitional: N agents still share one workspace)
-# Parsed with only split/contains — the .swift subset has no trim or regex.
+#     child      -> "working · ↳berg-sandbox"    (↳ = my parent conductor)
+#     conductor  -> "ready · ▾berg-sandbox"       (▾/▸ = expanded/collapsed; carries its OWN label)
+#     shared ws  -> "… · +2"                      (transitional: N agents still share one workspace)
+#
+# A conductor carries its own LABEL, not the word "conductor", because a conductor's WORKSPACE TITLE is
+# decorated ("Conductor - cmux-advisor" / "AD - Berg Sandbox") and so can't be matched against a child's
+# `parent`. The glyph alone says which kind it is. Parsed with only split/contains — the .swift subset has
+# no trim and no regex.
 DESC_CHILD, DESC_OPEN, DESC_SHUT = "↳", "▾", "▸"
+DESC_SEP = " · "
 
 
-def _descriptor(state, kind="child", parent="", collapsed=False, extra=0):
+def _descriptor(state, kind="child", parent="", collapsed=False, extra=0, label=""):
     """The short per-agent workspace subtitle. Deliberately reads as prose, not as a serialized record."""
     if kind == "conductor":
-        s = f"{state} · {DESC_SHUT if collapsed else DESC_OPEN}conductor"
+        s = f"{state}{DESC_SEP}{DESC_SHUT if collapsed else DESC_OPEN}{label}"
     elif parent and parent != "-":
-        s = f"{state} · {DESC_CHILD}{parent}"
+        s = f"{state}{DESC_SEP}{DESC_CHILD}{parent}"
     else:
         s = state
-    return s + (f" · +{extra}" if extra else "")
+    return s + (f"{DESC_SEP}+{extra}" if extra else "")
 
 
 def _is_descriptor(desc):
-    """True for a subtitle WE wrote. A user's own workspace description must never be parsed or clobbered."""
+    """True for a subtitle WE wrote. A user's own workspace description must never be parsed or clobbered,
+    so we require our exact separator+glyph, not a bare glyph that could occur in ordinary prose."""
     d = desc or ""
-    return (DESC_CHILD in d) or (f"{DESC_OPEN}conductor" in d) or (f"{DESC_SHUT}conductor" in d)
+    return any(f"{DESC_SEP}{g}" in d for g in (DESC_CHILD, DESC_OPEN, DESC_SHUT))
 
 
 def _descriptor_collapsed(descs):
     """{workspace_uuid: True} for every conductor workspace whose subtitle currently shows the COLLAPSED
     glyph. That glyph is the only place the user's collapse choice lives, so a repaint must read it back."""
     return {ws: True for ws, d in (descs or {}).items()
-            if _is_descriptor(d) and f"{DESC_SHUT}conductor" in (d or "")}
+            if _is_descriptor(d) and f"{DESC_SEP}{DESC_SHUT}" in (d or "")}
 
 
 def _paint(rows, sidebar_blob=False):
@@ -1198,7 +1204,7 @@ def _paint(rows, sidebar_blob=False):
             ags = sorted(ags, key=lambda r: (r.get("kind") != "conductor", r["label"]))
             p = ags[0]                                         # a conductor represents its workspace
             d = _descriptor(p["state"], p.get("kind", "child"), p.get("parent") or "",
-                            bool(collapsed_ws.get(ws)), len(ags) - 1)
+                            bool(collapsed_ws.get(ws)), len(ags) - 1, p["label"])
             cur[f"desc{_SEP}{ws}"] = d
             if descs.get(ws) != d:                             # diff the LIVE subtitle -> self-healing, no churn
                 _cmux("workspace-action", "--action", "set-description", "--description", d,

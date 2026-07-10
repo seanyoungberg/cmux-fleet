@@ -637,24 +637,26 @@ def _boss_rows():
 def test_descriptor_reads_as_prose_not_as_a_record():
     ff = _ff()
     assert ff._descriptor("working", "child", "berg-sandbox") == "working · ↳berg-sandbox"
-    assert ff._descriptor("ready", "conductor") == "ready · ▾conductor"
-    assert ff._descriptor("ready", "conductor", collapsed=True) == "ready · ▸conductor"
+    # a conductor carries its OWN label (its workspace TITLE is decorated and can't be matched on)
+    assert ff._descriptor("ready", "conductor", label="berg-sandbox") == "ready · ▾berg-sandbox"
+    assert ff._descriptor("ready", "conductor", collapsed=True, label="bs") == "ready · ▸bs"
     assert ff._descriptor("idle", "child", "") == "idle"                  # orphan -> just the state
     assert ff._descriptor("idle", "child", "-") == "idle"                 # '-' sentinel is not a parent
-    assert ff._descriptor("working", "conductor", extra=2) == "working · ▾conductor · +2"
+    assert ff._descriptor("working", "conductor", extra=2, label="bs") == "working · ▾bs · +2"
 
 
 def test_is_descriptor_only_claims_subtitles_we_wrote():
     ff = _ff()
     assert ff._is_descriptor("working · ↳berg-sandbox")
-    assert ff._is_descriptor("ready · ▸conductor")
+    assert ff._is_descriptor("ready · ▸berg-sandbox")
+    assert not ff._is_descriptor("a ▾ b")                                 # bare glyph, wrong separator
     assert not ff._is_descriptor("my own notes about this workspace")     # never clobber the user's text
     assert not ff._is_descriptor("")
 
 
 def test_descriptor_collapsed_reads_the_glyph_back():
     ff = _ff()
-    m = ff._descriptor_collapsed({"ws-A": "ready · ▸conductor", "ws-B": "ready · ▾conductor",
+    m = ff._descriptor_collapsed({"ws-A": "ready · ▸boss", "ws-B": "ready · ▾boss",
                                   "ws-C": "hand-written note"})
     assert m == {"ws-A": True}                                # only the collapsed conductor
 
@@ -669,7 +671,7 @@ def test_paint_writes_one_short_descriptor_per_agent_workspace(monkeypatch):
             dict(_row("boss", state="ready", ctx_pct_remaining=40), ws="ws-A", kind="conductor", surface="s1")]
     ff._paint(rows)
     desc = {c[-1]: c[c_index(c)] for c in calls if c[0] == "workspace-action" and "set-description" in c}
-    assert desc == {"ws-A": "ready · ▾conductor", "ws-B": "working · ↳boss"}
+    assert desc == {"ws-A": "ready · ▾boss", "ws-B": "working · ↳boss"}
     assert not any("FLEET" in v for v in desc.values())       # no serialized blob in the built-in view
 
 
@@ -683,13 +685,13 @@ def test_paint_marks_a_shared_workspace_with_the_extra_count(monkeypatch):
             dict(_row("boss", state="ready"), ws="ws-A", kind="conductor", surface="s1")]
     ff._paint(rows)
     desc = [c[c_index(c)] for c in calls if c[0] == "workspace-action" and "set-description" in c]
-    assert desc == ["ready · ▾conductor · +1"]                # conductor represents its workspace
+    assert desc == ["ready · ▾boss · +1"]                     # conductor represents its workspace
 
 
 def test_paint_carries_the_collapse_glyph_forward(monkeypatch):
     ff = _ff()
     monkeypatch.setenv("FLEET_SIDEBAR_BLOB", "1")
-    monkeypatch.setattr(ff, "_ws_descriptions", lambda: {"ws-A": "ready · ▸conductor"})  # user collapsed it
+    monkeypatch.setattr(ff, "_ws_descriptions", lambda: {"ws-A": "ready · ▸boss"})  # user collapsed it
     calls = _capture_cmux(ff, monkeypatch)
     ff._paint([dict(_row("boss", state="ready"), ws="ws-A", kind="conductor", surface="s1")])
     # regenerated identical -> no write at all, so the user's choice survives untouched
@@ -713,11 +715,11 @@ def test_paint_self_heals_a_corrupted_descriptor(monkeypatch):
     monkeypatch.setenv("FLEET_SIDEBAR_BLOB", "1")
     monkeypatch.setattr(ff, "_ws_descriptions", lambda: {"ws-A": "working · ↳WRONG"})
     os.makedirs(os.path.dirname(ff.PAINT_STATE), exist_ok=True)
-    json.dump({f"desc{ff._SEP}ws-A": "ready · ▾conductor"}, open(ff.PAINT_STATE, "w"))
+    json.dump({f"desc{ff._SEP}ws-A": "ready · ▾boss"}, open(ff.PAINT_STATE, "w"))
     calls = _capture_cmux(ff, monkeypatch)
     ff._paint(_boss_rows())
     desc = [c[c_index(c)] for c in calls if c[0] == "workspace-action" and "set-description" in c]
-    assert desc == ["working · ▾conductor"]                   # repaired despite the fingerprint
+    assert desc == ["working · ▾boss"]                        # repaired despite the fingerprint
 
 
 def test_paint_migrates_off_the_old_serialized_blob(monkeypatch):
