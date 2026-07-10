@@ -6,6 +6,21 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Added
+
+- **Real account identity in the usage accessor.** `identity` (`{email, display}`) and a ready-to-render
+  `label` per provider, so the sidebar shows the actual oauth account (e.g. "Berg") instead of the config
+  id; falls back to the config id when identity is unreadable.
+
+### Changed
+
+- **Sidebar state model: no post-turn lag, and "ready" no longer reads as "asleep".** A real-time,
+  transcript-based turn-end signal clears a just-finished agent's "working" in ~5s instead of ~60s (cmux's
+  own idle timer lags at `running` post-turn); it fails closed, so it only ever *clears* a stale "working".
+  Ready-vs-idle is now time-based — a recently-finished agent reads "ready", only a long-dormant one reads
+  "idle". The subscription usage footer is one line per subscription (5h %, 7d %, and soonest reset
+  together), a larger font, real account names, and a single clean "usage stale" line for a stale provider.
+
 ## [0.10.0] - 2026-07-10
 
 ### Added
