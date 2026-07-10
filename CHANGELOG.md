@@ -8,6 +8,22 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Fixed
 
+- **Recycle: fresh confirm is live-pid-resolved** — `_poll_session_back` fresh mode now confirms on the
+  freshest hook-store record with an ALIVE pid (`_live_bound_sid`), replacing the sid-exclusion confirm
+  that rode poll_session's arbitrary-first-record fallback and could stare at the dead lingering ghost
+  forever while a healthy fresh agent sat on the seat unconfirmed (four identical berg-sandbox
+  misdetects, 2026-07-09). A live bind equal to the OLD sid does not confirm as fresh (a cmux
+  restart-resume zombie is live, not fresh) — it falls through to WARN + escalation.
+- **Recycle: never paste a launch into a live agent** — `_fire_launch` refuses to fire when an agent TUI
+  (or its resume menu) is already up on the surface, covering both the initial fire and the self-heal
+  re-fire. Kills the garbled-inert-draft class: the old self-heal re-pasted the launch into the live
+  TUI it had just misdetected. The bare-shell self-heal (PATH-not-ready crash recovery) is preserved.
+- **Recycle: failures escalate to an actor** — every terminal recycle failure (respawn-not-confirmed,
+  no-session-after-launch, resume-menu-wedged) now routes a `recycle-failed` doctor alert to the failed
+  agent's parent conductor (inbox + wake, per-attempt event key) or — for conductors — fans out to peer
+  conductors + the desktop like conductor-down. Previously the only signals were a banner on the failed
+  seat itself (which nobody is watching, by definition) and a `recycle_abort` log line.
+
 - **Notification dedup: event-key ack** — every inbox row now carries a durable `event_key`, and one
   `fleet inbox-ack <seq>` clears that event on **every** presentation path at once (awareness, Stop-drain,
   heartbeat, the router wake gate, `fleet inbox`) and refuses a producer re-put of it. A bare
@@ -20,6 +36,11 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   reminder) has surfaced within `HEARTBEAT_REMIND_S`, and a genuinely-ignored unacked row still gets a
   reminder once the window elapses. Kills the heartbeat re-waking a row a direct peer/doctor/completion
   wake or a drain block already put in front of the agent. (audit fix-order #4)
+
+### Added
+
+- **Design note: exec the recycle launch as the pane process** (`docs/design-exec-launch.md`) — kill the
+  paste class (`respawn-pane --command "/bin/zsh -ilc '<launch>'"`); design-only pending A+B field proof.
 
 ## [0.9.0] - 2026-07-08
 
