@@ -98,52 +98,83 @@ func ctxColor(_ remain) -> String {
   return "#E5484D"
 }
 
-// ctx bar straight off the native progress field (paint writes value = fraction USED)
+// last two path segments of a cwd (repo/leaf), so the row shows where the agent actually works
+func tailPath(_ p) -> String {
+  let parts = p.split(separator: "/")
+  if parts.count == 0 { return p }
+  if parts.count == 1 { return String(parts[0]) }
+  return "\(parts[parts.count - 2])/\(parts[parts.count - 1])"
+}
+
+// ctx bar, hand-rolled: `ProgressView` renders its own VALUE as a label ("0.41000000003"), so it can't be
+// used here. The shapes have no intrinsic size and inflate — every one needs an explicit .frame clamp.
+// Bar and percent share ONE line.
 func ctxRow(_ w) -> some View {
   if let p = w.progress {
     let remain = (1.0 - p.value) * 100.0
-    return AnyView(HStack(spacing: 6) {
-      ProgressView(value: 1.0 - p.value, total: 1.0).tint(ctxColor(remain)).frame(width: 84)
+    return AnyView(HStack(spacing: 7) {
+      HStack(spacing: 0) {
+        RoundedRectangle(cornerRadius: 2).foregroundColor(ctxColor(remain))
+          .frame(width: 78 * (1.0 - p.value), height: 5)
+        Spacer()
+      }
+      .frame(width: 78, height: 5)
+      .background { RoundedRectangle(cornerRadius: 2).foregroundColor("#2A2E37") }
       Text("\(Int(remain))%").font(.system(size: 10, design: .monospaced)).foregroundColor(.secondary)
       Spacer()
-    })
+    }.frame(height: 12))
   }
   return AnyView(EmptyView())
 }
+func cwdLine(_ w) -> some View {                              // `directory` is always present
+  return HStack(spacing: 4) {
+    Image(systemName: "folder").font(.system(size: 8)).foregroundColor("#5A5A63")
+    Text(tailPath(w.directory)).font(.system(size: 9, design: .monospaced))
+      .foregroundColor("#6F6E77").lineLimit(1).truncationMode(.middle)
+    Spacer()
+  }
+}
 func lastLine(_ w) -> some View {
   if let m = w.latestMessage {
-    return AnyView(Text(m).font(.system(size: 12)).foregroundColor(.tertiary)
+    return AnyView(Text(m).font(.system(size: 11)).foregroundColor(.tertiary)
       .lineLimit(2).truncationMode(.tail))
   }
   return AnyView(EmptyView())
 }
+// POSITIVE condition first, fall through to EmptyView. A bare `if cond { return EmptyView() }` early-exit
+// is NOT honored in a `some View` func — that is why this badge painted a giant "0" box on every row.
+// The .frame clamp is mandatory: the background shape has no intrinsic size and inflates without it.
 func unreadDot(_ w) -> some View {
-  if w.unread == 0 { return AnyView(EmptyView()) }
-  return AnyView(Text("\(w.unread)").font(.system(size: 10, design: .monospaced))
-    .foregroundColor("#0A0C10").padding(.horizontal, 5).padding(.vertical, 1)
-    .background { RoundedRectangle(cornerRadius: 6).foregroundColor("#F5A623") })
+  if w.unread > 0 {
+    return AnyView(Text("\(w.unread)").font(.system(size: 9, design: .monospaced))
+      .foregroundColor("#0A0C10").frame(width: 14, height: 14)
+      .background { Circle().foregroundColor("#F5A623") })
+  }
+  return AnyView(EmptyView())
 }
 
 func agentRow(_ w, _ isCon) -> some View {
   return Button(action: { cmux("workspace.select", workspace_id: w.id) }) {
     HStack(alignment: .top, spacing: 7) {
-      VStack(alignment: .leading, spacing: 2) {
+      VStack(alignment: .leading, spacing: 3) {
         HStack(spacing: 6) {
-          Image(systemName: iconFor(stateOf(w))).font(.system(size: isCon ? 13 : 11))
+          Image(systemName: iconFor(stateOf(w))).font(.system(size: isCon ? 12 : 10))
             .foregroundColor(colorFor(stateOf(w)))
           Text(w.title)
-            .font(.system(size: isCon ? 14 : 13))
+            .font(.system(size: isCon ? 13 : 12))
             .fontWeight(isCon ? .bold : .semibold)
             .foregroundColor(isCon ? colorFor(stateOf(w)) : "#E8E8EC")
             .lineLimit(1).truncationMode(.tail)
+          Spacer()
           unreadDot(w)
         }
         ctxRow(w)
+        cwdLine(w)
         lastLine(w)
       }
       Spacer()
     }
-    .padding(5)
+    .padding(6)
     .background { RoundedRectangle(cornerRadius: 6).foregroundColor(w.selected ? "#1B2029" : (isCon ? "#14171E" : "#00000000")) }
   }
 }
