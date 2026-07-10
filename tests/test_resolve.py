@@ -478,3 +478,54 @@ def test_detached_or_names_the_state_and_never_masks_a_gate():
     # the state must be renderable: it needs a glyph and a rank, or vitals sorts it to the bottom
     assert "detached" in ff.STATE_STYLE
     assert ff.STATE_STYLE["detached"][2] < ff.STATE_STYLE["ready"][2]   # ranks ahead of ready
+
+# ================= the workspace-teardown primitives (Berg's remove-the-workspace ruling) ===========
+# `occupants` is kill_targets() for a surface whose TOOL IS UNKNOWN — a bystander the fleet is about to
+# close as collateral when it closes a workspace. `workspace_surfaces` answers "who else lives here" from
+# the TREE, because the registry's `workspace` field goes stale the moment cmux re-homes a surface.
+
+def test_occupants_finds_a_live_agent_of_either_tool_on_an_unlabelled_surface():
+    """The real-shape ps table: a claude agent is self-referential (CMUX_CLAUDE_PID == own pid); a codex
+    agent has no wrapper and is identified by argv0 in FIELD 5 of `ps axeww`; a daemon carrying the same
+    surface env is neither. A workspace close must be blocked by the first two and not by the third."""
+    from cmux_fleet import resolve as rs
+    CL, CX, DAEMON = 61001, 61002, 61003
+    ps_table = (f"  PID   TT  STAT      TIME COMMAND\n"
+                f"{CL} s001  S+     0:05.00 /Users/b/.local/bin/claude --resume abc "
+                f"CMUX_SURFACE_ID=S-CL CMUX_CLAUDE_PID={CL}\n"
+                f"{CX} s002  S+     0:02.00 /opt/homebrew/bin/codex -a never CMUX_SURFACE_ID=S-CX\n"
+                f"{DAEMON}   ??  Ss     1:00.00 /x/.venv/bin/python -m cmux_fleet.daemon "
+                f"CMUX_SURFACE_ID=S-CL CMUX_CLAUDE_PID={CL}\n")
+    import cmux_fleet.state as _fs
+    old_alive, old_store = _fs.pid_alive, _fs.read_hook_store
+    _fs.pid_alive = lambda pid: pid in (CL, CX, DAEMON)
+    _fs.read_hook_store = lambda: {"sessions": {}, "activeSessionsBySurface": {}}
+    try:
+        assert rs.occupants("S-CL", ps_out=ps_table) == {CL}      # the agent blocks; its daemon does not
+        assert rs.occupants("S-CX", ps_out=ps_table) == {CX}      # codex found without naming its tool
+        assert rs.occupants("S-EMPTY", ps_out=ps_table) == set()  # a bare shell / view pane is free
+    finally:
+        _fs.pid_alive, _fs.read_hook_store = old_alive, old_store
+
+
+def test_workspace_surfaces_reads_membership_from_the_tree():
+    from cmux_fleet import cli, resolve as rs
+    tree = ('window window:1 9FBB70C6-7B17-4DA5-B54D-8FF3641D24E2 [current] ◀ active\n'
+            '├── workspace workspace:6 B1656D4C-22E7-438F-9797-B62A92B7AF81 "resume-research"\n'
+            '│   └── pane pane:8 CD82F4D9-4D4C-4177-A985-51950E26B88A [focused]\n'
+            '│       ├── surface surface:25 2694CB4C-706E-45A7-BB64-EA572AA9421C [terminal] "✳ agent" [selected]\n'
+            '│       └── surface surface:24 5CD821D0-5098-4C77-941B-32352BD866FD [markdown] "notes.md"\n'
+            '├── workspace workspace:23 022AF32C-AF42-4603-B610-E4DC16F40717 "graph-view"\n'
+            '│   └── pane pane:29 A2146F3B-4772-42F3-B31B-033EB72CB239 [focused]\n'
+            '│       └── surface surface:83 4E496E4B-A010-482B-BB04-A7DF9929EBCD [terminal] "✳ solo" [selected]\n')
+    m = cli.surface_ws_map_from_tree(tree)
+    assert rs.workspace_surfaces("B1656D4C-22E7-438F-9797-B62A92B7AF81", ws_map=m) == \
+        ["2694CB4C-706E-45A7-BB64-EA572AA9421C", "5CD821D0-5098-4C77-941B-32352BD866FD"]
+    assert len(rs.workspace_surfaces("022AF32C-AF42-4603-B610-E4DC16F40717", ws_map=m)) == 1
+    assert rs.workspace_surfaces("", ws_map=m) == []
+    # every surface KIND is seen: a workspace close takes the markdown viewer with it, so a survey that
+    # only counted terminals would call a two-surface workspace "empty apart from the agent".
+    kinds = sorted(k for _s, _w, k, _t in cli._iter_tree_surfaces(tree))
+    assert kinds == ["markdown", "terminal", "terminal"]
+    assert [s for s, _w, _t in cli._iter_terminal_surfaces(tree)] == \
+        ["2694CB4C-706E-45A7-BB64-EA572AA9421C", "4E496E4B-A010-482B-BB04-A7DF9929EBCD"]

@@ -235,6 +235,40 @@ def kill_targets(surface, st=None, tool="claude"):
     return pids(surface, st) | pids_ps(surface, tool=tool)
 
 
+# Every agent tool the fleet can seat. The seat-agent rule is per-tool (claude: the wrapper's
+# self-referential CMUX_CLAUDE_PID; codex: argv0 basename), so a surface whose tool is UNKNOWN must be
+# tested against all of them. Extend here when a third tool ships.
+KNOWN_TOOLS = ("claude", "codex")
+
+
+def occupants(surface, st=None, ps_out=None, tools=KNOWN_TOOLS):
+    """kill_targets() for a surface whose TOOL IS UNKNOWN: the live agent pids on it under ANY known
+    seat-agent rule. This is the never-orphan floor asked of a BYSTANDER surface — one the fleet is
+    about to close as collateral (a workspace close takes every surface in the workspace with it) and
+    for which no registry row names a tool. Empty means nothing to orphan.
+
+    Sound as a superset because the per-tool rules only ever ADD pids: a claude agent is found by the
+    CMUX_CLAUDE_PID self-pid rule, a codex agent by argv0, and a non-agent env carrier (daemon, router,
+    the `claude -p` summarizer, a bare login shell) satisfies neither. One `ps axeww` sweep is shared
+    across the tools; pass `ps_out` to share it across surfaces too."""
+    ps_out = _ps_axeww() if ps_out is None else ps_out
+    out = set(pids(surface, st))
+    for t in tools:
+        out |= pids_ps(surface, ps_out=ps_out, tool=t)
+    return out
+
+
+def workspace_surfaces(ws, ws_map=None):
+    """Every surface UUID (upper-cased) the live tree places in workspace `ws`. Tree-derived, never
+    registry-derived: the registry's `workspace` field goes stale the moment cmux re-homes a surface,
+    and workspace MEMBERSHIP is exactly the question a workspace close must not get wrong."""
+    m = surface_ws_map() if ws_map is None else ws_map
+    w = (ws or "").upper()
+    if not w:
+        return []
+    return sorted(s for s, v in m.items() if (v or "").upper() == w)
+
+
 # --- topology (tree-derived; the tree is the only never-stale source) ------------------------------
 def surface_ws_map(ttl=2.0):
     """{SURFACE_UUID_UPPER: workspace_uuid} from the live cmux tree, memoized. Canonical body lives
