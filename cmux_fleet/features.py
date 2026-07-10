@@ -605,7 +605,8 @@ def _countdown(epoch):
     return f"resets in {h}h{m:02d}m" if h else f"resets in {m}m"
 
 
-def _age(epoch):
+def _ago(epoch):
+    """Renders a unix epoch as '5m ago'. Distinct from _age(secs), which renders a DURATION bare."""
     if not epoch:
         return "never"
     d = int(time.time()) - int(epoch)
@@ -637,7 +638,7 @@ def cmd_usage(argv):
         star = " *default" if r.get("is_default") else ""
         who = attrib.get(key) or []
         whom = f"  [{len(who)} live: {', '.join(who[:3])}{'…' if len(who) > 3 else ''}]" if who else ""
-        lines.append(f"\n{key}{star}  ({r.get('type', '?')}, checked {_age(r.get('checked_at'))}){whom}")
+        lines.append(f"\n{key}{star}  ({r.get('type', '?')}, checked {_ago(r.get('checked_at'))}){whom}")
         if not r.get("ok"):
             lines.append(f"    !! not readable: {r.get('error', 'unknown')}")
             continue

@@ -1755,10 +1755,9 @@ def cmd_plugins(argv):
 
 
 # ---------------------------------------------------------------- lifecycle verbs (the conductor's job)
-def _store():
-    from . import state as fs                                  # union of all per-agent hook stores
-    return fs.read_hook_store()
-
+# (_store — a verbatim second definition of the one at the top of this module — was DELETED
+# 2026-07-10. It shadowed nothing (identical body) but see tests/test_no_shadowed_defs.py: the same
+# pattern in features.py silently swapped a duration formatter for an epoch one for three days.)
 
 # (_pid_for_surface — the first-record, no-aliveness-check pid lookup — was DELETED 2026-07-10 with
 # zero callers left. It fed every kill site the wrong target on multi-record surfaces: the recycle

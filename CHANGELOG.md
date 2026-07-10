@@ -6,6 +6,20 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Fixed
+
+- **`fleet vitals` and `fleet sessions` printed every age as `495464h ago`.** On 2026-07-07 the
+  providers work added a second `def _age(epoch)` to `features.py`, beside the `def _age(secs)` that
+  had been there since 06-29. Python bound the later one, so the two callers that pass a DURATION
+  (`vitals`' idle column, `sessions`' per-session age) silently got the EPOCH formatter and rendered
+  `now - 120s` as ~56 years; `sessions` also doubled the suffix (`495464h ago ago`). Nothing raised —
+  the argument is a plausible int either way — and the suite stayed green for three days. The epoch
+  formatter is now `_ago()`; `_age()` is the duration formatter again. Note which signal this blanked:
+  `sessions`' age column is the operator's only guardrail when choosing a session to revive.
+- **A duplicate `_store()` in `cli.py`** (verbatim, harmless) is deleted, and
+  `tests/test_no_shadowed_defs.py` now fails any module that defines a top-level name twice — the
+  class-level guard for both bugs above.
+
 ### Changed
 
 - **Recycle launch is exec-style — the paste class is dead.** The relaunch is now delivered as the pane
