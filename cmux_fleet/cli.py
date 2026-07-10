@@ -1852,18 +1852,16 @@ def _signal_agent_pids(surf, tool, log, tag):
     this surface — never the first record, never a dead one), and each is re-verified as this tool's
     live process at signal time (_agent_pid_check, the pid-reuse guard). A dead pid is a no-op by
     construction; a live pid that fails the identity check is SKIPPED loudly (better to abort the
-    recycle than SIGINT a foreign process). Targets are split BY SOURCE (cmux-advisor blocker,
-    2026-07-10): STORE pids are candidates as-is (the store claims they are the agent) and get the
-    loud identity-checked skip below; PS-ENV pids (rs.pids_ps — needed because SessionEnd reaps the
-    record ~0.3s BEFORE the process exits, finding 2) are candidates ONLY if they identify as the
-    tool, silently — a conductor's surface env is legitimately inherited by daemons, routers, node
-    servers, and hook scripts, none of which are ours to signal or to warn about."""
+    recycle than SIGINT a foreign process). Targets = store pids UNION seat-agent ps pids: the ps
+    side exists because SessionEnd reaps the record ~0.3s BEFORE the process exits (cmux-advisor
+    finding 2), and it is filtered to the SEAT AGENT at the source (rs.pids_ps applies the
+    CMUX_CLAUDE_PID self-referential rule), so a conductor's legitimately-inherited env carriers
+    (daemon, router, node servers, the `claude -p` summarizer) are never candidates at all — the
+    unfiltered union wedged every conductor close (the 2026-07-10 blocker)."""
     import signal
     from . import resolve as rs
     signalled = []
-    store_pids = set(_surface_pids(surf))
-    env_pids = {p for p in rs.pids_ps(surf) if p not in store_pids and _agent_pid_check(p, tool)}
-    for pid in sorted(store_pids | env_pids):
+    for pid in sorted(set(_surface_pids(surf)) | rs.pids_ps(surf, tool=tool)):
         if not _agent_pid_check(pid, tool):
             log(f"{tag}: pid {pid} is alive but does not identify as a live {tool} process "
                 f"(reused/foreign pid?); NOT signalling it")
@@ -1924,13 +1922,15 @@ def _stop_agent_for_close(surf, tool, label, verb):
     for a hung shutdown, forever. `fleet rm ptrprobe` live-corroborated it: 'removed (closed +
     archived)' printed with pid 98942 still alive.
 
-    The block rule is split BY SOURCE (cmux-advisor blocker, same day): a STORE pid blocks if alive
-    (the store claims it is the agent, identified or not — fail closed); a PS-ENV pid blocks only if
-    it IDENTIFIES as the tool. A conductor's surface env is legitimately inherited by never-dying
-    processes (the fleet daemon, the router, `cmux events`, node servers — measured: 3-5 foreign
-    env-carriers on every live conductor), so an unfiltered ps-env union made rm/archive refuse to
-    close ANY conductor, permanently. The wedge shipped because the suite stubs the ps sweep and the
-    live probe was an ad-hoc seat with no daemons; the regression test now injects a mixed ps table."""
+    The block set: a STORE pid blocks if alive (the store claims it is the agent — fail closed); a
+    ps-side pid blocks because it IS the seat agent (rs.pids_ps applies the CMUX_CLAUDE_PID
+    self-referential rule at the source: the wrapper exports its own pid into the agent's env, so
+    only the agent satisfies env pid == own pid; descendants inherit the value with different pids).
+    A conductor's surface env is legitimately inherited by never-dying processes (daemon, router,
+    `cmux events`, node servers — measured 3-5 per live conductor), so the earlier unfiltered ps-env
+    union made rm/archive refuse to close ANY conductor, permanently (the 2026-07-10 blocker). It
+    shipped because the suite stubs the ps sweep and the live probe was an ad-hoc seat with no
+    daemons; the regression test now injects a mixed ps table through the REAL parse."""
     from . import state as fs
     from . import resolve as rs
     def log(m):
@@ -1942,7 +1942,7 @@ def _stop_agent_for_close(surf, tool, label, verb):
             time.sleep(0.3)
     still = sorted({p for p in signalled if fs.pid_alive(p)}
                    | set(_surface_pids(surf))
-                   | {p for p in rs.pids_ps(surf) if _agent_pid_check(p, tool)})
+                   | rs.pids_ps(surf, tool=tool))
     if not still:
         return True, ""
     return False, (f"live agent pid(s) {still} still on the surface "

@@ -167,12 +167,33 @@ def _ps_axeww():
         return ""
 
 
-def pids_ps(surface, ps_out=None):
-    """Live pids whose process ENVIRONMENT carries CMUX_SURFACE_ID=<surface>, from one `ps axeww`
-    sweep — the store-independent view of who actually sits on this seat. This exists because
-    SessionEnd removes the hook-store record ~0.3s before the process exits (measured), and an agent
-    that fires SessionEnd then hangs is invisible to the store forever: the never-orphan check must
-    not depend on a record existing. `ps_out` is injectable for tests."""
+def _line_is_seat_agent(pid, line, tool):
+    """PURE seat-agent rule over one `ps axeww` line (command + args + appended env). A surface's env
+    is inherited by everything the agent spawns (daemons, routers, node servers, hook scripts, the
+    memsearch `claude -p` summarizer), so carrying CMUX_SURFACE_ID proves presence on the seat, not
+    BEING the agent. The exact discriminator (cmux-advisor, verified on all three live conductors):
+    the cmux claude wrapper does `export CMUX_CLAUDE_PID=$$` then execs claude, so **the agent is the
+    one process whose CMUX_CLAUDE_PID equals its own pid** — every descendant inherits the value with
+    a different pid, including the summarizer (parent's pid) and any daemon (a dead prior agent's
+    pid). A hung post-SessionEnd agent still satisfies it (env never changes), so the invisible
+    orphan this sweep exists for is still caught. codex has no wrapper and therefore no
+    CMUX_CLAUDE_PID: fall back to argv0-basename == tool, the best available identity there."""
+    if (tool or "claude") == "claude":
+        return f"CMUX_CLAUDE_PID={pid}" in line.split()
+    toks = line.split(None, 1)
+    argv0 = (toks[1].split() or [""])[0] if len(toks) > 1 else ""
+    return os.path.basename(argv0) == tool
+
+
+def pids_ps(surface, ps_out=None, tool="claude"):
+    """Live pids of THE SEAT AGENT(s) on `surface` per the process table: one `ps axeww` sweep,
+    filtered to lines carrying CMUX_SURFACE_ID=<surface> AND passing the seat-agent rule
+    (_line_is_seat_agent, at the source, so every consumer — kill targets, safe-to-close, the union —
+    inherits it). Store-independent because SessionEnd removes the hook-store record ~0.3s before the
+    process exits (measured), and an agent that fires SessionEnd then hangs is invisible to the store
+    forever. An unfiltered surface-env sweep is NOT this set: it wedged every conductor close on the
+    3-5 legitimate never-dying env-carriers per surface (cmux-advisor blocker). `ps_out` is
+    injectable for tests."""
     surf = (surface or "").upper()
     if not surf:
         return set()
@@ -184,24 +205,22 @@ def pids_ps(surface, ps_out=None):
         if needle not in line.upper():
             continue
         m = re.match(r"\s*(\d+)\s", line)
-        if m:
-            out.add(int(m.group(1)))
+        if not m:
+            continue
+        pid = int(m.group(1))
+        if _line_is_seat_agent(pid, line, tool):
+            out.add(pid)
     return {p for p in out if fs.pid_alive(p)}
 
 
-def kill_targets(surface, st=None):
-    """The teardown CANDIDATE set: store-derived live pids UNION ps-env live pids. Sound where either
-    source alone is not — the store misses a process whose record SessionEnd already reaped (the
-    measured 0.3s window, or forever for a hung shutdown); ps-env misses nothing that still runs with
-    the seat's surface id in its environment.
-
-    CANDIDATES, not targets: the two sources carry different trust and the caller MUST apply the
-    per-source rule (cli's kill/close sites do): a store pid is treated as the agent as-is; a ps-env
-    pid counts only if its ps identity matches the tool, because a conductor's surface env is
-    legitimately inherited by never-dying non-agents (fleet daemon, router, `cmux events`, node
-    servers — measured 3-5 per live conductor). An unfiltered union wedged rm/archive on every
-    conductor (cmux-advisor blocker, 2026-07-10)."""
-    return pids(surface, st) | pids_ps(surface)
+def kill_targets(surface, st=None, tool="claude"):
+    """THE teardown set: store-derived live pids UNION seat-agent pids from the process table. Sound
+    where either source alone is not — the store misses a process whose record SessionEnd already
+    reaped (the measured 0.3s window, or forever for a hung shutdown); the ps side misses nothing
+    that still runs as the seat's agent. The seat-agent rule is applied at the source (pids_ps), so
+    this union is sound everywhere: never-dying surface-env carriers (daemon/router/servers) and
+    inherited-env subprocesses (the `claude -p` summarizer) are excluded by construction."""
+    return pids(surface, st) | pids_ps(surface, tool=tool)
 
 
 # --- topology (tree-derived; the tree is the only never-stale source) ------------------------------

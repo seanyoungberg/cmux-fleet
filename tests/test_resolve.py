@@ -242,15 +242,24 @@ def test_missing_transcript_falls_back_to_deterministic_only(monkeypatch, tmp_pa
 # --- 4. never-orphan: the teardown set is store UNION ps-env (cmux-advisor finding 2) -----------------
 PS_FIXTURE = """  PID COMMAND
   501 /sbin/launchd HOME=/ SHELL=/bin/zsh
-98942 claude --resume abc CMUX_SURFACE_ID=S-ORPH CMUX_WORKSPACE_ID=WS-1 TERM=xterm
-77001 claude CMUX_SURFACE_ID=S-OTHER TERM=xterm
+98942 claude --resume abc CMUX_SURFACE_ID=S-ORPH CMUX_WORKSPACE_ID=WS-1 CMUX_CLAUDE_PID=98942 TERM=xterm
+98999 claude -p summarize CMUX_SURFACE_ID=S-ORPH CMUX_CLAUDE_PID=98942 TERM=xterm
+77001 claude CMUX_SURFACE_ID=S-OTHER CMUX_CLAUDE_PID=77001 TERM=xterm
+66001 codex resume abc CMUX_SURFACE_ID=S-CDX TERM=xterm
 """
 
 
-def test_pids_ps_extracts_env_matching_live_pids(monkeypatch):
-    monkeypatch.setattr(fs, "pid_alive", lambda pid: pid == 98942)
+def test_pids_ps_returns_only_the_seat_agent(monkeypatch):
+    monkeypatch.setattr(fs, "pid_alive", lambda pid: pid in (98942, 98999, 66001))
+    # the seat agent: CMUX_CLAUDE_PID equals its own pid
     assert rs.pids_ps("S-ORPH", ps_out=PS_FIXTURE) == {98942}
+    # the memsearch `claude -p` summarizer inherits the PARENT's CMUX_CLAUDE_PID: excluded exactly
+    # (this was the accepted residual under the basename rule; the self-referential rule closes it)
+    assert 98999 not in rs.pids_ps("S-ORPH", ps_out=PS_FIXTURE)
     assert rs.pids_ps("S-OTHER", ps_out=PS_FIXTURE) == set()   # 77001 not alive
+    # codex has no wrapper env: argv0-basename fallback
+    assert rs.pids_ps("S-CDX", ps_out=PS_FIXTURE, tool="codex") == {66001}
+    assert rs.pids_ps("S-CDX", ps_out=PS_FIXTURE, tool="claude") == set()
     assert rs.pids_ps("", ps_out=PS_FIXTURE) == set()
 
 
@@ -259,7 +268,7 @@ def test_kill_targets_unions_store_and_ps(monkeypatch):
     st = _store_of({"sid-a": _rec("S-KT", "sid-a", 11111, "idle", 1000.0)})
     monkeypatch.setattr(fs, "read_hook_store", lambda: st)
     monkeypatch.setattr(fs, "pid_alive", lambda pid: pid in (11111, 22222))
-    monkeypatch.setattr(rs, "pids_ps", lambda surface, ps_out=None: {22222})
+    monkeypatch.setattr(rs, "pids_ps", lambda surface, ps_out=None, tool="claude": {22222})
     assert rs.kill_targets("S-KT", st=st) == {11111, 22222}
 
 
@@ -270,7 +279,7 @@ def test_stop_for_close_refuses_while_a_signalled_pid_survives_store_reap(monkey
     # still alive.
     monkeypatch.setattr(cli, "_surface_pids", lambda surf: set())          # record already reaped
     monkeypatch.setattr(cli, "_agent_pid_check", lambda pid, tool: True)
-    monkeypatch.setattr(rs, "pids_ps", lambda surface, ps_out=None: {98942})  # ps still sees it
+    monkeypatch.setattr(rs, "pids_ps", lambda surface, ps_out=None, tool="claude": {98942})  # ps still sees it
     monkeypatch.setattr(fs, "pid_alive", lambda pid: True)                  # ...and it stays alive
     monkeypatch.setattr(cli.os, "kill", lambda pid, sig: None)
     monkeypatch.setattr(cli.time, "sleep", lambda *_: None)
@@ -301,14 +310,16 @@ def test_conductor_close_never_blocked_by_foreign_env_carriers(monkeypatch):
     test deliberately un-stubs the ps sweep (conftest blanks it, which is exactly why the wedge
     shipped) and runs the REAL pids_ps parse over a mixed process table."""
     AGENT, DAEMON, ROUTER = 55001, 55002, 55003
+    # daemon/router carry the surface env AND a CMUX_CLAUDE_PID naming some OTHER (even dead prior)
+    # agent pid — the live shape on all three real conductors. Only the agent is self-referential.
     ps_table = (f"  PID COMMAND\n"
-                f"{AGENT} /Users/b/.local/bin/claude --resume abc CMUX_SURFACE_ID=S-COND X=1\n"
-                f"{DAEMON} /x/.venv/bin/python -m cmux_fleet.daemon CMUX_SURFACE_ID=S-COND\n"
-                f"{ROUTER} /x/.venv/bin/python -m cmux_fleet.router --live CMUX_SURFACE_ID=S-COND\n")
+                f"{AGENT} /Users/b/.local/bin/claude --resume abc CMUX_SURFACE_ID=S-COND CMUX_CLAUDE_PID={AGENT} X=1\n"
+                f"{DAEMON} /x/.venv/bin/python -m cmux_fleet.daemon CMUX_SURFACE_ID=S-COND CMUX_CLAUDE_PID={AGENT}\n"
+                f"{ROUTER} /x/.venv/bin/python -m cmux_fleet.router --live CMUX_SURFACE_ID=S-COND CMUX_CLAUDE_PID=99999\n")
     monkeypatch.setattr(rs, "_ps_axeww", lambda: ps_table)              # real parse, mixed table
     alive = {AGENT: False, DAEMON: True, ROUTER: True}                   # agent counterfactually DEAD
     monkeypatch.setattr(fs, "pid_alive", lambda pid: alive.get(pid, False))
-    identities = {AGENT: True, DAEMON: False, ROUTER: False}             # ps identity per pid
+    identities = {AGENT: True, DAEMON: False, ROUTER: False}             # store-loop ps identity per pid
     monkeypatch.setattr(cli, "_agent_pid_check", lambda pid, tool: identities.get(pid, False))
     monkeypatch.setattr(cli, "_surface_pids", lambda surf: set())        # record already reaped
     killed = []
@@ -329,7 +340,7 @@ def test_stop_for_close_ok_when_signalled_pid_actually_dies(monkeypatch):
     alive = {98942: True}
     monkeypatch.setattr(cli, "_surface_pids", lambda surf: set())
     monkeypatch.setattr(cli, "_agent_pid_check", lambda pid, tool: True)
-    monkeypatch.setattr(rs, "pids_ps", lambda surface, ps_out=None: {98942} if alive[98942] else set())
+    monkeypatch.setattr(rs, "pids_ps", lambda surface, ps_out=None, tool="claude": {98942} if alive[98942] else set())
     monkeypatch.setattr(fs, "pid_alive", lambda pid: alive.get(pid, False))
 
     def _kill(pid, sig):
