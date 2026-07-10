@@ -49,6 +49,19 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   "idle". The subscription usage footer is one line per subscription (5h %, 7d %, and soonest reset
   together), a larger font, real account names, and a single clean "usage stale" line for a stale provider.
 
+### Fixed
+
+- **`fleet rm --with-group` no longer refuses to dissolve any Model-B group.** The dissolve preflight
+  cross-checks the registry's believed group membership against cmux's REAL membership and aborts on
+  divergence (the 2026-07-02 registry-integrity guard). Under the new empty-anchor model that check
+  compared against cmux's *full* membership, which always includes the AGENTLESS scaffold anchor no
+  registry row can ever occupy — so every Model-B group looked like a mismatch and `--with-group`
+  refused to dissolve any of them (regression caught by the 2026-07-10 live acceptance). The guard now
+  subtracts the group's anchor scaffold (resolved via `anchor_workspace_ref`) before comparing agent
+  workspaces. Its real purpose is unchanged: a genuine divergence among *agent* workspaces, an
+  unverifiable registry row (agent with no workspace), or unreadable cmux group data still aborts. The
+  dissolve itself already closes the scaffold (`workspace-group delete <ref>` closes every member).
+
 ## [0.10.0] - 2026-07-10
 
 ### Added
