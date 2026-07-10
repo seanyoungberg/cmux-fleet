@@ -2968,8 +2968,21 @@ def cmd_move(argv):
         live_note = (f"\n[fleet]   note: cmux's hook store reads {a.label} as not-live post-move (a known "
                      f"binding desync). Completions still route via the registry session; if `fleet ls` "
                      f"shows STALE, `fleet recycle {a.label}` rebinds it.")
+    # The agent PROCESS keeps the CMUX_WORKSPACE_ID it was launched with — a live process's env cannot be
+    # rewritten. cmux's hooks resolve by that env, so after a move they silently no-op: agentLifecycle
+    # freezes at its last value, `fleet ls`/vitals read the agent as stale, and cmux's OWN sidebar loses the
+    # agent's metadata for that workspace. Verified 2026-07-10: usage-ops sat 82min frozen at 'unknown'
+    # while answering prompts; a recycle (fresh env) made the very next turn stamp 'idle'. Nothing in fleet
+    # can fix this in-process — only a relaunch re-exports the env. Say so rather than let it rot silently.
+    env_note = (f"\n[fleet]   WARNING: {a.label}'s process still exports the OLD CMUX_WORKSPACE_ID "
+                f"({cur_ws[:8]}); a running process's env cannot be rewritten. cmux's hooks resolve by it, "
+                f"so they will silently stop updating this agent (lifecycle freezes; ls/vitals read STALE; "
+                f"cmux's own sidebar drops its metadata). Run `fleet recycle {a.label}` to re-export the "
+                f"env and rebind the hooks — it keeps the session and context.")
     print(f"[fleet] moved {a.label}: surface {surf[:8]} {cur_ws[:8]} -> {new_ws[:8]}"
-          + (f" (group '{new_group}')" if new_group else "") + f"; same session, still live.{live_note}")
+          + (f" (group '{new_group}')" if new_group else "")
+          + f"; same session, still live.{live_note}{env_note}")
+    fs.log_event("move_env_stale", label=a.label, surface=surf, old_ws=cur_ws, new_ws=new_ws)
     return 0
 
 
