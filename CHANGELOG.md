@@ -8,6 +8,16 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- **Codex env-token account switching (unified home).** `fleet launch --provider codex:<acct>` selects a
+  ChatGPT account per launch via `-c model_provider=<acct>` + a fleet-owned OAuth token injected at spawn,
+  against one shared `~/.codex` (no per-account `CODEX_HOME`, no session/config split). The fleet owns the
+  token lifecycle: refresh before expiry (atomic writes; the rotated refresh_token is persisted), a
+  pre-launch guard that aborts loudly on a revoked account (never spawns into a 401), per-account usage
+  attribution (`fleet usage` filters the unified home's rollouts by `model_provider`), and idempotent,
+  *fenced* `~/.codex/config.toml` provisioning that never touches hand-written config. New `fleet codex-setup
+  <acct>` verb does the one-time seed + provision. **DORMANT** until a `codex-token:` provider is configured
+  in `fleet.toml`; **REQUIRES one interactive `codex login` per account** before it can be relied upon (the
+  first live refresh + agent turn are exercised then). `codex-home:<path>` per-profile remains as a fallback.
 - **Real account identity in the usage accessor.** `identity` (`{email, display}`) and a ready-to-render
   `label` per provider, so the sidebar shows the actual oauth account (e.g. "Berg") instead of the config
   id; falls back to the config id when identity is unreadable.
