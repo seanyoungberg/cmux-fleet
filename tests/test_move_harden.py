@@ -47,20 +47,85 @@ def test_group_init_bootstraps_and_records(fs, monkeypatch):
     assert fs.live_get("cond")["place"] == "workspace"
 
 
-def test_group_init_keeps_nonempty_scaffold(fs, monkeypatch):
-    # SAFETY: a new workspace that is NOT provably empty is never closed (avoid clobbering a real ws).
-    fs.live_put("cond", {"role": "c", "kind": "conductor", "tool": "claude", "surface": "COND-S",
-                         "workspace": "WS-COND", "status": "live"})
-    calls = []
-    monkeypatch.setattr(fleet, "cmuxq", lambda *a: (calls.append(a) or ""))
-    monkeypatch.setattr(fleet, "current_ws_for_surface", lambda surf: "WS-COND")
-    monkeypatch.setattr(fleet, "_group_ref", _seq("", "workspace_group:7"))
-    monkeypatch.setattr(fleet, "_all_workspace_uuids", _seq({"WS-COND"}, {"WS-COND", "WS-REAL"}))
-    monkeypatch.setattr(fleet, "_term_surface_in", lambda ws, pane=None: "SURF-X")   # NOT empty
+# The scaffold cmux spawns for a new group is NOT "provably empty": `workspace-group create --name N
+# --from <ref>` builds a whole new workspace named N with a bare login shell in it, anchors the group
+# there, and adopts <ref> as a member (measured on cmux 0.64.17, 2026-07-10). The old emptiness test
+# (_term_surface_in) therefore never fired, and every `fleet launch --place workspace --group <new>` left
+# a workspace named after the group sitting in the sidebar. _close_group_scaffold tests what actually
+# matters -- does any surface in it hold a live agent or a registered seat -- so these two tests feed it a
+# REAL `cmux tree` and a REAL `ps axeww` table rather than stubbing the question away.
 
-    assert fleet.cmd_group(["init", "--surface", "COND-S"]) == 0
-    assert not [c for c in calls if c[0] == "close-workspace"]          # nothing closed
+_WS_COND = "85576ACB-D5B9-4817-9A71-3FEBB54BC9EA"
+_WS_NEW = "F008C803-63B1-420C-8FAE-480787E454E1"
+_S_COND = "DCCA9A19-4F0C-4C22-9E5B-1C4C1A3F60B1"
+_S_NEW = "B941BC13-7380-4596-B58C-E0EB20B463EA"
+
+
+def _tree_with_scaffold(new_title="Terminal"):
+    return (f'window window:1 9FBB70C6-7B17-4DA5-B54D-8FF3641D24E2 [current] ◀ active\n'
+            f'├── workspace workspace:7 {_WS_COND} "Conductor - cmux-advisor" [selected]\n'
+            f'│   └── pane pane:9 00B68660-784E-4838-BB90-0C37093FB39D [focused]\n'
+            f'│       └── surface surface:12 {_S_COND} [terminal] "✳ Claude Code" [selected]\n'
+            f'├── workspace workspace:37 {_WS_NEW} "cond"\n'
+            f'│   └── pane pane:51 1BE4BFB8-33CD-4131-BA64-FA3508A3AAF1 [focused]\n'
+            f'│       └── surface surface:155 {_S_NEW} [terminal] "{new_title}" [selected]\n')
+
+
+def _init_with(monkeypatch, calls, tree):
+    monkeypatch.setattr(fleet, "cmuxq",
+                        lambda *a: (calls.append(a) or (tree if a[:1] == ("tree",) else "")))
+    monkeypatch.setattr(fleet, "current_ws_for_surface", lambda surf: _WS_COND)
+    monkeypatch.setattr(fleet, "_group_ref", _seq("", "workspace_group:7"))
+
+
+def test_group_init_reaps_the_bare_shell_scaffold_cmux_spawns(fs, monkeypatch):
+    """The scaffold holds a login shell, not nothing. It is still reapable: it did not exist a moment ago
+    (the before/after tree diff brackets the `create`), and no surface in it holds a live agent."""
+    fs.live_put("cond", {"role": "c", "kind": "conductor", "tool": "claude", "surface": _S_COND,
+                         "workspace": _WS_COND, "status": "live"})
+    calls = []
+    _init_with(monkeypatch, calls, _tree_with_scaffold())
+    # before-set: only the conductor's ws; after-set: the real tree above (both through the REAL parser)
+    monkeypatch.setattr(fleet, "_all_workspace_uuids",
+                        _seq({_WS_COND}, {_WS_COND, _WS_NEW}))
+    assert fleet.cmd_group(["init", "--surface", _S_COND]) == 0
+    assert ("close-workspace", "--workspace", _WS_NEW) in calls        # the scaffold WORKSPACE, not a surface
     assert fs.live_get("cond")["group"] == "cond"                      # name defaulted to the label
+
+
+def test_group_init_never_closes_a_new_workspace_holding_a_live_agent(fs, monkeypatch):
+    """SAFETY, restated against the check that replaced 'provably empty': a brand-new workspace that
+    somehow holds a LIVE agent is reported and left alone. Driven through the real `ps axeww` parse --
+    the conftest blanks that sweep, which is exactly the blindness that lets a teardown bug ship green."""
+    from cmux_fleet import resolve as rs
+    AGENT = 71001
+    ps_table = (f"  PID   TT  STAT      TIME COMMAND\n"
+                f"{AGENT} s001  S+   0:05.00 /Users/berg/.local/bin/claude "
+                f"CMUX_SURFACE_ID={_S_NEW} CMUX_CLAUDE_PID={AGENT}\n")
+    monkeypatch.setattr(rs, "_ps_axeww", lambda: ps_table)
+    monkeypatch.setattr(rs.fs, "pid_alive", lambda pid: pid == AGENT)
+    fs.live_put("cond", {"role": "c", "kind": "conductor", "tool": "claude", "surface": _S_COND,
+                         "workspace": _WS_COND, "status": "live"})
+    calls = []
+    _init_with(monkeypatch, calls, _tree_with_scaffold(new_title="✳ someone else's agent"))
+    monkeypatch.setattr(fleet, "_all_workspace_uuids", _seq({_WS_COND}, {_WS_COND, _WS_NEW}))
+    assert fleet.cmd_group(["init", "--surface", _S_COND]) == 0
+    assert not [c for c in calls if c[0] == "close-workspace"]          # nothing closed
+    assert fs.live_get("cond")["group"] == "cond"
+
+
+def test_group_init_never_closes_a_new_workspace_holding_a_registered_seat(fs, monkeypatch):
+    """The other half of the floor: a registered agent's surface blocks the close even with no live pid
+    (a wedged agent still owns its seat)."""
+    fs.live_put("cond", {"role": "c", "kind": "conductor", "tool": "claude", "surface": _S_COND,
+                         "workspace": _WS_COND, "status": "live"})
+    fs.live_put("someone", {"role": "w", "kind": "child", "tool": "claude", "surface": _S_NEW,
+                            "workspace": _WS_NEW, "status": "live"})
+    calls = []
+    _init_with(monkeypatch, calls, _tree_with_scaffold())
+    monkeypatch.setattr(fleet, "_all_workspace_uuids", _seq({_WS_COND}, {_WS_COND, _WS_NEW}))
+    assert fleet.cmd_group(["init", "--surface", _S_COND]) == 0
+    assert not [c for c in calls if c[0] == "close-workspace"]
 
 
 def test_group_init_existing_group_just_records(fs, monkeypatch):
@@ -235,29 +300,149 @@ def test_adapter_compile_codex_translates_effort_and_claude_stays_verbatim():
 # launch_error_line is the PURE scanner (shared with the router never-bound sweep) that tells a launch
 # that DIED on spawn (a bad flag / missing binary / crash) from a healthy agent TUI. _launch_failure_line
 # wires it to a live pane via cmuxq. cmd_launch uses these to FAIL LOUD instead of a false "DONE".
+#
+# FIXTURE SHAPE MATTERS (the same lesson as the two-column `ps` fixture that hid the codex argv0 bug).
+# The original fixtures here were bare error strings with no launch line. That is not what a fleet pane
+# looks like, and the difference is the whole bug: a real pane opens with the LOGIN SHELL's rc chatter,
+# and this box's rc chatter contains "no such file or directory" -- so the scanner cried LAUNCH FAILED on
+# every healthy codex launch. Every fixture below is a real pane: shell noise, the prompt, the echoed
+# `render_send_cmd` line with its AGENT_ROLE=/AGENT_LABEL= env prefix, then the tool's own output.
+# `_ZSHRC_NOISE` is verbatim from this box; `_BAD_FLAG` is verbatim from `codex --effort high` (0.144.1).
+
+_ZSHRC_NOISE = "/Users/berg/.zshrc:.:65: no such file or directory: /Users/berg/.local/bin/env"
+_PROMPT = "berg@Seans-MacBook-Pro cmux-fleet % "
+_LAUNCH_LINE = ("cd /Users/berg/tapestry/_meta/agents/probe && AGENT_ROLE=probe AGENT_LABEL=probe "
+                "CMUX_FLEET_STATE_DIR=/Users/berg/.local/state/cmux-fleet codex --effort high")
+_BAD_FLAG = ("error: unexpected argument '--effort' found\n"
+             "\n  tip: to pass '--effort' as a value, use '-- --effort'\n"
+             "\nUsage: codex [OPTIONS] [PROMPT]\n"
+             "       codex [OPTIONS] <COMMAND> [ARGS]\n"
+             "\nFor more information, try '--help'.")
+
+
+def _pane(*after_launch):
+    """A real fleet pane: rc noise ABOVE the launch line, the tool's output BELOW it."""
+    return "\n".join([_ZSHRC_NOISE, _PROMPT + _LAUNCH_LINE, *after_launch])
+
+
+def _live_codex_pane():
+    """The REAL pane of a healthy codex 0.144.1 launched by exec delivery, captured from this box on
+    2026-07-10 (`cmux capture-pane`). It contains three `⚠ MCP client ... failed to start` blocks -- one
+    of which reads `No such file or directory (os error 2)` -- above a perfectly live TUI. It carries NO
+    fleet launch line, because respawn-pane runs the launch AS the pane's process and nothing is echoed."""
+    with open(os.path.join(HERE, "fixtures", "pane-codex-live-exec.txt")) as f:
+        return f.read()
+
 
 def test_launch_error_line_catches_the_bad_flag_death():
-    pane = ("user@host cmux $ codex --effort high\n"
-            "error: unexpected argument '--effort' found\n"
-            "\n  tip: a similar argument exists: '--config'\n"
-            "user@host cmux $ ")
-    assert "unexpected argument" in fleet.launch_error_line(pane)
+    assert "unexpected argument" in fleet.launch_error_line(_pane(_BAD_FLAG, _PROMPT))
 
 
 def test_launch_error_line_catches_missing_binary():
-    assert "command not found" in fleet.launch_error_line("bash: codex: command not found")
+    assert "command not found" in fleet.launch_error_line(_pane("zsh: command not found: codex"))
+
+
+def test_launch_error_line_ignores_shell_rc_noise_above_the_launch_line():
+    """Cry-wolf, PASTE delivery. ~/.zshrc:65 sources a file uv never created, so every surface on this box
+    opens with a line matching the "No such file or directory" marker. It is the login shell's, printed
+    before the launch command was ever injected. A DEAD launch below the line must still report the tool's
+    OWN error, not the shell's."""
+    dead = _pane(_BAD_FLAG)
+    assert "unexpected argument" in fleet.launch_error_line(dead)
+    assert "zshrc" not in fleet.launch_error_line(dead)
+    # ...and with no launch line and no TUI, the noise alone is all there is to report (exec delivery has
+    # no shell, so a bare-noise pane can only come from a shell that never ran the launch).
+    assert "no such file or directory" in fleet.launch_error_line(_ZSHRC_NOISE).lower()
+
+
+def test_launch_error_line_is_quiet_on_a_REAL_live_codex_pane():
+    """THE cry-wolf bug, exec delivery, against the captured pane. A healthy codex whose MCP servers
+    failed to start printed "No such file or directory (os error 2)"; `fleet launch` called that a dead
+    process and printed a cleanup recipe. The agent was fine, and it is fine here."""
+    pane = _live_codex_pane()
+    assert "No such file or directory" in pane                      # the trap is really in the fixture
+    assert not fleet._FLEET_LAUNCH_SIG.search(pane)                 # ...and exec delivery echoes no launch line
+    assert fleet.agent_tui_visible(pane) is True                    # the TUI is painted -> a LIVE agent
+    assert fleet.launch_error_line(pane) == ""
+
+
+def test_agent_tui_visible_recognises_codex(monkeypatch):
+    """codex paints none of claude's markers, so `_agent_surfaced` was permanently False for it: the
+    enter-race loop would re-kick Enter into a live codex TUI, and the husk reaper's TUI backstop was
+    blind to codex entirely."""
+    pane = _live_codex_pane()
+    assert not any(m in pane for m in fleet._TUI_MARKERS)           # zero claude-isms on a live codex
+    assert fleet.agent_tui_visible(pane) is True
+    assert fleet._pane_shows_live_tui(pane) is True                 # the husk reaper's backstop, too
+    monkeypatch.setattr(fleet, "cmuxq", lambda *a: pane)
+    assert fleet._agent_surfaced("SURF") is True                    # -> stop kicking Enter into it
+    assert fleet.agent_tui_visible(_pane("zsh: command not found: codex")) is False
+
+
+def test_launch_error_line_still_catches_a_dead_exec_launch():
+    """The other half: exec delivery, no launch line, no TUI -> scan the whole pane. Removing the
+    launch-line requirement is what keeps the P0-4a protection alive on the exec path."""
+    dead = "error: unexpected argument '--effort' found\n\nUsage: codex [OPTIONS] [PROMPT]\n"
+    assert not fleet._FLEET_LAUNCH_SIG.search(dead)
+    assert "unexpected argument" in fleet.launch_error_line(dead)
+
+
+def test_launch_error_line_scans_below_the_LAST_launch_line():
+    """A re-kicked Enter echoes the launch line twice (the paste-settle race). The error that matters is
+    the one below the attempt that actually ran."""
+    pane = _pane("zsh: command not found: codex", _PROMPT + _LAUNCH_LINE, _BAD_FLAG)
+    assert "unexpected argument" in fleet.launch_error_line(pane)
 
 
 def test_launch_error_line_is_quiet_on_a_healthy_tui():
     # a booted agent shows its chrome, NOT a CLI error -> no false failure verdict.
-    healthy = "  Context Remaining: 100%   ? for shortcuts   esc to interrupt\n> \n"
+    healthy = _pane("  Context Remaining: 100%   ? for shortcuts   esc to interrupt", "> ")
     assert fleet.launch_error_line(healthy) == ""
     assert fleet.launch_error_line("") == ""
 
 
 def test_launch_failure_line_reads_the_pane_via_cmuxq(monkeypatch):
-    monkeypatch.setattr(fleet, "cmuxq",
-                        lambda *a: "error: unexpected argument '--effort' found" if a[:1] == ("capture-pane",) else "")
+    pane = _pane(_BAD_FLAG)
+    monkeypatch.setattr(fleet, "cmuxq", lambda *a: pane if a[:1] == ("capture-pane",) else "")
     assert "unexpected argument" in fleet._launch_failure_line("SURF")
-    monkeypatch.setattr(fleet, "cmuxq", lambda *a: "> healthy prompt")
+    monkeypatch.setattr(fleet, "cmuxq", lambda *a: _live_codex_pane())
     assert fleet._launch_failure_line("SURF") == ""
+
+
+# --- the codex update modal: the backstop to _codex_update_preflight -------------------------------
+# Strings lifted from the codex 0.144.1 binary. An out-of-date codex paints this INSTEAD of its TUI and
+# waits; the seat never binds, and for a LAZY tool an unbound seat is the HEALTHY path -> `fleet launch`
+# printed DONE over an agent wedged forever.
+
+def test_codex_update_modal_is_seen_on_a_wedged_seat():
+    pane = _pane("", "  Update available!", "  Update now (runs `codex update`)",
+                 "  Skip until next version", "  Release notes: https://github.com/openai/codex/releases/latest")
+    assert fleet.codex_update_modal(pane) is True
+    assert fleet.launch_error_line(pane) == ""            # the modal is NOT a startup error -> distinct verdicts
+
+
+def test_codex_update_modal_absent_on_a_healthy_codex_seat():
+    assert fleet.codex_update_modal(_pane("  Codex  v0.144.1", "  ? for shortcuts", "> ")) is False
+    assert fleet.codex_update_modal("") is False
+
+
+def test_codex_update_note_is_quiet_when_already_current():
+    # verbatim `codex update` output on this box when current (rc 0) -> nothing worth printing
+    out = ("Updating Codex via `brew upgrade --cask codex`...\n"
+           "Warning: Not upgrading codex, the latest version is already installed\n"
+           "\n🎉 Update ran successfully! Please restart Codex.\n")
+    assert fleet.codex_update_note(0, out) == ""
+    assert "updated codex" in fleet.codex_update_note(0, "Updating Codex...\n🎉 Update ran successfully!")
+
+
+def test_codex_update_note_never_blocks_the_launch():
+    # a timeout, a non-zero rc, and a missing binary all WARN and launch anyway (offline box).
+    assert "timed out" in fleet.codex_update_note(None, "")
+    assert "launching anyway" in fleet.codex_update_note(None, "")
+    assert "launching anyway" in fleet.codex_update_note(1, "Error: network unreachable")
+
+
+def test_codex_update_preflight_survives_a_missing_binary(monkeypatch):
+    monkeypatch.setattr(fleet.subprocess, "run",
+                        lambda *a, **k: (_ for _ in ()).throw(FileNotFoundError("codex")))
+    assert "could not run" in fleet._codex_update_preflight()

@@ -482,8 +482,12 @@ _HUSK_RESUME = re.compile(r"claude --resume\s+(" + _HUSK_UUID + r")")
 _HUSK_LABEL = re.compile(r"AGENT_LABEL=([A-Za-z0-9._-]+)")
 # A live claude/codex TUI paints one of these; a bare login-shell husk never does. SECONDARY guard —
 # pid/hook liveness (surface_has_live_agent, the union of both tool stores) is the authority.
+# `Context \d+% left` is codex's status line: every other alternative here is a claude-ism, so this
+# regex matched NOTHING on a live codex pane (measured, codex 0.144.1, 2026-07-10) and the backstop was
+# claude-only. The pid check is what kept the live codex surface out of the husk bucket, alone.
 _HUSK_LIVE_TUI = re.compile(r"Context Remaining|bypass permissions on \(shift|esc to interrupt\)|"
-                            r"⏵⏵ bypass|Auto-accept edits|for shortcuts|\btokens \(\d", re.I)
+                            r"⏵⏵ bypass|Auto-accept edits|for shortcuts|\btokens \(\d|"
+                            r"Context \d+% left", re.I)
 _HUSK_PROMPT = re.compile(r"^.*?@\S+\s+\S.*?[%$]\s?(.*)$|^\s*[❯➜\$%]\s?(.*)$")
 
 
@@ -539,23 +543,40 @@ def _husk_evidence(pane_text):
             "reason": "fleet launch artifact is the tail; bare shell; no live agent"}
 
 
-def _iter_terminal_surfaces(tree_text):
-    """Yield (surface_uuid, workspace_uuid, title) for every TERMINAL surface in `cmux tree` TEXT (pure).
-    Tracks the most-recent workspace line, like surface_ws_from_tree."""
+def _iter_tree_surfaces(tree_text):
+    """Yield (surface_uuid, workspace_uuid, kind, title) for EVERY surface in `cmux tree` TEXT (pure),
+    whatever its kind — `[terminal]`, `[browser]`, `[markdown]`. Tracks the most-recent workspace line,
+    like surface_ws_from_tree. The husk reaper wants terminals only (_iter_terminal_surfaces); a
+    workspace close takes every kind with it, so its collateral survey must see them all."""
     ws = ""
     for line in (tree_text or "").splitlines():
         mw = re.search(r"workspace\s+workspace:\d+\s+(" + _HUSK_UUID + ")", line)
         if mw:
             ws = mw.group(1)
             continue
-        ms = re.search(r"surface\s+surface:\d+\s+(" + _HUSK_UUID + r")\s+\[terminal\]\s+\"([^\"]*)\"", line)
+        ms = re.search(r"surface\s+surface:\d+\s+(" + _HUSK_UUID + r")\s+\[(\w+)\]\s+\"([^\"]*)\"", line)
         if ms:
-            yield ms.group(1), ws, ms.group(2)
+            yield ms.group(1), ws, ms.group(2), ms.group(3)
 
 
-def _ref_to_uuid(kind, ref):
+def _iter_terminal_surfaces(tree_text):
+    """Yield (surface_uuid, workspace_uuid, title) for every TERMINAL surface in `cmux tree` TEXT (pure)."""
+    for surf, ws, kind, title in _iter_tree_surfaces(tree_text):
+        if kind == "terminal":
+            yield surf, ws, title
+
+
+def surface_ws_map_from_tree(tree_text):
+    """{SURFACE_UUID_UPPER: workspace_uuid} from `cmux tree` TEXT (pure). The tree-derived topology
+    resolve.place_of/workspace_surfaces want, built from a tree text the CALLER already read — so a
+    teardown decision reads the tree ONCE and every question it asks is answered off that one snapshot
+    (no torn view between 'where does my surface live' and 'who else lives there')."""
+    return {surf.upper(): ws for surf, ws, _kind, _title in _iter_tree_surfaces(tree_text) if ws}
+
+
+def _ref_to_uuid(kind, ref, tree_text=None):
     import re
-    txt = cmuxq("tree", "--all", "--id-format", "both")
+    txt = cmuxq("tree", "--all", "--id-format", "both") if tree_text is None else tree_text
     UUID = r"[0-9A-Fa-f-]{36}"
     for line in txt.splitlines():
         m = re.search(rf"{kind}\s+{re.escape(ref)}\s+(" + UUID + ")", line)
@@ -579,6 +600,48 @@ def _term_surface_in(ws_uuid, pane_ref=None):
             if s.get("type") == "terminal" and s.get("id"):
                 return s["id"]
     return ""
+
+
+def _close_group_scaffold(before, keep_ws):
+    """Close the scaffolding workspace `workspace-group create` spawns. Returns (closed_uuids, notes).
+
+    THE CONTRACT, live-measured on cmux 0.64.17 (2026-07-10, reproduced twice): `workspace-group create
+    --name N --from <ref>` does NOT anchor the group on <ref>. It creates a NEW workspace named N holding
+    a bare login shell, anchors the group on THAT, and adopts <ref> as an ordinary member. So a
+    `fleet launch --place workspace --group <new-name>` left behind a bare-shell workspace named after the
+    group, sitting in the sidebar forever, anchoring the group -- the same residue class Berg's archive
+    ruling names, only created at LAUNCH. `fleet group init` half-guarded against it (it re-anchors, then
+    tries to close a "provably empty" new workspace) but cmux gives the scaffold a terminal surface, so
+    the emptiness test never fired and the scaffold survived there too.
+
+    Safe to close: `before` is the workspace set snapshotted immediately BEFORE the create, so `after -
+    before` is exactly what cmux made in the last instant -- nothing of anyone's can be inside. `keep_ws`
+    (the agent's own workspace) is excluded. The never-orphan floor is still CHECKED per surface
+    (resolve.occupants, any tool) rather than assumed away: a workspace that somehow holds a live agent or
+    a registered seat is reported and left alone."""
+    from . import state as fs
+    from . import resolve as rs
+    tree = cmuxq("tree", "--all", "--id-format", "both")
+    fresh = sorted(w for w in (_all_workspace_uuids(tree) - before) if w.upper() != (keep_ws or "").upper())
+    if not fresh:
+        return [], []
+    ws_map = surface_ws_map_from_tree(tree)
+    registered = {(v.get("surface") or "").upper() for v in fs.live_all().values()}
+    ps_out = rs._ps_axeww()                                # ONE sweep across every candidate surface
+    closed, notes = [], []
+    for w in fresh:
+        held = [s for s in rs.workspace_surfaces(w, ws_map=ws_map)
+                if s in registered or rs.occupants(s, ps_out=ps_out)]
+        if held:
+            notes.append(f"note: brand-new workspace {w[:8]} is OCCUPIED ({', '.join(s[:8] for s in held)}); "
+                         f"NOT closing it (inspect: cmux tree)")
+            continue
+        cmuxq("close-workspace", "--workspace", w)
+        closed.append(w)
+    if closed:
+        notes.append(f"closed {len(closed)} scaffolding workspace(s) `workspace-group create` spawned "
+                     f"({', '.join(w[:8] for w in closed)})")
+    return closed, notes
 
 
 def _group_ref(name_or_ref):
@@ -612,6 +675,31 @@ def _group_member_workspaces(gref):
     if g is None:
         return None
     return {_ref_to_uuid("workspace", r) for r in (g.get("member_workspace_refs") or [])}
+
+
+def _group_of_workspace(ws, tree_text):
+    """The workspace-group that CONTAINS workspace `ws`, as (gref, anchor_ws_uuid, {member_ws_uuids}),
+    or None when `ws` is ungrouped / the group data can't be read. cmux reports group membership and the
+    anchor as short refs (`workspace:11`), so each is resolved through the caller's ONE tree snapshot.
+
+    The anchor matters to teardown: per `cmux workspace-group --help`, "the group header IS the anchor's
+    sidebar representation. Closing the anchor dissolves the group while preserving its other members as
+    ungrouped workspaces." So closing a conductor's workspace silently scatters its children out of the
+    sidebar group — collateral the fleet must re-anchor away from, not discover afterwards."""
+    try:
+        gd = json.loads(cmuxq("workspace-group", "list", "--json"))
+    except Exception:
+        return None
+    target = (ws or "").upper()
+    if not target:
+        return None
+    for g in gd.get("groups") or []:
+        members = {u for u in (_ref_to_uuid("workspace", r, tree_text)
+                               for r in (g.get("member_workspace_refs") or [])) if u}
+        if target in {m.upper() for m in members}:
+            return g.get("ref", ""), _ref_to_uuid("workspace", g.get("anchor_workspace_ref") or "",
+                                                  tree_text), members
+    return None
 
 
 def create_surface(spec, parent_surf, direction):
@@ -654,18 +742,28 @@ def create_surface(spec, parent_surf, direction):
         # group does NOT exist -> BOOTSTRAP it, anchored on this agent's OWN new workspace (one
         # conductor = one group). Create the workspace standalone, THEN `workspace-group create --from
         # <that ref>` with an ALWAYS-EXPLICIT --from: the implicit form adopts the CALLER's workspace
-        # (a known footgun). Closing this anchor later dissolves the whole group.
+        # (a known footgun). `create` does NOT honour --from as the anchor -- it spawns its own
+        # bare-shell anchor workspace named after the group (measured, cmux 0.64.17) -- so this is the
+        # same three-step dance `fleet group init` performs: snapshot, create, then re-anchor onto the
+        # agent's workspace and close the scaffold. Without it, `--place workspace --group <new>` left a
+        # workspace named after the group sitting in the sidebar forever. Anchoring the group on the
+        # AGENT is what makes `fleet archive` able to re-anchor off it later, rather than dissolve it.
         out = cmuxq("new-workspace", "--name", spec["label"], "--cwd", spec["abs_cwd"], "--focus", "false")
         m = re.search(r"(workspace:\d+)", out)
         if not m:
             print(f"[fleet] ABORT: new-workspace (anchor) gave no workspace ref: {out.strip()}"); return None, None
         anchor_ref = m.group(1)
+        before = _all_workspace_uuids(cmuxq("tree", "--all", "--id-format", "both"))
         cmuxq("workspace-group", "create", "--name", group, "--from", anchor_ref)
-        if _group_ref(group):
-            print(f"[fleet] created group '{group}' anchored on {spec['label']} ({anchor_ref})")
+        ws = _ref_to_uuid("workspace", anchor_ref)
+        gref = _group_ref(group)
+        if gref:
+            cmuxq("workspace-group", "set-anchor", "--group", gref, "--workspace", ws)   # the AGENT anchors
+            for n in _close_group_scaffold(before, keep_ws=ws)[1]:
+                print(f"[fleet] {n}")
+            print(f"[fleet] created group '{group}' ({gref}) anchored on {spec['label']} ({anchor_ref})")
         else:
             print(f"[fleet] warn: group '{group}' did not register; {spec['label']} workspace is standalone")
-        ws = _ref_to_uuid("workspace", anchor_ref)
         return ws, _term_surface_in(ws)
 
     print(f"[fleet] ABORT: unknown place '{place}'"); return None, None
@@ -800,16 +898,28 @@ def render_send_cmd(bin_name, args, env, abs_cwd, raw_env=None):
 
 
 # markers that an agent TUI has taken over the surface (booting or up) — used to STOP re-kicking Enter
-# into a launch that already started (so a slow-booting agent is never spammed with stray keystrokes).
+# into a launch that already started (so a slow-booting agent is never spammed with stray keystrokes),
+# and to tell a LIVE agent from a DEAD launch (launch_error_line).
 _TUI_MARKERS = ("Context Remaining", "bypass permissions", "esc to interrupt",
                 "auto-accept edits", "? for shortcuts", "Welcome to Claude")
+# codex paints NONE of the above (verified against a live codex 0.144.1 pane, 2026-07-10): its status
+# line reads `gpt-5.5 xhigh · ~/cwd · main · Context 100% left`. Every marker above is a claude-ism, so
+# `_agent_surfaced` was permanently False for codex — the enter-race loop would re-kick Enter into a
+# live codex TUI, and launch_error_line had no way to see that a healthy codex was on screen.
+_CODEX_TUI = re.compile(r"Context \d+% left")
+
+
+def agent_tui_visible(pane_text):
+    """True if an agent TUI (claude or codex) is painted on the pane (PURE). A painted TUI means a LIVE
+    agent: not a shell awaiting an injected command, and not a launch that died on spawn."""
+    pane = pane_text or ""
+    return any(m in pane for m in _TUI_MARKERS) or bool(_CODEX_TUI.search(pane))
 
 
 def _agent_surfaced(surf):
     """True once an agent TUI is visible on the surface (booting or running). While False, the surface
     is still at the shell — an injected command that hasn't started, i.e. the enter-race symptom."""
-    pane = cmuxq("capture-pane", "--surface", surf) or ""
-    return any(m in pane for m in _TUI_MARKERS)
+    return agent_tui_visible(cmuxq("capture-pane", "--surface", surf) or "")
 
 
 # startup-error signatures on a pane -> a launch that DIED on spawn (a bad flag, a missing binary, an
@@ -823,20 +933,111 @@ _LAUNCH_ERROR_MARKERS = (
 
 
 def launch_error_line(pane_text):
-    """First startup-error line in a captured pane (a bad flag / missing binary / early crash), or ''.
-    PURE (no shell-out) so the launch-time verify (cli._launch_failure_line) and the fleet-doctor
-    never-bound sweep (router._surface_error_line) share ONE scanner and both stay unit-testable without
-    a live cmux -- the same shape as surface_ws_from_tree."""
-    for line in (pane_text or "").splitlines():
+    """First startup-error line printed BY THE LAUNCH in a captured pane (a bad flag / missing binary /
+    early crash), or ''. PURE (no shell-out) so the launch-time verify (cli._launch_failure_line) and the
+    fleet-doctor never-bound sweep (router._surface_error_line) share ONE scanner and both stay
+    unit-testable without a live cmux -- the same shape as surface_ws_from_tree.
+
+    THE SCANNER USED TO CRY WOLF ON EVERY CODEX LAUNCH. A marker match is not a dead launch: the marker
+    list ("No such file or directory", "command not found", "Usage: ") matches ordinary chatter from two
+    different sources, one per delivery path.
+
+      - PASTE delivery (the command is typed into a running login shell): the pane opens with the
+        SHELL's rc chatter. This box's ~/.zshrc:65 sources a file uv never created, so every surface
+        begins with `/Users/berg/.zshrc:.:65: no such file or directory: /Users/berg/.local/bin/env`.
+      - EXEC delivery (respawn-pane runs the launch AS the pane's process; see design-exec-launch.md):
+        no shell, no echoed command -- but a healthy codex prints `⚠ MCP client for \\`terraform\\` failed
+        to start: MCP startup failed: No such file or directory (os error 2)` and carries on happily.
+
+    Both were reported as "LAUNCH FAILED ... likely a tool/flag mismatch", with a cleanup recipe, over a
+    perfectly healthy agent. A scanner people learn to ignore is worse than no scanner.
+
+    TWO RULES, in this order:
+
+    1. A PAINTED AGENT TUI IS NOT A DEAD LAUNCH -> ''. This is the real discriminator, and it holds on
+       both delivery paths: a process that died on spawn cannot paint chrome. It required teaching
+       `agent_tui_visible` about codex, which paints none of claude's markers (its status line is
+       `Context 100% left`) -- so for codex this gate had never once fired.
+    2. Otherwise scan, and when the pane carries the fleet launch line (`_FLEET_LAUNCH_SIG`: the
+       AGENT_ROLE=/AGENT_LABEL=/CMUX_FLEET_* env prefix render_send_cmd emits, which a human's shell
+       never contains), scan only BELOW THE LAST one -- the shell's rc noise is always above it and the
+       tool's own output always below. A pane with no such line (exec delivery) is scanned whole: there
+       is no shell whose noise could be mistaken for the tool's.
+
+    Positional, not a denylist of benign strings: it needs no upkeep as rc files and MCP servers change."""
+    if agent_tui_visible(pane_text):                       # rule 1: a live agent, whatever else it printed
+        return ""
+    lines = (pane_text or "").splitlines()
+    sig = [i for i, l in enumerate(lines) if _FLEET_LAUNCH_SIG.search(l)]
+    if sig:
+        lines = lines[sig[-1] + 1:]                        # rule 2: strictly below the LAST launch line
+    for line in lines:
         low = line.lower()
         if any(m.lower() in low for m in _LAUNCH_ERROR_MARKERS):
             return line.strip()[:200]
     return ""
 
 
+# codex's interactive "update available" modal. An out-of-date codex paints this INSTEAD of its TUI and
+# waits for a keypress: the seat exists, no session ever binds, and `fleet launch` calls it DONE (codex
+# binds lazily, so an unbound seat is the healthy path for it). Strings lifted from the codex 0.144.1
+# binary. The BACKSTOP for _codex_update_preflight, which stops the modal from ever appearing.
+_CODEX_UPDATE_MODAL = ("Update available!", "Skip until next version", "Update now (runs")
+
+
+def codex_update_modal(pane_text):
+    """True if codex's blocking update modal is on the pane (PURE)."""
+    return any(m in (pane_text or "") for m in _CODEX_UPDATE_MODAL)
+
+
 def _launch_failure_line(surf):
     """launch_error_line applied to `surf`'s live pane (captured via cmuxq)."""
     return launch_error_line(cmuxq("capture-pane", "--surface", surf) or "")
+
+
+_CODEX_UPDATE_TIMEOUT_S = 120     # `codex update` shells `brew upgrade --cask codex`; ~1.5s when current
+
+
+def codex_update_note(rc, out):
+    """PURE: the one line to print for a finished `codex update` (rc, combined output), or '' when the
+    preflight found nothing worth saying. Split from the shell-out so the verdict is testable."""
+    if rc is None:
+        return f"codex update: timed out after {_CODEX_UPDATE_TIMEOUT_S}s; launching anyway"
+    if rc != 0:
+        return f"codex update: exited {rc} ({(out or '').strip().splitlines()[-1][:100] if (out or '').strip() else 'no output'}); launching anyway"
+    if "already installed" in (out or ""):
+        return ""                                         # the common case: current. Say nothing.
+    return "codex update: updated codex to the latest version before seating the agent"
+
+
+def _codex_update_preflight():
+    """Update codex BEFORE seating a codex agent, so its interactive update modal never appears.
+    Returns a note line ('' = nothing to say). Never raises; never blocks the launch.
+
+    THE BUG: an out-of-date codex opens a blocking "Update available! / Update now / Skip until next
+    version" modal at startup. It paints none of _TUI_MARKERS, so _send_launch_and_confirm reads the seat
+    as "still at the shell" and re-kicks Enter INTO the modal, and no session ever binds -- which for a
+    LAZY tool is indistinguishable from health, so `fleet launch` prints DONE over a seat that will sit
+    unbound forever. Berg's ruling: ALWAYS ALLOW THE UPDATE.
+
+    WHY A PREFLIGHT AND NOT A PANE SCAN. codex has no suppress-the-prompt flag; `codex update` is the
+    non-interactive subcommand. Updating before the surface exists means the modal has nothing to
+    interrupt -- the failure is designed out rather than detected. It is cheap and idempotent (it shells
+    the install manager -- `brew upgrade --cask codex` here -- and prints "already installed" in ~1.5s
+    when current), so paying it per codex launch costs less than one bind-wait timeout. A pane scan can
+    only ever tell you afterwards, on a seat already wedged; `codex_update_modal` keeps that scan as the
+    BACKSTOP (for an offline box, or a modal this preflight failed to prevent), never as the primary.
+
+    BEST-EFFORT BY DESIGN: a timeout / non-zero rc / missing binary WARNS and launches anyway. An
+    offline box must still be able to seat a codex agent, and the backstop catches what slips through."""
+    try:
+        p = subprocess.run(["codex", "update"], capture_output=True, text=True,
+                           timeout=_CODEX_UPDATE_TIMEOUT_S)
+        return codex_update_note(p.returncode, (p.stdout or "") + (p.stderr or ""))
+    except subprocess.TimeoutExpired:
+        return codex_update_note(None, "")
+    except Exception as ex:                               # binary missing / not executable / OS error
+        return f"codex update: could not run ({ex}); launching anyway"
 
 
 def _resume_menu_visible(surf):
@@ -1149,6 +1350,10 @@ def cmd_launch(argv):
     os.makedirs(spec["abs_cwd"], exist_ok=True)
     if a.adhoc:                                          # ad-hoc cwds are created fresh at launch ->
         _link_floor_claudemd(spec["abs_cwd"])            # symlink the floor CLAUDE.md so they inherit it
+    if spec["tool"] == "codex":                          # design the update modal out (Berg: always
+        note = _codex_update_preflight()                 # allow the update); the pane scan below is the
+        if note:                                         # backstop, not the primary
+            print(f"[fleet] {note}")
     ws, surf = create_surface(spec, a.parent, a.direction)
     if not ws or not surf:
         sys.exit(1)
@@ -1198,7 +1403,19 @@ def cmd_launch(argv):
     # the normal lazy path (the row is already registered, so a silent death still shows PENDING in
     # `fleet ls` and the daemon never-bound sweep is the backstop).
     if lazy and not sid:
-        errline = _launch_failure_line(surf)
+        pane = cmuxq("capture-pane", "--surface", surf) or ""
+        # BACKSTOP to _codex_update_preflight: an unbound lazy seat sitting in codex's update modal is
+        # indistinguishable from a healthy unbound one by session alone, so it used to report DONE and
+        # sit there forever. The preflight should have prevented this; say so, because reaching here
+        # means the preflight could not run (offline box, missing binary).
+        if codex_update_modal(pane):
+            print(f"\n[fleet] !!! LAUNCH WEDGED for {spec['label']} (tool {spec['tool']}): the seat is "
+                  f"sitting in codex's interactive update modal and will never bind a session.")
+            print(f"[fleet]   the pre-launch `codex update` did not run or did not take. Fix + retry:")
+            print(f"[fleet]     fleet rm {spec['label']} --kill")
+            print(f"[fleet]     codex update && fleet launch {a.role or ('--adhoc ' + a.adhoc)} ...")
+            return 2
+        errline = launch_error_line(pane)
         if errline:
             print(f"\n[fleet] !!! LAUNCH FAILED for {spec['label']} (tool {spec['tool']}): the process "
                   f"exited on spawn -- it never came up.")
@@ -1954,6 +2171,247 @@ def _stop_agent_for_close(surf, tool, label, verb):
                    f"registry row (invisible orphan). Check the pid(s), stop the agent, then re-run.")
 
 
+# --- the seat close: an archived agent leaves NO cmux residue --------------------------------------
+# Berg's ruling (2026-07-10): "You retired it ... but now there's just a workspace sitting there open
+# with that name on it. Remove the workspace from cmux whenever an agent is getting archived."
+#
+# The verb is `cmux close-workspace --workspace <uuid>`, which closes the workspace AND its surfaces.
+# `close-surface` cannot do it: cmux refuses with `invalid_state: Cannot close the last surface` when
+# the surface is its workspace's only one — documented behavior (docs/reap-surfaces.md item 3), and
+# precisely why a workspace-placed agent (whose surface IS the only one in its own workspace) needs the
+# workspace verb. It is also why the two verbs are not interchangeable in the other direction: a
+# tab/pane agent SHARES its parent conductor's workspace, and closing that workspace would take the
+# conductor down with it. So the choice of verb is a judgment about placement, and it is made here.
+def plan_seat_close(label, surface, workspace, caller_workspace, place, siblings):
+    """PURE: which cmux verb retires this agent's seat, and what it takes with it. Returns
+        {"verb": "close-workspace"|"close-surface", "workspace": ws, "collateral": [...], "blockers": [...]}
+    `siblings` is every OTHER surface the tree places in `workspace`, as
+    {"surface","kind","title","label" (registry label or ""), "pids" (live agent pids, any tool)}.
+
+    close-workspace requires ALL of:
+      1. the workspace is not the CALLER's own (never close the ground you stand on);
+      2. no sibling surface belongs to another REGISTERED agent, and no sibling surface carries a live
+         agent pid — the never-orphan floor (resolve.occupants), applied to bystanders because a
+         workspace close takes every surface with it, and applied to untracked seats too: a conductor
+         whose registry row was already archived is invisible to (1) and (2)-by-label, but its live
+         claude pid is not;
+      3. the agent's DERIVED placement (resolve.place_of) is 'workspace' — it owns this workspace,
+         rather than sitting in its parent's as a tab/pane.
+    Any blocker DOWNGRADES to close-surface (which the sibling that caused the blocker guarantees is
+    legal — a blocked workspace always has ≥2 surfaces). It never escalates a refusal: the agent still
+    retires, only its workspace outlives it, and the reason is printed."""
+    if not workspace:
+        return {"verb": "close-surface", "workspace": "", "collateral": [],
+                "blockers": ["workspace unresolvable from `cmux tree` (surface already closed?)"]}
+    blockers = []
+    if caller_workspace and caller_workspace.upper() == workspace.upper():
+        blockers.append("it is the CALLER's own workspace ($CMUX_SURFACE_ID lives here)")
+    if place != "workspace":
+        blockers.append(f"derived placement is {place or 'unknown'!r}, not 'workspace' "
+                        f"({label} shares this workspace rather than owning it)")
+    tenants = sorted(s["label"] for s in siblings if s.get("label"))
+    if tenants:
+        blockers.append(f"it still hosts registered agent(s): {', '.join(tenants)}")
+    busy = sorted((s["surface"], sorted(s["pids"])) for s in siblings if s.get("pids"))
+    if busy:
+        blockers.append("live agent pid(s) on bystander surface(s): "
+                        + "; ".join(f"{s[:8]} -> {p}" for s, p in busy))
+    if blockers:
+        return {"verb": "close-surface", "workspace": workspace, "collateral": [], "blockers": blockers}
+    return {"verb": "close-workspace", "workspace": workspace, "blockers": [], "collateral": list(siblings)}
+
+
+def _reanchor_group_off(ws, prefer, tree_text, ws_map=None):
+    """Move a group's ANCHOR off workspace `ws` before `ws` is closed. Returns (ok, note).
+
+    Closing an anchor dissolves its group -- cmux's documented behavior, and confirmed live on 0.64.17:
+    closing a two-member group's anchor left the survivor as an ungrouped workspace. So a conductor's
+    retirement would silently scatter its still-live children out of the sidebar group. Re-anchor onto a
+    surviving member first -- `workspace-group set-anchor` takes a group REF, never a name, plus a
+    workspace UUID.
+
+    Who inherits the header: `prefer` in order (the parent conductor's workspace, then the caller's),
+    then any survivor that HOSTS A REGISTERED AGENT, then the lowest-sorted survivor. The agent-hosting
+    rule matters because a group's other members can include workspaces nobody lives in -- anchoring the
+    group header onto an empty one is how a sidebar group ends up named after nothing.
+
+    ok=False REFUSES the close: the re-anchor is a cmux mutation we VERIFY (re-read the group list), and
+    an unverified anchor move means the next call would dissolve the group. Refuse and report."""
+    from . import state as fs
+    info = _group_of_workspace(ws, tree_text)
+    if not info:
+        return True, ""                                   # ungrouped -> nothing to protect
+    gref, anchor, members = info
+    if not anchor or anchor.upper() != (ws or "").upper():
+        return True, ""                                   # a plain member -> closing it just leaves the group
+    survivors = sorted(m for m in members if m and m.upper() != ws.upper())
+    if not survivors:
+        return True, (f"group {gref} has no member besides {ws[:8]}; closing it dissolves an empty group")
+    surv_up = {s.upper() for s in survivors}
+    m = surface_ws_map_from_tree(tree_text) if ws_map is None else ws_map
+    peopled = sorted(w for w in survivors
+                     if any(m.get((v.get("surface") or "").upper(), "").upper() == w.upper()
+                            for v in fs.live_all().values()))
+    new = next((p for p in prefer if p and p.upper() in surv_up), None) or \
+        (peopled[0] if peopled else survivors[0])
+    cmuxq("workspace-group", "set-anchor", "--group", gref, "--workspace", new)
+    after = _group_of_workspace(ws, tree_text)             # VERIFY: cmuxq gives us no rc worth trusting
+    if after and after[1] and after[1].upper() == ws.upper():
+        return False, (f"`workspace-group set-anchor --group {gref} --workspace {new}` did not move the "
+                       f"anchor off {ws[:8]}. NOT closing the workspace: closing an anchor dissolves "
+                       f"group {gref} and ungroups its {len(survivors)} surviving member(s). Re-anchor "
+                       f"by hand, then re-run.")
+    return True, f"re-anchored group {gref} onto {new[:8]} (was anchored on {ws[:8]})"
+
+
+def seat_close_plan(label, e):
+    """Read the tree ONCE and decide how `label`'s seat retires. Returns the plan bundle, or None when
+    there is nothing to close.
+
+    CALL THIS BEFORE STOPPING THE AGENT. Under exec delivery (docs/design-exec-launch.md) the agent IS
+    the pane's process, so the instant SIGINT lands cmux closes its surface — and a plan computed
+    afterwards can no longer see which workspace the agent lived in. Measured: `fleet archive` of an
+    exec-launched codex found the surface already absent from the tree, fell through to the
+    surface-unlocatable branch, and would have left a workspace-placed codex's workspace standing
+    forever — Berg's exact complaint, surviving the fix, for one tool.
+
+    Reading before the stop is also strictly more correct for claude: every topology question is answered
+    off ONE snapshot taken while the seat still exists, so the verb choice cannot straddle a torn view.
+    None of the guards depend on post-stop state — they ask about BYSTANDER surfaces, which stopping our
+    own agent cannot change."""
+    from . import state as fs
+    from . import resolve as rs
+    surf = (e or {}).get("surface", "")
+    if not surf:
+        return None
+    tree = cmuxq("tree", "--all", "--id-format", "both")
+    ws_map = surface_ws_map_from_tree(tree)
+    ws = ws_map.get(surf.upper(), "")
+    caller_ws = ws_map.get((os.environ.get("CMUX_SURFACE_ID") or "").upper(), "")
+    parent_entry = fs.live_get(e.get("parent") or "") or fs.archive_get(e.get("parent") or "")
+    place = rs.place_of(e, parent_entry, ws_map=ws_map)
+    siblings = []
+    if ws:
+        kinds = {s.upper(): (k, t) for s, _w, k, t in _iter_tree_surfaces(tree)}
+        by_surface = {(v.get("surface") or "").upper(): lbl for lbl, v in fs.live_all().items()
+                      if lbl != label}
+        ps_out = rs._ps_axeww()                            # ONE sweep, shared across every bystander
+        for s in rs.workspace_surfaces(ws, ws_map=ws_map):
+            if s == surf.upper():
+                continue
+            kind, title = kinds.get(s, ("?", ""))
+            siblings.append({"surface": s, "kind": kind, "title": title, "label": by_surface.get(s, ""),
+                             "pids": sorted(rs.occupants(s, ps_out=ps_out))})
+    return {"surface": surf, "workspace": ws, "tree": tree, "ws_map": ws_map, "caller_ws": caller_ws,
+            "parent_ws": (parent_entry or {}).get("workspace", ""),
+            "plan": plan_seat_close(label, surf, ws, caller_ws, place, siblings)}
+
+
+def _seat_residue(surf, ws=""):
+    """What of a retired seat is STILL in `cmux tree` — ('surface', 'workspace', both, or none). ONE
+    fresh tree read. The close is verified against the tree, never inferred from cmux's exit text."""
+    tree = cmuxq("tree", "--all", "--id-format", "both")
+    left = []
+    if surf and surf.upper() in surface_ws_map_from_tree(tree):
+        left.append("surface")
+    if ws and ws.upper() in {w.upper() for w in _all_workspace_uuids(tree)}:
+        left.append("workspace")
+    return left
+
+
+def _close_seat(label, e, verb, planned=None):
+    """Retire `label`'s cmux seat, leaving NO residue: close its WORKSPACE when it owns one, else just
+    its surface. Returns (ok, notes) -- ok=False means cmux residue SURVIVED the close, and the caller
+    must fail loudly. `planned` is a seat_close_plan() bundle read BEFORE the agent was stopped (see its
+    docstring); computed here if absent.
+
+    EVERY CLOSE IS VERIFIED AGAINST A FRESH TREE. `cmuxq` returns cmux's stdout+stderr and no exit code,
+    so a refusal reads exactly like a success: `fleet rm` on a workspace-placed agent hit the documented
+    `invalid_state: Cannot close the last surface`, swallowed it, and printed "removed (closed + archived
+    for recovery)" while the surface and its workspace sat untouched in the tree (cmux-advisor,
+    reproduced live 2026-07-10 on `placeprobe`). A teardown that reports success while leaving residue is
+    worse than one that refuses: the operator stops looking. Now the tree is re-read and disagreement is
+    an error, not a note. Verifying the WORKSPACE (not just the surface) matters because an exec-delivered
+    agent's surface leaves the tree with its process, so a surface-only check passes vacuously.
+
+    Tombstones every surface it is about to close — a workspace close closes bystander surfaces too, and
+    an untombstoned `surface.closed` frame makes the router fire a spurious "revive?" alert for a
+    deliberate retirement.
+
+    Callers MUST have written the registry row (archive_put) before calling: registry write precedes the
+    cmux mutation it describes (agent-management v2 §2), so a close that half-fails degrades to
+    "recorded, maybe-unresumable", never to "vanished"."""
+    from . import state as fs
+    planned = seat_close_plan(label, e) if planned is None else planned
+    if not planned:
+        return True, []
+    surf, ws, plan = planned["surface"], planned["workspace"], planned["plan"]
+    if not ws:
+        # No tree (stubbed/unreadable cmux) or the surface was never locatable. Fall back to the bare
+        # close-surface that predates this path: harmless on a closed surface, and the only thing we can
+        # honestly attempt without knowing where the surface lives. Nothing to verify against.
+        fs.expected_close_put(surf)
+        cmuxq("close-surface", "--surface", surf)
+        return True, []
+    notes = []
+    if plan["verb"] == "close-surface":
+        for b in plan["blockers"]:
+            notes.append(f"  workspace {ws[:8]} KEPT: {b}")
+        fs.expected_close_put(surf)
+        out = cmuxq("close-surface", "--surface", surf, "--workspace", ws)
+        left = _seat_residue(surf)
+        if left:
+            notes.append(f"  !!! surface {surf[:8]} did NOT close -- cmux said: "
+                         f"{out.strip()[:140] or '(nothing)'}")
+            return False, notes
+        return True, notes
+    ok, note = _reanchor_group_off(ws, [planned["parent_ws"], planned["caller_ws"]], planned["tree"],
+                                   ws_map=planned["ws_map"])
+    if note:
+        notes.append(f"  {note}")
+    if not ok:
+        fs.expected_close_put(surf)                        # the surface still goes; the workspace does not
+        out = cmuxq("close-surface", "--surface", surf, "--workspace", ws)
+        if _seat_residue(surf):
+            notes.append(f"  !!! surface {surf[:8]} did NOT close either -- cmux said: "
+                         f"{out.strip()[:140] or '(nothing)'}")
+        return False, notes
+    for s in plan["collateral"]:
+        fs.expected_close_put(s["surface"])
+        notes.append(f"  also closing {s['surface'][:8]} [{s['kind']}] {s['title'][:44]!r} (in this workspace)")
+    fs.expected_close_put(surf)
+    out = cmuxq("close-workspace", "--workspace", ws)
+    left = _seat_residue(surf, ws)
+    if left:
+        notes.append(f"  !!! workspace {ws[:8]} did NOT close ({' + '.join(left)} still in `cmux tree`) -- "
+                     f"cmux said: {out.strip()[:120] or '(nothing)'}")
+        return False, notes
+    notes.append(f"  closed workspace {ws[:8]} (no cmux residue)")
+    fs.log_event("workspace-closed", label=label, workspace=ws, via=verb,
+                 collateral=[s["surface"] for s in plan["collateral"]])
+    return True, notes
+
+
+def _report_seat_residue(label, verb, planned, notes):
+    """Print the loud, actionable failure a surviving seat deserves. Returns rc 2."""
+    surf = (planned or {}).get("surface", "")
+    ws = (planned or {}).get("workspace", "")
+    for n in notes:
+        print(f"[fleet] {n}")
+    print(f"\n[fleet] !!! {verb} {label}: the agent is STOPPED and ARCHIVED, but its cmux seat is STILL "
+          f"OPEN. This is residue, not success.")
+    print(f"[fleet]   surface   : {surf}")
+    print(f"[fleet]   workspace : {ws or '(unresolved)'}")
+    print(f"[fleet]   inspect + clean up by hand:")
+    print(f"[fleet]     cmux tree --all --id-format both")
+    if ws:
+        print(f"[fleet]     cmux close-workspace --workspace {ws}     # closes the workspace AND its surfaces")
+    print(f"[fleet]     cmux close-surface --surface {surf} --workspace {ws or '<ws>'}")
+    from . import state as fs
+    fs.log_event("seat_close_residue", label=label, surface=surf, workspace=ws, via=verb)
+    return 2
+
+
 def _direct_kill(surf, tool, log):
     """cmux-INDEPENDENT teardown of the old agent process(es): SIGINT x2 straight to every live,
     identity-checked pid on the surface (_signal_agent_pids). respawn-pane's OWN kill goes through cmux
@@ -2063,8 +2521,9 @@ def cmd_rm(argv):
     swept member's worktree dir and branch are left UNMANAGED: their registry rows are gone, so `fleet
     worktree clean` (which discovers from the registry) cannot find them. Reclaim manually with `git
     worktree list` + `git worktree remove <path>` (and `git branch -D fleet/<label>` if you want the
-    branch gone). WITHOUT --with-group, only this agent's own workspace goes and remaining members are
-    left ungrouped."""
+    branch gone). WITHOUT --with-group, only this agent's OWN seat goes (_close_seat: its workspace when
+    it owns one, else just its surface) and the group survives -- re-anchored onto a surviving member
+    first if this agent's workspace was the anchor."""
     from . import state as fs; import signal
     from . import resolve as rs
     kill = "--kill" in argv
@@ -2111,6 +2570,7 @@ def cmd_rm(argv):
     # The cross-check (registry group can diverge from cmux's real group -- the 2026-07-02 root cause) still
     # ABORTS on any disagreement. Only after this passes do we tombstone + dissolve (below).
     grp = None
+    seat_notes, seat_ok, planned = [], True, None
     if with_group and e.get("group"):
         gname = e["group"]
         gref = _group_ref(gname)
@@ -2285,6 +2745,8 @@ def cmd_rm(argv):
             group_note = f"\n[fleet] group '{gname}' not found live; nothing to dissolve"
     archived = False
     if closing:
+        # read the seat's topology BEFORE the stop (exec delivery closes the surface with the process)
+        planned = seat_close_plan(label, e_live)
         # STOP the agent(s) FIRST — live-only, identity-checked targets (_stop_agent_for_close), and
         # REFUSE the whole removal if a live agent won't die or can't be identified: close-surface does
         # NOT reliably kill the pane's agent, so closing over a survivor strands it invisibly (the
@@ -2306,7 +2768,11 @@ def cmd_rm(argv):
         fs.log_event("archived", label=label, role=e.get("role"), session=e.get("session"),
                      via="kill" if kill else "rm")
         archived = True
-        cmuxq("close-surface", "--surface", surf)
+        # close the SEAT, not just the surface: a workspace-placed agent's workspace goes too, so `rm`
+        # leaves no named husk workspace in the sidebar (Berg's ruling). Guards + verb choice live in
+        # _close_seat/plan_seat_close; a tab/pane agent still only loses its own surface.
+        seat_ok, seat_notes = _close_seat(label, e_live, "rm --with-group" if with_group else "rm",
+                                          planned=planned)
     wt_note = ""
     if kill and e.get("worktree"):
         from . import worktree as wt
@@ -2330,6 +2796,10 @@ def cmd_rm(argv):
     else:
         tail = ""
     print(f"[fleet] removed {label}{tail}{group_note}{wt_note}")
+    if not seat_ok:                                     # "removed (closed + archived)" over a surface that
+        return _report_seat_residue(label, "rm", planned, seat_notes)   # never closed was THE lie. Not 0.
+    for n in seat_notes:
+        print(f"[fleet] {n}")
     return 0
 
 
@@ -2449,9 +2919,14 @@ def _build_archive_entry(e, b):
 
 def cmd_archive(argv):
     """Park a live agent: stop its process(es) (SIGINT x2 to every live identity-checked pid = clean
-    TUI exit), close the tab, move it to the archive shelf with enough to `claude --resume` it later.
-    REFUSES — registry untouched, surface left open — if a live agent on the surface won't die or can't
-    be identified: closing over a survivor strands it invisibly (the 2026-07-10 leak class)."""
+    TUI exit), close its cmux seat, move it to the archive shelf with enough to `claude --resume` it
+    later. REFUSES — registry untouched, surface left open — if a live agent on the surface won't die or
+    can't be identified: closing over a survivor strands it invisibly (the 2026-07-10 leak class).
+
+    "Close its seat" is _close_seat, not `close-surface`: an agent that OWNS a workspace has its
+    workspace closed too, so archiving leaves no husk surface and no empty named workspace in the
+    sidebar (Berg's ruling, 2026-07-10). A tab/pane agent only loses its surface — its parent's
+    workspace survives."""
     from . import state as fs
     if not argv:
         sys.exit("usage: fleet archive <label>")
@@ -2465,19 +2940,29 @@ def cmd_archive(argv):
     # post-launch overrides included) instead of the lossy registry-spec snapshot. The binding lives
     # on the surface; once close-surface runs it's gone, so read it first.
     b = _resume_binding(surf) if surf else {}
+    # decide the seat teardown BEFORE the stop: an exec-delivered agent's surface leaves the tree the
+    # instant its process dies, taking with it the only evidence of which workspace it owned.
+    planned = seat_close_plan(label, e) if surf else None
+    notes = []
     if surf:
         ok, note = _stop_agent_for_close(surf, e.get("tool") or "claude", label, "archive")
         if not ok:
             print(f"[fleet] archive {label} REFUSED: {note}")
             fs.log_event("archive_refused", label=label, surface=surf, reason="live-agent-would-orphan")
             return 1
-        fs.expected_close_put(surf)                     # deliberate archive: shield the router's
-                                                        # surface.closed handler from a spurious stale alert
-        cmuxq("close-surface", "--surface", surf)
+    # registry BEFORE the cmux mutation it describes (v2 §2): a seat close that half-fails must degrade
+    # to "recorded, maybe-unresumable", never to "vanished".
     fs.archive_put(label, _build_archive_entry(e, b))
+    seat_ok = True
+    if surf:
+        seat_ok, notes = _close_seat(label, e, "archive", planned=planned)
     fs.live_del(label)
     fs.log_event("archived", label=label, role=e.get("role"), session=e.get("session"))
     print(f"[fleet] archived {label} (session {e.get('session')}); revive with: fleet revive {label}")
+    if not seat_ok:                                     # the row is written and the agent is dead; the
+        return _report_seat_residue(label, "archive", planned, notes)   # seat is not. Never call that 0.
+    for n in notes:
+        print(f"[fleet] {n}")
     return 0
 
 
@@ -2925,18 +3410,16 @@ def cmd_group(argv):
             sys.exit(f"[fleet] group init: `workspace-group create` did not register a group named "
                      f"'{name}'. No registry change. Inspect: cmux workspace-group list --json")
         cmuxq("workspace-group", "set-anchor", "--group", gref, "--workspace", my_ws)  # my ws IS the anchor
-        after = _all_workspace_uuids(cmuxq("tree", "--all", "--id-format", "both"))
-        closed = []
-        for ws in sorted(after - before - {my_ws}):
-            if not _term_surface_in(ws):                    # PROVABLY empty -> the scaffolding anchor
-                cmuxq("close-workspace", "--workspace", ws)
-                closed.append(ws)
-            else:
-                print(f"[fleet] group init: note: new NON-empty workspace {ws} appeared; NOT closing "
-                      f"(inspect: cmux tree). It is not part of group '{name}'.")
+        # close the bare-shell anchor cmux spawns for the group (the 2026-07-02 footgun). The old test
+        # here was "provably empty" (_term_surface_in) -- but cmux gives the scaffold a login shell, so it
+        # never fired and the scaffold survived. _close_group_scaffold tests the thing that actually
+        # matters (does any surface hold a live agent or a registered seat) and closes the WORKSPACE.
+        closed, notes = _close_group_scaffold(before, keep_ws=my_ws)
+        for n in notes:
+            print(f"[fleet] group init: {n}")
         fs.live_put(self_label, {**self_entry, "group": name, "place": "workspace"})
         fs.log_event("group-init", label=self_label, via="bootstrap", group=name)
-        tail = f"; closed {len(closed)} empty scaffold workspace(s)" if closed else ""
+        tail = f"; closed {len(closed)} scaffold workspace(s)" if closed else ""
         print(f"[fleet] group '{name}' ({gref}) anchored on {self_label}'s workspace{tail}. "
               f"Children launched with --place workspace (no --group) now join it.")
         return 0

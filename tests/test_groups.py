@@ -43,6 +43,14 @@ def test_workspace_bootstrap_uses_explicit_from(monkeypatch):
     create = [c for c in calls if c[:2] == ("workspace-group", "create")][0]
     assert "--from" in create and "workspace:7" in create       # ALWAYS explicit --from (never implicit)
     assert "--name" in create and "g1" in create
+    # ...and --from is NOT enough: cmux anchors the new group on a bare-shell workspace it spawns itself,
+    # so the bootstrap must re-anchor onto the AGENT's workspace (and later reap the scaffold). Without
+    # this, `fleet archive` of the agent would find itself a plain member and leave the group behind,
+    # anchored on an empty workspace named after the group.
+    setanchor = [c for c in calls if c[:2] == ("workspace-group", "set-anchor")][0]
+    assert "--group" in setanchor and "workspace_group:3" in setanchor
+    assert "--workspace" in setanchor and "WS" in setanchor
+    assert calls.index(create) < calls.index(setanchor)
 
 
 def test_workspace_joins_existing_group(monkeypatch):

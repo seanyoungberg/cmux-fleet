@@ -1,0 +1,35 @@
+
+  Tip: Our most capable model yet. GPT-5.6 Sol can tackle complex code changes, dig into research,
+  produce polished documents, and take on your most ambitious work. Sol is highly capable at lower
+  reasoning efforts—try starting lower, then turn it up for harder jobs.
+
+⚠ MCP client for `terraform` failed to start: MCP startup failed: No such file or directory (os
+  error 2)
+
+⚠ MCP client for `codex_apps` failed to start: MCP startup failed: handshaking with MCP server
+  failed: Send message error Transport
+  [rmcp::transport::worker::WorkerTransport<rmcp::transport::streamable_http_client::StreamableHttp
+  ClientWorker<codex_rmcp_client::http_client_adapter::StreamableHttpClientAdapter>>] error:
+  unexpected server response: HTTP 401: {
+    "error": {
+      "message": "Your authentication token has been invalidated. Please try signing in again.",
+      "type": "invalid_request_error",
+      "code": "token_invalidated",
+      "param": null
+    },
+    "status": 401
+  }, when send initialize request
+
+⚠ MCP client for `basic-memory` failed to start: MCP startup failed: handshaking with MCP server
+  failed: Send message error Transport
+  [rmcp::transport::worker::WorkerTransport<rmcp::transport::streamable_http_client::StreamableHttp
+  ClientWorker<codex_rmcp_client::http_client_adapter::StreamableHttpClientAdapter>>] error: Client
+  error: HTTP request failed: http/request failed: error sending request for url
+  (http://127.0.0.1:8000/mcp), when send initialize request
+
+⚠ MCP startup incomplete (failed: basic-memory, codex_apps, terraform)
+
+ 
+› Write tests for @filename
+ 
+  gpt-5.5 xhigh · ~/tapestry/_meta/agents/ad-hoc/probe-cdx · main · Context 100% left
