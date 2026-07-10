@@ -279,6 +279,52 @@ def test_stop_for_close_refuses_while_a_signalled_pid_survives_store_reap(monkey
     assert ok is False and "98942" in note
 
 
+def test_identity_rule_is_argv0_basename_not_substring():
+    # the substring rule passed marketplace hook scripts ('claude' in the PATH) — the class that let
+    # pids_ps feed foreign processes into the kill path (cmux-advisor blocker)
+    assert cli._identifies_as("/Users/b/.local/bin/claude --resume abc", "claude") is True
+    assert cli._identifies_as("/Users/b/.cmux/cmux-cli-shims/S123/claude", "claude") is True
+    assert cli._identifies_as("claude -p", "claude") is True            # accepted residual: ephemeral
+    assert cli._identifies_as("codex resume abc", "codex") is True
+    assert cli._identifies_as(
+        "python3 /Users/b/.claude/plugins/claude-marketplace/memsearch/hooks/stop.py", "claude") is False
+    assert cli._identifies_as(
+        "/x/.worktrees/resolve-v2/.venv/bin/python -m cmux_fleet.daemon", "claude") is False
+    assert cli._identifies_as("node /Users/b/lavish-axi/server.js", "claude") is False
+    assert cli._identifies_as("", "claude") is False
+
+
+def test_conductor_close_never_blocked_by_foreign_env_carriers(monkeypatch):
+    """The conductor-wedge regression (cmux-advisor blocker): a conductor's surface env is inherited
+    by never-dying daemons/routers/servers. With the agent counterfactually dead, the close must
+    proceed — a store pid blocks as-is, a ps-env pid blocks ONLY if it identifies as the tool. This
+    test deliberately un-stubs the ps sweep (conftest blanks it, which is exactly why the wedge
+    shipped) and runs the REAL pids_ps parse over a mixed process table."""
+    AGENT, DAEMON, ROUTER = 55001, 55002, 55003
+    ps_table = (f"  PID COMMAND\n"
+                f"{AGENT} /Users/b/.local/bin/claude --resume abc CMUX_SURFACE_ID=S-COND X=1\n"
+                f"{DAEMON} /x/.venv/bin/python -m cmux_fleet.daemon CMUX_SURFACE_ID=S-COND\n"
+                f"{ROUTER} /x/.venv/bin/python -m cmux_fleet.router --live CMUX_SURFACE_ID=S-COND\n")
+    monkeypatch.setattr(rs, "_ps_axeww", lambda: ps_table)              # real parse, mixed table
+    alive = {AGENT: False, DAEMON: True, ROUTER: True}                   # agent counterfactually DEAD
+    monkeypatch.setattr(fs, "pid_alive", lambda pid: alive.get(pid, False))
+    identities = {AGENT: True, DAEMON: False, ROUTER: False}             # ps identity per pid
+    monkeypatch.setattr(cli, "_agent_pid_check", lambda pid, tool: identities.get(pid, False))
+    monkeypatch.setattr(cli, "_surface_pids", lambda surf: set())        # record already reaped
+    killed = []
+    monkeypatch.setattr(cli.os, "kill", lambda pid, sig: killed.append(pid))
+    monkeypatch.setattr(cli.time, "sleep", lambda *_: None)
+    monkeypatch.setattr(cli, "_STOP_WAIT_S", 0.01)
+    ok, note = cli._stop_agent_for_close("S-COND", "claude", "conductor-x", "rm")
+    assert ok is True, note                                              # the daemons never block the close
+    assert DAEMON not in killed and ROUTER not in killed                 # and are never signalled
+    # ...and with the agent ALIVE, it (alone) still blocks:
+    alive[AGENT] = True
+    ok, note = cli._stop_agent_for_close("S-COND", "claude", "conductor-x", "rm")
+    assert ok is False and str(AGENT) in note
+    assert DAEMON not in killed and ROUTER not in killed
+
+
 def test_stop_for_close_ok_when_signalled_pid_actually_dies(monkeypatch):
     alive = {98942: True}
     monkeypatch.setattr(cli, "_surface_pids", lambda surf: set())

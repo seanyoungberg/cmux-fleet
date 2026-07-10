@@ -1816,19 +1816,33 @@ def _surface_pids(surface):
     return rs.pids(surface, st=_store())
 
 
+def _identifies_as(cmdline, tool):
+    """PURE identity rule for kill targets: the process's argv0 BASENAME equals the tool. The old
+    rule was a substring over the whole command line, which passed `python3
+    .../claude-marketplace/.../hook.py` (path contains 'claude') — harmless while targets came only
+    from the hook store (real agents), but pids_ps now feeds every surface-env process through this
+    check, so a substring rule would SIGINT plugin hook scripts (cmux-advisor blocker, 2026-07-10).
+    Basename-of-argv0 keeps `~/.local/bin/claude` and the cmux shim `.../cmux-cli-shims/<S>/claude`,
+    and excludes the daemon python and any marketplace path. Known residual, accepted: a `claude -p`
+    subprocess (the memsearch summarizer) IS argv0 claude and still passes; it is ephemeral, so it
+    can transiently block a close but can never wedge one."""
+    toks = (cmdline or "").split()
+    return bool(toks) and os.path.basename(toks[0]) == (tool or "claude")
+
+
 def _agent_pid_check(pid, tool):
-    """True iff `pid` is a live process whose command line looks like this agent `tool` — the same
-    ps-identity pattern _is_live_router/_is_daemon_supervisor use, applied to KILL targets immediately
-    before signalling. The pid-reuse guard: the 2026-07-10 direct-kill fired SIGINT x2 at bare pid
-    70208, which by then belonged to no claude at all — had the OS recycled that pid, we'd have
-    signalled an unrelated process. Fails CLOSED (unreadable ps -> False): never signal a process we
-    can't identify; the verify then refuses and the recycle aborts safely instead."""
+    """True iff `pid` is a live process that identifies as this agent `tool` (_identifies_as over its
+    ps command line), applied to KILL targets immediately before signalling. The pid-reuse guard: the
+    2026-07-10 direct-kill fired SIGINT x2 at bare pid 70208, which by then belonged to no claude at
+    all — had the OS recycled that pid, we'd have signalled an unrelated process. Fails CLOSED
+    (unreadable ps -> False): never signal a process we can't identify; the verify then refuses and
+    the recycle aborts safely instead."""
     try:
         out = subprocess.run(["ps", "-o", "command=", "-p", str(int(pid))],
                              capture_output=True, text=True, timeout=5).stdout or ""
     except Exception:
         return False
-    return (tool or "claude") in out
+    return _identifies_as(out, tool)
 
 
 def _signal_agent_pids(surf, tool, log, tag):
@@ -1838,15 +1852,18 @@ def _signal_agent_pids(surf, tool, log, tag):
     this surface — never the first record, never a dead one), and each is re-verified as this tool's
     live process at signal time (_agent_pid_check, the pid-reuse guard). A dead pid is a no-op by
     construction; a live pid that fails the identity check is SKIPPED loudly (better to abort the
-    recycle than SIGINT a foreign process). Targets = store pids UNION ps-env pids (rs.pids_ps):
-    SessionEnd reaps the record ~0.3s BEFORE the process exits (measured, cmux-advisor finding 2,
-    2026-07-10), so a store-only set can miss a live agent whose record is already gone — the
-    invisible-orphan class by another door. Anything ps finds still passes the per-pid identity
-    check below before being signalled."""
+    recycle than SIGINT a foreign process). Targets are split BY SOURCE (cmux-advisor blocker,
+    2026-07-10): STORE pids are candidates as-is (the store claims they are the agent) and get the
+    loud identity-checked skip below; PS-ENV pids (rs.pids_ps — needed because SessionEnd reaps the
+    record ~0.3s BEFORE the process exits, finding 2) are candidates ONLY if they identify as the
+    tool, silently — a conductor's surface env is legitimately inherited by daemons, routers, node
+    servers, and hook scripts, none of which are ours to signal or to warn about."""
     import signal
     from . import resolve as rs
     signalled = []
-    for pid in sorted(set(_surface_pids(surf)) | rs.pids_ps(surf)):
+    store_pids = set(_surface_pids(surf))
+    env_pids = {p for p in rs.pids_ps(surf) if p not in store_pids and _agent_pid_check(p, tool)}
+    for pid in sorted(store_pids | env_pids):
         if not _agent_pid_check(pid, tool):
             log(f"{tag}: pid {pid} is alive but does not identify as a live {tool} process "
                 f"(reused/foreign pid?); NOT signalling it")
@@ -1901,11 +1918,19 @@ def _stop_agent_for_close(surf, tool, label, verb):
     visible and recoverable; a surface CLOSED over one hides it forever — so on any doubt the caller
     must refuse the close (even under --force, which forces past the quiet gate, not past this).
 
-    Death is observed on the SIGNALLED pids themselves plus the union set, never on store emptiness:
-    SessionEnd removes the hook-store record ~0.3s before the process exits (measured, cmux-advisor
-    finding 2), so `while _surface_pids(surf)` returned empty while the agent still ran — for a hung
-    shutdown, forever. `fleet rm ptrprobe` live-corroborated it: 'removed (closed + archived)' printed
-    with pid 98942 still alive. The docstring's promise is now the code's behavior."""
+    Death is observed on the SIGNALLED pids themselves plus the per-source block set, never on store
+    emptiness: SessionEnd removes the hook-store record ~0.3s before the process exits (measured,
+    cmux-advisor finding 2), so `while _surface_pids(surf)` returned empty while the agent still ran —
+    for a hung shutdown, forever. `fleet rm ptrprobe` live-corroborated it: 'removed (closed +
+    archived)' printed with pid 98942 still alive.
+
+    The block rule is split BY SOURCE (cmux-advisor blocker, same day): a STORE pid blocks if alive
+    (the store claims it is the agent, identified or not — fail closed); a PS-ENV pid blocks only if
+    it IDENTIFIES as the tool. A conductor's surface env is legitimately inherited by never-dying
+    processes (the fleet daemon, the router, `cmux events`, node servers — measured: 3-5 foreign
+    env-carriers on every live conductor), so an unfiltered ps-env union made rm/archive refuse to
+    close ANY conductor, permanently. The wedge shipped because the suite stubs the ps sweep and the
+    live probe was an ad-hoc seat with no daemons; the regression test now injects a mixed ps table."""
     from . import state as fs
     from . import resolve as rs
     def log(m):
@@ -1916,7 +1941,8 @@ def _stop_agent_for_close(surf, tool, label, verb):
         while time.time() < end and any(fs.pid_alive(p) for p in signalled):
             time.sleep(0.3)
     still = sorted({p for p in signalled if fs.pid_alive(p)}
-                   | set(_surface_pids(surf)) | rs.pids_ps(surf))
+                   | set(_surface_pids(surf))
+                   | {p for p in rs.pids_ps(surf) if _agent_pid_check(p, tool)})
     if not still:
         return True, ""
     return False, (f"live agent pid(s) {still} still on the surface "

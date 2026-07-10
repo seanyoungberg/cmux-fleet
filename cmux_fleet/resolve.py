@@ -190,11 +190,17 @@ def pids_ps(surface, ps_out=None):
 
 
 def kill_targets(surface, st=None):
-    """THE teardown set: store-derived live pids UNION ps-env live pids. Sound where either source
-    alone is not — the store misses a process whose record SessionEnd already reaped (the measured
-    0.3s window, or forever for a hung shutdown); ps-env misses nothing that still runs with the
-    seat's surface id in its environment. Every kill site and every safe-to-close check reads this,
-    never store pids alone (cmux-advisor finding 2, 2026-07-10)."""
+    """The teardown CANDIDATE set: store-derived live pids UNION ps-env live pids. Sound where either
+    source alone is not — the store misses a process whose record SessionEnd already reaped (the
+    measured 0.3s window, or forever for a hung shutdown); ps-env misses nothing that still runs with
+    the seat's surface id in its environment.
+
+    CANDIDATES, not targets: the two sources carry different trust and the caller MUST apply the
+    per-source rule (cli's kill/close sites do): a store pid is treated as the agent as-is; a ps-env
+    pid counts only if its ps identity matches the tool, because a conductor's surface env is
+    legitimately inherited by never-dying non-agents (fleet daemon, router, `cmux events`, node
+    servers — measured 3-5 per live conductor). An unfiltered union wedged rm/archive on every
+    conductor (cmux-advisor blocker, 2026-07-10)."""
     return pids(surface, st) | pids_ps(surface)
 
 
