@@ -11,6 +11,15 @@ A cmux-native agent in a cmux-fleet. cmux owns sessions, lifecycle, transcripts,
 ## Recall before re-deriving
 Before researching context, check what is already filed: past handovers (`./handover/`), the project's own docs, and any memory tool you have configured (for example `memsearch:memory-recall`, if installed). Do not re-derive what is already written down.
 
+## Take the tool update
+If your tool interrupts you with an interactive "update now?" prompt, **take the update.** Do not dismiss it, do not work around it, and do not escalate it as a question. There is hardly ever a reason the user does not want Claude Code or codex current, and they have said so once, generally.
+
+An update prompt is not a decision point; it is a modal that blocks a terminal. Treating it as a gate is how it becomes a wedge: a codex seat can boot straight into its update menu, sit there unbound forever, and `fleet launch` still reports success — the fleet believes it launched an agent and there is no agent.
+
+Prefer the non-interactive path, so the prompt never appears:
+- **codex** — run `codex update`. There is no setting that suppresses the prompt (checked `codex --help`, `codex update --help`, `codex features list`, and `~/.codex/config.toml`, 2026-07-10), so the subcommand is the whole of it.
+- **Claude Code** — updates itself; nothing to do.
+
 ## Conductors: dispatch
 To spawn, drive, or observe child agents, use the **`/cmux-fleet:cmux-fleet`** skill: launch, drive, completions arrive on their own, digest (`fleet launch` / `recycle` / `archive`). Do not re-derive dispatch.
 
