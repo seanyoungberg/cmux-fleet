@@ -16,8 +16,10 @@
 // STRUCTURE follows Examples/CustomSidebars/status-board.swift: no top-level `let`, no array-returning
 // funcs. Arrays are bound with `let` INSIDE the view body and passed into view helpers.
 
+// Reach EVERY optional with `if let`. The interpreter evaluates `!= nil` / `== nil` to nothing, so a
+// guard like `if w.description != nil { ... }` is never true and the field silently reads as absent.
 func descOf(_ w) -> String {
-  if w.description != nil && w.description != "" { return w.description }
+  if let d = w.description { return d }
   return ""
 }
 func isOurs(_ w) -> Bool {
@@ -75,6 +77,7 @@ func colorFor(_ s) -> String {
   if s == "working" { return "#30A46C" }
   if s == "done" { return "#46A758" }
   if s == "ready" { return "#3DB9A0" }
+  if s == "detached" { return "#A45CDB" }
   if s == "idle" { return "#8B8D98" }
   return "#6F6E77"
 }
@@ -85,6 +88,7 @@ func iconFor(_ s) -> String {
   if s == "working" { return "gearshape.fill" }
   if s == "done" { return "checkmark.circle.fill" }
   if s == "ready" { return "circle.dashed" }
+  if s == "detached" { return "antenna.radiowaves.left.and.right.slash" }
   if s == "idle" { return "moon.zzz.fill" }
   return "questionmark.circle"
 }
@@ -94,23 +98,24 @@ func ctxColor(_ remain) -> String {
   return "#E5484D"
 }
 
-func hasProgress(_ w) -> Bool {
-  return w.progress != nil && w.progress.value != nil
-}
 // ctx bar straight off the native progress field (paint writes value = fraction USED)
 func ctxRow(_ w) -> some View {
-  if !hasProgress(w) { return AnyView(EmptyView()) }
-  let remain = (1.0 - w.progress.value) * 100.0
-  return AnyView(HStack(spacing: 6) {
-    ProgressView(value: 1.0 - w.progress.value, total: 1.0).tint(ctxColor(remain)).frame(width: 84)
-    Text("\(Int(remain))%").font(.system(size: 10, design: .monospaced)).foregroundColor(.secondary)
-    Spacer()
-  })
+  if let p = w.progress {
+    let remain = (1.0 - p.value) * 100.0
+    return AnyView(HStack(spacing: 6) {
+      ProgressView(value: 1.0 - p.value, total: 1.0).tint(ctxColor(remain)).frame(width: 84)
+      Text("\(Int(remain))%").font(.system(size: 10, design: .monospaced)).foregroundColor(.secondary)
+      Spacer()
+    })
+  }
+  return AnyView(EmptyView())
 }
 func lastLine(_ w) -> some View {
-  if w.latestMessage == nil { return AnyView(EmptyView()) }
-  return AnyView(Text(w.latestMessage).font(.system(size: 12)).foregroundColor(.tertiary)
-    .lineLimit(2).truncationMode(.tail))
+  if let m = w.latestMessage {
+    return AnyView(Text(m).font(.system(size: 12)).foregroundColor(.tertiary)
+      .lineLimit(2).truncationMode(.tail))
+  }
+  return AnyView(EmptyView())
 }
 func unreadDot(_ w) -> some View {
   if w.unread == 0 { return AnyView(EmptyView()) }
@@ -188,16 +193,13 @@ VStack(alignment: .leading, spacing: 8) {
   }
   Divider()
 
-  // self-diagnosing empty state: says WHICH stage failed instead of a bare "no data"
+  // self-diagnosing empty state: names the failing stage instead of a bare "no data"
   if mine.count == 0 {
-    let described = workspaces.filter { descOf($0) != "" }
     Text("no fleet rows matched").font(.system(size: 11)).foregroundColor("#F5A623")
-    Text("workspaces: \(workspaces.count)")
+    Text("\(workspaces.count) workspaces · run: fleet paint --sidebar")
       .font(.system(size: 10, design: .monospaced)).foregroundColor("#6F6E77")
-    Text("with description: \(described.count)")
-      .font(.system(size: 10, design: .monospaced)).foregroundColor("#6F6E77")
-    ForEach(described.prefix(3)) { d in
-      Text(descOf(d)).font(.system(size: 9, design: .monospaced)).foregroundColor("#6F6E77").lineLimit(1)
+    ForEach(workspaces.prefix(3)) { w in
+      Text("[\(descOf(w))]").font(.system(size: 9, design: .monospaced)).foregroundColor("#6F6E77").lineLimit(1)
     }
   }
 

@@ -89,18 +89,31 @@ The custom-sidebar file is **interpreted**, not compiled, and it supports only a
 that renders nothing. There is no eval/render RPC either (`extension.sidebar.snapshot` and `sidebar.custom.open`
 are the only two), so the render can only be confirmed by eye. Budget for that.
 
-Two rules that cost an hour each. Both are obeyed by cmux's own shipped
-`Examples/CustomSidebars/status-board.swift` — diff against it when something silently renders empty:
+Three rules, each of which cost an hour. Every one fails **silently** — the sidebar renders empty, or a field
+reads as absent, and nothing anywhere reports an error:
 
+- **Reach every optional with `if let`. Never `!= nil`.** The interpreter evaluates `x != nil` / `x == nil` to
+  *nothing*, so `if w.description != nil && w.description != "" { … }` is never true and the field looks absent
+  even when it is populated. This one is nasty: cmux's own shipped `status-board.swift` uses the `!= nil` form
+  (line 29: `w.progress != nil && w.progress.value != nil`), so **copying the example reproduces the bug**.
+
+      func descOf(_ w) -> String {          // right
+        if let d = w.description { return d }
+        return ""
+      }
+
+  Corollary: `Text("\(x == nil)")` interpolates to an empty string, which is itself the tell — if a probe
+  prints `dNil=` with nothing after it, you are looking at this bug.
 - **No top-level `let`.** A file-scope `let CHILD = " · ↳"` is *not resolvable from inside a `func`*. The func
   silently misbehaves (ours returned `false` for every workspace, so the board filtered itself to nothing).
   Declare `let` only **inside a func** or **inside the view body**.
 - **Never return an array from a helper.** `func rows() -> [Any]` does not work. Bind arrays with `let` in the
   **view body** and pass them into view helpers as parameters (`func group(_ c, _ kids) -> some View`).
 
-Also: guard optionals the way the example does (`w.progress != nil && w.progress.value != nil`), and prefer
-proven views (`ProgressView(value:total:).tint(...)`) over hand-rolled shapes.
+Prefer proven views (`ProgressView(value:total:).tint(...)`) over hand-rolled shapes.
 
-When a sidebar renders empty, make the empty state **self-diagnosing** — print `workspaces.count`, how many
-carry a description, and the first raw descriptor strings. One screenshot then tells you whether the binding,
-the data, or your matching logic is at fault.
+**Debugging.** `cmux sidebar-state` is a dump of the sidebar *layer's* own state — it is **not** the SwiftUI
+binding surface, and its field list says nothing about what binds. Don't infer the transport from it. Instead,
+make the empty state **self-diagnosing**: print `workspaces.count` and interpolate the raw field
+(`Text("[\(descOf(w))]")`). One screenshot then separates binding vs. data vs. matching logic. Interpolating the
+raw optional is the reliable probe; interpolating a `== nil` comparison is not.

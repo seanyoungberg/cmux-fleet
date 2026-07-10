@@ -93,13 +93,17 @@ STATE_STYLE = {
     "error":       ("#E5484D", "exclamationmark.triangle.fill", 0),
     "needs-input": ("#F5A623", "hand.raised.fill",              1),
     "review":      ("#3E63DD", "eye.fill",                      2),
-    "working":     ("#30A46C", "gearshape.fill",                3),
-    "done":        ("#46A758", "checkmark.circle.fill",         4),
-    "ready":       ("#3DB9A0", "circle.dashed",                 5),   # calm teal — turn finished, available
-    "idle":        ("#8B8D98", "moon.zzz.fill",                 6),
-    "pending":     ("#8B8D98", "hourglass",                     7),
-    "stale":       ("#6F6E77", "questionmark.circle",           8),
-    "gone":        ("#6F6E77", "xmark.circle",                  8),
+    # alive and working, but its cmux hook channel is dead — every TIME-based signal about it is a lie.
+    # A WARNING, not an error: distinct from 'stale' (gone) and from 'working' (we can still hear it).
+    # Violet, not amber, so it can never be misread as 'needs-input'. Remedy is a recycle (re-exports env).
+    "detached":    ("#A45CDB", "antenna.radiowaves.left.and.right.slash", 3),
+    "working":     ("#30A46C", "gearshape.fill",                4),
+    "done":        ("#46A758", "checkmark.circle.fill",         5),
+    "ready":       ("#3DB9A0", "circle.dashed",                 6),   # calm teal — turn finished, available
+    "idle":        ("#8B8D98", "moon.zzz.fill",                 7),
+    "pending":     ("#8B8D98", "hourglass",                     8),
+    "stale":       ("#6F6E77", "questionmark.circle",           9),
+    "gone":        ("#6F6E77", "xmark.circle",                  9),
 }
 
 
@@ -496,7 +500,7 @@ def _render_vitals(rows):
     lines = [f"FLEET VITALS ({len(rows)})   ctx = used / REAL per-agent window",
              f"    {'label':<17}{'state':<12}{'ctx-left':<15}{'model':<13}{'eff':<7}{'cwd':<17}{'idle':<6}last"]
     for r in rows:
-        glyph = {"error": "✗", "needs-input": "◍", "review": "⊙", "working": "▶",
+        glyph = {"error": "✗", "needs-input": "◍", "review": "⊙", "working": "▶", "detached": "⚠",
                  "done": "✓", "ready": "◌", "idle": "·", "pending": "…", "stale": "?", "gone": "✗"}.get(r["state"], "·")
         muted = " M" if r["muted"] else ""
         lines.append(f"  {glyph} {_fit(r['label'], 16):<17}{r['state']:<12}{_ctx(r):<15}"
