@@ -103,10 +103,55 @@ def test_resolve_missing_token_file_errors(providers_toml, monkeypatch):
         pv.resolve_launch("claude", "throwaway")
 
 
-def test_resolve_codex_default_noop_nondefault_provisional(providers_toml):
-    assert pv.resolve_launch("codex", "berg-team")["env"] == {}       # ~/.codex = current home
+def test_resolve_codex_home_default_noop(providers_toml):
+    r = pv.resolve_launch("codex", "berg-team")                       # codex-home:~/.codex = current home
+    assert r["env"] == {} and r["raw_env"] == {} and r["args"] == []
+
+
+def test_resolve_codex_home_without_login_errors(providers_toml):
+    # fixture's acct2 = codex-home at a dir with no auth.json -> refuse loudly (never silent-fallback to ~/.codex)
+    with pytest.raises(pv.ProviderError, match="codex login"):
+        pv.resolve_launch("codex", "acct2")
+
+
+def test_resolve_codex_home_with_login_sets_home(providers_toml):
+    home = providers_toml["tmp"] / "codex-acct2"
+    home.mkdir(exist_ok=True)
+    (home / "auth.json").write_text('{"auth_mode":"chatgpt"}')
     r = pv.resolve_launch("codex", "acct2")
-    assert r["provisional"] is True and "CODEX_HOME" in r["env"]
+    assert r["env"]["CODEX_HOME"] == str(home) and not r["provisional"] and r["args"] == []
+
+
+def test_resolve_codex_token_env_path(tmp_path, monkeypatch):
+    tok = tmp_path / "codex-acctx.token"
+    tok.write_text("ya29-fake-chatgpt-oauth-token\n")
+    toml = _toml(tmp_path, f"""
+        [providers.codex]
+        default = "acctx"
+        [providers.codex.acctx]
+        type = "subscription"
+        auth = "codex-token:{tok}"
+    """)
+    monkeypatch.setattr(pv, "FLEET_TOML", toml)
+    r = pv.resolve_launch("codex", "acctx")
+    # per-launch account selection via -c model_provider, token read at spawn (secret not embedded)
+    assert r["args"] == ["-c", "model_provider=acctx"]
+    raw = r["raw_env"][pv.CODEX_TOKEN_ENV]
+    assert raw.startswith('"$(cat ') and str(tok) in raw and "ya29" not in raw
+    assert not r["provisional"]
+
+
+def test_resolve_codex_token_missing_file_errors(tmp_path, monkeypatch):
+    toml = _toml(tmp_path, """
+        [providers.codex]
+        default = "acctx"
+        [providers.codex.acctx]
+        type = "subscription"
+        auth = "codex-token:/nonexistent/x.token"
+    """)
+    monkeypatch.setattr(pv, "FLEET_TOML", toml)
+    with pytest.raises(pv.ProviderError, match="token file not found"):
+        pv.resolve_launch("codex", "acctx")
 
 
 def test_resolve_vertex_reads_env_file(providers_toml):
@@ -413,3 +458,33 @@ def test_launch_provider_dry_run_hides_token(cli_env, tmp_path, providers_toml):
     assert str(tokfile) in p.stdout                          # the PATH is shown
     assert "E2ESECRET" not in p.stdout                       # the token VALUE is not
     assert "$(cat " in p.stdout                              # injected as a spawn-time read
+
+
+def test_launch_codex_provider_env_token_threads_args(cli_env, tmp_path):
+    # codex env-token path: -c model_provider=<acct> threaded into the codex command, token via $(cat ...).
+    tokfile = tmp_path / "cx.token"
+    tokfile.write_text("CXSECRET-oauth-token\n")
+    toml = _toml(tmp_path, f"""
+        [tool.codex]
+        flags = "-a never"
+        [role.cxworker]
+        kind = "child"
+        place = "tab"
+        cwd = "cxworker"
+        tool = "codex"
+        [providers.codex]
+        default = "acctx"
+        [providers.codex.acctx]
+        type = "subscription"
+        auth = "codex-token:{tokfile}"
+    """)
+    env = dict(cli_env)
+    env["CMUX_FLEET_TOML"] = toml
+    p = subprocess.run([sys.executable, "-m", "cmux_fleet", "launch", "cxworker",
+                        "--provider", "codex:acctx", "--dry-run"],
+                       env=env, capture_output=True, text=True)
+    assert p.returncode == 0, p.stderr
+    assert "provider: codex:acctx" in p.stdout
+    assert "-c model_provider=acctx" in p.stdout             # per-launch account selection
+    assert f'CMUX_FLEET_CODEX_TOKEN="$(cat {tokfile})"' in p.stdout   # spawn-time token read
+    assert "CXSECRET" not in p.stdout                        # the token VALUE is never printed

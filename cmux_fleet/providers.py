@@ -149,7 +149,9 @@ def resolve_launch(tool, name):
     label = f"{tool}:{resolved}"
     ptype = spec["type"]
     method, arg = _parse_auth(spec["auth"])
-    base = {"label": label, "env": {}, "raw_env": {}, "provisional": False, "note": ""}
+    # `args` = extra tool CLI tokens the launch appends (codex needs `-c model_provider=<acct>` to select
+    # a unified-home account per launch). claude/vertex/api leave it empty.
+    base = {"label": label, "env": {}, "raw_env": {}, "args": [], "provisional": False, "note": ""}
 
     if ptype == "vertex":
         base["env"] = _read_env_file(arg) if method == "env-file" else {}
@@ -162,7 +164,7 @@ def resolve_launch(tool, name):
 
     # subscription:
     if tool == "codex":
-        return _resolve_codex(base, method, arg)
+        return _resolve_codex(base, resolved, method, arg)
     # claude (and any future OAuth-token tool):
     if method == "keychain":
         return base                                  # current account: tool uses the keychain natively
@@ -178,22 +180,49 @@ def resolve_launch(tool, name):
     raise ProviderError(f"provider '{label}': unsupported auth method '{method}' for a claude subscription")
 
 
-def _resolve_codex(base, method, arg):
-    """STUB — codex account selection is UNSETTLED (verdict pending: CODEX_HOME-per-profile vs env-token).
-    Keep this the ONLY place that decides the codex mechanism. Today it emits CODEX_HOME and marks the
-    result PROVISIONAL so nothing downstream treats it as final. When the verdict lands, swap the body;
-    resolve_launch()'s contract does not change."""
-    if method != "codex-home":
-        raise ProviderError(f"codex provider auth '{method}' not wired (selection verdict pending)")
-    home = os.path.expanduser(arg)
-    default_home = os.path.expanduser("~/.codex")
-    if os.path.realpath(home) == os.path.realpath(default_home):
-        return base                                  # default home = current account, no injection needed
-    base["env"]["CODEX_HOME"] = home
-    base["provisional"] = True
-    base["note"] = ("codex account selection is PROVISIONAL (mechanism verdict pending); "
-                    f"using CODEX_HOME={home}")
-    return base
+# The env var a codex env-token launch reads for the account's ChatGPT OAuth token. Deliberately custom
+# (not codex's own CODEX_ACCESS_TOKEN/CODEX_API_KEY, which have special metered/agent-identity meaning): a
+# per-launch `[model_providers.<acct>]` block in ~/.codex/config.toml declares `env_key = "<this>"`.
+CODEX_TOKEN_ENV = "CMUX_FLEET_CODEX_TOKEN"
+
+
+def _resolve_codex(base, acct, method, arg):
+    """Codex per-launch account selection. Two methods (verdict settled 2026-07-07; env-token validated
+    live 2026-07-10, so it is now the PREFERRED path, not a stub):
+
+      codex-token:<file>  (PREFERRED, unified home, no session/config split) — inject the account's ChatGPT
+          OAuth token into `CODEX_TOKEN_ENV` at spawn (spawn-time $(cat), secret-safe) and select the account
+          with `-c model_provider=<acct>`. Requires a one-time `[model_providers.<acct>]` block in
+          ~/.codex/config.toml (name="OpenAI", base_url="https://chatgpt.com/backend-api/codex",
+          env_key="CMUX_FLEET_CODEX_TOKEN", wire_api="responses", requires_openai_auth=false). The token file
+          is fleet-owned and kept fresh by the refresh loop (SEPARATE, not yet wired — this resolver only
+          READS the file; a stale token fails the launch loudly at codex, it does not silently fall back).
+
+      codex-home:<path>   (FALLBACK/opt-in, self-refreshing, splits sessions per home) — select the account
+          by pointing CODEX_HOME at its own config dir + auth.json.
+    """
+    if method == "codex-token":
+        path = _token_path(arg)
+        if not os.path.exists(path):
+            raise ProviderError(f"codex provider '{acct}': token file not found: {path} "
+                                f"(the fleet-owned token; provision + refresh it there)")
+        base["raw_env"][CODEX_TOKEN_ENV] = f'"$(cat {shlex.quote(path)})"'
+        base["args"] = ["-c", f"model_provider={acct}"]
+        base["note"] = (f"codex account '{acct}' via env-token (unified home; needs "
+                        f"[model_providers.{acct}] in ~/.codex/config.toml with env_key={CODEX_TOKEN_ENV})")
+        return base
+    if method == "codex-home":
+        home = os.path.expanduser(arg)
+        if os.path.realpath(home) == os.path.realpath(os.path.expanduser("~/.codex")):
+            return base                              # default home = current account, no injection needed
+        if not os.path.exists(os.path.join(home, "auth.json")):
+            raise ProviderError(f"codex provider '{acct}' home has no auth.json: {home} "
+                                f"(log it in once with `CODEX_HOME={home} codex login`)")
+        base["env"]["CODEX_HOME"] = home
+        base["note"] = f"codex account '{acct}' via CODEX_HOME={home} (fallback; splits sessions)"
+        return base
+    raise ProviderError(f"codex provider '{acct}' auth method '{method}' unsupported; use "
+                        f"codex-token:<file> (preferred) or codex-home:<path> (fallback)")
 
 
 def _read_env_file(path):

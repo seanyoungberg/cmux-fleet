@@ -1288,6 +1288,7 @@ def cmd_launch(argv):
             sys.exit(f"[fleet] --provider: {e}")
         env.update(pr["env"])
         raw_env.update(pr["raw_env"])
+        args = args + list(pr.get("args") or [])         # provider CLI tokens (codex `-c model_provider=<acct>`)
         spec["provider"] = pr["label"]
         print(f"[fleet] provider: {pr['label']}" + (f"  ({pr['note']})" if pr.get("note") else ""))
         if pr.get("provisional"):
