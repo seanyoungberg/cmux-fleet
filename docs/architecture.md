@@ -4,6 +4,8 @@ The spine as-built, by file:
 
 - `cmux_fleet/config.py` resolves every path/setting (env > `[fleet]` toml > XDG default).
 - `cmux_fleet/state.py` owns the state model: the label-keyed registry, the unified inbox, the archive shelf, the hook-store union, the idle-wake gate.
+- `cmux_fleet/resolve.py` is THE resolver (agent-management v2, step 1): seat()/snapshot() derive presence, topology, and the attachment axis (invariant I4: present-but-detached) at read time; kill_targets() is the never-orphan union (store pids + ps-env pids). Lifecycle reads route through it; the state.py predicate bodies it delegates to relocate here in step 3.
+- `cmux_fleet/adapter.py` owns the risky cmux ACTIONS (v2, step 2): exec-delivery (a process start is the pane process via respawn-pane; launch/revive/recycle all ride it, `CMUX_FLEET_EXEC_LAUNCH=0` reverts all three to the paste path during the soak) and the resume-summary menu dismisser.
 - `cmux_fleet/router.py` is the bus router: child `Stop` -> deliver a completion to the parent. One process serves every conductor.
 - `cmux_fleet/daemon.py` is the daemon manager (`fleet daemon start|stop|status|restart` + `start --foreground` for launchd): it double-forks `router.py --live` into a detached supervisor so the router survives shell exit, Bash-tool cleanup, and a conductor recycle.
 - `cmux_fleet/hookverbs.py` holds the `fleet hook-awareness` / `fleet hook-drain` logic that surfaces the inbox into a conductor's context (never its input box); the plugin hook files are thin fail-open shims (`scripts/hooks/_shim.py`) that shell into those verbs.
