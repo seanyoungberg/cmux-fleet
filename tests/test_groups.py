@@ -221,6 +221,70 @@ def test_rm_with_group_refuses_on_membership_mismatch(monkeypatch):
     assert fs.live_get("staging-conductor") is not None   # nothing swept -- refusal touches no registry row
 
 
+def test_rm_with_group_dissolves_modelb_group_including_scaffold_anchor(monkeypatch):
+    # Model B (empty-anchor, ratified 2026-07-10) regression the 2026-07-10 live acceptance caught: cmux
+    # lists the AGENTLESS scaffold anchor INSIDE member_workspace_refs, so cmux's real membership is always
+    # a SUPERSET of what the registry knows (registry={agent ws}, cmux={scaffold, agent ws}). The
+    # --with-group guard must subtract the anchor before the registry-vs-cmux compare, or every Model-B
+    # group falsely trips "registry and cmux disagree about membership" and REFUSES to dissolve. Here the
+    # group is a scaffold anchor (workspace:88, no agent) + two agent members; the dissolve must PROCEED,
+    # and `workspace-group delete <ref>` closes ALL members INCLUDING the scaffold (nothing else closes it
+    # -- the scaffold has no registry row).
+    from cmux_fleet import state as fs
+    fs.live_put("X", {"role": "c", "kind": "conductor", "tool": "claude", "group": "Conductor - X",
+                      "surface": "", "workspace": "WS-X", "status": "live"})
+    fs.live_put("kid", {"role": "w", "kind": "child", "tool": "claude", "group": "Conductor - X",
+                        "parent": "X", "surface": "", "workspace": "WS-KID", "status": "live"})
+    calls = []
+
+    def fake_cmuxq(*a):
+        calls.append(a)
+        if a[:2] == ("workspace-group", "list"):
+            return json.dumps({"groups": [{
+                "ref": "workspace_group:7", "name": "Conductor - X",
+                "anchor_workspace_ref": "workspace:88",                        # empty scaffold, no agent
+                "member_workspace_refs": ["workspace:88", "workspace:1", "workspace:2"]}]})
+        return ""
+
+    uuid = {"workspace:88": "WS-ANCHOR", "workspace:1": "WS-X", "workspace:2": "WS-KID"}
+    monkeypatch.setattr(fleet, "cmuxq", fake_cmuxq)
+    monkeypatch.setattr(fleet, "_group_ref", lambda g: "workspace_group:7")
+    monkeypatch.setattr(fleet, "_ref_to_uuid", lambda kind, ref: uuid.get(ref, ""))
+    fleet.cmd_rm(["X", "--with-group"])
+    assert ("workspace-group", "delete", "workspace_group:7") in calls   # dissolved (closes scaffold too)
+    assert fs.live_get("X") is None                                      # named target cleared
+    assert fs.live_get("kid") is None                                    # agent member swept
+
+
+def test_rm_with_group_refuses_on_modelb_agent_mismatch_despite_anchor(monkeypatch):
+    # The anchor subtraction must NOT mask a genuine agent divergence. A Model-B group WITH a scaffold
+    # anchor, but whose real AGENT workspace disagrees with the registry's belief, must still ABORT (no
+    # dissolve, no sweep) -- the guard's original 2026-07-02 purpose. Registry believes X is at WS-STALE;
+    # cmux's real non-anchor member resolves to WS-REAL, so subtracting the anchor still leaves a mismatch.
+    from cmux_fleet import state as fs
+    fs.live_put("X", {"role": "c", "kind": "conductor", "tool": "claude", "group": "Conductor - X",
+                      "surface": "S1", "workspace": "WS-STALE", "status": "live"})
+    calls = []
+
+    def fake_cmuxq(*a):
+        calls.append(a)
+        if a[:2] == ("workspace-group", "list"):
+            return json.dumps({"groups": [{
+                "ref": "workspace_group:9", "name": "Conductor - X",
+                "anchor_workspace_ref": "workspace:88",
+                "member_workspace_refs": ["workspace:88", "workspace:1"]}]})
+        return ""
+
+    uuid = {"workspace:88": "WS-ANCHOR", "workspace:1": "WS-REAL"}
+    monkeypatch.setattr(fleet, "cmuxq", fake_cmuxq)
+    monkeypatch.setattr(fleet, "_group_ref", lambda g: "workspace_group:9")
+    monkeypatch.setattr(fleet, "_ref_to_uuid", lambda kind, ref: uuid.get(ref, ""))
+    with pytest.raises(SystemExit):
+        fleet.cmd_rm(["X", "--with-group"])
+    assert not [c for c in calls if c[:2] == ("workspace-group", "delete")]  # refused BEFORE dissolving
+    assert fs.live_get("X") is not None                                      # nothing swept
+
+
 def test_register_scrubs_group_for_non_workspace_placement(fs):
     # Item 2 point 3 (launcher-misplacement discovery): a role's toml (or a caller --group) can carry a
     # `group` value alongside place="tab"/"pane" (e.g. a --place override away from a workspace-default

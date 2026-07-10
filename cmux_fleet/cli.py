@@ -635,6 +635,28 @@ def _group_member_workspaces(gref):
     return {_ref_to_uuid("workspace", r) for r in (g.get("member_workspace_refs") or [])}
 
 
+def _group_anchor_workspace(gref):
+    """The anchor workspace UUID of a group ref, or '' if unknown. Under Model B (empty-anchor, ratified
+    2026-07-10) a group's anchor is an AGENTLESS scaffold workspace that cmux ALSO reports inside
+    `member_workspace_refs` -- so the `--with-group` membership cross-check must SUBTRACT it before
+    comparing cmux's real membership against the registry (which can never know the scaffold: no agent
+    lives on it, so no registry row occupies it). Without this every Model-B group reads as a registry
+    mismatch and refuses to dissolve (the anchor-flip regression, live-caught 2026-07-10). `workspace-group
+    list --json` reports the anchor as a short ref (`anchor_workspace_ref`: "workspace:88"); resolve it
+    through the same _ref_to_uuid `cmux tree` lookup used for members. Returns '' when the group data can't
+    be read, the ref isn't listed, or the group has no anchor ref (Model A / contract drift) -- the caller
+    then compares against the full real membership unchanged (fail-closed, never masking a real mismatch)."""
+    try:
+        gd = json.loads(cmuxq("workspace-group", "list", "--json"))
+    except Exception:
+        return ""
+    g = next((x for x in (gd.get("groups") or []) if x.get("ref") == gref), None)
+    if g is None:
+        return ""
+    ref = g.get("anchor_workspace_ref") or ""
+    return _ref_to_uuid("workspace", ref) if ref else ""
+
+
 def _group_of_workspace(ws, tree_text):
     """The workspace-group that CONTAINS workspace `ws`, as (gref, anchor_ws_uuid, {member_ws_uuids}),
     or None when `ws` is ungrouped / the group data can't be read. cmux reports group membership and the
@@ -2600,8 +2622,22 @@ def cmd_rm(argv):
             registry_ws = {lbl: v.get("workspace") for lbl, v in registry_all.items()}
             unverifiable = sorted(lbl for lbl, ws in registry_ws.items() if not ws)
             real_ws = _group_member_workspaces(gref)
-            if real_ws is None or unverifiable or set(registry_ws.values()) != real_ws:
-                real_display = sorted(real_ws) if real_ws is not None else "UNREADABLE (cmux group data unavailable)"
+            # Model B (empty-anchor, ratified 2026-07-10): a group's anchor is an AGENTLESS scaffold
+            # workspace that cmux ALSO lists inside member_workspace_refs. No registry row can occupy it
+            # (no agent runs on the scaffold), so subtract it before the registry-vs-cmux membership
+            # compare -- else EVERY Model-B group trips this abort (the anchor-flip regression the
+            # 2026-07-10 live acceptance caught: registry={X-ws}, cmux={scaffold, X-ws} -> false
+            # mismatch). The guard's REAL purpose is preserved: a genuine divergence among AGENT
+            # workspaces still aborts, as do unverifiable rows (registry agent with no workspace) and
+            # unreadable cmux data. An unresolvable/absent anchor leaves real_agents==real_ws (fail-closed:
+            # a Model-A group, or contract drift, still aborts if its full membership disagrees).
+            anchor_ws = _group_anchor_workspace(gref)
+            real_agents = (real_ws - {anchor_ws}) if (real_ws is not None and anchor_ws) else real_ws
+            if real_ws is None or unverifiable or set(registry_ws.values()) != real_agents:
+                real_display = (sorted(real_agents) if real_agents is not None
+                                else "UNREADABLE (cmux group data unavailable)")
+                anchor_note = (f"  (excl. Model-B anchor scaffold {anchor_ws[:8]})"
+                               if anchor_ws and real_ws is not None else "")
                 sys.exit(
                     f"[fleet] ABORT --with-group: refusing to dissolve '{gname}' ({gref}) -- registry and "
                     f"cmux disagree about membership (this is a registry-integrity bug, not a --force case; "
@@ -2609,7 +2645,7 @@ def cmd_rm(argv):
                     f"[fleet]   registry believes group '{gname}' = {sorted(registry_ws)}"
                     + (f"  (workspace id unknown for: {', '.join(unverifiable)} -- can't verify, treated as a "
                        f"mismatch)" if unverifiable else "") + "\n"
-                    f"[fleet]   cmux reports group '{gref}' member workspaces = {real_display}\n"
+                    f"[fleet]   cmux reports group '{gref}' agent workspaces = {real_display}{anchor_note}\n"
                     f"[fleet] no dissolve, no sweep happened. Investigate before retrying "
                     f"(`fleet ls`, `cmux workspace-group list --json`).")
             # AGREEMENT confirmed. HARD GUARDS next — ABSOLUTE refusals (rc 1, zero signals, nothing
