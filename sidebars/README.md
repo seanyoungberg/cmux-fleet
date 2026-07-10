@@ -30,34 +30,77 @@ It's on-change-only (no churn). Run it on a loop to keep it live: `while true; d
 
 ## 3. Custom rich sidebar — `fleet.swift`  (opt-in; Custom Sidebars beta)
 
-A vibe-coded SwiftUI-style sidebar that renders the whole board as **conductor→worker groups** with a state
-icon/color, a threshold-colored context bar (green >50 / amber 30–50 / red <30, drains right), model·effort,
-cwd, a tool marker, the latest message, and tap-to-focus.
+A SwiftUI-style sidebar that renders the board as **collapsible conductor→worker groups**: a state icon/color,
+a threshold-colored context bar (green >50 / amber 30–50 / red <30), the latest message, an unread badge, and
+tap-to-focus.
 
-Because a custom sidebar can only read cmux's own workspace fields (not fleet state), the board rides in
-through a **workspace `description` blob**. Enable it with `fleet paint --sidebar` (or `FLEET_SIDEBAR_BLOB=1`)
-— OFF by default because that blob shows as the marker workspace's *subtitle* in the built-in sidebar.
+**Native-first.** Now that each agent owns a workspace, nearly everything comes from cmux's own fields —
+`w.title` (label), `w.progress` (ctx bar), `w.latestMessage`, `workspace.select(w.id)` (tap). The only things
+fleet has to push are **state, parent and the collapse bit**, and they ride in a short workspace `description`
+that reads as prose in the built-in sidebar instead of clobbering it:
 
-Install:
+| workspace | description |
+|---|---|
+| child     | `working · ↳berg-sandbox` |
+| conductor | `ready · ▾berg-sandbox`  (`▸` = collapsed) |
+| shared ws | `… · +2`  (agents still sharing one workspace) |
+
+A conductor carries **its own label**, not the word `conductor`: a conductor's workspace *title* is decorated
+(`Conductor - cmux-advisor`), so a child can never match its parent by title. Title is a display string, not an
+identity. The glyph alone encodes kind.
+
+**Collapse without `@State`** (the interpreter has none): the chevron rewrites that workspace's description with
+the glyph flipped (`workspace.action` / `set-description`); `fleet paint` reads the glyph back and carries it
+forward, so a repaint never clobbers the choice.
+
+Feed it: `fleet paint --sidebar` (or `FLEET_SIDEBAR_BLOB=1`). OFF by default.
 
 ```sh
-cp sidebars/fleet.swift ~/.config/cmux/sidebars/fleet.swift
 # Settings → Beta features → Custom sidebars  (once)
 cmux sidebar validate fleet && cmux sidebar select fleet
-# feed it:
 while true; do fleet paint --sidebar; sleep 3; done
 ```
 
-## Known gap (enabling fix wanted)
+> `fleet paint` **without** `--sidebar` CLEARS the descriptors, and `fleet paint --help` is unhandled so it
+> falls through to a real paint. Don't run a bare paint while the custom sidebar is live.
 
-`fleet.swift` groups agents by a pushed `parent` field because **neither** cmux's sidebar binding **nor**
-fleet's own snapshot cleanly exposes per-agent workspace + conductor-group identity:
+## Deploy — the repo is the single source of truth
 
-- cmux's `workspaces` binding has **no group-membership field**.
-- fleet's snapshot `ws` = the hook-store `workspaceId`, which **collapses a conductor's group members to one
-  workspace id** (observed: 4 group agents all reporting the conductor's ws). So per-agent paint can't key
-  onto the individual workspaces even when cmux has them separated.
+`~/.config/cmux/sidebars/fleet.swift` is a **symlink** into this repo. That symlink *is* the deploy mechanism:
+edit the repo file, and the live sidebar follows (hot reload still works, `cmux sidebar validate` resolves
+through the link). Treat the sidebar as code — commit it.
 
-A small fleet-state change — resolve/expose each agent's **current individual workspace ref + its group** in
-`snapshot()` — would let both the pill paint and the custom sidebar key on real per-agent identity (and unlock
-native `Reorderable(move: "workspace.reorder")` + native group-collapse). Tracked for a follow-up.
+```sh
+ln -sfn "$PWD/sidebars/fleet.swift" ~/.config/cmux/sidebars/fleet.swift
+```
+
+Two rules, both learned the hard way:
+
+- **Never keep a second copy under `~/.config`.** A regular file there silently diverges from the repo (ours
+  drifted 1 KB), and the untracked side is one prune or one wrong-copy edit from being lost.
+- **Point the symlink at the MAIN checkout, never at a git worktree.** A worktree is ephemeral; `git worktree
+  prune` leaves a dangling symlink and the sidebar dies. Corollary: editing `sidebars/fleet.swift` *inside a
+  worktree* does **not** hot-reload the live sidebar — it resolves to main. Land sidebar changes on main.
+
+## Authoring the `.swift` — interpreter gotchas
+
+The custom-sidebar file is **interpreted**, not compiled, and it supports only a subset of Swift. Worse,
+`cmux sidebar validate` only **parses**; it never exercises the code, so it happily reports `OK` for a sidebar
+that renders nothing. There is no eval/render RPC either (`extension.sidebar.snapshot` and `sidebar.custom.open`
+are the only two), so the render can only be confirmed by eye. Budget for that.
+
+Two rules that cost an hour each. Both are obeyed by cmux's own shipped
+`Examples/CustomSidebars/status-board.swift` — diff against it when something silently renders empty:
+
+- **No top-level `let`.** A file-scope `let CHILD = " · ↳"` is *not resolvable from inside a `func`*. The func
+  silently misbehaves (ours returned `false` for every workspace, so the board filtered itself to nothing).
+  Declare `let` only **inside a func** or **inside the view body**.
+- **Never return an array from a helper.** `func rows() -> [Any]` does not work. Bind arrays with `let` in the
+  **view body** and pass them into view helpers as parameters (`func group(_ c, _ kids) -> some View`).
+
+Also: guard optionals the way the example does (`w.progress != nil && w.progress.value != nil`), and prefer
+proven views (`ProgressView(value:total:).tint(...)`) over hand-rolled shapes.
+
+When a sidebar renders empty, make the empty state **self-diagnosing** — print `workspaces.count`, how many
+carry a description, and the first raw descriptor strings. One screenshot then tells you whether the binding,
+the data, or your matching logic is at fault.
