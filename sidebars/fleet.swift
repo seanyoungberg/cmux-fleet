@@ -11,6 +11,10 @@
 // workspace's description with the bit flipped; `fleet paint` reads it back and carries it forward, so a
 // repaint never clobbers the choice.
 //
+// USAGE FOOTER: fleet-global subscription usage has no per-workspace channel, so it rides every conductor's
+// description after a `⧗` (`…⧗acct~label~pct~stale⧗…`, one line per subscription); the footer reads it off
+// the first conductor. `⧗` is stripped from record text, so the record parse above is never affected.
+//
 // INTERPRETER RULES (each fails SILENTLY — a wrong guard just renders nothing, no error anywhere):
 //   • reach optionals with `if let`, never `== nil` / `!= nil` (those evaluate to nothing);
 //   • a helper returns a String or a View, never an array — bind arrays with `let` in the view body;
@@ -27,7 +31,9 @@ func recStr(_ w) -> String {
   let d = descOf(w)
   let parts = d.split(separator: ";")
   if parts.count < 2 { return "" }
-  return String(parts[1])
+  let r = String(parts[1])
+  let segs = r.split(separator: "⧗")            // drop the fleet-global usage tail if this ws carries it
+  return String(segs[0])
 }
 // field i of that record; "" if absent. Every emitted field is non-empty ('-'), so split never drops one.
 func fld(_ w, _ i) -> String {
@@ -67,7 +73,9 @@ func toggled(_ w) -> String {
   let recs = d.split(separator: ";")
   if recs.count != 2 { return d }
   let s = String(recs[1])
-  let t = s.split(separator: "~")
+  let segs = s.split(separator: "⧗")            // drop any usage tail; paint re-appends it next cycle
+  let base = String(segs[0])
+  let t = base.split(separator: "~")
   if t.count < 12 { return d }
   let nc = t[10] == "1" ? "0" : "1"
   return "FLEET4;\(t[0])~\(t[1])~\(t[2])~\(t[3])~\(t[4])~\(t[5])~\(t[6])~\(t[7])~\(t[8])~\(t[9])~\(nc)~\(t[11])"
@@ -173,6 +181,45 @@ func extraBadge(_ w) -> some View {                          // "+N" when agents
   return AnyView(EmptyView())
 }
 
+// ── fleet-global subscription usage ────────────────────────────────────────────────────────────
+// cmux gives a custom sidebar NO global channel, so `fleet paint` rides the usage panel on every
+// conductor's description after a ⧗: "FLEET4;<rec>⧗acct~5h~63~0⧗acct2~-~-~1". One line per subscription,
+// pct = CONSUMED %; a '1' stale flag means the poll can't be trusted (never render a confident number).
+func hasUsage(_ w) -> Bool { return descOf(w).contains("⧗") }
+func usageField(_ s, _ i) -> String {
+  let t = s.split(separator: "~")
+  if t.count <= i { return "" }
+  return String(t[i])
+}
+func usageColor(_ used) -> String {                           // by CONSUMED share of the window
+  if used > 80 { return "#E5484D" }
+  if used > 60 { return "#F5A623" }
+  return "#30A46C"
+}
+func usageLine(_ s) -> some View {
+  let acct = usageField(s, 0)
+  if usageField(s, 3) == "1" {                                // untrusted -> say so, don't fake a number
+    return AnyView(HStack(spacing: 6) {
+      Text(acct).font(.system(size: 10, design: .monospaced)).foregroundColor("#8B8D98").lineLimit(1)
+      Text("· usage stale").font(.system(size: 10)).foregroundColor("#6F6E77")
+      Spacer()
+    })
+  }
+  let used = Double(usageField(s, 2))
+  return AnyView(HStack(spacing: 7) {
+    Text(acct).font(.system(size: 10, design: .monospaced)).foregroundColor("#B8B8C0").lineLimit(1)
+    Text(usageField(s, 1)).font(.system(size: 9, design: .monospaced)).foregroundColor("#6F6E77")
+    HStack(spacing: 0) {
+      RoundedRectangle(cornerRadius: 2).foregroundColor(usageColor(used)).frame(width: 56 * used / 100.0, height: 5)
+      Spacer()
+    }
+    .frame(width: 56, height: 5)
+    .background { RoundedRectangle(cornerRadius: 2).foregroundColor("#2A2E37") }
+    Text("\(Int(used))%").font(.system(size: 10, design: .monospaced)).foregroundColor(.secondary)
+    Spacer()
+  })
+}
+
 func agentRow(_ w, _ isCon) -> some View {
   return Button(action: { cmux("workspace.select", workspace_id: w.id) }) {
     HStack(alignment: .top, spacing: 7) {
@@ -261,4 +308,16 @@ VStack(alignment: .leading, spacing: 8) {
   }
 
   Spacer()
+
+  // subscription usage footer — read off the first conductor carrying a ⧗ segment (fleet-global, per
+  // subscription not per agent). Bound in the body (helpers never return arrays).
+  let carriers = mine.filter { isConductor($0) && hasUsage($0) }
+  if carriers.count > 0 {
+    Divider()
+    Text("subscriptions").font(.system(size: 9, design: .monospaced)).foregroundColor("#6F6E77")
+    let segs = descOf(carriers[0]).split(separator: "⧗")
+    ForEach(Array(segs.dropFirst(1))) { seg in
+      usageLine(String(seg))
+    }
+  }
 }.padding(8)

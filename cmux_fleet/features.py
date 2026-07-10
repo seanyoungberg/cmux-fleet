@@ -1039,13 +1039,16 @@ _SEP = "\x1f"                                                 # key delimiter (n
 
 BLOB_TAG = "FLEET4"                                           # bump when the record shape changes
 BLOB_FIELDS = 12                                              # surface label state ctx parent kind tool model effort cwd col last
+USAGE_MARK = "⧗"                                              # separates the fleet-global usage panel from the
+                                                             # blob (and each usage line); stripped from record text
 
 
 def _blob_clean(s, n):
     """Free text -> one safe blob field. Strips the ~ and ; delimiters so a stray char can't break the
     parse, and NEVER returns empty: Swift's `split(separator:)` DROPS empty components, which would shift
     every later field's index in the sidebar. '-' is the empty sentinel."""
-    v = str(s or "").replace("~", "-").replace(";", ",").replace("\n", " ").replace("#", "").strip()[:n]
+    v = str(s or "").replace("~", "-").replace(";", ",").replace("\n", " ").replace("#", "")
+    v = v.replace(USAGE_MARK, "").strip()[:n]                 # no field may carry the usage-panel separator
     return v or "-"
 
 
@@ -1145,6 +1148,33 @@ def _is_descriptor(desc):
     return any(f"{DESC_SEP}{g}" in d for g in (DESC_CHILD, DESC_OPEN, DESC_SHUT))
 
 
+def _usage_lines():
+    """Compact per-SUBSCRIPTION usage for the sidebar footer, from the STABLE `usage_for_paint()` accessor
+    (schema 1). One record per subscription provider, `account~label~pct~stale`, where `pct` is the CONSUMED
+    % of the most-constrained window (the accessor's `headline`). An untrusted row (poll failed / stale /
+    no pct) serializes pct '-' and stale '1', so a number is never rendered as confident. Provider-agnostic:
+    skips non-subscription rows (api/vertex have no windows). Returns [] on no snapshot OR a schema mismatch
+    — an unknown schema must render nothing, never mis-parse a future shape."""
+    try:
+        from . import providers as pv
+        view = pv.usage_for_paint()
+    except Exception:
+        return []
+    if view.get("schema") != 1:                              # gate on the shape THIS code was written against
+        return []
+    lines = []
+    for p in view.get("providers", []):
+        if p.get("kind") != "subscription":
+            continue
+        acct = _blob_clean(p.get("account") or p.get("id") or "?", 16)
+        h = p.get("headline") or {}
+        if (not p.get("ok")) or p.get("stale") or h.get("pct") is None:
+            lines.append("~".join([acct, "-", "-", "1"]))     # untrusted -> no confident number
+        else:
+            lines.append("~".join([acct, _blob_clean(h.get("label") or "", 6), str(int(h["pct"])), "0"]))
+    return lines
+
+
 def _progress_label(r, pct, shared=False):
     """The ctx bar's caption. Carries model·effort, which are NOT native cmux fields — they'd otherwise
     have to lengthen the workspace subtitle. Reads as prose under the bar: 'fable-5 · xhigh · 63% left'.
@@ -1237,6 +1267,16 @@ def _paint(rows, sidebar_blob=False):
     if want_sb:
         collapsed = _collapsed_map(descs)                      # {surface: '0'/'1'} — read the user's taps back
         blobs = _fleet_blobs(rows, collapsed)                  # {ws: 'FLEET4;rec;…'} — model/effort/tool intact
+        # fleet-GLOBAL subscription usage has no per-workspace home, so ride it on every CONDUCTOR's blob
+        # (the sidebar reads it off whichever it renders first). '⧗line⧗line' appended after the record;
+        # ⧗ is stripped from record text, so it never collides. Off when there's no subscription snapshot.
+        ulines = _usage_lines()
+        if ulines:
+            tail = USAGE_MARK + USAGE_MARK.join(ulines)
+            conductor_ws = {r["ws"] for r in rows if r.get("kind") == "conductor" and r.get("ws")}
+            for ws in list(blobs):
+                if ws in conductor_ws:
+                    blobs[ws] = blobs[ws] + tail
         for ws, blob in blobs.items():
             cur[f"desc{_SEP}{ws}"] = blob
             if descs.get(ws) != blob:                          # diff the LIVE subtitle -> self-healing, no churn

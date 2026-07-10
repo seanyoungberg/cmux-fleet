@@ -742,3 +742,42 @@ def test_paint_clears_the_blob_when_the_sidebar_is_disabled(monkeypatch):
     calls = _capture_cmux(ff, monkeypatch)
     ff._paint([])
     assert ("workspace-action", "--action", "clear-description", "--workspace", "ws-A") in calls
+
+
+# ── subscription-usage panel (per subscription, NOT per agent) — from the stable usage_for_paint() ──
+def test_usage_lines_from_the_accessor(monkeypatch):
+    ff = _ff()
+    from cmux_fleet import providers as pv
+    monkeypatch.setattr(pv, "usage_for_paint", lambda: {"schema": 1, "providers": [
+        {"kind": "subscription", "account": "berg-max", "ok": True, "stale": False,
+         "headline": {"label": "7d", "pct": 37.0}},
+        {"kind": "subscription", "account": "berg-team", "ok": True, "stale": True,      # stale -> untrusted
+         "headline": {"label": "5h", "pct": 1.0}},
+        {"kind": "api", "account": "vertex-x", "ok": True, "stale": False, "headline": None},   # not a sub -> skip
+    ]})
+    assert ff._usage_lines() == ["berg-max~7d~37~0", "berg-team~-~-~1"]   # one line per SUBSCRIPTION; stale -> '-','1'
+
+
+def test_usage_lines_gate_on_schema(monkeypatch):
+    ff = _ff()
+    from cmux_fleet import providers as pv
+    monkeypatch.setattr(pv, "usage_for_paint", lambda: {"schema": 2, "providers": [
+        {"kind": "subscription", "account": "x", "ok": True, "stale": False, "headline": {"label": "5h", "pct": 5}}]})
+    assert ff._usage_lines() == []                                       # unknown schema -> render nothing, never mis-parse
+
+
+def test_paint_rides_usage_on_conductor_blobs_only(monkeypatch):
+    # fleet-global usage has no per-workspace home, so it rides every CONDUCTOR's blob (the sidebar reads it
+    # off the first). ⧗ separates it from the record and is stripped from record text, so it never collides.
+    ff = _ff()
+    monkeypatch.setenv("FLEET_SIDEBAR_BLOB", "1")
+    monkeypatch.setattr(ff, "_ws_descriptions", lambda: {})
+    monkeypatch.setattr(ff, "_usage_lines", lambda: ["berg-max~7d~37~0", "berg-team~-~-~1"])
+    calls = _capture_cmux(ff, monkeypatch)
+    rows = [dict(_row("boss", state="ready", ctx_pct_remaining=40), ws="ws-A", kind="conductor", surface="s1"),
+            dict(_row("kid", state="working", ctx_pct_remaining=50), ws="ws-B", kind="child", parent="boss", surface="s2")]
+    ff._paint(rows)
+    desc = {c[-1]: c[c_index(c)] for c in calls if c[0] == "workspace-action" and "set-description" in c}
+    assert desc["ws-A"].endswith("⧗berg-max~7d~37~0⧗berg-team~-~-~1")    # conductor carries the panel
+    assert desc["ws-A"].split("⧗")[0] == "FLEET4;s1~boss~ready~40~-~conductor~claude~-~-~-~0~-"  # record intact
+    assert "⧗" not in desc["ws-B"]                                       # a child never carries it
