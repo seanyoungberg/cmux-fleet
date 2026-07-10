@@ -379,6 +379,29 @@ def _open_gate_uuids():
     return out
 
 
+# I4: states that must NEVER be masked by `detached`. needs-input / review come from the live cmux Feed
+# and are actionable NOW; error and pending describe a seat, not a hook channel. Everything else
+# (working / ready / idle / done / stale) is a TIME-based reading of a frozen record — for a detached
+# agent those readings are lies, and saying "detached" is the only honest answer.
+_ATTACH_PRESERVE = ("needs-input", "review", "error", "pending")
+
+
+def detached_or(state, attached):
+    """`detached` when the hook channel is dead, else `state`. The ONE place the I4 axis meets the
+    status vocabulary, shared by `fleet vitals` and `fleet ls` so they can never disagree.
+
+    STATE_STYLE has carried a violet 'detached' glyph and rank since the status taxonomy landed, and
+    resolve.attachment() has computed the axis since v2 step 1 — but nothing ever ASSIGNED the state,
+    so a detached agent rendered as `ready` in both views. Live proof (2026-07-10): a moved agent read
+    `ready` with attached=False and a correct env-mismatch reason sitting unused one field away, and
+    berg-sandbox read `stale` while six hours detached. The design's whole point was to NAME this
+    state; it was visible only in `--json` and the doctor alert.
+    """
+    if attached is False and state not in _ATTACH_PRESERVE:
+        return "detached"
+    return state
+
+
 def _infer_state(entry, session, open_gates=frozenset()):
     """state for one agent: read live signals, then classify (the impure edge over _classify). `open_gates`
     is the set of session uuids with an unreplied Feed gate (computed once per snapshot). Lifecycle reads
@@ -409,6 +432,7 @@ def snapshot():
         sess = rs.freshest(surf, st=store)
         state = _infer_state(e, sess, open_gates)
         att = rs.attachment(surf, st=store, ws_map=ws_map, now=now)
+        state = detached_or(state, att["attached"])
         used, tmodel = _context_used(sess.get("transcriptPath", ""))
         # Fix 1: the LAUNCHED model carries the window flavor ([1m]); the transcript model doesn't.
         # Prefer it, fall back to the transcript's, then the tool keyword — window is derived from it.

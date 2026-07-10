@@ -1999,6 +1999,9 @@ def cmd_ls(argv):
         # gate -> needs-input; needsInput-no-gate -> ready; running -> working; else idle/pending/stale.
         _sid = fs.bare_uuid(rs.freshest(surf, st=store).get("sessionId", ""))
         state = ff._classify(life or "", bool(v.get("session")), "", open_gate=bool(_sid) and _sid in open_gates)
+        # I4: a detached agent's lifecycle string is frozen, so every state derived from it is a lie.
+        # Same rule as vitals (ff.detached_or), so the two views can never disagree about the axis.
+        state = ff.detached_or(state, rs.attachment(surf, st=store)["attached"])
         # STALE if NO genuinely-live agent holds the surface: lifecycle terminal, OR frozen non-terminal
         # on a DEAD pid (the SessionEnd-less brick, root-caused 2026-07-06). Routed through the shared
         # liveness rule (rs.present) so the pid -- not the lifecycle string -- is the authority: a

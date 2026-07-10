@@ -452,3 +452,29 @@ def test_transcript_age_is_none_when_no_turn_found(tmp_path):
     p.write_text('{"type":"system"}\nnot json at all\n')
     assert rs._transcript_age({"transcriptPath": str(p)}, __import__("time").time()) is None
     assert rs._transcript_age({"transcriptPath": "/nope/missing.jsonl"}, 0) is None
+
+
+# --- the I4 axis must reach the STATUS VOCABULARY, not just --json ----------------------------------
+def test_detached_or_names_the_state_and_never_masks_a_gate():
+    """STATE_STYLE carried a violet `detached` glyph and resolve.attachment() computed the axis, but
+    nothing ever ASSIGNED the state: a detached agent rendered as `ready` in `fleet ls` and `fleet
+    vitals`, with its env-mismatch reason sitting unused one field away. Live-proven 2026-07-10 on a
+    moved agent and on berg-sandbox. `detached_or` is the one place the axis meets the vocabulary."""
+    from cmux_fleet import features as ff
+
+    # time-based readings of a frozen record are lies -> say detached
+    for masked in ("working", "ready", "idle", "done", "stale"):
+        assert ff.detached_or(masked, False) == "detached", masked
+
+    # actionable, live-Feed / seat states are NEVER masked
+    for preserved in ("needs-input", "review", "error", "pending"):
+        assert ff.detached_or(preserved, False) == preserved, preserved
+
+    # attached, or unjudgeable (no live agent), changes nothing
+    for att in (True, None):
+        assert ff.detached_or("ready", att) == "ready"
+        assert ff.detached_or("working", att) == "working"
+
+    # the state must be renderable: it needs a glyph and a rank, or vitals sorts it to the bottom
+    assert "detached" in ff.STATE_STYLE
+    assert ff.STATE_STYLE["detached"][2] < ff.STATE_STYLE["ready"][2]   # ranks ahead of ready
