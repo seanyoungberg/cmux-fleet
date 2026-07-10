@@ -50,6 +50,10 @@ def test_classify_needs_input_only_on_open_gate():
     # an UNREPLIED Feed gate is the ONLY needs-input signal -> genuinely blocked
     assert ff._classify("needsInput", True, "", open_gate=True) == "needs-input"
     assert ff._classify("idle", True, "", open_gate=True) == "needs-input"
+    # a mid-turn agent is NEVER blocked on the human: `running` outranks a (stale) open gate. Regression
+    # guard for the live 2026-07-09 FP -- notif-dedup read needs-input while actively executing, because a
+    # resume-picker Feed row answered via send-key was never marked terminal.
+    assert ff._classify("running", True, "", open_gate=True) == "working"
     # cmux says needsInput but NO open gate = the turn just ENDED -> 'ready', never a false needs-input
     assert ff._classify("needsInput", True, "") == "ready"
     assert ff._classify("needsInput", True, "Standing by for your direction.") == "ready"

@@ -298,10 +298,13 @@ def _classify(life, has_session, last_text, open_gate=False):
     proceed. cmux's agentLifecycle is authoritative for live work; when cmux says `needsInput` but NO gate
     is open, that's just a FINISHED TURN, so we fall through to the keyword-refine and land on review / done
     / 'ready' (the calm just-finished-and-available state) instead of a false 'needs-input'. Stateless."""
+    if life == "running":
+        return "working"                                      # mid-turn: cannot be blocked on the human,
+        # so `running` OUTRANKS an open gate. cmux stamps needsInput for a REAL gate, never running, so a
+        # gate seen alongside `running` is a stale non-terminal Feed row (e.g. a resume picker answered by
+        # a key-send, which never marks the row terminal) -- honoring it resurrects the needs-input FP.
     if open_gate:
         return "needs-input"                                  # unreplied Feed gate -> genuinely blocked
-    if life == "running":
-        return "working"
     if life in ("", "ended", "unknown"):
         return "pending" if not has_session else "stale"
     # life == "needsInput" (turn ended, no open gate) OR "idle": refine from last words. A just-ended turn
