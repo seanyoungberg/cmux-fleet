@@ -40,6 +40,42 @@ def _cmux(*args):
         return ""
 
 
+_UUID_RE = r"[0-9A-Fa-f]{8}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{12}"
+_WS_MAP = {"at": 0.0, "map": {}}
+
+
+def _surface_ws_map(ttl=2.0):
+    """`{SURFACE_UUID: workspace_uuid}` derived from the LIVE cmux tree — the only never-stale source.
+
+    Neither cached copy can be trusted here, and they go stale in opposite directions:
+      - the hook store's `workspaceId` is written when a session starts and is NEVER updated when the
+        surface MOVES, so `fleet move` silently leaves it pointing at the old workspace;
+      - the registry's `workspace` is written by fleet's own verbs and goes stale when CMUX re-homes a
+        surface (a reboot/restore), which is how three agents ended up naming dead workspaces.
+    Symptom that forced this (2026-07-10, found by sidebar-build): `snapshot()` read the hook store, so
+    two agents moved into their own workspaces both reported the conductor's workspace — collapsed onto
+    one id. cmux's own sidebar shows the same blind spot for those two, being downstream of the same field.
+
+    ONE `cmux tree` call per snapshot (not per agent), memoized for `ttl` seconds. Callers fall back to
+    the cached fields when the tree can't be read, so this can never regress a working read."""
+    now = time.time()
+    if _WS_MAP["map"] and (now - _WS_MAP["at"]) < ttl:
+        return _WS_MAP["map"]
+    out = _cmux("tree", "--all", "--id-format", "both")
+    mapping, ws = {}, ""
+    for line in out.splitlines():
+        mw = re.search(r"workspace\s+workspace:\d+\s+(" + _UUID_RE + ")", line)
+        if mw:
+            ws = mw.group(1)
+            continue
+        ms = re.search(r"surface\s+surface:\d+\s+(" + _UUID_RE + ")", line)
+        if ms and ws:
+            mapping[ms.group(1).upper()] = ws
+    if mapping:
+        _WS_MAP.update({"at": now, "map": mapping})
+    return mapping or _WS_MAP["map"]
+
+
 # ─── status inference (keyword tables, NO LLM) ────────────────────────────────────────────────
 # cmux's agentLifecycle (idle|running|needsInput) is the authoritative base. The keyword tables only
 # REFINE an idle agent — they tell apart "idle: finished cleanly", "idle: hit an error", "idle:
@@ -355,6 +391,7 @@ def snapshot():
     Pure derive: registry + hook store + transcripts. No cmux screen reads (keeps it cheap)."""
     store = fs.read_hook_store()
     open_gates = _open_gate_uuids()                           # one Feed query per snapshot (not per agent)
+    ws_map = _surface_ws_map()                                # one cmux tree per snapshot (not per agent)
     now = time.time()
     rows = []
     for label, e in fs.live_all().items():
@@ -372,7 +409,11 @@ def snapshot():
         rows.append({
             "label": label, "role": e.get("role", "-"), "kind": e.get("kind", "-"),
             "tool": e.get("tool", "-"), "parent": e.get("parent", ""), "surface": surf,
-            "ws": sess.get("workspaceId", ""), "state": state,
+            # DERIVED workspace: live tree first, then the two caches as degraded fallbacks (registry
+            # before hook store — fleet's verbs at least update it on move). Never read the hook store
+            # alone: it collapses moved agents onto their launch workspace.
+            "ws": ws_map.get(surf.upper()) or e.get("workspace") or sess.get("workspaceId", ""),
+            "state": state,
             "rank": STATE_STYLE.get(state, ("", "", 9))[2],
             "ctx_used": used, "ctx_pct_remaining": pct_remaining, "window": window,
             "model": model, "effort": effort or "",                     # Fix 2: effort + cwd surfaced

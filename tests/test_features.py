@@ -579,3 +579,28 @@ def test_paint_emits_blob_to_first_conductor_workspace(monkeypatch):
     assert "--description" in desc[0]
     blob = desc[0][desc[0].index("--description") + 1]
     assert blob.startswith("FLEET3;") and "boss~working~40" in blob and "worker~working~50" in blob
+
+
+def test_surface_ws_map_parses_the_tree_and_snapshot_prefers_it_over_stale_caches(fs, monkeypatch):
+    # 2026-07-10 (found by sidebar-build): snapshot read the hook store's workspaceId, which is never
+    # updated when a surface MOVES — so two agents moved into their own workspaces both reported the
+    # conductor's workspace, collapsed onto one id. The live tree is the only never-stale source.
+    from cmux_fleet import features as ff
+    WS_A = "AAAAAAAA-1111-2222-3333-444444444444"
+    WS_B = "BBBBBBBB-1111-2222-3333-444444444444"
+    S_A  = "11111111-1111-2222-3333-444444444444"
+    S_B  = "22222222-1111-2222-3333-444444444444"
+    tree = (f'workspace workspace:1 {WS_A} "a"\n'
+            f'  pane pane:1 99999999-1111-2222-3333-444444444444\n'
+            f'    surface surface:1 {S_A} [terminal]\n'
+            f'workspace workspace:2 {WS_B} "b"\n'
+            f'    surface surface:2 {S_B} [terminal]\n')
+    ff._WS_MAP.update({"at": 0.0, "map": {}})                  # defeat the memo
+    monkeypatch.setattr(ff, "_cmux", lambda *a: tree)
+    m = ff._surface_ws_map(ttl=0)
+    assert m[S_A.upper()] == WS_A and m[S_B.upper()] == WS_B   # surfaces bind to their OWN workspace
+
+    # an unreadable tree must not regress a working read: caller falls back to the cached fields
+    ff._WS_MAP.update({"at": 0.0, "map": {}})
+    monkeypatch.setattr(ff, "_cmux", lambda *a: "")
+    assert ff._surface_ws_map(ttl=0) == {}
