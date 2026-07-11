@@ -181,6 +181,52 @@ def test_context_used_none_for_missing_or_codex(tmp_path):
     assert ff._context_used(str(p))[0] is None               # codex counter is cumulative -> we don't guess
 
 
+def _codex_rollout(tmp_path, events):
+    p = tmp_path / "rollout.jsonl"
+    p.write_text("\n".join(json.dumps(x) for x in events))
+    return str(p)
+
+
+def _tok(inp, window):
+    return {"type": "event_msg", "payload": {"type": "token_count", "info": {
+        "last_token_usage": {"input_tokens": inp, "cached_input_tokens": 0, "output_tokens": 5, "total_tokens": inp + 5},
+        "model_context_window": window}}}
+
+
+def _turn_ctx(model, effort):
+    return {"type": "turn_context", "payload": {"model": model, "effort": effort, "personality": "pragmatic"}}
+
+
+def test_codex_rollout_stats_extracts_context_model_effort(tmp_path):
+    ff = _ff()
+    path = _codex_rollout(tmp_path, [
+        {"type": "session_meta", "payload": {"model_provider": "sean-flat"}},
+        _turn_ctx("gpt-5.5", "low"),
+        _tok(22027, 258400),                                 # the live token_count -> used + real window
+    ])
+    cx = ff._codex_rollout_stats(path)
+    assert cx["used"] == 22027 and cx["window"] == 258400
+    assert cx["model"] == "gpt-5.5" and cx["effort"] == "low"
+
+
+def test_codex_rollout_stats_newest_token_count_wins(tmp_path):
+    ff = _ff()
+    path = _codex_rollout(tmp_path, [_tok(10000, 258400), _turn_ctx("gpt-5.5", "high"), _tok(45000, 258400)])
+    cx = ff._codex_rollout_stats(path)
+    assert cx["used"] == 45000 and cx["effort"] == "high"    # last reading, not the first
+
+
+def test_codex_rollout_stats_probe_without_token_count_is_dash(tmp_path):
+    # a probe/one-shot rollout with no token_count -> used/window None (vitals '—'), but model/effort still show
+    ff = _ff()
+    path = _codex_rollout(tmp_path, [{"type": "session_meta", "payload": {}}, _turn_ctx("gpt-5.5", "medium")])
+    cx = ff._codex_rollout_stats(path)
+    assert cx["used"] is None and cx["window"] is None
+    assert cx["model"] == "gpt-5.5" and cx["effort"] == "medium"
+    assert ff._codex_rollout_stats("")["used"] is None       # missing path -> inert
+    assert ff._codex_rollout_stats(str(tmp_path / "nope.jsonl"))["used"] is None
+
+
 def test_context_used_none_for_zero_token_usage(tmp_path):
     # Fix 3: a usage block that sums to 0 (an errored/empty turn) is NOT a real context reading — used
     # stays None so vitals shows '—', never the garbage '0k 100%' (a 0 total made 1 - 0/window == 100%).

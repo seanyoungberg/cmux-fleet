@@ -269,6 +269,44 @@ def _context_used(path):
     return used, model
 
 
+def _codex_rollout_stats(path):
+    """Codex vitals from its rollout JSONL (the fleet records a codex agent's rollout as its transcriptPath,
+    same as last_agent_text reads). ONE newest-wins pass yields what claude gets from its transcript but
+    codex records elsewhere:
+      • context — the last `event_msg/token_count`: info.last_token_usage.input_tokens is the live prompt
+        occupancy (the full re-sent context that turn, cached tokens included — they still fill the window),
+        over info.model_context_window (the model's REAL window, e.g. gpt-5.5 = 258400, more precise than a
+        keyword guess). Mirrors claude's prompt-size approach; requires a POSITIVE count (a probe/empty
+        rollout has no token_count -> used stays None -> vitals shows '—', exactly like claude).
+      • model / effort — the last `turn_context`: the EFFECTIVE values codex ran with (effort defaults land
+        here even when no --effort flag was passed; the field is `effort`, not `reasoning_effort`).
+    Returns {used, window, model, effort} (None/'' when absent). Never raises."""
+    out = {"used": None, "window": None, "model": "", "effort": ""}
+    if not path or not os.path.exists(path):
+        return out
+    try:
+        for line in open(path):
+            try:
+                e = json.loads(line)
+            except Exception:
+                continue
+            t, pl = e.get("type"), (e.get("payload") or {})
+            if t == "event_msg" and pl.get("type") == "token_count":
+                info = pl.get("info") or {}
+                inp = (info.get("last_token_usage") or {}).get("input_tokens")
+                if isinstance(inp, int) and inp > 0:                 # 0/None == no real reading -> keep prior
+                    out["used"] = inp
+                win = info.get("model_context_window")
+                if isinstance(win, int) and win > 0:
+                    out["window"] = win
+            elif t == "turn_context":
+                out["model"] = pl.get("model") or out["model"]
+                out["effort"] = pl.get("effort") or out["effort"]
+    except Exception:
+        return out
+    return out
+
+
 # The interactive tool calls that genuinely BLOCK a turn on the human. A trailing, unanswered one of
 # these is the ONLY needsInput state the fleet-doctor should alert on (fleet-doctor #iii). Everything
 # else at needsInput — a completed turn idling >~60s at the prompt (which cmux also stamps needsInput via
@@ -472,6 +510,18 @@ def snapshot():
         lmodel, effort = _launched_prefs(sess, e.get("tool", ""))
         model = lmodel or tmodel
         window = _context_window(model or e.get("tool", ""))
+        # codex records context/model/effort in its rollout, not the (claude-shaped) transcript that
+        # _context_used/_launched_prefs read — so for codex, prefer the rollout's ground truth (real
+        # per-turn occupancy + the model's real window + the effective model/effort). '—' still shows
+        # when the rollout carries no token_count yet (used stays None), same as claude.
+        if (e.get("tool", "") or "").lower() == "codex":
+            cx = _codex_rollout_stats(sess.get("transcriptPath", ""))
+            if cx["used"] is not None:
+                used = cx["used"]
+            if cx["window"]:
+                window = cx["window"]
+            model = cx["model"] or model                     # rollout = what codex ACTUALLY ran
+            effort = cx["effort"] or effort
         pct_remaining = None if used is None else max(0, round(100 * (1 - used / window)))
         updated = sess.get("updatedAt") or 0
         rows.append({
