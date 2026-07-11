@@ -346,6 +346,34 @@ def _codex_flags(tokens):
     return out
 
 
+def _codex_config_mcp_servers(config_text):
+    """The top-level `[mcp_servers.<name>]` server names declared in a codex config.toml. `[^\\].]+` stops
+    at the first `.` or `]`, so a subtable like `[mcp_servers.node_repl.env]` still yields just `node_repl`
+    (deduped); server names with hyphens (gemini-cli, basic-memory) come through whole."""
+    return sorted(set(re.findall(r'^\s*\[mcp_servers\.([^\].]+)', config_text, re.M)))
+
+
+def _codex_clean_config_flags(config_path="~/.codex/config.toml"):
+    """Launch flags that strip the Codex DESKTOP-app cruft from a fleet codex worker WITHOUT ignoring the
+    config — so the fleet-owned `[model_providers.*]` blocks (and thus the unified-home env-token auth) still
+    load. The interactive `codex` TUI can't `--ignore-user-config` (exec-only), and `-c mcp_servers={}`
+    MERGES rather than clears, so each cruft surface is disabled explicitly (both verified on codex 0.144.1):
+      - `--disable plugins` — all enabled plugins + their contributed MCP servers + marketplaces, in one
+        feature flag. Leaves `features.hooks` alone, so the fleet's OWN codex lifecycle hooks still fire.
+      - `-c mcp_servers.<n>.enabled=false`, one per `[mcp_servers.<n>]` found in the LIVE config — so the 5
+        desktop servers (incl. the 2 dead ones that error every launch) never spawn. Read from the config at
+        launch, so it is drift-robust: a server Berg adds to his desktop config is auto-disabled for workers
+        too. Absent/unreadable config → just `--disable plugins` (nothing else to disable)."""
+    flags = ["--disable", "plugins"]
+    try:
+        text = open(os.path.expanduser(config_path)).read()
+    except OSError:
+        return flags
+    for name in _codex_config_mcp_servers(text):
+        flags += ["-c", f"mcp_servers.{name}.enabled=false"]
+    return flags
+
+
 def adapter_compile(tool, spec, caller_tokens):
     """Compile {plugins, flags, env, settings} + caller passthrough -> (bin, arg_tokens, env_map)
     for the given tool. Adding a tool = adding a branch here + a [tool.<t>] block."""
@@ -378,7 +406,10 @@ def adapter_compile(tool, spec, caller_tokens):
         # provision CODEX_HOME (deferred) -> plugins/settings are still no-ops for codex, so warn.
         if spec["plugins"] or spec["settings"]:
             print("[fleet] warn: 'plugins'/'settings' are not yet provisioned for codex; ignored")
-        return "codex", _codex_flags(merged), env
+        # Clean config: fleet codex workers must not inherit the desktop app's MCP servers (2 dead) +
+        # plugins + marketplaces. Prepend the disable flags (they precede the provider's model_provider
+        # selector, appended in cmd_launch); config stays loaded so env-token auth is untouched.
+        return "codex", _codex_clean_config_flags() + _codex_flags(merged), env
 
     sys.exit(f"fleet: unknown tool '{tool}' (no adapter)")
 

@@ -242,16 +242,45 @@ def test_codex_flags_effort_as_last_bare_token_is_dropped_not_crashed():
     assert fleet._codex_flags(["--effort"]) == []                       # no value -> emit nothing, no IndexError
 
 
-def test_adapter_compile_codex_translates_effort_and_claude_stays_verbatim():
+def test_adapter_compile_codex_translates_effort_and_claude_stays_verbatim(monkeypatch):
+    # pin the clean-config prefix so the assertion is hermetic (not coupled to the real ~/.codex/config.toml)
+    monkeypatch.setattr(fleet, "_codex_clean_config_flags", lambda *a, **k: ["--disable", "plugins"])
     spec = {"tool": "codex", "role": "w", "label": "w", "flags": [], "env": {},
             "plugins": [], "settings": "", "setting_sources": ""}
     binn, args, _ = fleet.adapter_compile("codex", spec, ["--effort", "high"])
     assert binn == "codex"
     assert "--effort" not in args and "-c" in args and "model_reasoning_effort=high" in args
+    assert args[:2] == ["--disable", "plugins"]                         # clean-config prefix leads the argv
     # the SAME caller tokens on a claude spec are forwarded AS-IS (claude owns --effort natively).
     cspec = dict(spec, tool="claude")
     _, cargs, _ = fleet.adapter_compile("claude", cspec, ["--effort", "high"])
     assert "--effort" in cargs and "high" in cargs                      # claude path unchanged (regression guard)
+    assert "--disable" not in cargs                                     # clean-config is codex-only
+
+
+def test_codex_config_mcp_servers_parses_top_level_names(tmp_path):
+    cfg = ("model = \"gpt-5.5\"\n"
+           "[mcp_servers.context7]\ncommand = \"npx\"\n"
+           "[mcp_servers.gemini-cli]\ncommand = \"npx\"\n"
+           "[mcp_servers.node_repl]\ncommand = \"x\"\n"
+           "[mcp_servers.node_repl.env]\nFOO = \"bar\"\n"          # a SUBTABLE -> still just node_repl
+           "[mcp_servers.basic-memory]\nurl = \"http://127.0.0.1:8000/mcp\"\n"
+           "[model_providers.berglabs]\nname = \"OpenAI\"\n")     # NOT an mcp_server -> excluded
+    assert fleet._codex_config_mcp_servers(cfg) == ["basic-memory", "context7", "gemini-cli", "node_repl"]
+
+
+def test_codex_clean_config_flags_disables_plugins_and_each_server(tmp_path):
+    p = tmp_path / "config.toml"
+    p.write_text("[mcp_servers.context7]\ncommand=\"npx\"\n[mcp_servers.terraform]\ncommand=\"x\"\n")
+    flags = fleet._codex_clean_config_flags(str(p))
+    assert flags[:2] == ["--disable", "plugins"]
+    assert flags == ["--disable", "plugins",
+                     "-c", "mcp_servers.context7.enabled=false",
+                     "-c", "mcp_servers.terraform.enabled=false"]
+
+
+def test_codex_clean_config_flags_missing_config_is_plugins_only(tmp_path):
+    assert fleet._codex_clean_config_flags(str(tmp_path / "nope.toml")) == ["--disable", "plugins"]
 
 
 # ================= P0-4a: launch verification (a dead-on-arrival lazy child != DONE) ================
