@@ -337,9 +337,12 @@ def codex_health_check():
                 rec["status"] = "revoked"
                 rec["detail"] = ("token rejected by the ChatGPT backend (superseded / server-revoked "
                                  "despite a future expiry — needs a re-login)")
-            else:                                    # 'live' or 'unreachable' — a transient probe never cries wolf
-                rec["status"] = "healthy"
-                rec["detail"] = "" if probe == "live" else "backend probe unreachable (expiry OK; unverified)"
+            elif probe == "live":
+                rec["status"], rec["detail"] = "healthy", ""
+            else:                                    # 'unreachable' — a transient probe blip. 'error' (no alert),
+                rec["status"] = "error"              # NOT a false-'healthy': we could not VERIFY the token, and
+                rec["detail"] = "backend probe unreachable; token unverified this tick"  # this matches the
+                #                                      transient-refresh branch below (both -> 'error', retry next tick).
         except ProviderTransientError as e:          # network blip / 5xx — NOT offline; retry next tick, no alert
             rec["status"], rec["detail"] = "error", str(e)
         except ProviderError as e:                   # a genuine rejection (revoked) or an unseeded account

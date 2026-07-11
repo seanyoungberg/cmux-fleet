@@ -655,7 +655,8 @@ def test_codex_health_check_detects_backend_revocation(tmp_path, monkeypatch):
     h = {r["acct"]: r["status"] for r in pv.codex_health_check()}
     assert h["superseded"] == "revoked"              # backend 401 despite a future expiry -> the gap, closed
     assert h["alive"] == "healthy"                   # backend 200 -> genuinely healthy
-    assert h["flaky"] == "healthy"                   # backend unreachable -> no cry wolf, expiry stands
+    assert h["flaky"] == "error"                     # backend unreachable -> transient 'error' (no alert, no
+    #                                                  false-'healthy'), consistent with a transient refresh
 
 
 def test_codex_health_scan_edge_triggers_and_rearms(tmp_path, monkeypatch):
