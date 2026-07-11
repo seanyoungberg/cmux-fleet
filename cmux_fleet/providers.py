@@ -862,6 +862,24 @@ def _headline(windows):
     return {"key": w["key"], "label": w["label"], "pct": w["pct"], "resets_in_s": w["resets_in_s"]}
 
 
+# The provider BADGE (a small source chip in the sidebar) and the SUBSCRIPTION grouping key (§3). A badge
+# is per-tool; the subscription key groups SEATS that share one bill. Codex seats on the same ChatGPT
+# subscription share `account_id` (verified: sean-flat + berglabs both = 77cd2846); claude has one account
+# per config entry, so it groups by its own id. api-key providers (Gemini) have no seats — each is its own
+# group. Kept provider-agnostic: no subscription-only assumption hardcoded.
+_TOOL_BADGE = {"claude": "Claude Code", "codex": "Codex", "gemini": "Gemini"}
+
+
+def _provider_badge(tool):
+    return _TOOL_BADGE.get(tool, tool.title() if tool else "")
+
+
+def _subscription_key(rec):
+    """The grouping key: `account_id` when the provider reports one (codex seats share it per subscription),
+    else the provider's own `tool:account` (claude, api-key) so it forms a singleton group."""
+    return rec.get("account_id") or f"{rec.get('tool', '')}:{rec.get('name', '')}"
+
+
 def usage_for_paint():
     """STABLE, versioned, render-ready view of the last usage poll — THE contract that `fleet paint` (and
     the sidebar behind it) consume. Decoupled from the raw poll record so the poller can evolve without
@@ -892,6 +910,8 @@ def usage_for_paint():
         label = ident.get("display") or ident.get("email") or r.get("name", "")
         provs.append({
             "id": pid, "tool": r.get("tool", ""), "account": r.get("name", ""),
+            "badge": _provider_badge(r.get("tool", "")),        # §3: source chip (Claude Code / Codex / …)
+            "subscription": _subscription_key(r),               # §3: group seats sharing one bill
             "identity": {"email": ident.get("email"), "display": ident.get("display")},
             "label": label,
             "kind": r.get("type", ""), "plan": r.get("plan", ""),
@@ -899,5 +919,7 @@ def usage_for_paint():
             "ok": bool(r.get("ok")), "error": r.get("error"), "stale": bool(r.get("stale")),
             "checked_at": ca, "age_s": (int(time.time()) - int(ca)) if ca else None,
             "windows": windows, "headline": _headline(windows), "budget": r.get("budget"),
+            # §2 keep-stale-grayed: hard-cap signal + the metered-spend cap distinct from the % bars
+            "limit_reached": bool(r.get("limit_reached")),
         })
     return {"schema": PAINT_SCHEMA, "generated_at": int(time.time()), "providers": provs}

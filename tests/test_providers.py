@@ -403,6 +403,43 @@ def test_usage_for_paint_surfaces_real_identity():
     assert p["claude:noident"]["label"] == "noident"                        # falls back to config id
 
 
+def test_usage_for_paint_badge_and_subscription_grouping():
+    now = int(time.time())
+    # two codex SEATS on ONE subscription (shared account_id) + one on another + a claude account
+    fs.provider_usage_write({
+        "codex:sean-flat": {"tool": "codex", "name": "sean-flat", "type": "subscription", "ok": True,
+                            "checked_at": now, "windows": {}, "scoped": [], "account_id": "acct-77"},
+        "codex:berglabs": {"tool": "codex", "name": "berglabs", "type": "subscription", "ok": True,
+                           "checked_at": now, "windows": {}, "scoped": [], "account_id": "acct-77"},
+        "codex:sean-dot": {"tool": "codex", "name": "sean-dot", "type": "subscription", "ok": True,
+                           "checked_at": now, "windows": {}, "scoped": [], "account_id": "acct-20"},
+        "claude:berg-max": {"tool": "claude", "name": "berg-max", "type": "subscription", "ok": True,
+                            "checked_at": now, "windows": {}, "scoped": []},
+    })
+    p = {x["id"]: x for x in pv.usage_for_paint()["providers"]}
+    # badge per tool
+    assert p["codex:sean-flat"]["badge"] == "Codex" and p["claude:berg-max"]["badge"] == "Claude Code"
+    # two seats sharing account_id group under one subscription; a third seat is its own group
+    assert p["codex:sean-flat"]["subscription"] == p["codex:berglabs"]["subscription"] == "acct-77"
+    assert p["codex:sean-dot"]["subscription"] == "acct-20"
+    # claude (no account_id) falls back to its own tool:account singleton group
+    assert p["claude:berg-max"]["subscription"] == "claude:berg-max"
+    # the short seat handle stays on `account` (disambiguates the dotted/flat gmails)
+    assert p["codex:sean-flat"]["account"] == "sean-flat"
+
+
+def test_usage_for_paint_surfaces_limit_reached():
+    now = int(time.time())
+    fs.provider_usage_write({
+        "codex:capped": {"tool": "codex", "name": "capped", "type": "subscription", "ok": True,
+                         "checked_at": now, "windows": {}, "scoped": [], "limit_reached": True},
+        "codex:ok": {"tool": "codex", "name": "ok", "type": "subscription", "ok": True,
+                     "checked_at": now, "windows": {}, "scoped": []},
+    })
+    p = {x["id"]: x for x in pv.usage_for_paint()["providers"]}
+    assert p["codex:capped"]["limit_reached"] is True and p["codex:ok"]["limit_reached"] is False
+
+
 def test_codex_identity_decodes_id_token(tmp_path):
     import base64
     def jwt(claims):
