@@ -238,6 +238,91 @@ def test_window_label_mapping():
     assert pv._window_label(None) is None
 
 
+# --- codex server-side usage API (the productized path) ------------------------------------------
+# A real /backend-api/codex/usage 200 body (captured live 2026-07-10). Windows are in SECONDS here.
+_CODEX_USAGE_BODY = {
+    "user_id": "user-KUwx", "account_id": "77cd2846-abcd", "email": "sean@berglabs.net",
+    "plan_type": "team",
+    "rate_limit": {
+        "allowed": True, "limit_reached": False, "rate_limit_reached_type": None,
+        "primary_window": {"used_percent": 2, "limit_window_seconds": 18000,
+                           "reset_after_seconds": 15783, "reset_at": 1783748355},
+        "secondary_window": {"used_percent": 0, "limit_window_seconds": 604800,
+                             "reset_after_seconds": 602583, "reset_at": 1784335155},
+    },
+    "credits": {"has_credits": False, "unlimited": False, "overage_limit_reached": False, "balance": None},
+    "spend_control": {"reached": False, "individual_limit": None},
+}
+
+
+def test_normalize_codex_usage_maps_windows_by_length():
+    r = pv._normalize_codex_usage(_CODEX_USAGE_BODY)
+    assert r["ok"] and r["error"] is None
+    # 18000s -> 300min -> five_hour (Berg's "maybe 4h" is 5h: server-authoritative); 604800s -> 7d
+    assert r["windows"]["five_hour"]["pct"] == 2 and r["windows"]["five_hour"]["window_minutes"] == 300
+    assert r["windows"]["five_hour"]["resets_at"] == 1783748355
+    assert r["windows"]["seven_day"]["window_minutes"] == 10080
+    assert r["identity"]["email"] == "sean@berglabs.net" and r["plan"] == "team"
+    assert r["account_id"] == "77cd2846-abcd"                     # subscription grouping key
+    assert r["limit_reached"] is False and r["credits"]["has_credits"] is False
+    assert r["spend_control"]["reached"] is False
+
+
+def test_normalize_codex_usage_captures_hard_cap_signals():
+    body = json.loads(json.dumps(_CODEX_USAGE_BODY))
+    body["rate_limit"]["limit_reached"] = True
+    body["rate_limit"]["rate_limit_reached_type"] = "WorkspaceOwnerUsageLimitReached"
+    body["credits"]["overage_limit_reached"] = True
+    body["spend_control"]["reached"] = True
+    r = pv._normalize_codex_usage(body)
+    assert r["limit_reached"] is True
+    assert r["rate_limit_reached_type"] == "WorkspaceOwnerUsageLimitReached"
+    assert r["credits"]["overage_limit_reached"] is True and r["spend_control"]["reached"] is True
+
+
+def test_normalize_codex_usage_single_window_ok():
+    body = json.loads(json.dumps(_CODEX_USAGE_BODY))
+    body["rate_limit"]["secondary_window"] = None            # a plan may send only one window
+    r = pv._normalize_codex_usage(body)
+    assert "five_hour" in r["windows"] and "seven_day" not in r["windows"]
+
+
+class _FakeResp:
+    def __init__(self, body): self._b = json.dumps(body).encode()
+    def read(self): return self._b
+    def __enter__(self): return self
+    def __exit__(self, *a): return False
+
+
+def test_poll_codex_api_success(monkeypatch):
+    import urllib.request
+    captured = {}
+    def fake_urlopen(req, timeout=None):
+        captured["ua"] = req.headers.get("User-agent")
+        captured["auth"] = req.headers.get("Authorization")
+        captured["acct"] = req.headers.get("Chatgpt-account-id")
+        return _FakeResp(_CODEX_USAGE_BODY)
+    monkeypatch.setattr(urllib.request, "urlopen", fake_urlopen)
+    r = pv.poll_codex_api("tok-abc", account_id="77cd2846-abcd")
+    assert r["ok"] and r["windows"]["five_hour"]["window_minutes"] == 300
+    assert captured["auth"] == "Bearer tok-abc"
+    assert captured["acct"] == "77cd2846-abcd"
+    assert captured["ua"]                               # non-empty UA is required (empty -> 403 at the edge)
+
+
+def test_poll_codex_api_401_is_soft_error(monkeypatch):
+    import urllib.request, urllib.error
+    def fake_urlopen(req, timeout=None):
+        raise urllib.error.HTTPError(pv.CODEX_USAGE_ENDPOINT, 401, "Unauthorized", {}, None)
+    monkeypatch.setattr(urllib.request, "urlopen", fake_urlopen)
+    r = pv.poll_codex_api("stale-tok", account_id="x")
+    assert r["ok"] is False and r["error"] == "HTTP 401"     # caller falls back to the rollout scrape
+
+
+def test_poll_codex_api_no_token():
+    assert pv.poll_codex_api("")["ok"] is False
+
+
 def test_poll_all_writes_snapshot(providers_toml, monkeypatch):
     # point codex acct2's home at a temp home with a rollout; claude poll will fail (no token) -> ok:false,
     # but the record must still be present. poll_all writes provider-usage.json in the throwaway STATE.

@@ -700,6 +700,72 @@ def poll_codex(home, model_provider=None):
     }
 
 
+# --- server-side codex usage (the productized path; replaces the rollout scrape) ----------------
+# The ChatGPT backend exposes a usage endpoint the seat's OAuth access token can hit directly, server-side
+# (the codex analog to Claude's /api/oauth/usage). Verified 2026-07-10 against a live seat token. Strictly
+# richer than the rollout scrape: a LIVE reset countdown (no resets_at math, never a stale snapshot),
+# email + plan in the same call, and the metered/hard-cap signals (credits, spend_control, limit_reached)
+# the "4 limit types" taxonomy needs beyond the % bars. Terminal-independent: no agent need have RUN.
+CODEX_USAGE_ENDPOINT = "https://chatgpt.com/backend-api/codex/usage"
+
+
+def _normalize_codex_usage(data):
+    """Map the /codex/usage JSON into the shared poll record (windows keyed by LENGTH via _window_label, so
+    the accessor renders codex identically to claude). Captures the metered/spend signals too."""
+    rl = data.get("rate_limit") or {}
+    windows = {}
+    for slot in ("primary_window", "secondary_window"):
+        w = rl.get(slot)
+        if not isinstance(w, dict):
+            continue
+        secs = w.get("limit_window_seconds")
+        mins = int(secs // 60) if isinstance(secs, (int, float)) else None
+        # prefer the server's live countdown; fall back to reset_at if absent
+        resets_at = w.get("reset_at")
+        label = _window_label(mins) or slot.replace("_window", "")
+        windows[label] = {"pct": w.get("used_percent"), "resets_at": resets_at, "window_minutes": mins}
+    email = data.get("email")
+    ident = {"email": email, "display": email, "plan": data.get("plan_type")}
+    credits = data.get("credits") or {}
+    spend = data.get("spend_control") or {}
+    return {
+        "ok": True, "error": None, "stale": False, "windows": windows, "identity": ident,
+        "plan": data.get("plan_type") or "", "account_id": data.get("account_id"),
+        "scoped": [], "extra_usage": {"enabled": False, "pct": None}, "active_limit": "",
+        # metered / hard-cap signals (distinct from the % bars; the $-spend + quota caps in the taxonomy)
+        "limit_reached": bool(rl.get("limit_reached")),
+        "rate_limit_reached_type": rl.get("rate_limit_reached_type"),
+        "credits": {"has_credits": bool(credits.get("has_credits")),
+                    "overage_limit_reached": bool(credits.get("overage_limit_reached")),
+                    "balance": credits.get("balance")},
+        "spend_control": {"reached": bool(spend.get("reached")),
+                          "individual_limit": spend.get("individual_limit")},
+    }
+
+
+def poll_codex_api(token, account_id=None):
+    """Server-side codex usage via GET /backend-api/codex/usage with `Authorization: Bearer <access token>`
+    (+ the `chatgpt-account-id` header when known; the token scopes the account either way). Returns the
+    normalized poll record; never raises. A non-empty User-Agent is REQUIRED — the backend edge 403s an
+    empty UA. A 401 means the token is invalidated/rotated (the unified-home clobber case); the caller falls
+    back to the rollout scrape (keep-stale)."""
+    import urllib.request, urllib.error
+    if not token:
+        return {"ok": False, "error": "no token"}
+    hdrs = {"Authorization": f"Bearer {token}", "Accept": "application/json",
+            "User-Agent": _OAUTH_HEADERS["User-Agent"]}
+    if account_id:
+        hdrs["chatgpt-account-id"] = account_id
+    try:
+        with urllib.request.urlopen(urllib.request.Request(CODEX_USAGE_ENDPOINT, headers=hdrs), timeout=20) as r:
+            data = json.loads(r.read().decode())
+    except urllib.error.HTTPError as e:
+        return {"ok": False, "error": f"HTTP {e.code}"}
+    except Exception as e:
+        return {"ok": False, "error": f"{type(e).__name__}"}
+    return _normalize_codex_usage(data)
+
+
 # --- poller registry (the pluggability seam) ----------------------------------------------------
 # Adding a provider family (Vertex-metered, Gemini, a direct inference API with a usage endpoint) is:
 #   1. write a poller  fn(spec, name) -> {ok, error?, windows{...}, plan?, extra_usage?, scoped?, budget?}
