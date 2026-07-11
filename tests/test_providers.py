@@ -611,8 +611,51 @@ def test_codex_health_check_classifies(tmp_path, monkeypatch):
             raise pv.ProviderError("codex account 'new' is not seeded (...missing)")
         raise pv.ProviderError("codex account 'dead' token refresh failed; the account may be revoked")
     monkeypatch.setattr(pv, "codex_ensure_fresh", fake_ensure)
+    monkeypatch.setattr(pv, "codex_probe_backend", lambda tok, **k: "live")   # 'good' passes the backend probe too
     h = {r["acct"]: r["status"] for r in pv.codex_health_check()}
     assert h == {"good": "healthy", "dead": "revoked", "new": "unseeded"}   # home1 (codex-home) is NOT monitored
+
+
+def test_codex_probe_backend_classifies(monkeypatch):
+    import urllib.error
+    class _Resp:                                    # minimal context-manager stand-in for urlopen's return
+        def __init__(self, status): self.status = status
+        def __enter__(self): return self
+        def __exit__(self, *a): return False
+    def urlopen_status(status):
+        def _f(req, timeout=None): return _Resp(status)
+        return _f
+    def urlopen_raise(exc):
+        def _f(req, timeout=None): raise exc
+        return _f
+    # 200 = the backend accepts the token -> live
+    monkeypatch.setattr("urllib.request.urlopen", urlopen_status(200))
+    assert pv.codex_probe_backend("tok") == "live"
+    # 401/403 = the backend REJECTED a token the clock still thinks is valid -> revoked (THE gap this closes)
+    monkeypatch.setattr("urllib.request.urlopen", urlopen_raise(urllib.error.HTTPError("u", 401, "no", None, None)))
+    assert pv.codex_probe_backend("tok") == "revoked"
+    monkeypatch.setattr("urllib.request.urlopen", urlopen_raise(urllib.error.HTTPError("u", 403, "no", None, None)))
+    assert pv.codex_probe_backend("tok") == "revoked"
+    # 5xx and network errors are TRANSIENT -> unreachable (never cry wolf)
+    monkeypatch.setattr("urllib.request.urlopen", urlopen_raise(urllib.error.HTTPError("u", 503, "busy", None, None)))
+    assert pv.codex_probe_backend("tok") == "unreachable"
+    monkeypatch.setattr("urllib.request.urlopen", urlopen_raise(urllib.error.URLError("connection refused")))
+    assert pv.codex_probe_backend("tok") == "unreachable"
+
+
+def test_codex_health_check_detects_backend_revocation(tmp_path, monkeypatch):
+    """THE regression for the expiry-only gap: a token that ensure_fresh accepts (future exp, refresh not
+    even attempted) but the ChatGPT backend has REVOKED must classify 'revoked', not 'healthy'."""
+    _codex_health_toml(tmp_path, monkeypatch, ["superseded", "alive", "flaky"])
+    # ensure_fresh accepts all three (future exp; no refresh); return a per-acct token so the probe stub
+    # can render a distinct verdict without depending on iteration order.
+    monkeypatch.setattr(pv, "codex_ensure_fresh", lambda acct, force=False: f"tok-{acct}")
+    verdict = {"tok-superseded": "revoked", "tok-alive": "live", "tok-flaky": "unreachable"}
+    monkeypatch.setattr(pv, "codex_probe_backend", lambda tok, **k: verdict[tok])
+    h = {r["acct"]: r["status"] for r in pv.codex_health_check()}
+    assert h["superseded"] == "revoked"              # backend 401 despite a future expiry -> the gap, closed
+    assert h["alive"] == "healthy"                   # backend 200 -> genuinely healthy
+    assert h["flaky"] == "healthy"                   # backend unreachable -> no cry wolf, expiry stands
 
 
 def test_codex_health_scan_edge_triggers_and_rearms(tmp_path, monkeypatch):
@@ -623,6 +666,7 @@ def test_codex_health_scan_edge_triggers_and_rearms(tmp_path, monkeypatch):
             return "t"
         raise pv.ProviderError("refresh failed; may be revoked")
     monkeypatch.setattr(pv, "codex_ensure_fresh", fake_ensure)
+    monkeypatch.setattr(pv, "codex_probe_backend", lambda tok, **k: "live")   # isolate: refresh-path revocation only
     calls = []
     notify = lambda acct, email, msg: calls.append(acct)
     pv.codex_health_scan(notify); assert calls == ["a"]          # first revocation -> alert

@@ -198,6 +198,11 @@ CODEX_TOKEN_ENV = "CMUX_FLEET_CODEX_TOKEN"
 CODEX_OAUTH_TOKEN_URL = "https://auth.openai.com/oauth/token"
 CODEX_OAUTH_CLIENT_ID = "app_EMoamEEZ73f0CkXaXp7hrann"
 CODEX_REFRESH_MARGIN_S = 1800          # refresh when the access token expires within 30 min
+# The ChatGPT backend endpoint a codex token actually authenticates against — the layer that REVOKES a
+# superseded token (unified-home one-active-session-per-client). A cheap read-only GET here is the ONLY
+# reliable liveness check: verified 2026-07-10 that a superseded seat's token returns 200 from the IdP
+# `userinfo` AND has a future JWT `exp`, yet returns 401 here. Expiry/refresh checks alone are false-healthy.
+CODEX_BACKEND_PROBE_URL = "https://chatgpt.com/backend-api/me"
 
 
 def _codex_token_path(acct):
@@ -285,11 +290,39 @@ def _codex_token_identity(acct):
 #                    concept, tracked separately by poll_codex's `stale`).
 #   "token dead"   = the refresh_token is revoked/expired, so the account cannot be refreshed and will go
 #                    OFFLINE. Needs a human re-login. THIS is the only "account offline" signal to notify.
+def codex_probe_backend(access_token, timeout=15):
+    """READ-ONLY liveness validation of a codex access token against the ChatGPT backend — the layer codex
+    actually calls, and the layer that REVOKES a superseded token. Returns one of:
+      'live'        — the backend accepted the token (HTTP < 400).
+      'revoked'     — the backend REJECTED it (HTTP 401/403). This is the signal the clock cannot see: a
+                      token superseded by a later `codex login` on the shared codex OAuth client keeps a
+                      FUTURE JWT `exp` and still passes the IdP `userinfo`, yet the backend 401s it
+                      (unified-home one-active-session-per-client; verified 2026-07-10).
+      'unreachable' — network error / timeout / 5xx: TRANSIENT, never cry wolf.
+    No refresh, no mint, no token spend — a pure GET. (Kept separate from _oauth_refresh, which MUTATES.)"""
+    import urllib.request, urllib.error, socket
+    req = urllib.request.Request(CODEX_BACKEND_PROBE_URL,
+                                 headers={"Authorization": f"Bearer {access_token}",
+                                          "User-Agent": "cmux-fleet-health"})
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as r:
+            return "live" if r.status < 400 else "unreachable"
+    except urllib.error.HTTPError as e:
+        return "revoked" if e.code in (401, 403) else "unreachable"   # 5xx/other = transient, not offline
+    except (urllib.error.URLError, socket.timeout, OSError):
+        return "unreachable"
+
+
 def codex_health_check():
-    """Check each configured codex-token account's TOKEN health (not its usage). Runs codex_ensure_fresh
-    (silent refresh only if near expiry — a healthy, not-near-expiry token costs no network), and
-    classifies: 'healthy' | 'revoked' (refresh failed — needs re-login) | 'unseeded' (never set up — not
-    an alert). Returns [{acct, email, status, detail, checked_at}]. Never raises."""
+    """Check each configured codex-token account's TOKEN health (not its usage). Two layers, because the
+    clock alone is FALSE-HEALTHY for a superseded token (future `exp`, but the backend has revoked it):
+      1. codex_ensure_fresh — silent refresh only if near expiry (a not-near-expiry token costs no network);
+         a dead refresh_token surfaces here as 'revoked'.
+      2. codex_probe_backend — a read-only GET against the ChatGPT backend that catches a token the clock
+         and refresh_token both still consider valid but the backend has revoked (the one-active-session
+         supersession; see CODEX_BACKEND_PROBE_URL). This is the gap the expiry-only check missed.
+    Classifies: 'healthy' | 'revoked' (needs re-login) | 'unseeded' (never set up — not an alert) | 'error'
+    (transient, no alert). Returns [{acct, email, status, detail, checked_at}]. Never raises."""
     out = []
     for tool, name, spec, _ in iter_providers():
         method, _m = _parse_auth(spec.get("auth", ""))
@@ -298,8 +331,15 @@ def codex_health_check():
         rec = {"acct": name, "email": (_codex_token_identity(name) or {}).get("email"),
                "checked_at": int(time.time())}
         try:
-            codex_ensure_fresh(name)
-            rec["status"], rec["detail"] = "healthy", ""
+            tok = codex_ensure_fresh(name)
+            probe = codex_probe_backend(tok)         # layer 2: server truth, catches supersession
+            if probe == "revoked":
+                rec["status"] = "revoked"
+                rec["detail"] = ("token rejected by the ChatGPT backend (superseded / server-revoked "
+                                 "despite a future expiry — needs a re-login)")
+            else:                                    # 'live' or 'unreachable' — a transient probe never cries wolf
+                rec["status"] = "healthy"
+                rec["detail"] = "" if probe == "live" else "backend probe unreachable (expiry OK; unverified)"
         except ProviderTransientError as e:          # network blip / 5xx — NOT offline; retry next tick, no alert
             rec["status"], rec["detail"] = "error", str(e)
         except ProviderError as e:                   # a genuine rejection (revoked) or an unseeded account
