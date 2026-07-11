@@ -107,6 +107,20 @@ def test_rm_dead_pid_running_ghost_not_refused(fs, monkeypatch):
     assert ("close-surface", "--surface", "S5B") in calls         # surface actually closed
 
 
+def test_rm_codex_done_turn_not_refused(fs, monkeypatch):
+    # gap 3: a FINISHED codex agent sticks at lifecycle='running' with a LIVE pid (codex fires no
+    # SessionEnd), but its rollout ends in task_complete -- done, not mid-turn -- so a plain `rm` must
+    # proceed. turn_ended is the codex-aware close signal; here it proves the turn is over.
+    _seed(fs, "w5c", "S5C")
+    calls = []
+    _stub_cmux(monkeypatch, fs, lifecycle="running", calls=calls, has_pid=True)   # live pid, 'running' string
+    monkeypatch.setattr("cmux_fleet.features.turn_ended", lambda p: True)          # rollout ended in task_complete
+    fleet.cmd_rm(["w5c"])                                          # no --force needed
+    assert fs.live_get("w5c") is None                             # removed
+    assert fs.archive_get("w5c") is not None                      # archived for recovery
+    assert ("close-surface", "--surface", "S5C") in calls         # surface actually closed
+
+
 def test_rm_force_closes_running_surface(fs, monkeypatch):
     _seed(fs, "w6", "S6")
     calls = []

@@ -366,15 +366,44 @@ def pending_interactive_gate(transcript_path):
                for c in (msg.get("content") or []))
 
 
-def turn_ended(transcript_path):
-    """True iff the transcript's LAST assistant turn CLOSED (a terminal stop_reason with nothing after it) —
-    a REAL-TIME turn-completion signal. cmux's agentLifecycle keeps reading 'running' for ~60s after a turn
-    ends (its idle timer lags), so a just-finished agent shows 'working' far too long; the transcript flips
-    the instant the turn closes. FAILS CLOSED to False (absent/unreadable/codex/mid-turn/gate) so an
-    unprovable case keeps whatever cmux's lifecycle says — this only ever CLEARS a lagged 'working'."""
-    parsed = _last_assistant_turn(transcript_path)
-    if not parsed:
+def _codex_turn_ended(path):
+    """True iff a CODEX rollout's latest turn CLOSED. Codex fires no SessionEnd, so a finished codex agent
+    otherwise reads 'working' forever (and a plain `fleet rm` refuses it); its rollout's `task_complete`
+    event is the done signal. A turn is task_started -> ... -> task_complete, so the turn is ended iff the
+    LAST turn-boundary event is task_complete with no task_started/user_message after it. FAILS CLOSED to
+    False (absent/unreadable/no boundary/mid-turn), matching turn_ended's only-ever-CLEAR contract."""
+    if not path or not os.path.exists(path):
         return False
+    ended = None
+    try:
+        for line in open(path):
+            try:
+                e = json.loads(line)
+            except Exception:
+                continue
+            if e.get("type") != "event_msg":
+                continue
+            pt = (e.get("payload") or {}).get("type")
+            if pt == "task_complete":
+                ended = True
+            elif pt in ("task_started", "user_message"):       # a new turn opened after the last complete
+                ended = False
+    except Exception:
+        return False
+    return ended is True
+
+
+def turn_ended(transcript_path):
+    """True iff the transcript's LAST turn CLOSED — a REAL-TIME turn-completion signal. cmux's agentLifecycle
+    keeps reading 'running' for a while after a turn ends (its idle timer lags, and codex can stick there
+    since it fires no SessionEnd), so a just-finished agent shows 'working' far too long; the transcript
+    flips the instant the turn closes. Two dialects: claude = a terminal stop_reason with nothing after it;
+    codex = a trailing task_complete (see _codex_turn_ended). FAILS CLOSED to False (absent/unreadable/
+    mid-turn/gate) so an unprovable case keeps whatever cmux's lifecycle says — this only ever CLEARS a
+    lagged 'working'."""
+    parsed = _last_assistant_turn(transcript_path)
+    if not parsed:                                             # no claude assistant rows -> try the codex dialect
+        return _codex_turn_ended(transcript_path)
     msg, has_user_after = parsed
     if has_user_after:                                         # a tool_result / new turn follows -> not ended
         return False

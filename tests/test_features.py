@@ -154,7 +154,23 @@ def test_turn_ended_reads_the_transcript_close(tmp_path):
     answered = w([{"type": "assistant", "message": {"stop_reason": "end_turn", "content": []}},
                   {"type": "user", "message": {}}])               # a new user turn follows
     assert ff.turn_ended(answered) is False
-    assert ff.turn_ended("") is False                             # codex / no transcript -> fail closed
+    assert ff.turn_ended("") is False                             # no transcript -> fail closed
+
+
+def test_turn_ended_codex_dialect(tmp_path):
+    # codex fires no SessionEnd and has no claude 'assistant' rows; its trailing task_complete IS the close.
+    ff = _ff()
+    def w(rows):
+        p = tmp_path / "rollout.jsonl"; p.write_text("\n".join(json.dumps(x) for x in rows)); return str(p)
+    em = lambda pt: {"type": "event_msg", "payload": {"type": pt}}
+    ended = w([em("task_started"), {"type": "turn_context", "payload": {"model": "gpt-5.5"}},
+               em("agent_message"), em("task_complete")])
+    assert ff.turn_ended(ended) is True                           # trailing task_complete -> turn CLOSED
+    working = w([em("task_complete"), em("task_started")])        # a NEW turn opened after the last complete
+    assert ff.turn_ended(working) is False                        # mid-turn -> not ended (fails closed)
+    no_boundary = w([{"type": "turn_context", "payload": {"model": "gpt-5.5"}}])
+    assert ff.turn_ended(no_boundary) is False                    # no task_complete seen -> fail closed
+    assert ff._codex_turn_ended(str(tmp_path / "nope.jsonl")) is False
 
 
 # ── context-token reading ─────────────────────────────────────────────────────────────────────

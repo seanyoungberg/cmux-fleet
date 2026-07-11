@@ -2561,6 +2561,7 @@ def cmd_rm(argv):
     first if this agent's workspace was the anchor."""
     from . import state as fs; import signal
     from . import resolve as rs
+    from . import features as ff                              # turn_ended: the codex-aware turn-close signal
     kill = "--kill" in argv
     detach = "--detach" in argv
     force = "--force" in argv
@@ -2594,7 +2595,12 @@ def cmd_rm(argv):
     # work to interrupt -- so it must NOT block a plain `rm` (Berg's gap: a dead ghost forced --force). The
     # string==running specificity is kept (idle/needsInput/unknown already proceed as safe per _quiet_gate's
     # vocabulary); surface_has_live_pid just strips the dead-ghost false-positive.
-    if closing and not force and rs.lifecycle(surf) == "running" and rs.has_live_pid(surf):
+    # ...and whose transcript does NOT prove the turn already CLOSED. A finished codex agent sticks at
+    # lifecycle=running forever (it fires no SessionEnd) though its rollout ends in task_complete — that is
+    # done, not mid-turn, so a plain `rm` must work (the gap). turn_ended fails closed, so this only NARROWS
+    # the refusal: a genuinely mid-turn agent (no terminal close / a task_started after) still refuses.
+    if (closing and not force and rs.lifecycle(surf) == "running" and rs.has_live_pid(surf)
+            and not ff.turn_ended((rs.freshest(surf) or {}).get("transcriptPath", ""))):
         sys.exit(f"[fleet] rm: '{label}' is mid-turn (lifecycle=running on surface {surf[:8]}). "
                  f"Use --force to close it anyway, or --detach to drop the registry row and leave "
                  f"the surface running.")
