@@ -44,6 +44,10 @@ def providers_toml(tmp_path, monkeypatch):
         type = "subscription"
         auth = "file:{tokfile}"
         track = "windows"
+        [providers.claude.acct2]
+        type = "subscription"
+        auth = "securestorage:~/.claude-acct2"
+        track = "windows"
         [providers.claude.vtx]
         type = "vertex"
         auth = "env-file:{tmp_path / 'vtx.env'}"
@@ -71,7 +75,7 @@ def test_providers_doc_parse(providers_toml):
     doc = pv._providers_doc()
     assert set(doc) == {"claude", "codex"}
     assert doc["claude"]["default"] == "berg-max"
-    assert set(doc["claude"]["providers"]) == {"berg-max", "throwaway", "vtx"}
+    assert set(doc["claude"]["providers"]) == {"berg-max", "throwaway", "acct2", "vtx"}
     assert doc["claude"]["providers"]["throwaway"]["type"] == "subscription"
     assert pv.default_provider("codex") == "berg-team"
 
@@ -101,6 +105,48 @@ def test_resolve_missing_token_file_errors(providers_toml, monkeypatch):
     os.remove(providers_toml["token"])
     with pytest.raises(pv.ProviderError):
         pv.resolve_launch("claude", "throwaway")
+
+
+# --- securestorage: a second claude account via keychain namespacing, NO config-dir swap ----------
+# CLAUDE_SECURESTORAGE_CONFIG_DIR namespaces ONLY the keychain credential (service
+# `Claude Code-credentials-<sha256(dir)[:8]>`); CLAUDE_CONFIG_DIR — session logs, hooks, settings — is
+# untouched. Proven live 2026-07-12: bogus dir 401s, real dir runs + polls, logs stay in ~/.claude.
+def test_securestorage_service_namespace_rule():
+    # the EXACT sha256[:8] claude uses, pinned on ABSOLUTE paths (machine-independent literals, hand-verified
+    # against the live keychain 2026-07-12) so a hashing regression — trailing slash, wrong slice, wrong algo —
+    # fails loudly instead of silently reading an empty namespace and 401-ing every agent.
+    assert pv._securestorage_service("/Users/seanyoungberg/.claude-berglabs") == "Claude Code-credentials-00753994"
+    assert pv._securestorage_service("/Users/seanyoungberg/.claude") == "Claude Code-credentials-edf52d82"
+    # ~ is expanded before hashing (a literal "~/..." would hash differently and read the wrong namespace)
+    assert pv._securestorage_service("~/.claude-x") == \
+        pv._securestorage_service(os.path.expanduser("~/.claude-x"))
+    assert pv._securestorage_service("~/.claude-x") != \
+        "Claude Code-credentials-" + pv.hashlib.sha256(b"~/.claude-x").hexdigest()[:8]
+
+
+def test_resolve_securestorage_injects_namespace_var_only(providers_toml):
+    r = pv.resolve_launch("claude", "acct2")
+    assert r["label"] == "claude:acct2"
+    # the account var is injected, config-dir is NOT (that is the whole point: logs/hooks stay default)
+    assert r["env"]["CLAUDE_SECURESTORAGE_CONFIG_DIR"] == os.path.expanduser("~/.claude-acct2")
+    assert "CLAUDE_CONFIG_DIR" not in r["env"]
+    # no secret materialized anywhere — the dir is a keychain key, not a token
+    assert r["raw_env"] == {} and not r["provisional"]
+
+
+def test_read_oauth_token_securestorage_reads_the_namespaced_service(providers_toml, monkeypatch):
+    # the poller must query the sha256 service, not the literal path — otherwise it reads the wrong account.
+    seen = {}
+    class _P:
+        stdout = '{"claudeAiOauth":{"accessToken":"sk-ant-oat01-ACCT2"}}'
+    def fake_run(argv, **kw):
+        seen["service"] = argv[argv.index("-s") + 1]
+        return _P()
+    monkeypatch.setattr(pv.subprocess, "run", fake_run)
+    tok = pv._read_oauth_token("securestorage:~/.claude-acct2")
+    assert tok == "sk-ant-oat01-ACCT2"
+    assert seen["service"] == "Claude Code-credentials-" + \
+        pv.hashlib.sha256(os.path.expanduser("~/.claude-acct2").encode()).hexdigest()[:8]
 
 
 # --- per-seat codex homes (the model, settled by the 2026-07-11 coexistence test) -----------------

@@ -33,8 +33,20 @@
 #   file:<path>         a long-lived token minted by `claude setup-token`; relative → under STATE
 #                       (~/.local/state/cmux-fleet/, e.g. providers/<name>.token, 0600). Injected at
 #                       launch as CLAUDE_CODE_OAUTH_TOKEN via a spawn-time `$(cat <path>)` so the secret
-#                       NEVER lands in the rendered/printed launch command. (Prototype stopgap. ROADMAP:
-#                       fold these secrets into Berg's SOPS env-var mechanism — document, do not build.)
+#                       NEVER lands in the rendered/printed launch command. SUPERSEDED by securestorage:
+#                       for account SELECTION — an env token is IGNORED whenever a keychain login exists
+#                       (a bogus token authenticates fine), so file: cannot pick a second account. Kept
+#                       for headless/CI hosts with no keychain. (ROADMAP: fold into Berg's SOPS mechanism.)
+#   securestorage:<dir> a SECOND claude subscription with NO config-dir swap. CLAUDE_SECURESTORAGE_CONFIG_DIR
+#                       namespaces ONLY the macOS keychain credential (service
+#                       `Claude Code-credentials-<sha256(dir)[:8]>`), leaving CLAUDE_CONFIG_DIR — and so
+#                       session logs, hooks, settings, plugins — in the tool's default ~/.claude. Nothing is
+#                       injected as a secret; the launch line carries only the dir. Provision with
+#                       `fleet claude-login <name>` (a full login, which mints user:profile so usage polls
+#                       AND identity is verifiable — setup-token mints neither). The dir is a keychain KEY,
+#                       not a home: it need not exist on disk. Proven 2026-07-12: bogus dir 401s (namespace
+#                       is load-bearing), real dir runs + polls, logs never move, login does NOT supersede
+#                       the default account.
 #   codex-home:<path>   CODEX_HOME for a codex account. NOTE: codex account SELECTION is UNSETTLED (a live
 #                       test is deciding CODEX_HOME-per-profile vs an env-token path). This resolver is a
 #                       clean STUB: it emits CODEX_HOME but marks the result PROVISIONAL. Swap the body in
@@ -42,6 +54,7 @@
 #   env-file:<path>     source KEY=VALUE lines (vertex: CLAUDE_CODE_USE_VERTEX, project, region).
 #   env:<VAR>           an api key already present in the ambient/role env (api type; pass-through).
 import glob
+import hashlib
 import json
 import os
 import re
@@ -139,6 +152,18 @@ def _token_path(arg):
     return p if os.path.isabs(p) else os.path.join(STATE, p)
 
 
+def _securestorage_service(config_dir):
+    """The macOS keychain service name claude uses for a given CLAUDE_SECURESTORAGE_CONFIG_DIR. Claude
+    namespaces the OAuth blob as `Claude Code-credentials-<sha256(dir)[:8]>`, dir os.path.expanduser'd with
+    NO trailing slash — verified against every config dir on the machine (2026-07-12).
+
+    Wrinkle worth knowing: the DEFAULT ~/.claude also keeps a live UNSUFFIXED `Claude Code-credentials` entry,
+    and its suffixed twin can be stale. So securestorage: is for NON-default accounts; the default account
+    should stay on `keychain:Claude Code-credentials` (the unsuffixed entry it uses natively)."""
+    d = os.path.expanduser(config_dir)
+    return "Claude Code-credentials-" + hashlib.sha256(d.encode()).hexdigest()[:8]
+
+
 # --- launch-time auth resolution (per tool/type) ------------------------------------------------
 def resolve_launch(tool, name):
     """Resolve the env a launch needs to run `tool` under provider `name` (default if name==""). Returns:
@@ -185,6 +210,14 @@ def resolve_launch(tool, name):
         # spawn-time read: the secret never enters the rendered/printed command, only the path does.
         base["raw_env"]["CLAUDE_CODE_OAUTH_TOKEN"] = f'"$(cat {shlex.quote(path)})"'
         base["note"] = f"claude token injected from {path} (spawn-time read; not printed)"
+        return base
+    if method == "securestorage":
+        # Second account WITHOUT a config-dir swap: this var namespaces ONLY the keychain credential, so
+        # CLAUDE_CONFIG_DIR (session logs, hooks, settings, plugins) stays in the default ~/.claude. No
+        # secret is injected — only the dir, which is a keychain KEY, not a home (need not exist on disk).
+        d = os.path.expanduser(arg)
+        base["env"]["CLAUDE_SECURESTORAGE_CONFIG_DIR"] = d
+        base["note"] = f"claude securestorage namespace {d} (keychain-only; config dir unchanged)"
         return base
     raise ProviderError(f"provider '{label}': unsupported auth method '{method}' for a claude subscription")
 
@@ -914,6 +947,9 @@ def _read_oauth_token(auth):
             return open(_token_path(arg)).read().strip() or None
         except OSError:
             return None
+    if method == "securestorage":
+        # the account's OAuth blob lives at the sha256-namespaced keychain service; poll it like any keychain
+        return _read_oauth_token("keychain:" + _securestorage_service(arg))
     return None
 
 
