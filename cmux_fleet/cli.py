@@ -1290,6 +1290,23 @@ def _deliver_launch(ws, surf, send_cmd):
         cmuxq("send", "--workspace", ws, "--surface", surf, send_cmd + "\n")
 
 
+def _adopt_misfiled_session(surf, label):
+    """The session of the agent we just seated on `surf`, when cmux filed it under a DIFFERENT surfaceId.
+    Returns '' when nothing proves a match. Prints the adoption note. Shared by every seating verb.
+
+    WITHOUT THIS, A MISFILE IS AN ABORT AFTER THE AGENT IS ALREADY RUNNING. That is not theory: `revive`
+    polled only its own surface, so when cmux misfiled the session it saw nothing, timed out, and exited —
+    leaving a LIVE agent on a surface nobody owned and its label stranded in the ARCHIVE. `fleet ls` then
+    rendered the archived row over a working agent and `vitals` dropped it entirely. cmux-custom spent an
+    evening in that state, doing real work, while the fleet insisted it was parked."""
+    sid = _session_on_launched_surface(surf, label)
+    if sid:
+        print(f"[fleet] note: cmux filed this session under a different surfaceId; adopted session "
+              f"{sid[:8]} for the SEATED surface {surf} (proven via the agent's own "
+              f"CMUX_SURFACE_ID/AGENT_LABEL env). The registry keeps the seated surface.")
+    return sid
+
+
 def _session_on_launched_surface(surf, label):
     """The session id of the agent WE JUST LAUNCHED onto `surf`, recovered from the hook store when cmux
     filed its record under a DIFFERENT surfaceId. Returns '' when nothing PROVES a match.
@@ -1375,18 +1392,14 @@ def _bind_launched_session(ws, surf, send_cmd, tool, label, abs_cwd, caller, laz
                      f"settles. Inspect: cmux capture-pane --surface {surf}")
         sid = poll_session(surf)
     if not sid and not lazy:
-        sid = _session_on_launched_surface(surf, label)
-        if sid:
-            print(f"[fleet] note: cmux filed this session under a different surfaceId; adopted session "
-                  f"{sid[:8]} for the LAUNCHED surface {surf} (proven via the agent's own "
-                  f"CMUX_SURFACE_ID/AGENT_LABEL env). The registry keeps the launched surface.")
+        sid = _adopt_misfiled_session(surf, label)
     return ws, surf, sid
 
 
 _OBSERVABLE_TIMEOUT_S = 8         # cmux files the session, then stamps; both are prompt when they happen at all
 
 
-def _observable_within(surf, cursor, timeout=_OBSERVABLE_TIMEOUT_S):
+def _observable_within(surf, cursor, timeout=None):
     """POSITIVE proof that cmux can see an agent on `surf`, within a bounded window.
 
     TWO INDEPENDENT READS, either of which is proof: cmux's hook STORE files a live agent here
@@ -1396,7 +1409,7 @@ def _observable_within(surf, cursor, timeout=_OBSERVABLE_TIMEOUT_S):
     repair. Requiring proof rather than the absence of a complaint is the point — a launch that cannot show
     its agent is visible has not succeeded, whatever the pane says."""
     from . import resolve as rs
-    end = time.time() + timeout
+    end = time.time() + (_OBSERVABLE_TIMEOUT_S if timeout is None else timeout)   # read at CALL time
     while True:
         if rs.present(surf) or rs.stamps_since(surf, cursor):
             return True
@@ -1405,25 +1418,35 @@ def _observable_within(surf, cursor, timeout=_OBSERVABLE_TIMEOUT_S):
         time.sleep(0.5)
 
 
-def _reseat_if_dark(ws, surf, sid, spec, parent, direction, send_cmd, caller, lazy, cursor, attempts=1):
+def _reseat_if_dark(ws, surf, sid, spec, parent, direction, cursor, redeliver, attempts=1):
     """Hand back a surface cmux is ACTUALLY FILING. Returns (ws, surf, sid).
 
-    THE DARK SURFACE. cmux sometimes files a freshly-launched agent's session under a surfaceId that is not
-    the one it put the agent on. The fleet already survives the registry half of that (it adopts the session
-    against the live process's OWN env and keeps the launched surface — invariant I5). But cmux keeps
-    stamping the PHANTOM: the agent runs, serves read-screen, takes inbox messages and completes turns,
-    while `vitals`, `ls` and the sidebar — all keyed by surface — look straight through it. Permanently.
-    Observed on 2 of 4 launches; the specimens stamped 94 and 66 status updates onto surfaces the fleet
-    (and the agents' own env) had never heard of, and 0 onto their own.
+    THE ONE dark-surface guard, for EVERY verb that seats an agent onto a fresh surface. `redeliver(ws,
+    surf) -> sid` is the only per-verb part: launch delivers a launch and binds; revive re-delivers and
+    resumes through the summary menu. Everything else — the proof, the re-seat, the bound retry, the
+    non-destructive give-up — is the same code, because two implementations of this would be precisely the
+    bug we spent last night killing.
+
+    THE DARK SURFACE. cmux sometimes files a freshly-seated agent's session under a surfaceId that is not
+    the one it put the agent on. The fleet survives the registry half of that (it adopts the session against
+    the live process's OWN env and keeps the seated surface — invariant I5). But cmux keeps stamping the
+    PHANTOM: the agent runs, serves read-screen, takes inbox messages and completes turns, while `vitals`,
+    `ls` and the sidebar — all keyed by surface — look straight through it. Permanently. The specimens
+    stamped 94, 66 and 0 status updates onto surfaces the fleet (and the agents' own env) had never heard
+    of, and 0 onto their own.
+
+    IT BIT `revive` IN PRODUCTION, which is the sharpest reason this is shared code now: revive is the
+    PRESCRIBED CURE for a dark surface, and it had no dark check of its own — so the cure reproduced the
+    disease, landing cmux-custom dark while it worked on a real job.
 
     A dark agent reads exactly like a dead one to every store-derived check, and the reflex cure for death
     is to relaunch — which puts a SECOND agent on the same worktree and the same branch as the first, which
     is still alive and working. That is the trap this exists to keep anyone from ever walking into.
 
-    So repair it AT t=0, where the repair is free: the agent has done no work, holds no context, and owns
-    nothing worth saving. Close the surface, take the process down with it, and seat a fresh one. (After
-    t=0 the remedy is `archive` + `revive` onto a new surface — never `recycle`, which re-execs onto the
-    same dark surface and fixes nothing.)
+    So repair it AT t=0, where the repair is free: the agent has just been seated, holds no new context, and
+    owns nothing worth saving. Close the surface, take the process down with it, and seat a fresh one. (Once
+    it is WORKING the remedy is `archive` + `revive` onto a new surface — never `recycle`, which re-execs
+    onto the same dark surface and fixes nothing.)
 
     Bounded, and NON-DESTRUCTIVE when it gives up: if a re-seat is still dark we keep the agent, register
     it, and say plainly that it is invisible and how to repair it. An alarm that cannot fix a thing does
@@ -1455,8 +1478,7 @@ def _reseat_if_dark(ws, surf, sid, spec, parent, direction, send_cmd, caller, la
             return ws, surf, sid
         ws, surf = ws2, surf2
         print(f"[fleet]   re-seated onto surface {surf}")
-        ws, surf, sid = _bind_launched_session(ws, surf, send_cmd, spec["tool"], spec["label"],
-                                               spec["abs_cwd"], caller, lazy, timeout=8 if lazy else 60)
+        sid = redeliver(ws, surf)                        # the ONE per-verb part: launch binds, revive resumes
     return ws, surf, sid
 
 
@@ -1718,8 +1740,11 @@ def cmd_launch(argv):
     # repair it here — at t=0 the agent holds nothing, so a re-seat is free. Only when a session actually
     # bound: a lazy tool has none yet, and there is nothing for cmux to have misfiled.
     if sid:
-        ws, surf, sid = _reseat_if_dark(ws, surf, sid, spec, a.parent, a.direction, send_cmd, caller, lazy,
-                                        stamp_cursor)
+        ws, surf, sid = _reseat_if_dark(
+            ws, surf, sid, spec, a.parent, a.direction, stamp_cursor,
+            redeliver=lambda w, s: _bind_launched_session(w, s, send_cmd, spec["tool"], spec["label"],
+                                                          spec["abs_cwd"], caller, lazy,
+                                                          timeout=8 if lazy else 60)[2])
     register(surf, spec, a.parent, sid or "", ws)
     log_launch(spec, a.parent, surf, sid or "", send_cmd)
     # post-launch placement reconciliation: confirm the surface actually came up IN the worktree (a
@@ -3494,30 +3519,45 @@ def cmd_revive(argv):
         print("[fleet] dry-run"); return 0
     if not a.parent:
         sys.exit("[fleet] ABORT: no --parent and no $CMUX_SURFACE_ID")
+    from . import resolve as rs
+    _pc = _count_plugin_dirs(send_cmd)
+
+    def _seat(w, s):
+        """Deliver + resume onto surface `s`, returning the bound sid ('' if it never bound). The per-verb
+        half of the shared dark-surface guard — revive's delivery is a resume through the summary menu."""
+        _deliver_launch(w, s, send_cmd)          # exec by default (step 2); paste under the soak flag
+        # full-resume: dismiss the summary menu, and GATE the bind on it clearing. The menu blocks the
+        # session bind, so binding behind an undismissed menu would register nothing and leave the agent
+        # live-but-UNREGISTERED (invisible to `fleet ls`, still shown archived).
+        if not _resume_and_gate(s, send_cmd, tool, sess, lambda m: print(f"[fleet] {m}")):
+            sys.exit(f"[fleet] ABORT: resume-summary menu never resolved for {a.label} (surface still "
+                     f"booting or wedged at the menu); NOT registering. Re-run `fleet revive {a.label}`.")
+        # scale the post-menu bind poll by loadout (recovery-safety #9): after the menu clears, a heavy boot
+        # (5 plugins + memsearch onnx embedding load — the ~100s+ tail that made revive time out) can run
+        # past a flat 60s. Same plugin-count heuristic the menu ceiling uses, with a higher bind ceiling.
+        bound = poll_session(s, timeout=_resume_menu_timeout(_pc, base=60, per_plugin=8, ceiling=180))
+        # ...and when the poll comes up empty, ADOPT rather than abort. THE PRODUCTION BUG: revive polled
+        # only its own surface, so a misfiled session read as "never bound" — and revive exited AFTER the
+        # agent was already running, stranding a LIVE agent on an unowned surface with its label still in
+        # the ARCHIVE. `ls` then rendered the archived row over a working agent and `vitals` dropped it.
+        return bound or _adopt_misfiled_session(s, a.label)
+
+    stamp_cursor = rs.stamp_cursor()             # BEFORE the surface exists: only OUR stamps may count
     ws, surf = create_surface(spec, a.parent, "down")
     if not ws or not surf:
         sys.exit(1)
-    _deliver_launch(ws, surf, send_cmd)          # exec by default (step 2); paste under the soak flag
-    # full-resume: dismiss the summary menu, and GATE the bind on it clearing. The menu blocks the
-    # session bind, so binding behind an undismissed menu would register nothing and leave the agent
-    # live-but-UNREGISTERED (invisible to `fleet ls`, still shown archived). On timeout we abort BEFORE
-    # archive_del so the label stays parked and re-runnable rather than half-revived.
-    if not _resume_and_gate(surf, send_cmd, tool, sess, lambda m: print(f"[fleet] {m}")):
-        sys.exit(f"[fleet] ABORT: resume-summary menu never resolved for {a.label} (surface still "
-                 f"booting or wedged at the menu); NOT registering. Re-run `fleet revive {a.label}`.")
-    # scale the post-menu bind poll by loadout (recovery-safety #9): after the menu clears, a heavy boot
-    # (5 plugins + memsearch onnx embedding load — the ~100s+ tail that made revive time out) can run past
-    # a flat 60s. Same plugin-count heuristic the menu ceiling uses, with a higher bind ceiling.
-    _pc = _count_plugin_dirs(send_cmd)
-    sid = poll_session(surf, timeout=_resume_menu_timeout(_pc, base=60, per_plugin=8, ceiling=180))
+    sid = _seat(ws, surf)
     if not sid:
-        # the menu cleared but the session hasn't bound within the (loadout-scaled) ceiling. The surface is
-        # LIVE and still booting — NEVER torn down — so it is adoptable the instant it binds. Signpost the
-        # register-after escape hatch (the label stays PARKED: archive_del hasn't run, so it's re-runnable).
+        # nothing bound and nothing adoptable: the agent may still be booting. The surface is LIVE and is
+        # NEVER torn down, so it is adoptable the instant it binds. The label stays PARKED (archive_del has
+        # not run), so the command is re-runnable.
         sys.exit(f"[fleet] timed out waiting for session binding on surface {surf} (plugin_count={_pc}); the "
                  f"agent is likely still booting. It is NOT torn down and '{a.label}' stays parked. Adopt it "
                  f"once it binds:\n[fleet]     fleet register {a.label} --surface {surf}\n"
                  f"[fleet]   (inspect: cmux capture-pane --surface {surf})")
+    # THE SAME PROOF `launch` DEMANDS. revive is the prescribed CURE for a dark surface — so a revive that
+    # cannot show its agent is observable has not succeeded, it has merely reproduced the disease.
+    ws, surf, sid = _reseat_if_dark(ws, surf, sid, spec, a.parent, "down", stamp_cursor, redeliver=_seat)
     sid = _resume_binding(surf).get("checkpoint_id", "") or sid   # ground-truth session over a bridge poll id
     register(surf, spec, a.parent, sid, ws)
     fs.archive_del(a.label)
@@ -3682,6 +3722,7 @@ def cmd_register(argv):
     Promotes a parked (archived) label to live; idempotent on the SAME surface; refuses to move a label
     that is already live under a DIFFERENT surface."""
     from . import state as fs
+    from . import resolve as rs
     ap = argparse.ArgumentParser(prog="fleet register")
     ap.add_argument("label")
     ap.add_argument("--surface", default="", help="the agent's live surface UUID (primary input); if "
@@ -3771,6 +3812,17 @@ def cmd_register(argv):
           f"ws={ws or '-'}, parent={fs.label_for_surface(a.parent) or a.parent or '-'}, source={source})"
           + ("; promoted from archive" if promoted else "")
           + ("; updated in place" if live and not arch else ""))
+    # `register` adopts a surface that ALREADY EXISTS, so it can never CREATE a dark one — but it will
+    # happily register one and print DONE, which is how a live agent becomes a row nobody can see. It must
+    # NOT re-seat: this is the manual escape hatch, the agent is already working, and a re-seat here would
+    # destroy the very context the operator ran `register` to rescue. So: WARN, and name the remedy.
+    # (A heuristic may PREVENT a destruction; it may never AUTHORIZE one — and this alarm authorizes nothing.)
+    if rs.dark(surf, tool):
+        print(f"\n[fleet] WARNING: {label} is alive on {surf[:8]} but cmux is NOT filing it there — the row "
+              f"is registered and drivable, and it will NOT appear in `vitals`/`ls`/the sidebar.")
+        print(f"[fleet]   Nothing is wrong with the agent; it is invisible, not broken. To restore it: "
+              f"`fleet archive {label}` then `fleet revive {label}` (NOT `recycle` — that re-execs onto "
+              f"this same dark surface).")
     return 0
 
 

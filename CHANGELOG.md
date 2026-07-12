@@ -8,6 +8,29 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Fixed
 
+- **`fleet revive` could land an agent on a dark surface — the cure reproduced the disease.** `revive` is
+  the *prescribed remedy* for a dark surface, and it had no dark check of its own. It bit production an hour
+  after the launch fix shipped: `cmux-custom` was archived and revived, the revive landed it dark, and it
+  spent the evening doing real work while the fleet insisted it was parked.
+  - **The stranded label was the same event, not a second bug.** `revive` polled only its own surface
+    (`poll_session`) with **no adoption fallback**, so a misfiled session read as "never bound" — and revive
+    `sys.exit`ed *after the agent was already running*. A live agent on a surface nobody owned, its label
+    still in the ARCHIVE, `ls` rendering the archived row over a working agent, and `vitals` dropping it
+    entirely. The launch path had had the adoption fallback all along. `revive` now adopts (proven from the
+    live process's own env) instead of aborting, and registers.
+  - **One guard, every seating verb.** The dark-surface proof + re-seat is factored out of `launch`:
+    `_reseat_if_dark(..., redeliver)` — the only per-verb part is the delivery (launch binds; revive resumes
+    through the summary menu). Two implementations of this would have been the exact bug the previous night
+    was spent killing.
+  - **A structural test now pins the rule, not the call sites:** *any function that seats an agent onto a
+    fresh surface must prove that surface is observable.* Unwiring the guard from `launch` or `revive` — a
+    mutation no unit test caught — now fails, and so will a verb nobody has written yet.
+  - `register` audited: it adopts an **existing** surface, so it cannot *create* a dark one, but it would
+    register one and print DONE. It now WARNS and names the remedy. It must never re-seat — the agent is
+    already working, and a re-seat there would destroy the context the operator ran `register` to rescue.
+    `recycle` is sound by construction (it re-execs on the *same* surface, and its rebind gate already
+    requires `present`, so a misfile surfaces as a loud rebind failure, never a silent dark row).
+
 - **ONE liveness authority, and it is `resolve`.** Two branches independently built a pid-authoritative
   liveness guard — one in `resolve.py`, one in `cli.py` — and they did not textually conflict, which is
   *worse* than if they had: two authorities that never collide are two authorities that drift, silently.
