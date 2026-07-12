@@ -473,6 +473,139 @@ def _open_gate_uuids():
     return out
 
 
+# ─── blocked: the DECISION column (invariant: never guess) ────────────────────────────────────────
+# `blocked` answers the one question a conductor actually has — IS THIS AGENT WAITING ON ME? — and it
+# is emphatically NOT cmux's `needsInput`. cmux stamps needsInput ~60s after ANY turn ends, so it reads
+# identically on a real gate and on an ordinary done-idle agent (live-confirmed 2026-07-12: berg-sandbox
+# sat at `needsInput` with a half-typed draft in its input box, gated on nobody). Every conductor has had
+# to learn that trivia individually; this column exists so nobody has to.
+#
+# Both errors are expensive, and they are NOT the same kind of expensive:
+#   false YES -> the conductor sends text into a BUSY pane. A session send mid-turn WEDGES the agent:
+#                the cure damages a healthy agent.
+#   false NO  -> the agent sits forever waiting on a human who was never told. (Today's behavior.)
+# Therefore NEITHER answer is guessed. `yes` and `no` each require positive evidence; when the evidence
+# is missing or self-contradictory the column SAYS SO (`?`) instead of picking a side. Three honest
+# states beat two confident ones.
+#
+# The tri-state is carried as True / False / None (never the strings) precisely because a naive consumer
+# writes `if row["blocked"]: send_answer(...)` — with None, unknown collapses to the SAFE side (no send,
+# no wedge). A truthy "unknown" string would collapse to the expensive one.
+#
+# EVIDENCE (each proof is independent; provenance for every marker is a live capture, not a guess):
+#   YES  feed       — cmux's Feed carries an unreplied gate row for this session. Proven end-to-end on a
+#                     live gate (2026-07-12): raising an AskUserQuestion posted `kind: "question"` with no
+#                     resolved_at, and ANSWERING it set `resolved_at` + `status: "expired"`, so
+#                     _open_gate_uuids() correctly stops reporting it. The Feed both fires AND retires.
+#   YES  transcript — the last assistant turn ends on an unanswered AskUserQuestion/ExitPlanMode tool_use
+#                     (pending_interactive_gate). Independent of cmux entirely, so it still holds for a
+#                     DETACHED agent, whose gate never reaches the Feed at all.
+#   YES  pane       — a selection dialog / permission prompt is on screen (pane_gate).
+#   NO   transcript — the turn provably CLOSED (turn_ended): a terminal stop_reason with nothing after it.
+#                     A gated agent's last message ALWAYS ends on a tool_use (the gate tool, or the tool
+#                     whose permission is pending), never on a terminal stop, so a closed turn is positive
+#                     proof that no gate can be open. This is also what retires a STALE feed row (a picker
+#                     answered by a key-send never marks its row terminal), which is why it outranks it.
+#   NO   pane       — the normal prompt UI owns the bottom of the screen and no dialog is over it.
+_PANE_TAIL_LINES = 12          # the live UI zone: a dialog and the prompt box both render at the BOTTOM
+
+# Verbatim from real captures (tests/fixtures/pane-claude-*.txt, taken off the live fleet 2026-07-12 —
+# including one taken from OUTSIDE this very agent while it sat on a genuine AskUserQuestion).
+_PANE_GATE_MARKERS = (
+    "enter to select",                      # the selection-dialog footer: AskUserQuestion / ExitPlanMode
+    "esc to cancel",                        #   (both lines observed on the real gate capture)
+    "do you want to proceed?",              # the permission prompt
+    "would you like to proceed?",           # ExitPlanMode
+    "no, and tell claude what to do differently",
+    "resume from summary",                  # the --resume picker (see adapter.dismiss_resume_menu)
+)
+# The normal prompt chrome. Present on idle AND working panes alike — it means "the agent's ordinary UI
+# is up", NOT "the agent is free": a dialog REPLACES this chrome (confirmed on all four captures), so its
+# presence is proof that no dialog is up. `blocked` asks gate/no-gate only; working-vs-ready is `state`.
+_PANE_PROMPT_MARKERS = ("context remaining", "bypass permissions", "shift+tab to cycle")
+_PANE_CARET_OPTION_RE = re.compile(r"^\s*[❯>]\s*\d+\.\s+\S")     # the SELECTED option of a dialog
+_PANE_OPTION_RE = re.compile(r"^\s*[❯>]?\s*\d+\.\s+\S")          # any numbered option
+
+
+def pane_gate(pane):
+    """Tri-state read of ONE captured pane. True = a dialog the agent cannot get past without a human is
+    on screen; False = the agent's normal prompt UI is up with no dialog over it; None = unrecognized.
+
+    Reads only the bottom _PANE_TAIL_LINES: on a live pane the dialog (or the prompt box + status footer)
+    always owns the bottom of the screen, while the agent's own OUTPUT scrolls above it. That anchoring is
+    what stops an agent that merely PRINTED the words "Enter to select" (this session did, writing this
+    very matcher) from reading as gated.
+
+    Contradictory evidence — gate markers AND the prompt chrome in the same tail — returns None, not a
+    verdict. That is the whole discipline of this column: when the pane does not clearly say, we do not
+    decide. Normalizes NBSP, which cmux renders inside the prompt box (`❯\\xa0`) and which would otherwise
+    defeat every space-bearing pattern here."""
+    if not pane or not pane.strip():
+        return None
+    lines = [l for l in pane.replace("\xa0", " ").splitlines() if l.strip()][-_PANE_TAIL_LINES:]
+    tail = "\n".join(lines).lower()
+    has_gate = any(m in tail for m in _PANE_GATE_MARKERS)
+    if not has_gate:                        # a caret'd option beside >=2 numbered ones IS a selection list
+        opts = [l for l in lines if _PANE_OPTION_RE.match(l)]
+        has_gate = len(opts) >= 2 and any(_PANE_CARET_OPTION_RE.match(l) for l in opts)
+    has_prompt = any(m in tail for m in _PANE_PROMPT_MARKERS)
+    if has_gate and not has_prompt:
+        return True
+    if has_prompt and not has_gate:
+        return False
+    return None                             # both (or neither) -> the pane does not settle it
+
+
+def blocked_of(present, feed_gate, transcript_gate, turn_done, unregistered=False, pane=None):
+    """THE tri-state, PURE (no I/O — the whole rule is unit-testable). Returns (blocked, why) where
+    blocked is True / False / None(=cannot tell) and `why` names the evidence that decided it.
+
+    Order is precedence, and it is deliberate:
+      1. UNREGISTERED (a live seat PROCESS with no hook-store record) -> the store and the transcript are
+                                     both mute here, so nothing below may run: SessionStart has not fired,
+                                     so any transcript on this surface belongs to a PRIOR session and its
+                                     closed turn proves nothing about what is on screen NOW. This is the
+                                     `claude --resume` picker window — the agent hangs at a dialog it cannot
+                                     pass, having never taken a turn. Only the pane can speak. (Rule 3 would
+                                     otherwise read that stale closed turn and call it `no`, and the agent
+                                     would hang unseen — the exact false negative this column exists to kill.
+                                     adapter.dismiss_resume_menu drives this dialog away at launch/recycle,
+                                     so the window is narrow; narrow is not the same as closed.)
+      2. no live agent            -> not blocked (nothing is waiting on you; `state` already says stale)
+      3. the turn provably CLOSED -> not blocked, and this OUTRANKS the feed: it is what retires a stale
+                                     gate row (mirrors _classify's turn_done rule, for the same reason).
+                                     Sound ONLY because rule 1 already took the unregistered case: a live
+                                     store record means SessionStart fired, so the transcript we just read
+                                     is THIS session's and the picker is behind us.
+                                     turn_done and transcript_gate are mutually exclusive by construction
+                                     (a gate leaves stop_reason=tool_use); the `not transcript_gate` guard
+                                     is belt-and-braces so the precedence does not depend on proving that.
+      4. any positive gate proof  -> blocked
+      5. the pane, when probed    -> the only ground truth for a dialog the transcript cannot see
+      6. otherwise                -> None. Mid-turn with no gate evidence is genuinely UNKNOWABLE from the
+                                     cheap signals: a long tool call and a silent dialog look identical.
+                                     Say so."""
+    if unregistered:
+        if pane is True:
+            return True, "pane: dialog on an unregistered seat (never took a turn — e.g. the resume picker)"
+        if pane is False:
+            return False, "pane: normal prompt on a seat that has not registered yet (still booting)"
+        return None, "live process, no session record — booting or hung at a pre-session dialog; look at the pane"
+    if not present:
+        return False, "no live agent on the surface"
+    if turn_done and not transcript_gate:
+        return False, "transcript: turn closed (a gate would have left it open)"
+    if feed_gate:
+        return True, "feed: unreplied gate row for this session"
+    if transcript_gate:
+        return True, "transcript: unanswered AskUserQuestion/ExitPlanMode"
+    if pane is True:
+        return True, "pane: selection dialog on screen"
+    if pane is False:
+        return False, "pane: normal prompt, no dialog"
+    return None, "mid-turn, no gate evidence either way — capture-pane to settle"
+
+
 # I4: states that must NEVER be masked by `detached`. needs-input / review come from the live cmux Feed
 # and are actionable NOW; error and pending describe a seat, not a hook channel. Everything else
 # (working / ready / idle / done / stale) is a TIME-based reading of a frozen record — for a detached
@@ -496,12 +629,13 @@ def detached_or(state, attached):
     return state
 
 
-def _infer_state(entry, session, open_gates=frozenset(), now=None):
+def _infer_state(entry, session, open_gates=frozenset(), now=None, turn_done=None):
     """state for one agent: read live signals, then classify (the impure edge over _classify). `open_gates`
     is the set of session uuids with an unreplied Feed gate (computed once per snapshot). Lifecycle reads
     route through resolve (the one resolver; step 1 of the v2 migration). Also reads the transcript's
     end-of-turn signal (beats cmux's ~60s lifecycle lag) and how long the agent has been quiet (ready vs
-    idle)."""
+    idle). `turn_done` may be passed in when the caller already read the transcript tail (snapshot does,
+    for `blocked`) — it is the same signal, so re-reading the file per row would be pure waste."""
     from . import resolve as rs
     sid = fs.bare_uuid(session.get("sessionId", ""))
     tpath = session.get("transcriptPath", "")
@@ -510,7 +644,7 @@ def _infer_state(entry, session, open_gates=frozenset(), now=None):
     return _classify(rs.lifecycle(entry.get("surface", "")), bool(entry.get("session")),
                      fs.last_agent_text(tpath, cap=400),
                      open_gate=bool(sid) and sid in open_gates,
-                     turn_done=turn_ended(tpath), quiet=quiet)
+                     turn_done=turn_ended(tpath) if turn_done is None else turn_done, quiet=quiet)
 
 
 def snapshot():
@@ -527,12 +661,37 @@ def snapshot():
     ws_map = _surface_ws_map()                                # one cmux tree per snapshot (not per agent)
     now = time.time()
     rows = []
+
+    _sweep = []                                              # memo cell for the at-most-one `ps axeww`
+
+    def _ps():
+        """The process-table sweep, taken AT MOST ONCE per snapshot and only when a row is unregistered
+        (see blocked_of rule 1). A healthy fleet has none, so it costs nothing there."""
+        if not _sweep:
+            _sweep.append(rs._ps_axeww())
+        return _sweep[0]
+
     for label, e in fs.live_all().items():
         surf = e.get("surface", "")
         sess = rs.freshest(surf, st=store)
-        state = _infer_state(e, sess, open_gates, now=now)
+        tpath = sess.get("transcriptPath", "")
+        # the two transcript reads `blocked` needs, taken ONCE and shared with the state classifier
+        tdone, tgate = turn_ended(tpath), pending_interactive_gate(tpath)
+        sid = fs.bare_uuid(sess.get("sessionId", ""))
+        state = _infer_state(e, sess, open_gates, now=now, turn_done=tdone)
         att = rs.attachment(surf, st=store, ws_map=ws_map, now=now)
         state = detached_or(state, att["attached"])
+        # `blocked` reads the SEAT (a live-pid record), never the lifecycle string — see blocked_of.
+        # This is the CHEAP tier: no pane read. Rows it cannot settle come back None and are probed by
+        # probe_blocked() (one capture-pane each, only for those rows).
+        present = bool(rs.freshest_live(surf, st=store))
+        # A registered member with NO live record may still be a live PROCESS (booting, or hung at a
+        # pre-session dialog the store cannot see). The ps sweep is the only witness; it is taken once
+        # per snapshot and only if some row actually needs it — a steady fleet never pays for it.
+        unreg = (not present) and bool(surf) and bool(
+            rs.pids_ps(surf, ps_out=_ps(), tool=e.get("tool", "claude")))
+        blocked, why = blocked_of(present=present, feed_gate=bool(sid) and sid in open_gates,
+                                  transcript_gate=tgate, turn_done=tdone, unregistered=unreg)
         used, tmodel = _context_used(sess.get("transcriptPath", ""))
         # Fix 1: the LAUNCHED model carries the window flavor ([1m]); the transcript model doesn't.
         # Prefer it, fall back to the transcript's, then the tool keyword — window is derived from it.
@@ -565,8 +724,13 @@ def snapshot():
             "ctx_used": used, "ctx_pct_remaining": pct_remaining, "window": window,
             "model": model, "effort": effort or "",                     # Fix 2: effort + cwd surfaced
             "cwd": e.get("cwd", "") or sess.get("cwd", ""), "muted": bool(e.get("muted")),
-            "last_text": fs.last_agent_text(sess.get("transcriptPath", ""), cap=120),
+            "last_text": fs.last_agent_text(tpath, cap=120),
             "last_age_s": (now - updated) if updated else None,
+            # THE decision column: True = waiting on you, False = not, None = cannot tell (never guessed).
+            # None here means "the cheap signals are exhausted"; probe_blocked() settles it off the pane.
+            # `unregistered` = a live seat PROCESS with no hook-store record (booting, or hung at a
+            # pre-session dialog): the one case where the transcript's closed turn must NOT be believed.
+            "blocked": blocked, "blocked_why": why, "unregistered": unreg,
             # invariant I4: attached=False means present-but-DETACHED (record frozen while the agent
             # demonstrably works, or an env/pointer mismatch proves the hook channel dead). None =
             # not present / unjudgeable. An idle agent reads attached=True (both clocks frozen equally).
@@ -575,6 +739,33 @@ def snapshot():
     # cheapest-first triage: most-urgent state first, then longest-idle (oldest activity) within a state
     rows.sort(key=lambda r: (r["rank"], -(r["last_age_s"] or 0)))
     return rows
+
+
+def probe_blocked(rows, cap=_cmux):
+    """Settle the rows the cheap tier could not: ONE `cmux capture-pane` per row whose `blocked` is None,
+    and none at all for the rest. Mutates rows in place; returns how many panes it read.
+
+    This is the escalation the design leans on: mid-turn, a long tool call and a silent dialog are
+    IDENTICAL to every cheap signal (store, lifecycle, transcript all freeze the same way) — the screen is
+    the only thing that can tell them apart. It stays affordable because a healthy fleet is mostly rows
+    that already proved themselves (turn closed -> no; feed/transcript gate -> yes), so in practice this
+    probes a handful of rows, not the board. A pane that does not clearly say (pane_gate -> None) leaves
+    the row at `?`: an unreadable screen is not evidence of anything."""
+    probed = 0
+    for r in rows:
+        if r["blocked"] is not None or not r.get("surface"):
+            continue
+        verdict = pane_gate(cap("capture-pane", "--surface", r["surface"]))
+        probed += 1
+        if verdict is None:
+            continue                                # still unknown — say so rather than pick a side
+        # Re-run the rule with the pane as the new evidence. Everything else is already known to be
+        # inconclusive (that is WHY this row is None), so the pane is what decides — but `unregistered`
+        # must ride along, or the verdict would explain itself with the wrong evidence.
+        r["blocked"], r["blocked_why"] = blocked_of(
+            present=True, feed_gate=False, transcript_gate=False, turn_done=False,
+            unregistered=bool(r.get("unregistered")), pane=verdict)
+    return probed
 
 
 # ─── helpers for rendering ────────────────────────────────────────────────────────────────────
@@ -630,23 +821,39 @@ def _fit(s, w):
 
 
 # ─── vitals: cheapest-first triage table (+ context-remaining %) ───────────────────────────────
+def _blk(r):
+    """The blocked cell: yes / no / ? — the tri-state rendered. `?` is a first-class answer, not a gap."""
+    return {True: "yes", False: "no", None: "?"}[r.get("blocked")]
+
+
 def _render_vitals(rows):
     """Render the vitals board to a single string (the human table). Pure: no I/O. Shared by the
     one-shot `fleet vitals` and the `--watch` dock loop so they never drift."""
     lines = [f"FLEET VITALS ({len(rows)})   ctx = used / REAL per-agent window",
-             f"    {'label':<17}{'state':<12}{'ctx-left':<15}{'model':<13}{'eff':<7}{'cwd':<17}{'idle':<6}last"]
+             f"    {'label':<17}{'state':<12}{'blocked':<9}{'ctx-left':<15}{'model':<13}{'eff':<7}{'cwd':<17}{'idle':<6}last"]
     for r in rows:
         glyph = {"error": "✗", "needs-input": "◍", "review": "⊙", "working": "▶", "detached": "⚠",
                  "done": "✓", "ready": "◌", "idle": "·", "pending": "…", "stale": "?", "gone": "✗"}.get(r["state"], "·")
         muted = " M" if r["muted"] else ""
-        lines.append(f"  {glyph} {_fit(r['label'], 16):<17}{r['state']:<12}{_ctx(r):<15}"
+        lines.append(f"  {glyph} {_fit(r['label'], 16):<17}{r['state']:<12}{_blk(r):<9}{_ctx(r):<15}"
                      f"{_fit(_short_model(r['model']), 12):<13}{_fit(r['effort'] or '-', 6):<7}"
                      f"{_fit(_short_cwd(r['cwd']), 16):<17}{_age(r['last_age_s']):<6}{_fit(r['last_text'], 26)}{muted}")
+    waiting = [r for r in rows if r.get("blocked") is True]
+    if waiting:
+        lines.append(f"\n  ◍ {len(waiting)} WAITING ON YOU: " + ", ".join(r["label"] for r in waiting))
+    unsure = [r for r in rows if r.get("blocked") is None]
+    if unsure:
+        lines.append(f"  ? {len(unsure)} can't tell: " + ", ".join(r["label"] for r in unsure)
+                     + "  — `cmux capture-pane --surface <id>` and look before you send")
     near = [r for r in rows if r["ctx_pct_remaining"] is not None and r["ctx_pct_remaining"] <= 30]
     if near:
         lines.append(f"\n  ! {len(near)} near-full (<=30% ctx left): "
                      + ", ".join(r["label"] for r in near) + "  — recycle candidates")
-    lines.append("\n(ctx = context REMAINING % of each agent's window — an explicit [1m]/[200k] flavor on the "
+    lines.append("\n(blocked = is this agent waiting on YOU: an OPEN GATE it cannot get past alone (feed row / "
+                 "unanswered question in the transcript / dialog on the pane). NOT cmux's `needsInput`, which is "
+                 "stamped ~60s after ANY turn and so reads the same on a done-idle agent. `?` = cannot tell — "
+                 "look at the pane before sending, because a send into a busy pane wedges it. Why: --json.)")
+    lines.append("(ctx = context REMAINING % of each agent's window — an explicit [1m]/[200k] flavor on the "
                  "launched model wins; else the fleet's declared window ([fleet].context_window); '—' = no usage "
                  "yet / unparseable. A bare model can't disambiguate 200k vs 1M, so we don't guess it. role in --json.)")
     return "\n".join(lines)
@@ -655,8 +862,13 @@ def _render_vitals(rows):
 def _vitals_fp(rows):
     """Change-fingerprint for the watch loop: the fields that mean 'the board meaningfully changed'.
     Deliberately EXCLUDES idle/last-age (they tick every second → would force churn). A heartbeat in
-    the loop refreshes ages anyway. Mirrors the on-change-only discipline of `_paint`."""
-    return "\n".join(f"{r['label']}|{r['state']}|{r['ctx_pct_remaining']}|{r['last_text']}" for r in rows)
+    the loop refreshes ages anyway. Mirrors the on-change-only discipline of `_paint`.
+
+    `blocked` is IN: an agent hitting a gate is the single most repaint-worthy event on the board, and it
+    can flip without `state` moving at all (the feed row and the transcript gate are invisible to the
+    lifecycle string — that is the entire reason the column exists)."""
+    return "\n".join(f"{r['label']}|{r['state']}|{r.get('blocked')}|{r['ctx_pct_remaining']}|{r['last_text']}"
+                     for r in rows)
 
 
 def _apply_scope(rows, scope, caller):
@@ -675,15 +887,19 @@ def _mine_footer(scope, caller, rows, verb):
 
 
 def cmd_vitals(argv):
-    """fleet vitals [--scope mine|all|conductors|children] [--json] [--paint] [--watch [--interval N]]
+    """fleet vitals [--scope mine|all|conductors|children] [--json] [--paint] [--no-probe] [--watch [--interval N]]
     one-glance triage: who needs you, who's near-full. Rows are most-urgent first (error/needs-input/
-    review/working/done/idle). `ctx` is context-REMAINING % from each agent's transcript token usage — a
-    `!` marks <=30% left (recycle candidate). Scoped like every read: defaults `--scope mine` (you + your
-    direct children); `--scope all` opens the whole fleet. `--watch` is the dock-pane mode: clears+reprints
-    only on the fleet's change-fingerprint (no churn)."""
+    review/working/done/idle). `blocked` is the decision column — yes/no/? for "is this agent waiting on
+    ME", grounded in an actual gate and never in cmux's `needsInput`. `ctx` is context-REMAINING % from each
+    agent's transcript token usage — a `!` marks <=30% left (recycle candidate). Scoped like every read:
+    defaults `--scope mine` (you + your direct children); `--scope all` opens the whole fleet. `--watch` is
+    the dock-pane mode: clears+reprints only on the fleet's change-fingerprint (no churn).
+
+    `--no-probe` skips the pane read that settles the rows the cheap signals cannot (they stay `?`)."""
     as_json = "--json" in argv
     paint = "--paint" in argv
     watch = "--watch" in argv
+    probe = "--no-probe" not in argv
     scope_arg, _ = fs.pop_scope(argv, default=None)
     scope, caller = fs.read_scope(scope_arg, "vitals")
     interval = 2.0
@@ -693,8 +909,10 @@ def cmd_vitals(argv):
         except (ValueError, IndexError):
             interval = 2.0
     if watch and not as_json:
-        return _watch_vitals(paint, interval, scope, caller)
+        return _watch_vitals(paint, interval, scope, caller, probe=probe)
     rows = snapshot()
+    if probe:
+        probe_blocked(rows)                # one capture-pane per UNSETTLED row; none for the rest
     if paint:
         _paint(rows)                       # sidebar sync stays full-fleet — the view scope is display-only
     rows = _apply_scope(rows, scope, caller)
@@ -708,17 +926,23 @@ def cmd_vitals(argv):
     return 0
 
 
-def _watch_vitals(paint, interval, scope="all", caller=""):
+def _watch_vitals(paint, interval, scope="all", caller="", probe=True):
     """Dock-pane loop: poll `snapshot()` every `interval`s; repaint the terminal only when the board's
     change-fingerprint moves (or on a slow heartbeat, so idle ages don't freeze). Uses ANSI cursor-home
     + clear-to-end instead of a full `clear` so the board sits still and readable instead of flashing.
-    Applies the same `--scope` filter each poll (paint stays full-fleet — the scope is display-only)."""
+    Applies the same `--scope` filter each poll (paint stays full-fleet — the scope is display-only).
+
+    The pane probe runs here too (`--no-probe` to skip): the watch board is the one a conductor actually
+    leaves open, so it is the LAST place that should quietly downgrade to a guess. It only ever reads the
+    panes the cheap tier could not settle, so a quiet fleet costs nothing extra per poll."""
     HOME_CLEAR = "\x1b[H\x1b[J"            # cursor home, then erase from cursor to end of screen
     HEARTBEAT = 12.0                       # force a redraw at least this often (refresh idle ages)
     prev_fp, last_draw = None, 0.0
     try:
         while True:
             rows = snapshot()
+            if probe:
+                probe_blocked(rows)
             if paint:
                 _paint(rows)
             rows = _apply_scope(rows, scope, caller)

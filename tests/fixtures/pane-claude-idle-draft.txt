@@ -1,0 +1,12 @@
+  The mission now waits on exactly one thing: your read-list ratification on the board. Everything else either runs without you (cmux-advisor's handoffs, the open tasks) or queues behind that gate.
+  Goodnight, or fire the gate whenever you surface.
+
+✻ Worked for 2m 8s · 3 shells still running
+                                                                                                                                                                    new task? /clear to save 446.4k tokens
+───────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+❯ ok man - these things don't mean a lot to me "A2", etc. can you update the
+───────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+  📁 ~/tapestry/_meta/agents/conductors/berg-sandbox  🌿 main  🤖 Fable 5  📟 v2.1.207  🎨 default                                                                                                     /rc
+  🧠 Context Remaining: 56% [=====-----]
+  💰 $82.11 ($17.18/h)  📊 446393 tok (1556 tpm)
+  ⏵⏵ bypass permissions on · 3 shells

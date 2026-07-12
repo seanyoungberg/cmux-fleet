@@ -1,0 +1,12 @@
+  One thing worth carrying into the later rewrites, since this was the exemplar: both defects were unexercised claims that read as true, and both survived my own verification pass because they were prose
+  rather than commands. The claim ledger discipline caught every tool claim and missed the two assertions about tools. Worth making that an explicit check when Phase B copies this pattern.
+
+✻ Baked for 1m 41s
+                                                                                                                                                                    new task? /clear to save 342.9k tokens
+───────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+❯ 
+───────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+  📁 ~/tapestry/domains/ai-workflows/loom/_code/loom-plugin  🌿 main  🤖 Opus 4.8 (1M context)  📟 v2.1.207  🎨 default                                                                                /rc
+  🧠 Context Remaining: 66% [======----]
+  💰 $8.58 ($23.17/h)  📊 342408 tok (15406 tpm)
+  ⏵⏵ bypass permissions on (shift+tab to cycle) · ← for agents
