@@ -26,9 +26,13 @@ from cmux_fleet import features as ff
 FIX = os.path.join(REPO, "tests", "fixtures")
 
 
-def pane(name):
-    with open(os.path.join(FIX, f"pane-claude-{name}.txt"), encoding="utf-8") as f:
+def pane_of(tool, name):
+    with open(os.path.join(FIX, f"pane-{tool}-{name}.txt"), encoding="utf-8") as f:
         return f.read()
+
+
+def pane(name):
+    return pane_of("claude", name)
 
 
 # --- pane_gate: the tri-state screen read (real captures) -----------------------------------------
@@ -47,6 +51,53 @@ def test_pane_gate_reads_ordinary_panes_as_not_gated(name):
       working     — mid-turn, spinner running (`✻ Simmering… (18m 5s · ↓ 63.4k tokens)`)
     A dialog REPLACES that chrome, so its presence is proof no dialog is up."""
     assert ff.pane_gate(pane(name)) is False
+
+
+# --- codex: a DIFFERENT TUI, captured rather than imagined ----------------------------------------
+def test_pane_gate_sees_a_real_codex_approval_prompt():
+    """Codex renders nothing like claude: its caret is `›` (U+203A), not `❯` (U+276F), and its dialog reads
+    "Would you like to run the following command?" / "Press enter to confirm or esc to cancel".
+
+    Captured by launching a real codex seat with approvals RE-ENABLED (the fleet floor pins
+    `--dangerously-bypass-approvals-and-sandbox`, precisely because codex prompts by default and that
+    deadlocks a worker — so under the floor this dialog can never fire) and driving it into a write outside
+    its sandbox. Guessing these strings was not an option; this is what the tool actually draws."""
+    assert ff.pane_gate(pane_of("codex", "gate-approval")) is True
+
+
+@pytest.mark.parametrize("name", ["idle-prompt", "working"])
+def test_pane_gate_reads_ordinary_codex_panes_as_not_gated(name):
+    """The hole this closes: a codex seat mid-turn used to read `?`, because every marker was claude chrome.
+    `working` here is a real `• Working (2s • esc to interrupt)` frame."""
+    assert ff.pane_gate(pane_of("codex", name)) is False
+
+
+def test_the_codex_footer_is_matched_by_SHAPE_not_by_model_name():
+    """codex's status footer is `gpt-5.5 xhigh fast · ~/path`. Keying on the model string would silently
+    stop working the day the floor's model pin moves — and that pin HAS moved. `· <path>` is the durable
+    part, so the footer must still read as chrome under a different model."""
+    renamed = pane_of("codex", "idle-prompt").replace("gpt-5.5", "gpt-9-quantum")
+    assert ff.pane_gate(renamed) is False
+
+
+def test_a_codex_dialog_REPLACES_the_chrome_the_same_way_claude_s_does():
+    """The structural fact the whole pane read rests on, and the reason a real gate capture was worth the
+    launch: if a dialog rendered ABOVE a still-visible footer, "chrome present" would prove nothing and
+    every gated codex seat would read `no` — a false negative on exactly the class we are hunting.
+
+    Measured across the 16-frame live capture: the pre-gate frames carry the chrome and no gate; the gated
+    frames carry the gate and NO chrome. Pinned here on the two committed endpoints."""
+    gated, ordinary = pane_of("codex", "gate-approval"), pane_of("codex", "idle-prompt")
+    tail = lambda p: "\n".join(l for l in p.splitlines() if l.strip()).lower()
+    assert "press enter to confirm" in tail(gated) and "·" not in tail(gated).split("press enter")[-1]
+    assert ff._PANE_CODEX_FOOTER_RE.search(tail(ordinary))          # chrome on the ordinary pane...
+    assert not any(m in tail(gated) for m in ff._PANE_PROMPT_MARKERS)  # ...and gone on the gated one
+
+
+def test_the_preexisting_codex_exec_fixture_is_not_a_gate():
+    """A real codex pane already in the repo (captured for a different feature) must not become a false
+    positive now that codex markers exist."""
+    assert ff.pane_gate(pane_of("codex", "live-exec")) is False
 
 
 def test_pane_gate_abstains_on_an_unreadable_pane():
@@ -160,8 +211,9 @@ def test_an_unregistered_seat_at_a_clean_prompt_is_merely_booting():
 
 
 # --- probe_blocked: the escalation ----------------------------------------------------------------
-def _rows(*blocked):
-    return [{"label": f"a{i}", "surface": f"S{i}", "blocked": b, "blocked_why": "", "unregistered": False}
+def _rows(*blocked, fp="fp1", unregistered=False):
+    return [{"label": f"a{i}", "surface": f"S{i}", "blocked": b, "blocked_why": "",
+             "unregistered": unregistered, "probe_fp": fp}
             for i, b in enumerate(blocked)]
 
 
@@ -191,6 +243,76 @@ def test_probe_promotes_a_real_gate_to_blocked():
     rows = _rows(None)
     ff.probe_blocked(rows, cap=lambda *a: pane("gate-question"))
     assert rows[0]["blocked"] is True
+
+
+# --- the debounce: buy cheapness by not repeating work, never by dropping accuracy ------------------
+def test_a_stable_surface_is_probed_ONCE_not_once_per_tick():
+    """The watch loop polls every 2s. Re-reading an unchanged pane every tick is pure waste — so a surface
+    whose advance marker has not moved reuses the verdict. A stable blocked agent costs ONE probe."""
+    memo, reads = {}, []
+    cap = lambda *a: reads.append(a) or pane("gate-question")
+    for _ in range(5):                                  # five watch ticks, nothing on the agent moved
+        rows = _rows(None)
+        ff.probe_blocked(rows, cap=cap, memo=memo)
+        assert rows[0]["blocked"] is True               # ...and every tick still reports the gate
+    assert len(reads) == 1, "the pane was re-read on a tick where nothing had advanced"
+    assert "cached" in rows[0]["blocked_why"]
+
+
+def test_the_cache_is_INVALIDATED_the_moment_the_agent_advances():
+    """The safety half. The marker moves whenever the agent writes — and every way a gate can ARRIVE writes
+    first (an AskUserQuestion is an assistant message; an approval prompt follows the tool call that
+    triggered it). So a moved marker must force a fresh read, or the cache would serve a stale `no` over a
+    live gate — the exact false negative this column exists to kill."""
+    memo, reads = {}, []
+
+    def cap(*a):                        # 1st read: working. 2nd read: a gate has appeared.
+        n = len(reads)
+        reads.append(a)
+        return pane("working") if n == 0 else pane("gate-question")
+
+    first = _rows(None, fp="turn-1")
+    ff.probe_blocked(first, cap=cap, memo=memo)
+    assert first[0]["blocked"] is False                 # working: no dialog
+
+    advanced = _rows(None, fp="turn-2")                 # the agent wrote something -> marker moved
+    ff.probe_blocked(advanced, cap=cap, memo=memo)
+    assert len(reads) == 2, "an advanced surface must be re-read, not served from cache"
+    assert advanced[0]["blocked"] is True               # and the new gate is seen
+
+
+def test_an_UNREGISTERED_seat_is_never_cached():
+    """It has no record and no transcript, so it has no advance marker at all — a cached verdict there would
+    freeze forever, which is the resume-picker stall wearing a green badge."""
+    memo, reads = {}, []
+    cap = lambda *a: reads.append(a) or pane("working")
+    for _ in range(3):
+        rows = _rows(None, fp="", unregistered=True)
+        ff.probe_blocked(rows, cap=cap, memo=memo)
+    assert len(reads) == 3, "an unregistered seat must be re-probed every time"
+
+
+def test_an_inconclusive_pane_is_never_cached():
+    """`?` is not a finding. An unreadable screen now may be readable next tick — retry it."""
+    memo, reads = {}, []
+    cap = lambda *a: reads.append(a) or ""
+    for _ in range(3):
+        rows = _rows(None)
+        ff.probe_blocked(rows, cap=cap, memo=memo)
+        assert rows[0]["blocked"] is None
+    assert len(reads) == 3
+
+
+def test_the_advance_marker_moves_when_the_transcript_grows(tmp_path):
+    """_advance_fp must be SENSITIVE: it may fire when nothing important happened (a wasted read is
+    harmless), but it must never sit still while a dialog appears."""
+    t = tmp_path / "t.jsonl"
+    t.write_text("one\n")
+    a = ff._advance_fp("sid", 100, str(t))
+    t.write_text("one\ntwo\n")                          # the agent wrote a turn
+    assert ff._advance_fp("sid", 100, str(t)) != a
+    assert ff._advance_fp("sid", 101, str(t)) != ff._advance_fp("sid", 100, str(t))   # a hook fired
+    assert ff._advance_fp("", 0, "") == ""              # nothing to fingerprint -> never cacheable
 
 
 # --- the tri-state contract ------------------------------------------------------------------------

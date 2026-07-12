@@ -1,0 +1,12 @@
+
+
+› Run this exact shell command and nothing else: touch /tmp/codex-gate-probe.txt && echo WROTE. It
+  writes outside your read-only sandbox, so request approval when codex asks. Do not skip it.
+
+
+• Working (2s • esc to interrupt)
+
+ 
+› Explain this codebase
+ 
+  gpt-5.5 xhigh fast · ~/tapestry/_meta/agents/ad-hoc/codexpane

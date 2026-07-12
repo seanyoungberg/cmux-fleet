@@ -1,0 +1,14 @@
+│ >_ OpenAI Codex (v0.144.1)                          │
+│                                                     │
+│ model:     gpt-5.5 xhigh   /model to change         │
+│ directory: ~/tapestry/_meta/agents/ad-hoc/codexpane │
+╰─────────────────────────────────────────────────────╯
+
+  Tip: Our most capable model yet. GPT-5.6 Sol can tackle complex code changes, dig into research,
+  produce polished documents, and take on your most ambitious work. Sol is highly capable at lower
+  reasoning efforts—try starting lower, then turn it up for harder jobs.
+
+ 
+› Explain this codebase
+ 
+  gpt-5.5 xhigh · ~/tapestry/_meta/agents/ad-hoc/codexpane

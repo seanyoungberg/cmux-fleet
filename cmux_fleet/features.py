@@ -509,22 +509,44 @@ def _open_gate_uuids():
 #   NO   pane       — the normal prompt UI owns the bottom of the screen and no dialog is over it.
 _PANE_TAIL_LINES = 12          # the live UI zone: a dialog and the prompt box both render at the BOTTOM
 
-# Verbatim from real captures (tests/fixtures/pane-claude-*.txt, taken off the live fleet 2026-07-12 —
-# including one taken from OUTSIDE this very agent while it sat on a genuine AskUserQuestion).
+# Every marker below is verbatim from a REAL capture (tests/fixtures/pane-{claude,codex}-*.txt, taken off
+# the live fleet 2026-07-12) — never from memory of what the TUI "looks like". One claude capture was taken
+# from OUTSIDE this very agent while it sat on a genuine AskUserQuestion; the codex set came from a codex
+# seat driven into a real approval prompt. Hand-written UI fixtures are how the two-column `ps` bug shipped.
+#
+# THE STRUCTURAL FACT both tools share, and the one this whole read depends on: a dialog REPLACES the
+# normal chrome, it does not render above it. Measured, not assumed — across 16 consecutive codex frames,
+# the 7 pre-gate frames carry the chrome and no gate markers, and the 9 gated frames carry the gate and NO
+# chrome. Claude's four captures show the same. That disjointness is what makes "chrome present" a sound
+# proof that no dialog is up.
 _PANE_GATE_MARKERS = (
+    # claude
     "enter to select",                      # the selection-dialog footer: AskUserQuestion / ExitPlanMode
     "esc to cancel",                        #   (both lines observed on the real gate capture)
     "do you want to proceed?",              # the permission prompt
     "would you like to proceed?",           # ExitPlanMode
     "no, and tell claude what to do differently",
     "resume from summary",                  # the --resume picker (see adapter.dismiss_resume_menu)
+    # codex — its approval prompt, captured live
+    "would you like to run the following command?",
+    "press enter to confirm",               # the codex dialog footer ("...or esc to cancel")
+    "no, and tell codex what to do differently",
 )
-# The normal prompt chrome. Present on idle AND working panes alike — it means "the agent's ordinary UI
-# is up", NOT "the agent is free": a dialog REPLACES this chrome (confirmed on all four captures), so its
-# presence is proof that no dialog is up. `blocked` asks gate/no-gate only; working-vs-ready is `state`.
-_PANE_PROMPT_MARKERS = ("context remaining", "bypass permissions", "shift+tab to cycle")
-_PANE_CARET_OPTION_RE = re.compile(r"^\s*[❯>]\s*\d+\.\s+\S")     # the SELECTED option of a dialog
-_PANE_OPTION_RE = re.compile(r"^\s*[❯>]?\s*\d+\.\s+\S")          # any numbered option
+# The normal prompt chrome. Present on idle AND working panes alike — it means "the agent's ordinary UI is
+# up", NOT "the agent is free": `blocked` asks gate/no-gate only, and working-vs-ready is `state`'s job.
+_PANE_PROMPT_MARKERS = (
+    "context remaining", "bypass permissions", "shift+tab to cycle",   # claude
+    "esc to interrupt",                                                # codex (and some claude builds)
+)
+# codex's status footer — `gpt-5.5 xhigh fast · ~/path/to/cwd` — as a SHAPE, not a model name: matching
+# "gpt-5.5" would silently stop working the day the floor's model pin changes (and that pin has moved
+# before). `· <path>` is the durable part. Anchored to the last lines, where the footer lives.
+_PANE_CODEX_FOOTER_RE = re.compile(r"·\s*[~/]\S")
+# The caret of a SELECTED option. codex draws it `›` (U+203A) and claude `❯` (U+276F) — different glyphs,
+# identical meaning. Both tools also use their caret as the INPUT prompt char, so a caret alone proves
+# nothing; it is the caret ON a numbered option that means "a selection list is up".
+_PANE_CARET_OPTION_RE = re.compile(r"^\s*[❯›>]\s*\d+\.\s+\S")
+_PANE_OPTION_RE = re.compile(r"^\s*[❯›>]?\s*\d+\.\s+\S")          # any numbered option
 
 
 def pane_gate(pane):
@@ -548,7 +570,8 @@ def pane_gate(pane):
     if not has_gate:                        # a caret'd option beside >=2 numbered ones IS a selection list
         opts = [l for l in lines if _PANE_OPTION_RE.match(l)]
         has_gate = len(opts) >= 2 and any(_PANE_CARET_OPTION_RE.match(l) for l in opts)
-    has_prompt = any(m in tail for m in _PANE_PROMPT_MARKERS)
+    has_prompt = (any(m in tail for m in _PANE_PROMPT_MARKERS)
+                  or any(_PANE_CODEX_FOOTER_RE.search(l) for l in lines[-3:]))
     if has_gate and not has_prompt:
         return True
     if has_prompt and not has_gate:
@@ -564,19 +587,22 @@ def blocked_of(present, feed_gate, transcript_gate, turn_done, unregistered=Fals
       1. UNREGISTERED (a live seat PROCESS with no hook-store record) -> the store and the transcript are
                                      both mute here, so nothing below may run: SessionStart has not fired,
                                      so any transcript on this surface belongs to a PRIOR session and its
-                                     closed turn proves nothing about what is on screen NOW. This is the
-                                     `claude --resume` picker window — the agent hangs at a dialog it cannot
-                                     pass, having never taken a turn. Only the pane can speak. (Rule 3 would
-                                     otherwise read that stale closed turn and call it `no`, and the agent
-                                     would hang unseen — the exact false negative this column exists to kill.
-                                     adapter.dismiss_resume_menu drives this dialog away at launch/recycle,
-                                     so the window is narrow; narrow is not the same as closed.)
+                                     closed turn proves nothing about what is on screen NOW. Only the pane
+                                     can speak. This is the `claude --resume` picker / startup-stall class:
+                                     the agent hangs at a dialog it cannot pass, having never taken a turn —
+                                     codex seats have sat at `pending` FOREVER on exactly this state.
+                                     It is NOT excused by "adapter.dismiss_resume_menu cleans it up": a
+                                     detector whose blind spot is only survivable because some OTHER code
+                                     happens to run is a detector that LIES the day that code does not run.
       2. no live agent            -> not blocked (nothing is waiting on you; `state` already says stale)
-      3. the turn provably CLOSED -> not blocked, and this OUTRANKS the feed: it is what retires a stale
-                                     gate row (mirrors _classify's turn_done rule, for the same reason).
-                                     Sound ONLY because rule 1 already took the unregistered case: a live
-                                     store record means SessionStart fired, so the transcript we just read
-                                     is THIS session's and the picker is behind us.
+      3. turn CLOSED **and BOUND** -> not blocked. BOUND is the whole guard, and it is not redundant: an
+                                     UNBOUND closed turn is a resume-picker/startup-stall and MUST fall
+                                     through to the probe (rule 1). Someone will eventually read
+                                     `not unregistered` here, think it cannot matter because rule 1 already
+                                     returned, and delete it — leaving nothing but rule 1 between a hung
+                                     agent and a cheerful `no`. Leave both.
+                                     This also OUTRANKS the feed: it is what retires a stale gate row that a
+                                     key-send never marked terminal (mirrors _classify's turn_done rule).
                                      turn_done and transcript_gate are mutually exclusive by construction
                                      (a gate leaves stop_reason=tool_use); the `not transcript_gate` guard
                                      is belt-and-braces so the precedence does not depend on proving that.
@@ -593,8 +619,8 @@ def blocked_of(present, feed_gate, transcript_gate, turn_done, unregistered=Fals
         return None, "live process, no session record — booting or hung at a pre-session dialog; look at the pane"
     if not present:
         return False, "no live agent on the surface"
-    if turn_done and not transcript_gate:
-        return False, "transcript: turn closed (a gate would have left it open)"
+    if turn_done and not unregistered and not transcript_gate:      # BOUND is the guard — see rule 3
+        return False, "transcript: turn closed on a bound session (a gate would have left it open)"
     if feed_gate:
         return True, "feed: unreplied gate row for this session"
     if transcript_gate:
@@ -731,6 +757,8 @@ def snapshot():
             # `unregistered` = a live seat PROCESS with no hook-store record (booting, or hung at a
             # pre-session dialog): the one case where the transcript's closed turn must NOT be believed.
             "blocked": blocked, "blocked_why": why, "unregistered": unreg,
+            "probe_fp": _advance_fp(sid, updated, tpath),
+
             # invariant I4: attached=False means present-but-DETACHED (record frozen while the agent
             # demonstrably works, or an env/pointer mismatch proves the hook channel dead). None =
             # not present / unjudgeable. An idle agent reads attached=True (both clocks frozen equally).
@@ -741,20 +769,65 @@ def snapshot():
     return rows
 
 
-def probe_blocked(rows, cap=_cmux):
+def _advance_fp(sid, updated, tpath):
+    """The surface's ADVANCE MARKER: a fingerprint that moves iff the agent has done anything since we last
+    looked. `(session, record updatedAt, transcript mtime+size)`.
+
+    It is deliberately SENSITIVE rather than specific — it is allowed to move when nothing important
+    happened (an extra probe is a wasted read, which is harmless), but it must never sit still while a
+    dialog appears. It does not, and the reason is mechanical: every way a gate can arrive WRITES first.
+    An AskUserQuestion/ExitPlanMode is an assistant message -> the transcript grows. A permission or codex
+    approval prompt is preceded by the tool call that triggered it -> PreToolUse fires -> updatedAt moves,
+    and the transcript grows. So the marker moves at the exact moment the verdict could change.
+
+    '' when there is nothing to fingerprint (no record, no transcript) — the caller must then NEVER cache,
+    because a constant marker would freeze a verdict forever. That is precisely the unregistered seat."""
+    try:
+        st = os.stat(tpath) if tpath else None
+        tfp = f"{st.st_mtime_ns}:{st.st_size}" if st else ""
+    except OSError:
+        tfp = ""
+    if not sid and not updated and not tfp:
+        return ""
+    return f"{sid}|{updated}|{tfp}"
+
+
+_PROBE_MEMO = {}                                    # surface -> (advance_fp, blocked, why)
+
+
+def probe_blocked(rows, cap=_cmux, memo=_PROBE_MEMO):
     """Settle the rows the cheap tier could not: ONE `cmux capture-pane` per row whose `blocked` is None,
-    and none at all for the rest. Mutates rows in place; returns how many panes it read.
+    and none at all for the rest. Mutates rows in place; returns how many panes it actually READ.
 
     This is the escalation the design leans on: mid-turn, a long tool call and a silent dialog are
     IDENTICAL to every cheap signal (store, lifecycle, transcript all freeze the same way) — the screen is
-    the only thing that can tell them apart. It stays affordable because a healthy fleet is mostly rows
-    that already proved themselves (turn closed -> no; feed/transcript gate -> yes), so in practice this
-    probes a handful of rows, not the board. A pane that does not clearly say (pane_gate -> None) leaves
-    the row at `?`: an unreadable screen is not evidence of anything."""
+    the only thing that can tell them apart.
+
+    A probe is a READ. It cannot wedge anything — only a SEND can — so it carries no correctness risk at
+    all, and the only cost is IPC. That asymmetry is why accuracy is NOT behind a flag: the entire point of
+    this column is that nobody should have to memorize that `needsInput` means done-idle, and hiding the
+    correct answer behind `--probe` would just swap one piece of trivia for another ("remember to pass
+    --probe"). Correct by default; `--no-probe` exists only for someone who explicitly wants the cheap read.
+
+    The watch loop stays cheap by NOT REPEATING WORK rather than by dropping accuracy: a surface whose
+    advance marker has not moved since we last probed it reuses that verdict instead of re-reading the pane
+    every tick (see _advance_fp — it moves the instant a gate could have appeared). A stable blocked agent
+    therefore costs ONE probe, not one per refresh.
+
+    Never cached: an UNREGISTERED seat (no record, no transcript -> no advance marker, so a cached verdict
+    would freeze forever) and an INCONCLUSIVE pane (`?` is not a finding — retry it; an unreadable screen
+    now may be readable next tick)."""
     probed = 0
     for r in rows:
         if r["blocked"] is not None or not r.get("surface"):
             continue
+        fp = r.get("probe_fp") or ""
+        cacheable = bool(fp) and not r.get("unregistered")
+        if cacheable:
+            hit = memo.get(r["surface"])
+            if hit and hit[0] == fp:                # nothing has moved since we looked — reuse, don't re-read
+                r["blocked"], r["blocked_why"] = hit[1], f"{hit[2]} [cached: surface has not advanced]"
+                continue
         verdict = pane_gate(cap("capture-pane", "--surface", r["surface"]))
         probed += 1
         if verdict is None:
@@ -765,6 +838,8 @@ def probe_blocked(rows, cap=_cmux):
         r["blocked"], r["blocked_why"] = blocked_of(
             present=True, feed_gate=False, transcript_gate=False, turn_done=False,
             unregistered=bool(r.get("unregistered")), pane=verdict)
+        if cacheable:
+            memo[r["surface"]] = (fp, r["blocked"], r["blocked_why"])
     return probed
 
 
