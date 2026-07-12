@@ -862,6 +862,74 @@ def test_codex_seat_spoke_passes_the_seat_home_to_codex(tmp_path, monkeypatch):
     assert seen["home"] == str(tmp_path / "seat")
 
 
+# --- codex-login cycles ALL seats, and SKIPS the ones already working ----------------------------
+# The skip is a SAFETY property, not an optimization: every `codex login` supersedes that account's previous
+# session, so "re-login everything to be sure" is exactly how you break the seats that were working. A cycle
+# is only safe if it proves a seat is fine and then LEAVES IT ALONE.
+def _login_harness(tmp_path, monkeypatch, seats, verified):
+    """seats: {acct: home|None}. verified: the accts whose seat currently verifies. Returns the list of accts
+    that codex-login actually ATTEMPTED TO LOG IN (which, for a working seat, must stay empty)."""
+    _codex_health_toml(tmp_path, monkeypatch, seats)
+    monkeypatch.setattr(cli, "_codex_identity", lambda h: {"email": "x@y.com"}, raising=False)
+    monkeypatch.setattr(pv, "_codex_identity", lambda h: {"email": "x@y.com"})
+    monkeypatch.setattr(pv, "codex_home_installation_id", lambda h: "dev12345")
+    monkeypatch.setattr(cli, "codex_verify_seat",
+                        lambda home: (any(f".codex-{a}" == os.path.basename(home) for a in verified),
+                                      "live", "the model spoke"))
+    logged_in = []
+    def fake_login(acct, home, timeout):
+        logged_in.append(acct)
+        return True, "new@y.com"
+    monkeypatch.setattr(cli, "_codex_login_seat", fake_login)
+    return logged_in
+
+
+def test_codex_login_no_acct_CYCLES_every_seat(tmp_path, monkeypatch):
+    seats = {a: _seed_home(tmp_path, a) for a in ("one", "two", "three")}
+    logged_in = _login_harness(tmp_path, monkeypatch, seats, verified=[])   # none work yet
+    cli.cmd_codex_login([])                                                 # no acct -> the whole fleet
+    assert logged_in == ["one", "two", "three"]                             # every seat, one at a time
+
+
+def test_codex_login_SKIPS_a_seat_that_already_verifies(tmp_path, monkeypatch):
+    """THE safety property. A login supersedes, so a working seat must be left strictly alone -- proving it is
+    healthy is the ONLY thing we may do to it."""
+    seats = {a: _seed_home(tmp_path, a) for a in ("working", "broken")}
+    logged_in = _login_harness(tmp_path, monkeypatch, seats, verified=["working"])
+    cli.cmd_codex_login([])
+    assert logged_in == ["broken"]                    # the broken one is fixed...
+    assert "working" not in logged_in                 # ...and the working one is NEVER re-logged
+
+
+def test_codex_login_needs_home_seat_is_reported_and_does_not_abort_the_cycle(tmp_path, monkeypatch, capsys):
+    """A seat with no declared home is a CONFIG gap. It must not be guessed at, and it must not stop the other
+    seats from being logged in -- one unconfigured seat should never hold the fleet hostage."""
+    seats = {"nohome": None, "real": _seed_home(tmp_path, "real")}
+    logged_in = _login_harness(tmp_path, monkeypatch, seats, verified=[])
+    with pytest.raises(SystemExit):                   # exits nonzero: a seat IS unusable
+        cli.cmd_codex_login([])
+    assert logged_in == ["real"]                      # the cycle carried on past the config gap
+    out = capsys.readouterr().out
+    assert "NO HOME DECLARED" in out and "codex-home:~/.codex-nohome" in out    # says exactly what to write
+
+
+def test_codex_login_verify_only_NEVER_logs_anyone_in(tmp_path, monkeypatch):
+    """--verify-only is the safe read of the whole fleet: it must not open a single login, even for a seat that
+    is definitely broken."""
+    seats = {a: _seed_home(tmp_path, a) for a in ("working", "broken")}
+    logged_in = _login_harness(tmp_path, monkeypatch, seats, verified=["working"])
+    with pytest.raises(SystemExit):                   # 'broken' is not usable -> nonzero
+        cli.cmd_codex_login(["--verify-only"])
+    assert logged_in == []                            # nothing was superseded
+
+
+def test_codex_login_single_acct_still_targets_just_that_seat(tmp_path, monkeypatch):
+    seats = {a: _seed_home(tmp_path, a) for a in ("one", "two")}
+    logged_in = _login_harness(tmp_path, monkeypatch, seats, verified=[])
+    cli.cmd_codex_login(["two"])
+    assert logged_in == ["two"]                       # naming a seat still means ONLY that seat
+
+
 # --- config.toml fenced provisioning (never clobber Berg's manual config) ------------------------
 def test_codex_provision_config_fenced_and_idempotent(tmp_path):
     cfg = tmp_path / "config.toml"

@@ -5294,90 +5294,140 @@ def _codex_login_surface(home, cwd):
     return surf
 
 
-def cmd_codex_login(argv):
-    """fleet codex-login <acct> [--timeout N] [--verify-only]   log a codex SEAT into its OWN home.
+def codex_verify_seat(home):
+    """HARD verification of a seat AS IT STANDS. Returns (ok, probe, detail). NEVER logs in — so it is always
+    safe to call on a working seat, which matters because a login would supersede it.
 
-    Each codex seat needs its own CODEX_HOME: the ChatGPT backend keys one active session per DEVICE, and the
-    device id (installation_id) is a per-home file. Seats sharing a home supersede each other; seats in their
-    own homes run concurrently.
-
-    The cycle: resolve the seat's declared home (never invented) -> create it (codex refuses a home that does
-    not exist) -> open a terminal TAB with the login typed but NOT run -> wait for auth.json -> VERIFY HARD.
-
-    Verification is backend /me 200 AND the model actually SPEAKING (`codex exec -o`, which only an
-    authenticated run can write). It reports the email actually obtained, because a browser session that was
-    not signed out authenticates the WRONG account — and that must be caught, never celebrated."""
-    import argparse, time as _t
+    Both halves are required. A backend /me 200 alone is not enough (it does not prove this home can actually
+    run), and a model turn is the only thing a 401 cannot counterfeit."""
     from . import providers as pv
-    ap = argparse.ArgumentParser(prog="fleet codex-login")
-    ap.add_argument("acct", help="the codex seat (must declare `auth = \"codex-home:<path>\"` in fleet.toml)")
-    ap.add_argument("--timeout", type=int, default=300, help="seconds to wait for the login (default 300)")
-    ap.add_argument("--verify-only", action="store_true",
-                    help="verify the seat as it stands; never open a login (safe: a login supersedes)")
-    a = ap.parse_args(argv)
+    tok = pv.codex_home_token(home)
+    if not tok:
+        return False, "no-token", "no auth.json in the home (never logged in)"
+    probe = pv.codex_probe_backend(tok)
+    if probe != "live":
+        return False, probe, f"backend says {probe}"
+    ok, detail = pv.codex_seat_spoke(home)           # the model must actually SPEAK
+    return ok, probe, detail
 
-    spec = pv.get_provider("codex", a.acct)
-    if not spec:
-        sys.exit(f"[fleet] codex-login: no [providers.codex.{a.acct}] in fleet.toml")
-    try:
-        home = pv.codex_seat_home(a.acct, spec)      # loud + actionable when undeclared; NEVER guessed
-    except pv.ProviderError as e:
-        sys.exit(f"[fleet] codex-login: {e}")
 
-    # Already good? Then STOP. Every `codex login` supersedes that account's previous session, so re-logging
-    # a working seat is not a harmless no-op — it is a way to break the thing you were checking.
-    if pv.codex_home_token(home):
-        if pv.codex_probe_backend(pv.codex_home_token(home)) == "live":
-            ok, detail = pv.codex_seat_spoke(home)
-            if ok:
-                ident = pv._codex_identity(home) or {}
-                print(f"[fleet] codex seat '{a.acct}' is ALREADY authenticated — not logging in again "
-                      f"(a login would supersede it).")
-                print(f"  home        : {home}")
-                print(f"  account     : {ident.get('email') or '(unknown)'}")
-                print(f"  device id   : {pv.codex_home_installation_id(home)[:8] or '(not yet minted)'}")
-                print(f"  backend /me : live")
-                print(f"  model turn  : {detail}")
-                return 0
-    if a.verify_only:
-        sys.exit(f"[fleet] codex-login --verify-only: seat '{a.acct}' is NOT usable "
-                 f"(no live token in {home}). Re-run without --verify-only to log it in.")
-
+def _codex_login_seat(acct, home, timeout):
+    """Log ONE seat into its own home, then verify hard. Returns (ok, email). Interactive: opens a tab."""
+    import time as _t
+    from . import providers as pv
     os.makedirs(home, exist_ok=True)                 # codex ERRORS on a CODEX_HOME that does not exist
-    print(f"[fleet] codex-login '{a.acct}' -> home {home}")
+    print(f"\n[fleet] codex-login '{acct}' -> home {home}")
     print( "  1. SIGN OUT of chatgpt.com in your browser FIRST.")
     print( "     A login that reuses the browser session authenticates the WRONG account, and the fleet")
     print( "     cannot tell you asked for a different one — it can only tell you which one you got.")
-    print(f"  2. A terminal tab is opening with the command typed. Press Enter to run it, pick '{a.acct}'.")
+    print(f"  2. A terminal tab is opening with the command typed. Press Enter to run it, pick '{acct}'.")
 
-    surf = _codex_login_surface(home, os.getcwd())
-    if not surf:
+    if not _codex_login_surface(home, os.getcwd()):
         print(f"  (could not open a cmux tab — run it yourself:  CODEX_HOME={home} codex login)")
 
     authjson = os.path.join(home, "auth.json")
-    print(f"[fleet] waiting up to {a.timeout}s for {authjson} ...")
-    end = _t.time() + a.timeout
+    print(f"[fleet] waiting up to {timeout}s for {authjson} ...")
+    end = _t.time() + timeout
     while _t.time() < end and not os.path.exists(authjson):
         _t.sleep(2)
     if not os.path.exists(authjson):
-        sys.exit(f"[fleet] codex-login: timed out — no auth.json in {home}. Nothing was changed.")
+        print(f"[fleet] codex-login: timed out — no auth.json in {home}. Nothing was changed.")
+        return False, ""
 
-    ident = pv._codex_identity(home) or {}
-    got = ident.get("email") or "(unknown)"
+    got = (pv._codex_identity(home) or {}).get("email") or "(unknown)"
     print(f"[fleet] auth.json appeared. account obtained: {got}")
-
-    tok = pv.codex_home_token(home)
-    probe = pv.codex_probe_backend(tok) if tok else "no-token"
-    ok, detail = pv.codex_seat_spoke(home) if probe == "live" else (False, "skipped (backend rejected it)")
+    ok, probe, detail = codex_verify_seat(home)
     print(f"  backend /me : {probe}")
     print(f"  model turn  : {'YES — ' + detail if ok else 'NO — ' + detail}")
     # installation_id is minted on the FIRST RUN, not at login — so it only exists now, after the verify run.
     print(f"  device id   : {pv.codex_home_installation_id(home)[:8] or '(not yet minted)'}")
-    if not (probe == "live" and ok):
-        sys.exit(f"[fleet] codex-login: seat '{a.acct}' did NOT verify. It is not usable. "
-                 f"(A backend 200 AND the model speaking are both required.)")
-    print(f"[fleet] seat '{a.acct}' VERIFIED ({got}). Launch it: "
-          f"fleet launch <role> --tool codex --provider codex:{a.acct}")
+    if not ok:
+        print(f"[fleet] seat '{acct}' did NOT verify. It is not usable. "
+              f"(A backend 200 AND the model speaking are both required.)")
+        return False, got
+    print(f"[fleet] seat '{acct}' VERIFIED ({got}).")
+    return True, got
+
+
+def cmd_codex_login(argv):
+    """fleet codex-login [acct] [--timeout N] [--verify-only]   log codex SEATS into their OWN homes.
+
+    With no acct it CYCLES EVERY codex seat, which is the normal way to bring the fleet up: seats are done one
+    at a time (each login needs its own signed-out browser session) and a seat that ALREADY VERIFIES IS
+    SKIPPED, never re-logged.
+
+    That skip is the whole safety property, not an optimization. Every `codex login` supersedes that account's
+    previous session, so "just re-login everything to be sure" is precisely how you break the seats that were
+    working. The only safe cycle is one that proves a seat is fine and then LEAVES IT ALONE.
+
+    Each seat needs its own CODEX_HOME: the backend keys one active session per DEVICE, and the device id
+    (installation_id) is a per-home file. Seats sharing a home supersede each other; seats in their own homes
+    run concurrently. A seat that declares no home is a CONFIG gap — reported, never guessed at.
+
+    Verification is backend /me 200 AND the model actually SPEAKING (`codex exec -o`, which only an
+    authenticated run can write). It reports the email actually obtained, because a browser session that was
+    not signed out authenticates the WRONG account — and that must be caught, never celebrated."""
+    import argparse
+    from . import providers as pv
+    ap = argparse.ArgumentParser(prog="fleet codex-login")
+    ap.add_argument("acct", nargs="?",
+                    help="one codex seat; OMIT to cycle every seat (skipping the ones already verified)")
+    ap.add_argument("--timeout", type=int, default=300, help="seconds to wait for each login (default 300)")
+    ap.add_argument("--verify-only", action="store_true",
+                    help="verify the seat(s) as they stand; never open a login (safe: a login supersedes)")
+    a = ap.parse_args(argv)
+
+    seats = [(n, s) for tool, n, s, _ in pv.iter_providers()
+             if tool == "codex" and s.get("type") == "subscription"]
+    if a.acct:
+        seats = [(n, s) for n, s in seats if n == a.acct]
+        if not seats:
+            sys.exit(f"[fleet] codex-login: no [providers.codex.{a.acct}] in fleet.toml")
+    if not seats:
+        sys.exit("[fleet] codex-login: no codex subscription seats in fleet.toml — nothing to log in.")
+
+    results = []                                     # (acct, status, email, home)
+    for acct, spec in seats:
+        try:
+            home = pv.codex_seat_home(acct, spec)    # loud + actionable when undeclared; NEVER guessed
+        except pv.ProviderError as e:
+            print(f"\n[fleet] seat '{acct}': NO HOME DECLARED — skipping (this is config, not a login).\n{e}")
+            results.append((acct, "needs-home", "", ""))
+            continue
+
+        # Already good? Then STOP. Re-logging a working seat is not a harmless no-op — it supersedes the very
+        # session you were checking. This is what makes cycling ALL seats safe to run at any time.
+        ok, probe, detail = codex_verify_seat(home)
+        if ok:
+            ident = pv._codex_identity(home) or {}
+            email = ident.get("email") or "(unknown)"
+            print(f"\n[fleet] seat '{acct}' is ALREADY authenticated — not logging in again "
+                  f"(a login would supersede it).")
+            print(f"  home        : {home}")
+            print(f"  account     : {email}")
+            print(f"  device id   : {pv.codex_home_installation_id(home)[:8] or '(not yet minted)'}")
+            print(f"  backend /me : {probe}")
+            print(f"  model turn  : {detail}")
+            results.append((acct, "verified (already)", email, home))
+            continue
+
+        if a.verify_only:
+            print(f"\n[fleet] seat '{acct}' is NOT usable: {detail} (home {home})")
+            results.append((acct, f"NOT usable ({probe})", "", home))
+            continue
+
+        lok, email = _codex_login_seat(acct, home, a.timeout)
+        results.append((acct, "verified" if lok else "FAILED", email, home))
+
+    print("\n[fleet] codex seats:")
+    for acct, status, email, home in results:
+        print(f"  {acct:<14} {status:<20} {email or '-':<28} {home or '-'}")
+    good = [r for r in results if r[1].startswith("verified")]
+    bad = [r for r in results if not r[1].startswith("verified")]
+    if good:
+        print(f"[fleet] launch one: fleet launch <role> --tool codex --provider codex:{good[0][0]}")
+    if bad:
+        sys.exit(f"[fleet] {len(bad)} seat(s) not usable: {', '.join(r[0] for r in bad)}")
     return 0
 
 
@@ -5416,7 +5466,7 @@ VERB_USAGE = {
     "vitals": "  vitals [--scope mine|all|conductors|children] [--json] [--paint] [--watch [--interval N]] cheapest-first triage table + ctx-remaining % (default mine)",
     "usage": "  usage [--json]                                    per-provider subscription windows (5h + weekly bars, reset countdowns, metered/Fable flags, live attribution) from the daemon poller",
     "codex-setup": "  codex-setup <acct>                       SUPERSEDED -> use `codex-login` (it set up the shared-home env-token model, which is the supersession bug)",
-    "codex-login": "  codex-login <acct> [--timeout N] [--verify-only]  log a codex SEAT into its OWN home (each seat needs one: the backend keys a session per device, and the device id is per-home). Opens a terminal tab with the login typed, waits, then VERIFIES with a backend 200 + the model actually speaking, and reports the account it really got",
+    "codex-login": "  codex-login [acct] [--timeout N] [--verify-only]  log codex SEATS into their OWN homes (each seat needs one: the backend keys a session per device, and the device id is per-home). NO acct = cycle every seat, SKIPPING any that already verify (a login supersedes, so re-logging a working seat breaks it). Opens a terminal tab with the login typed, waits, then VERIFIES with a backend 200 + the model actually speaking, and reports the account it really got",
     "find": "  find <query> [--turns N] [--json]                 content-aware session lookup (label/role/cwd or transcript)",
     "graph": "  graph [--scope mine|all|<label>] [--json] [--html] [--out FILE]  fleet parentage tree (text/JSON/HTML); default mine = your subtree; --scope all = full tree",
     "serve": "  serve [--port N]                                  thin read-only localhost view (graph HTML + vitals.json); no daemon",
