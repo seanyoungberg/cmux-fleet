@@ -8,6 +8,33 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- **`fleet vitals` grows a `blocked` column — the decision column, grounded in an actual gate.** It answers
+  the question a conductor actually has (*is this agent waiting on ME?*) and it is emphatically NOT cmux's
+  `needsInput`, which is stamped ~60s after ANY turn and therefore reads identically on a real gate and on
+  an ordinary done-idle agent. Live-confirmed while building it: an agent sat at `needsInput` with a
+  half-typed human draft in its input box, gated on nobody. Every conductor had to learn that trivia
+  individually; the ones who didn't read it as "blocked" and were wrong.
+  - **Three states, because both errors are expensive and neither may be guessed.** A false `yes` sends
+    text into a busy pane and a mid-turn session send WEDGES the agent — the cure damages a healthy agent.
+    A false `no` strands one forever. So `yes` and `no` each require positive evidence, and when the
+    evidence is missing or self-contradictory the column says `?` rather than pick a side. In `--json` the
+    tri-state is `true`/`false`/`null` (never strings), so the naive `if row["blocked"]` collapses unknown
+    to the SAFE side; `blocked_why` always names the evidence that decided it.
+  - **Evidence, cheapest first.** `yes`: an unreplied cmux Feed gate row; an unanswered
+    AskUserQuestion/ExitPlanMode in the transcript (which still speaks for a DETACHED agent, whose gate
+    never reaches the Feed at all); a selection dialog on the pane. `no`: the turn provably CLOSED — a gate
+    always leaves it open — which also retires a stale feed row that a key-send never marked terminal; or
+    the normal prompt chrome on the pane with no dialog over it.
+  - **The pane is read ONLY for rows the cheap signals cannot settle** (`--no-probe` opts out). Mid-turn, a
+    long tool call and a silent dialog are identical to every cheap signal, so the screen is the only thing
+    that can tell them apart. A healthy fleet probes a handful of rows, not the board.
+  - An **unregistered seat** (a live process with no hook-store record) never trusts a closed turn: that
+    transcript belongs to a PRIOR session. This is the `claude --resume` picker window — hung at a dialog,
+    having never taken a turn.
+  - Verified end-to-end against the live 16-agent fleet by raising a REAL gate and reading the board from
+    outside: `blocked=True (feed: unreplied gate row for this session)` naming exactly one agent, zero false
+    positives across the other 16 in six consecutive samples.
+
 - **Codex per-seat homes: concurrent codex seats, PROVEN.** Every codex seat declares its own
   `auth = "codex-home:<path>"` and runs as its own device. Three seats (two of them on ONE shared team
   subscription) ran concurrently and each produced real assistant output; none revoked another. This replaces
@@ -81,6 +108,25 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   % bars. Additive fields; schema stays 1.
 
 ### Changed
+
+- **`cmux-handover` no longer defers to `loom:handover`; it is unconditionally THE handover skill.** The
+  skill opened by handing authority to a separate, private, vault-specific plugin when that plugin happened
+  to be loaded — which a productized standalone cmux-fleet cannot do (its users will never have loom), and
+  which forked the skill's behavior on the loadout. It also folds in the **commit chore**, until now tribal
+  knowledge: a handover commits **its own paths** and nothing else — never `git add -A` (it sweeps a
+  sibling's in-flight edit into a commit under your name), pass the paths to `commit` too (a bare commit
+  takes everything STAGED, and the index is not exclusively yours), never `--amend` under an active fleet
+  (a sibling may have committed underneath you), and `git -C <repo>` rather than `cd && git` (your cwd is
+  your identity seat).
+- **The resolve.py raw-hook-store invariant is now ENFORCED, not just asserted in a comment.** Its header
+  said "do not add a new raw hook-store read anywhere outside this module — the stale-ghost class (six
+  instances, all fixed 2026-07-10)". Six existed, all were fixed, and nothing prevented a seventh. A pure-AST
+  ratchet (`tests/test_resolve_ratchet.py`) now fails on any new `read_hook_store()` call or raw store-key
+  touch outside `resolve.py`/`state.py`. It is a BASELINE ratchet — the invariant as literally written was
+  never true (24 raw touches exist today) — and it fails in BOTH directions, so fixing one and leaving it
+  listed is also red: a baseline nobody prunes rots into a permission slip. It also pins resolve's
+  deliberate delegation to `state.py`, which looks exactly like something to "simplify" and whose removal
+  would silently detach much of the suite from the code it thinks it is patching. Mutation-tested four ways.
 
 - **Workspace-group anchor model flipped A→B (empty-anchor), ratified 2026-07-10.** A conductor's group
   anchor is now the EMPTY scaffold workspace `workspace-group create` always mints, titled
