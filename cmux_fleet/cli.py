@@ -5179,49 +5179,107 @@ def cmd_codex_setup(argv):
     return 0
 
 
+# ---------------------------------------------------------------- usage (ONE source of truth)
+# VERB_USAGE is BOTH halves of help: `fleet --help` prints the joined values, and `fleet <verb> --help`
+# prints the one entry (see main()'s guard). Keep the two leading spaces and the insertion order — the
+# joined blob is the top-level help verbatim, and tests/test_help.py pins that it stays that way.
+USAGE_HEADER = ("usage: fleet <launch|config|ls|plugins|archive|revive|register|recycle|move|group|unstick|"
+                "sessions|broadcast|mute|unmute|rm|vitals|usage|find|graph|serve|paint|worktree|profile|"
+                "daemon|drive-child|peer-msg|child-digest|inbox|inbox-ack> ...")
+VERB_USAGE = {
+    "launch": "  launch <role|--adhoc NAME> [--tool t] [--place p] [--parent s] [--effort L] [--model M] [--plugin NAME] [--provider NAME] [--dry-run] [-- <tool flags>]",
+    "config": "  config <role|--adhoc NAME|--cwd DIR> [--tool t]   effective config (base settings + fleet adds)",
+    "ls": "  ls [--scope mine|all|conductors|children] [--json] live fleet x hook store; flags STALE + archived (default mine = you + your children; --scope all = the world)",
+    "plugins": "  plugins <add|reconcile|ls|show|describe> ...      the plugin INDEX: add-from-URL (safe: never enables) + reconcile + on-demand discovery",
+    "archive": "  archive <label>                                   park a live agent (revivable)",
+    "revive": "  revive <label> [--fresh] [--session id] [--place p] [--parent s] [--plugin N] [-- <flags>]\n"
+              "                                                    bring a parked agent back (default RESUME last session; --fresh sheds; --session targets an arbitrary prior one)",
+    "register": "  register <label> [--surface UUID] [--parent s] [--session id]\n"
+                "                                                    pull a LIVE-but-unregistered agent into the registry (recovery for a skipped auto-register)",
+    "move": "  move <label> (--to-workspace WS | --own-workspace) [--name TITLE]\n"
+            "                                                    relocate a LIVE child to another workspace atomically (same surface/session; no archive, no recycle); --own-workspace joins the conductor's group",
+    "group": "  group <init [--name N] | add <label> [--name N]>  make THIS conductor's workspace a named group (init) or retrofit a live child into it (add); membership ops keep agents live (the safe lane)",
+    "recycle": "  recycle [label] [--fresh] [--session id] [--effort L] [--model M] [--force] [--plugin NAME] [--prime T|--no-prime] [-- <flags>]\n"
+               "                                                    restart in place, same surface/identity (default self+RESUME; --fresh sheds; --plugin = index-aware plugin add, reaches linked + enabled)\n"
+               "  recycle --scope mine|all|conductors|children [--include-muted] [--dry-run]\n"
+               "                                                    BULK restart (sequential + gated, skips self + muted); mine = your children; cross-conductor = the safe topology",
+    "unstick": "  unstick [label] [--surface UUID] [--dry-run]      reap a frozen dead-pid hook-store ghost (SessionEnd-less death) so ls/recycle/doctor stop trusting a dead 'running'; never touches a LIVE record",
+    "reap-surfaces": "  reap-surfaces [--all] [--json] [--close]          DRY-RUN survey of orphaned bare-shell HUSK surfaces (fleet launch artifact + no live agent + no registry); gated on the fleet env prefix + tail guard; --close is review-gated",
+    "sessions": "  sessions <label> [--all] [--json]                 list resumable prior sessions for the agent's surface (id, age, size, snippet)",
+    "broadcast": "  broadcast \"<msg>\" --scope mine|all|conductors|children [--no-wake] [--expect-reply] [--dry-run]\n"
+                 "                                                    input-safe heads-up to live agents (e.g. after a toml/floor change); never restarts them; --scope REQUIRED (an act)",
+    "mute": "  mute <label> | unmute <label> [| --scope mine]    stop/resume pushing a child's completions to its parent (parent reads on demand); --scope mine = all my children",
+    "rm": "  rm <label> [--detach] [--force] [--kill] [--wip-commit] [--with-group]\n"
+          "                                                    close + archive a label (revivable; refuses mid-turn, --force overrides); --detach drops the row only; --kill adds worktree teardown; --with-group dissolves its workspace-group",
+    "vitals": "  vitals [--scope mine|all|conductors|children] [--json] [--paint] [--watch [--interval N]] cheapest-first triage table + ctx-remaining % (default mine)",
+    "usage": "  usage [--json]                                    per-provider subscription windows (5h + weekly bars, reset countdowns, metered/Fable flags, live attribution) from the daemon poller",
+    "codex-setup": "  codex-setup <acct> [--auth-json PATH] [--no-provision]  provision a codex env-token account (seed cred store + fenced ~/.codex/config.toml block); run once after `codex login`",
+    "find": "  find <query> [--turns N] [--json]                 content-aware session lookup (label/role/cwd or transcript)",
+    "graph": "  graph [--scope mine|all|<label>] [--json] [--html] [--out FILE]  fleet parentage tree (text/JSON/HTML); default mine = your subtree; --scope all = full tree",
+    "serve": "  serve [--port N]                                  thin read-only localhost view (graph HTML + vitals.json); no daemon",
+    "paint": "  paint [--sidebar]                                 sync fleet state onto the cmux sidebar (status pills + ctx bars; --sidebar also feeds fleet.swift)",
+    "worktree": "  worktree <ls | clean <label> [--wip-commit]>      manage fleet-owned git worktrees (config-gated, default-off)",
+    "profile": "  profile <name> [--base DIR] [--root DIR] [--init]  emit env that pins ALL entrypoints at THIS build (eval it for multi-build isolation)",
+    "daemon": "  daemon <start|stop|status|restart> [--foreground] [--heartbeat [SECS]]  run the router as a detached daemon (survives shell exit + recycle); start --foreground for launchd",
+    "drive-child": "  drive-child <surface-uuid> <prompt...>            submit a prompt to a child's TUI (beats the paste-settle enter-race)",
+    "peer-msg": "  peer-msg <to-label> \"<body>\" [--no-reply] [--reply-to <id>] [--expect-reply] [--no-wake]\n"
+                "                                                    input-safe A2A: message a live PEER conductor (into its context, never its input box)",
+    "child-digest": "  child-digest <session-frag> [N]                   print a child's last N transcript turns (the reliable content source)",
+    "inbox": "  inbox [--scope mine|<label>|all|conductors|children] [--json]  pending inbox on demand (default mine = yours; <label> peeks one; all = triage) — the catch-up read after a recycle",
+    "inbox-ack": "  inbox-ack <seq> [--peer|--stale|--doctor] [--surface UUID]  mark shown completions/alerts/peer msgs handled so they stop re-surfacing",
+}
+# `unmute` shares mute's entry (one blob line covers both verbs) — alias it so `fleet unmute --help`
+# resolves. Without this it would fall through the guard and (un)mute a label named '--help'.
+USAGE_ALIAS = {"unmute": "mute"}
+# The two internal `_`-prefixed workers are NOT in VERB_USAGE (they must stay out of `fleet --help` —
+# they are not human verbs), but they are in the verb table, so they need a usage entry of their own or
+# `--help` would hand '--help' to json.load(open(...)) and traceback.
+INTERNAL_USAGE = {
+    "_recycle-exec": "  _recycle-exec <payload.json>                      internal: the detached single-recycle worker (spawned by `fleet recycle`)",
+    "_recycle-bulk-exec": "  _recycle-bulk-exec <payloads.json>               internal: the detached sequential bulk-recycle orchestrator (spawned by `fleet recycle --scope`)",
+}
+# Verbs that render their OWN `--help`: an ArgumentParser (richer, auto-generated, per-flag) or a
+# sub-verb dispatcher that already prints its usage (plugins, worktree). main()'s guard skips these and
+# lets them handle it. EVERY OTHER verb in the table is hand-rolled and gets its help from the guard.
+# Both halves are pinned by tests/test_help.py, which loops the whole table — that is what stops this
+# rotting as verbs gain parsers (the 2026-07-11 bug: 16 verbs where `--help` was a positional label or,
+# worse, silently ignored — `fleet serve --help` STARTED THE HTTP SERVER and blocked).
+SELF_HELP_VERBS = frozenset({
+    "launch", "config", "plugins", "revive", "register", "recycle", "move", "group", "unstick",
+    "reap-surfaces", "sessions", "worktree", "profile", "daemon", "find", "codex-setup",
+})
+
+
+def usage_for(verb):
+    """The `fleet <verb> --help` text, or None if the verb has no hand-rolled usage entry."""
+    entry = VERB_USAGE.get(USAGE_ALIAS.get(verb, verb)) or INTERNAL_USAGE.get(verb)
+    return None if entry is None else "usage: fleet " + entry.lstrip()
+
+
+def verb_table():
+    """verb -> handler. A function, not a module constant: building it imports features/daemon/helpers,
+    which the hook-verb hot path in main() must never pay for. tests/test_help.py enumerates it."""
+    from . import features as ff
+    from . import daemon as fd
+    from . import helpers as fh
+    return {"launch": cmd_launch, "config": cmd_config, "ls": cmd_ls, "plugins": cmd_plugins,
+            "archive": cmd_archive, "revive": cmd_revive, "register": cmd_register, "recycle": cmd_recycle,
+            "move": cmd_move, "group": cmd_group,
+            "unstick": cmd_unstick, "reap-surfaces": cmd_reap_surfaces, "sessions": cmd_sessions,
+            "_recycle-exec": cmd_recycle_exec, "_recycle-bulk-exec": cmd_recycle_bulk_exec,
+            "broadcast": cmd_broadcast,
+            "mute": lambda a: cmd_mute(a, mute=True), "unmute": lambda a: cmd_mute(a, mute=False),
+            "rm": cmd_rm, "worktree": cmd_worktree, "profile": cmd_profile, "daemon": fd.cmd_daemon,
+            "vitals": ff.cmd_vitals, "usage": ff.cmd_usage, "find": ff.cmd_find, "graph": ff.cmd_graph,
+            "codex-setup": cmd_codex_setup,
+            "serve": ff.cmd_serve, "paint": ff.cmd_paint,
+            "drive-child": fh.cmd_drive_child, "peer-msg": fh.cmd_peer_msg,
+            "child-digest": fh.cmd_child_digest, "inbox": fh.cmd_inbox, "inbox-ack": fh.cmd_inbox_ack}
+
+
 def main():
     if len(sys.argv) < 2 or sys.argv[1] in ("-h", "--help"):
-        print("usage: fleet <launch|config|ls|plugins|archive|revive|register|recycle|move|group|unstick|sessions|broadcast|mute|unmute|rm|vitals|usage|find|graph|serve|paint|worktree|profile|daemon|drive-child|peer-msg|child-digest|inbox|inbox-ack> ...\n"
-              "  launch <role|--adhoc NAME> [--tool t] [--place p] [--parent s] [--effort L] [--model M] [--plugin NAME] [--provider NAME] [--dry-run] [-- <tool flags>]\n"
-              "  config <role|--adhoc NAME|--cwd DIR> [--tool t]   effective config (base settings + fleet adds)\n"
-              "  ls [--scope mine|all|conductors|children] [--json] live fleet x hook store; flags STALE + archived (default mine = you + your children; --scope all = the world)\n"
-              "  plugins <add|reconcile|ls|show|describe> ...      the plugin INDEX: add-from-URL (safe: never enables) + reconcile + on-demand discovery\n"
-              "  archive <label>                                   park a live agent (revivable)\n"
-              "  revive <label> [--fresh] [--session id] [--place p] [--parent s] [--plugin N] [-- <flags>]\n"
-              "                                                    bring a parked agent back (default RESUME last session; --fresh sheds; --session targets an arbitrary prior one)\n"
-              "  register <label> [--surface UUID] [--parent s] [--session id]\n"
-              "                                                    pull a LIVE-but-unregistered agent into the registry (recovery for a skipped auto-register)\n"
-              "  move <label> (--to-workspace WS | --own-workspace) [--name TITLE]\n"
-              "                                                    relocate a LIVE child to another workspace atomically (same surface/session; no archive, no recycle); --own-workspace joins the conductor's group\n"
-              "  group <init [--name N] | add <label> [--name N]>  make THIS conductor's workspace a named group (init) or retrofit a live child into it (add); membership ops keep agents live (the safe lane)\n"
-              "  recycle [label] [--fresh] [--session id] [--effort L] [--model M] [--force] [--plugin NAME] [--prime T|--no-prime] [-- <flags>]\n"
-              "                                                    restart in place, same surface/identity (default self+RESUME; --fresh sheds; --plugin = index-aware plugin add, reaches linked + enabled)\n"
-              "  recycle --scope mine|all|conductors|children [--include-muted] [--dry-run]\n"
-              "                                                    BULK restart (sequential + gated, skips self + muted); mine = your children; cross-conductor = the safe topology\n"
-              "  unstick [label] [--surface UUID] [--dry-run]      reap a frozen dead-pid hook-store ghost (SessionEnd-less death) so ls/recycle/doctor stop trusting a dead 'running'; never touches a LIVE record\n"
-              "  reap-surfaces [--all] [--json] [--close]          DRY-RUN survey of orphaned bare-shell HUSK surfaces (fleet launch artifact + no live agent + no registry); gated on the fleet env prefix + tail guard; --close is review-gated\n"
-              "  sessions <label> [--all] [--json]                 list resumable prior sessions for the agent's surface (id, age, size, snippet)\n"
-              "  broadcast \"<msg>\" --scope mine|all|conductors|children [--no-wake] [--expect-reply] [--dry-run]\n"
-              "                                                    input-safe heads-up to live agents (e.g. after a toml/floor change); never restarts them; --scope REQUIRED (an act)\n"
-              "  mute <label> | unmute <label> [| --scope mine]    stop/resume pushing a child's completions to its parent (parent reads on demand); --scope mine = all my children\n"
-              "  rm <label> [--detach] [--force] [--kill] [--wip-commit] [--with-group]\n"
-              "                                                    close + archive a label (revivable; refuses mid-turn, --force overrides); --detach drops the row only; --kill adds worktree teardown; --with-group dissolves its workspace-group\n"
-              "  vitals [--scope mine|all|conductors|children] [--json] [--paint] [--watch [--interval N]] cheapest-first triage table + ctx-remaining % (default mine)\n"
-              "  usage [--json]                                    per-provider subscription windows (5h + weekly bars, reset countdowns, metered/Fable flags, live attribution) from the daemon poller\n"
-              "  codex-setup <acct> [--auth-json PATH] [--no-provision]  provision a codex env-token account (seed cred store + fenced ~/.codex/config.toml block); run once after `codex login`\n"
-              "  find <query> [--turns N] [--json]                 content-aware session lookup (label/role/cwd or transcript)\n"
-              "  graph [--scope mine|all|<label>] [--json] [--html] [--out FILE]  fleet parentage tree (text/JSON/HTML); default mine = your subtree; --scope all = full tree\n"
-              "  serve [--port N]                                  thin read-only localhost view (graph HTML + vitals.json); no daemon\n"
-              "  paint [--sidebar]                                 sync fleet state onto the cmux sidebar (status pills + ctx bars; --sidebar also feeds fleet.swift)\n"
-              "  worktree <ls | clean <label> [--wip-commit]>      manage fleet-owned git worktrees (config-gated, default-off)\n"
-              "  profile <name> [--base DIR] [--root DIR] [--init]  emit env that pins ALL entrypoints at THIS build (eval it for multi-build isolation)\n"
-              "  daemon <start|stop|status|restart> [--foreground] [--heartbeat [SECS]]  run the router as a detached daemon (survives shell exit + recycle); start --foreground for launchd\n"
-              "  drive-child <surface-uuid> <prompt...>            submit a prompt to a child's TUI (beats the paste-settle enter-race)\n"
-              "  peer-msg <to-label> \"<body>\" [--no-reply] [--reply-to <id>] [--expect-reply] [--no-wake]\n"
-              "                                                    input-safe A2A: message a live PEER conductor (into its context, never its input box)\n"
-              "  child-digest <session-frag> [N]                   print a child's last N transcript turns (the reliable content source)\n"
-              "  inbox [--scope mine|<label>|all|conductors|children] [--json]  pending inbox on demand (default mine = yours; <label> peeks one; all = triage) — the catch-up read after a recycle\n"
-              "  inbox-ack <seq> [--peer|--stale|--doctor] [--surface UUID]  mark shown completions/alerts/peer msgs handled so they stop re-surfacing")
+        print(USAGE_HEADER + "\n" + "\n".join(VERB_USAGE.values()))
         return 0
     sub, rest = sys.argv[1], sys.argv[2:]
     # Hook verbs are the per-turn hot path (a plugin shim shells into them on every UserPromptSubmit/Stop).
@@ -5229,22 +5287,15 @@ def main():
     if sub in ("hook-awareness", "hook-drain"):
         from . import hookverbs as hv
         return (hv.cmd_hook_awareness if sub == "hook-awareness" else hv.cmd_hook_drain)(rest)
-    from . import features as ff
-    from . import daemon as fd
-    from . import helpers as fh
-    fns = {"launch": cmd_launch, "config": cmd_config, "ls": cmd_ls, "plugins": cmd_plugins,
-           "archive": cmd_archive, "revive": cmd_revive, "register": cmd_register, "recycle": cmd_recycle,
-           "move": cmd_move, "group": cmd_group,
-           "unstick": cmd_unstick, "reap-surfaces": cmd_reap_surfaces, "sessions": cmd_sessions,
-           "_recycle-exec": cmd_recycle_exec, "_recycle-bulk-exec": cmd_recycle_bulk_exec,
-           "broadcast": cmd_broadcast,
-           "mute": lambda a: cmd_mute(a, mute=True), "unmute": lambda a: cmd_mute(a, mute=False),
-           "rm": cmd_rm, "worktree": cmd_worktree, "profile": cmd_profile, "daemon": fd.cmd_daemon,
-           "vitals": ff.cmd_vitals, "usage": ff.cmd_usage, "find": ff.cmd_find, "graph": ff.cmd_graph,
-           "codex-setup": cmd_codex_setup,
-           "serve": ff.cmd_serve, "paint": ff.cmd_paint,
-           "drive-child": fh.cmd_drive_child, "peer-msg": fh.cmd_peer_msg,
-           "child-digest": fh.cmd_child_digest, "inbox": fh.cmd_inbox, "inbox-ack": fh.cmd_inbox_ack}
+    # `fleet <verb> --help` for the hand-rolled verbs, BEFORE they get a chance to run. Fires ONLY when
+    # -h/--help is the FIRST token: peer-msg/drive-child/broadcast carry free text, so a message body that
+    # mentions --help must still be DELIVERED, never swallowed by help. Never scan the tail.
+    if rest[:1] and rest[0] in ("-h", "--help") and sub not in SELF_HELP_VERBS:
+        text = usage_for(sub)
+        if text:                                              # unknown verbs fall through to the error below
+            print(text)
+            return 0
+    fns = verb_table()
     if sub in fns:
         return fns[sub](rest)
     sys.exit(f"fleet: unknown subcommand '{sub}'")

@@ -95,6 +95,18 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Fixed
 
+- **`fleet <verb> --help` no longer RUNS the verb.** Only the verbs that happened to build an
+  `ArgumentParser` got `--help` for free. The 18 hand-rolled ones either swallowed it as a positional label
+  (`fleet rm --help` → "no such label '--help'") or — the dangerous half — ignored it and executed:
+  `fleet inbox --help` ran the inbox, `fleet paint --help` painted the sidebar, and **`fleet serve --help`
+  started the HTTP server and blocked**. The top-level usage blob is now a `VERB_USAGE` dict (one source of
+  truth: `fleet --help` prints the joined values, byte-identical to before), and `main()` prints the matching
+  entry for a hand-rolled verb *before* dispatch. The guard fires ONLY when `-h`/`--help` is the FIRST token,
+  so a `peer-msg`/`drive-child`/`broadcast` body that merely mentions `--help` is still delivered, never
+  swallowed. Argparse verbs keep their own richer auto-generated help. `tests/test_help.py` loops the WHOLE
+  dispatch table (internal workers included) and fails a verb that blocks, exits non-zero, prints anything
+  but usage, writes state, or shells out to cmux — so a verb added tomorrow cannot regress this.
+
 - **`fleet move` told operators to run the one command that cannot fix a moved surface.** Its post-move
   WARNING blamed the stale `CMUX_WORKSPACE_ID` and directed the operator to `fleet recycle <label>` "to
   re-export the env and rebind the hooks"; `resolve.py` likewise recorded the remedy for a detached agent
