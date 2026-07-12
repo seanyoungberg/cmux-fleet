@@ -640,3 +640,134 @@ def test_orphan_record_on_surface_does_not_mask_bound(fs, monkeypatch, wake):
     n = router.fleet_doctor_sweep(now=NOW)
     assert n == 1                                              # judged on the BOUND (stalled) record...
     assert fs.inbox_pending("PARENT", kind="doctor")[0]["reason"] == "stall"  # ...not the fresh orphan
+
+
+# ── PID AUTHORITY: a LIVE agent is never DOWN, and never gets a destructive remedy ───────────────────
+# The 2026-07-11 session-killer (cmux-advisor). fleet-doctor told the fleet that conductor berg-sandbox
+# "appears DOWN (stall) ... `fleet revive berg-sandbox`". berg-sandbox was NOT down: Berg — the human —
+# was sitting in it TYPING, pid up, 88% context. A human composing a message produces the stall signal
+# exactly (turn 'running', no Stop hook, updatedAt frozen), and conductors are precisely where humans
+# sit — so the false-positive rate is highest where acting is most expensive. Obeying the advice would
+# have destroyed the live session: `revive` archives the agent and relands it on a FRESH surface, so the
+# advertised "remedy" for the false positive KILLS the thing it falsely accused. The doctor also
+# contradicted itself — its own inbox header says "still LIVE — a health alert, not an archive".
+#
+# These pin the INVARIANT, not the prose: whatever an alert says about a LIVE pid, it may never call it
+# DOWN and never route to revive/archive/--force. They assert on every channel the advice reaches a peer
+# or a human through — the peer WAKE line, the DESKTOP banner, and the INBOX row — because that is what
+# stops this regressing into a session-killer.
+from cmux_fleet import hookverbs
+
+DESTRUCTIVE = ("revive", "archive", "--force")
+SANDBOX, SANDBOX_SURF = "berg-sandbox", "5AFE0000-0000-4000-8000-000000000001"
+
+
+def _scrub(text, *ids):
+    """Lowercased text with the label/surface blanked: an IDENTIFIER may contain 'down' (the shared
+    fixture's conductor is literally 'downc' on surface 'DOWN'), and that is not a DOWN verdict. We are
+    asserting on what the doctor SAYS, so the identifiers must not be able to launder or trip it."""
+    low = text.lower()
+    for i in ids:
+        if i:
+            low = low.replace(i.lower(), "<id>")
+    return low
+
+
+def _assert_safe_for_live(text, where, *ids):
+    """The duty of care owed to a LIVE pid: never DOWN, never destructive, and it must say outright that
+    a human may simply be typing in it."""
+    low = _scrub(text, *ids)
+    assert "down" not in low, f"{where}: a LIVE pid was described as DOWN -- {text!r}"
+    for verb in DESTRUCTIVE:
+        assert verb not in low, f"{where}: destructive remedy {verb!r} offered for a LIVE pid -- {text!r}"
+    assert "live" in low, f"{where}: must state the agent is still live -- {text!r}"
+    assert "typing" in low, f"{where}: must say a human may simply be typing -- {text!r}"
+
+
+def _seed_sandbox_and_peer():
+    """The incident shape: a LIVE conductor (berg-sandbox, a human typing in it) + a peer to alert."""
+    fs.live_put("peer", {"surface": "PEER", "kind": "conductor", "role": "c", "session": "claude-peer"})
+    fs.live_put(SANDBOX, {"surface": SANDBOX_SURF, "kind": "conductor", "role": "c",
+                          "session": "claude-sandbox"})
+
+
+@pytest.mark.parametrize("reason", ["stall", "detached"])
+def test_live_conductor_alert_is_never_down_and_never_destructive(fs, reason):
+    """The unit invariant, over BOTH reasons that fire on a PRESENT surface. conductor_alert_text is the
+    ONE place these words are written and it is gated on the pid — so this holds for any future reason
+    routed through it, not just the two that exist today."""
+    wake, title, body = router.conductor_alert_text(reason, SANDBOX, SANDBOX_SURF, live=True)
+    for text, where in ((wake, "peer wake"), (title, "desktop title"), (body, "desktop body")):
+        low = _scrub(text, SANDBOX, SANDBOX_SURF)
+        assert "down" not in low, f"{where}: a LIVE pid was described as DOWN -- {text!r}"
+        for verb in DESTRUCTIVE:
+            assert verb not in low, f"{where}: destructive remedy {verb!r} for a LIVE pid -- {text!r}"
+    _assert_safe_for_live(wake, "peer wake", SANDBOX, SANDBOX_SURF)   # the line a peer conductor ACTS on
+    assert "inspect" in wake.lower()                                   # ...and the correct action is INSPECT
+
+
+def test_down_conductor_still_gets_the_down_alarm(fs):
+    """The other half: the fix must not disarm the REAL alarm. With no live pid the conductor IS down and
+    `revive` IS the remedy — that text must survive intact."""
+    wake, title, body = router.conductor_alert_text("conductor-down", SANDBOX, SANDBOX_SURF, live=False)
+    assert "appears DOWN" in wake and f"fleet revive {SANDBOX}" in wake
+    assert "DOWN" in title and "revive" in body
+
+
+def test_berg_sandbox_repro_live_conductor_stall_never_says_down_or_revive(fs, monkeypatch, wake):
+    """END-TO-END through the real sweep on the live-observed shape: a conductor whose bound 'running'
+    record froze past STALL_S while its pid is ALIVE (Berg typing). The sweep still ALERTS — a stalled
+    conductor is worth a look — but every channel must route to INSPECT, not to a killer."""
+    msgs, banners = [], []
+    _seed_sandbox_and_peer()
+    monkeypatch.setattr(fs, "wake_if_idle", lambda surf, msg: msgs.append((surf, msg)) or True)
+    monkeypatch.setattr(router, "cmux", lambda *a, **k: banners.append(a) or "")
+    monkeypatch.setattr(fs, "read_hook_store",
+                        lambda: _store("running", STALE_UA, surface=SANDBOX_SURF, sid="sandbox"))
+    assert router.fleet_doctor_sweep(now=NOW) == 1
+    assert fs.surface_has_live_agent(SANDBOX_SURF) is True        # precondition: the pid really IS alive
+
+    row = fs.inbox_pending("PEER", kind="doctor")[0]
+    assert row["reason"] == "stall" and row["live"] is True        # the row records the pid verdict
+    (surf, wake_msg), = msgs
+    assert surf == "PEER"
+    _assert_safe_for_live(wake_msg, "peer wake", SANDBOX, SANDBOX_SURF)
+
+    notify, = [a for a in banners if a and a[0] == "notify"]
+    banner = _scrub(" ".join(notify), SANDBOX, SANDBOX_SURF)
+    assert "down" not in banner, f"desktop banner called a LIVE conductor DOWN: {banner!r}"
+    for verb in DESTRUCTIVE:
+        assert verb not in banner, f"desktop banner offered {verb!r} for a LIVE conductor: {banner!r}"
+
+    # ...and the INBOX row the peer actually reads must agree with its own header ("still LIVE").
+    _assert_safe_for_live(hookverbs._doctor_line(row), "inbox row", SANDBOX, SANDBOX_SURF)
+
+
+def test_dead_conductor_end_to_end_still_says_down_and_revive(fs, monkeypatch, wake):
+    """Guards the fix against over-correcting into silence: a REAL death (no live agent on the surface)
+    still reaches peers + desktop as DOWN, with revive."""
+    msgs, banners = [], []
+    _seed_sandbox_and_peer()
+    monkeypatch.setattr(fs, "wake_if_idle", lambda surf, msg: msgs.append((surf, msg)) or True)
+    monkeypatch.setattr(router, "cmux", lambda *a, **k: banners.append(a) or "")
+    store = {"v": _store("running", FRESH_UA, surface=SANDBOX_SURF, sid="sandbox")}   # seen live once...
+    monkeypatch.setattr(fs, "read_hook_store", lambda: store["v"])
+    assert router.fleet_doctor_sweep(now=NOW) == 0
+    store["v"] = _no_agents()                                                         # ...then the pid dies
+    assert router.fleet_doctor_sweep(now=NOW + CONDUCTOR_GRACE + 5) == 1
+
+    row = fs.inbox_pending("PEER", kind="doctor")[0]
+    assert row["reason"] == "conductor-down" and row["live"] is False
+    (_, wake_msg), = msgs
+    assert "appears DOWN" in wake_msg and f"fleet revive {SANDBOX}" in wake_msg
+    assert "DOWN" in " ".join(banners[-1]) and "revive" in " ".join(banners[-1])
+
+
+def test_stall_row_for_a_live_child_is_inspect_first(fs):
+    """The child channel owes the same duty: a stall row ONLY ever fires on a live pid (the sweep skips
+    no-live-agent surfaces and dead-pid ghosts outright), so its rendered advice must not read as a
+    death notice either."""
+    line = hookverbs._doctor_line({"reason": "stall", "label": "worker", "seq": 1,
+                                   "child_surface": SANDBOX_SURF, "stalled_s": 600})
+    _assert_safe_for_live(line, "child stall row", "worker", SANDBOX_SURF)
+    assert f"capture-pane --surface {SANDBOX_SURF}" in line     # the FULL uuid -> the command is runnable

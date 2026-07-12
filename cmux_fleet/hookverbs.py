@@ -33,12 +33,19 @@ def _doctor_line(r):
     conductors + Berg's desktop, where the affordance IS revive. Unknown reasons degrade to a generic
     'needs attention' rather than dropping."""
     label = r.get("label", "?")
-    surf = (r.get("child_surface") or "")[:8]
+    full = r.get("child_surface") or ""
+    surf = full[:8]
     reason = r.get("reason", "?")
     if reason == "stall":
         secs = int(r.get("stalled_s") or 0)
-        detail = (f"STALLED — turn 'running' but frozen ~{secs // 60}m (dead stream, no Stop hook fired); "
-                  f"check it, then recycle if wedged")
+        # A stall row ONLY ever fires on a surface with a LIVE pid (the sweep skips no-live-agent
+        # surfaces and dead-pid ghosts outright), and its signal — a 'running' record that stopped
+        # advancing — is indistinguishable from a HUMAN TYPING into the agent. So the row leads with
+        # INSPECT and says that outright; "recycle" stays, but only behind a confirmed wedge. Never
+        # revive/archive here: those are for a DOWN agent, and this one is by construction alive.
+        detail = (f"STALLED? — turn 'running' but the record froze ~{secs // 60}m ago (no Stop hook). "
+                  f"The pid is LIVE: a human TYPING in it produces this exact signal. INSPECT first "
+                  f"(`cmux capture-pane --surface {full}`); recycle ONLY if you confirm it is wedged")
     elif reason == "low-ctx":
         detail = (f"LOW CONTEXT — {r.get('ctx_pct_remaining', '?')}% left; wrap up + recycle before it "
                   f"runs out mid-task")

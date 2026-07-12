@@ -327,16 +327,55 @@ def _surface_error_line(surface):
     return cli.launch_error_line(cmux("capture-pane", "--surface", surface) or "")
 
 
+def conductor_alert_text(reason, label, surface, live):
+    """The peer-wake line + desktop (title, body) for a conductor alert, WORDED BY LIVENESS — never by
+    the reason string. Returns (wake, title, body).
+
+    PID AUTHORITY (the house rule): a LIVE pid is never DOWN, and never gets a destructive remedy.
+    Two of the reasons routed here — stall and detached — fire ONLY on a surface that _sweep_conductor
+    just proved PRESENT (a live agent is on it). Their positive signal is "the bound 'running' record
+    stopped advancing", which is EXACTLY what a human typing into the conductor produces: no Stop hook,
+    no stream, a frozen updatedAt. The old text hardcoded the DOWN script for every reason, so on
+    2026-07-11 a live berg-sandbox — Berg mid-sentence in it, pid up, 88% context — was reported to its
+    peers as "appears DOWN (stall) ... `fleet revive berg-sandbox`". `revive` archives the agent and
+    relands it on a FRESH surface, so obeying the alert would have DESTROYED the very session it
+    misread: the advertised remedy for the false positive is to kill what it falsely accused. The alert
+    also contradicted itself — the inbox header says "still LIVE — a health alert, not an archive".
+
+    So: live -> INSPECT (read the surface, peek the inbox), and say outright that a human may just be
+    typing. Dead -> the DOWN text, `revive` included. Deriving this from the pid HERE, in the one place
+    that writes the words, is what makes it structural: no reason routed through this function, present
+    or future, can hand a live agent a revive/archive/--force."""
+    if live:
+        return (f"(fleet-doctor) conductor {label} looks STUCK ({reason}) but is STILL LIVE (pid up) — "
+                f"a human may simply be TYPING in it. INSPECT, never recycle blind: read its surface "
+                f"(`cmux capture-pane --surface {surface}`) and peek its inbox before you touch it.",
+                f"conductor {label} needs a look ({reason})",
+                f"still LIVE (pid up) — may just be a human typing. Inspect first: "
+                f"cmux capture-pane --surface {surface}")
+    return (f"(fleet-doctor) conductor {label} appears DOWN ({reason}); "
+            f"check it and `fleet revive {label}` if it is",
+            f"conductor {label} DOWN ({reason})",
+            f"fleet-doctor found no live agent on {label}; revive with: fleet revive {label}")
+
+
 def _alert_conductor_peers(reason, down_label, down_entry, surface, payload, now=None, members=None, woke=None):
-    """Alert every OTHER live conductor plus Berg's desktop that conductor `down_label` looks DOWN
+    """Alert every OTHER live conductor plus Berg's desktop that conductor `down_label` needs attention
     (conductor-liveness condition #5). A conductor has no parent, so the alert fans out to peers and to a
     surfaceless macOS banner (`cmux notify` with no --surface) that reaches Berg regardless of focus or
-    which peers are awake. Rides the same inbox+wake rail as completions/stale. Shared by BOTH the sweep's
-    DOWN/stall predicates and _archive_closed_surface's conductor branch. Best-effort per channel; the
-    desktop banner fires even with zero live peers (the both-down case this backstop exists for)."""
+    which peers are awake. Rides the same inbox+wake rail as completions/stale. Shared by the sweep's
+    DOWN/stall/detached predicates, _archive_closed_surface's conductor branch, and recycle-failed.
+    Best-effort per channel; the desktop banner fires even with zero live peers (the both-down case this
+    backstop exists for).
+
+    The WORDS come from conductor_alert_text, gated on a fresh pid check (rs.present) rather than on the
+    reason — see there for why a live agent must never be told it is DOWN."""
     now = time.time() if now is None else now
     members = fs.live_all() if members is None else members
     woke = set() if woke is None else woke
+    live = bool(rs.present(surface))            # PID authority, re-read AT ALERT TIME (not the lifecycle
+    wake, title, body = conductor_alert_text(   # string, and not the predicate's older reading of it)
+        reason, down_label, surface, live)
     peers = [(lbl, e) for lbl, e in members.items()
              if e.get("kind") == "conductor" and lbl != down_label and e.get("surface")]
     ekey = _doctor_event_key(reason, down_label, down_entry.get("session") or "")
@@ -344,19 +383,18 @@ def _alert_conductor_peers(reason, down_label, down_entry, surface, payload, now
     for pl, pe in peers:                                # write the inbox row regardless of the --live
         ps = pe.get("surface")                          # global (like _emit; the sweep runs from the daemon
         s = fs.inbox_put("doctor", ps, {"reason": reason, "label": down_label,     # and _archive_closed_surface
-                                        "child_surface": surface, **payload},       # already LIVE-gates upstream)
-                         event_key=ekey)
+                                        "child_surface": surface, "live": live, **payload},
+                         event_key=ekey)                                          # already LIVE-gates upstream)
         if not s:
             continue                                    # THIS peer already acked this condition -> no row/wake
         seq = s
         if fs.idlewake_on() and ps not in woke:
             woke.add(ps)
-            if fs.wake_if_idle(ps, f"(fleet-doctor) conductor {down_label} appears DOWN ({reason}); "
-                                   f"check it and `fleet revive {down_label}` if it is"):
+            if fs.wake_if_idle(ps, wake):
                 fs.presented_mark(ps, [{"event_key": ekey}], "wake")
-    cmux("notify", "--title", f"conductor {down_label} DOWN ({reason})",
-         "--body", f"fleet-doctor found no live agent on {down_label}; revive with: fleet revive {down_label}")
-    log(f"[CONDUCTOR-DOWN seq={seq}] {down_label} {reason} -> {len(peers)} peer(s) + desktop")
+    cmux("notify", "--title", title, "--body", body)
+    log(f"[CONDUCTOR-{'STUCK' if live else 'DOWN'} seq={seq}] {down_label} {reason} "
+        f"(live={live}) -> {len(peers)} peer(s) + desktop")
     return seq
 
 
