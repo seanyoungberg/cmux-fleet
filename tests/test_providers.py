@@ -617,16 +617,22 @@ def test_poll_codex_filters_by_model_provider(tmp_path):
 
 
 # --- codex account health monitor (built on the refresh loop) ------------------------------------
-def _seed_home(tmp_path, acct, email=None, iid=None, logged_in=True):
+def _seed_home(tmp_path, acct, email=None, iid=None, logged_in=True, user_id=None, subscription=None):
     """A per-seat codex home on disk. `auth.json` IS the seat's credential. `installation_id` (the device id)
     is minted LAZILY on the first RUN — so a freshly logged-in home legitimately has none, and its absence
-    must never read as a failure."""
+    must never read as a failure.
+
+    `user_id` = the PERSON (chatgpt_user_id). `subscription` = the TEAM PLAN (chatgpt_account_id), which
+    DIFFERENT PEOPLE legitimately share. Defaults keep them distinct per seat; pass them explicitly to model
+    a real team (same subscription, different people) or the wrong-account bug (same person, two homes)."""
     home = tmp_path / f".codex-{acct}"
     home.mkdir(parents=True, exist_ok=True)
     if logged_in:
         toks = {"access_token": f"tok-{acct}"}
-        if email:
-            toks["id_token"] = _jwt({"email": email})
+        if email or user_id or subscription:
+            toks["id_token"] = _jwt({"email": email, "https://api.openai.com/auth": {
+                "chatgpt_user_id": user_id or f"user-{acct}",
+                "chatgpt_account_id": subscription or f"sub-{acct}"}})
         (home / "auth.json").write_text(json.dumps({"tokens": toks}))
     if iid:
         (home / "installation_id").write_text(iid)
@@ -908,6 +914,82 @@ def test_poll_codex_provider_unseeded_seat_says_UNSEEDED_not_no_rollouts(tmp_pat
     assert {x["acct"]: x["status"] for x in pv.codex_health_check()}["new"] == "unseeded"
 
 
+# --- the wrong-account interlock: one PERSON in two homes (never one SUBSCRIPTION) ---------------
+# Berg's real topology, and the distinction the first version of this guard got wrong:
+#   berglabs   sean@berglabs.net       person KUwx…   subscription 77cd2846  \  ONE TEAM PLAN,
+#   sean-flat  seanyoungberg@gmail.com person mzQC…   subscription 77cd2846  /  TWO PEOPLE — legal.
+#   sean-dot   sean.youngberg@gmail.com person 6MUK…  subscription 20495a2e
+# chatgpt_account_id is the BILL; several people share one, because that is what a team seat IS. A guard keyed
+# on it calls berglabs+sean-flat a duplicate and BLOCKS A VALID SETUP -- it cried wolf on a correct login.
+# chatgpt_user_id is the PERSON, and the person is what the backend keys a device session on. Same person in
+# two homes = two devices for one identity = they supersede each other. Key on the person, never the plan.
+_SUB_TEAM = "77cd2846"
+
+
+def test_collision_allows_TEAMMATES_sharing_one_subscription(tmp_path, monkeypatch):
+    """The false positive that a subscription-keyed guard produces. Two DIFFERENT PEOPLE on ONE team plan is
+    the normal, intended setup -- it must be allowed, or the guard blocks Berg's correct login."""
+    seats = {"berglabs": _seed_home(tmp_path, "berglabs", email="sean@berglabs.net",
+                                    user_id="user-KUwx", subscription=_SUB_TEAM),
+             "sean-flat": _seed_home(tmp_path, "sean-flat", email="seanyoungberg@gmail.com",
+                                     user_id="user-mzQC", subscription=_SUB_TEAM)}
+    _codex_health_toml(tmp_path, monkeypatch, seats)
+    for acct in seats:
+        assert pv.codex_seat_collision(acct, str(seats[acct])) == ""      # same BILL, different PEOPLE -> fine
+
+
+def test_collision_catches_the_SAME_PERSON_in_two_homes(tmp_path, monkeypatch):
+    """The real bug, live on 2026-07-12: a login reused a signed-in chatgpt.com session, so codex authenticated
+    sean@berglabs.net INTO the sean-flat home. One person, two homes -- and note it is the SAME subscription
+    too, so the person key catches it without the plan key ever being consulted."""
+    seats = {"berglabs": _seed_home(tmp_path, "berglabs", email="sean@berglabs.net",
+                                    user_id="user-KUwx", subscription=_SUB_TEAM),
+             "sean-flat": _seed_home(tmp_path, "sean-flat", email="sean@berglabs.net",   # WRONG account landed
+                                     user_id="user-KUwx", subscription=_SUB_TEAM)}
+    _codex_health_toml(tmp_path, monkeypatch, seats)
+    assert pv.codex_seat_collision("sean-flat", str(seats["sean-flat"])) == "berglabs"   # names the collision
+    assert pv.codex_seat_collision("berglabs", str(seats["berglabs"])) == "sean-flat"
+
+
+def test_collision_is_a_PURE_READ_and_never_runs_codex(tmp_path, monkeypatch):
+    """THE lesson of the whole episode. Verification RUNS codex, and a codex run is what MINTS the home's
+    installation_id -- so verifying a mis-logged-in home would mint the second device for that identity and
+    supersede the seat we were protecting. The check would DESTROY THE THING IT WAS CHECKING. It must be a
+    pure read of auth.json, and it must come BEFORE any run."""
+    seats = {a: _seed_home(tmp_path, a, user_id="user-same") for a in ("one", "two")}   # same person, 2 homes
+    _codex_health_toml(tmp_path, monkeypatch, seats)
+    monkeypatch.setattr(pv, "codex_seat_spoke", lambda *a, **k: pytest.fail(
+        "the collision check must NEVER run codex — a run mints the second device and trips the bug"))
+    monkeypatch.setattr("subprocess.run", lambda *a, **k: pytest.fail("no subprocess at all"))
+    assert pv.codex_seat_collision("two", str(seats["two"])) == "one"
+
+
+def test_collision_unseeded_home_collides_with_nothing(tmp_path, monkeypatch):
+    seats = {"new": _seed_home(tmp_path, "new", logged_in=False),
+             "live": _seed_home(tmp_path, "live", user_id="user-live")}
+    _codex_health_toml(tmp_path, monkeypatch, seats)
+    assert pv.codex_seat_collision("new", str(seats["new"])) == ""     # nothing to collide with; not an error
+
+
+def test_codex_login_REFUSES_a_wrong_account_home_BEFORE_running_anything(tmp_path, monkeypatch, capsys):
+    """The interlock wired into the cycle: a home holding someone else's identity is refused, and nothing is
+    run in it. `logged_in` here is a decoy -- the seat would otherwise verify fine, which is exactly why the
+    check must precede verification rather than follow it."""
+    seats = {"berglabs": _seed_home(tmp_path, "berglabs", email="sean@berglabs.net", user_id="user-KUwx"),
+             "sean-flat": _seed_home(tmp_path, "sean-flat", email="sean@berglabs.net", user_id="user-KUwx")}
+    logged_in = _login_harness(tmp_path, monkeypatch, seats, verified=["berglabs"])
+    monkeypatch.setattr(cli, "codex_verify_seat", lambda home: pytest.fail(
+        "the wrong-account home must be refused BEFORE it is verified — verifying it RUNS codex")
+        if "sean-flat" in str(home) else (True, "live", "the model spoke"))
+    with pytest.raises(SystemExit):                       # a seat is unusable -> nonzero
+        cli.cmd_codex_login([])
+    assert logged_in == []                                # nothing logged in, nothing superseded
+    out = capsys.readouterr().out
+    assert "WRONG ACCOUNT IN THIS HOME" in out
+    assert "ALREADY seat 'berglabs'" in out               # names WHO it collided with
+    assert "Nothing was run in that home" in out          # and says so, so the operator knows it is defused
+
+
 # --- codex-login cycles ALL seats, and SKIPS the ones already working ----------------------------
 # The skip is a SAFETY property, not an optimization: every `codex login` supersedes that account's previous
 # session, so "re-login everything to be sure" is exactly how you break the seats that were working. A cycle
@@ -916,8 +998,8 @@ def _login_harness(tmp_path, monkeypatch, seats, verified):
     """seats: {acct: home|None}. verified: the accts whose seat currently verifies. Returns the list of accts
     that codex-login actually ATTEMPTED TO LOG IN (which, for a working seat, must stay empty)."""
     _codex_health_toml(tmp_path, monkeypatch, seats)
-    monkeypatch.setattr(cli, "_codex_identity", lambda h: {"email": "x@y.com"}, raising=False)
-    monkeypatch.setattr(pv, "_codex_identity", lambda h: {"email": "x@y.com"})
+    # identity is READ FROM DISK, never stubbed: the collision interlock keys on the real chatgpt_user_id in
+    # each home's id_token, and a stub that flattened every seat to one fake identity would hide it.
     monkeypatch.setattr(pv, "codex_home_installation_id", lambda h: "dev12345")
     monkeypatch.setattr(cli, "codex_verify_seat",
                         lambda home: (any(f".codex-{a}" == os.path.basename(home) for a in verified),

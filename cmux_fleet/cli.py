@@ -5395,6 +5395,26 @@ def cmd_codex_login(argv):
             results.append((acct, "needs-home", "", ""))
             continue
 
+        # THE INTERLOCK, and it must come BEFORE anything else touches this home. Verification RUNS codex (the
+        # model has to speak), and a codex run is what MINTS the home's installation_id. So if this home holds
+        # a person who is already logged into another home, merely verifying it would mint the second device
+        # for that identity and supersede the seat we were trying to protect: the check would destroy the very
+        # thing it was checking. A pure READ of auth.json is the only safe order of operations.
+        clash = pv.codex_seat_collision(acct, home)
+        if clash:
+            ident = pv._codex_identity(home) or {}
+            print(f"\n[fleet] seat '{acct}': WRONG ACCOUNT IN THIS HOME — refusing to touch it.")
+            print(f"  {home} holds {ident.get('email')}, who is ALREADY seat '{clash}'.")
+            print( "  That is one PERSON in two homes = two devices for one identity, and they will supersede")
+            print( "  each other. (Sharing a team SUBSCRIPTION is fine and expected — teammates do it. Sharing")
+            print( "  a person is not.) It happens when a login reuses a chatgpt.com session that was never")
+            print( "  signed out, so codex authenticated whoever the browser was already.")
+            print(f"  FIX: sign out of chatgpt.com, remove {os.path.join(home, 'auth.json')}, then re-run")
+            print(f"       `fleet codex-login {acct}` and pick the intended account.")
+            print( "  Nothing was run in that home, so no second device was minted.")
+            results.append((acct, f"WRONG ACCOUNT (= {clash})", ident.get("email") or "", home))
+            continue
+
         # Already good? Then STOP. Re-logging a working seat is not a harmless no-op — it supersedes the very
         # session you were checking. This is what makes cycling ALL seats safe to run at any time.
         ok, probe, detail = codex_verify_seat(home)

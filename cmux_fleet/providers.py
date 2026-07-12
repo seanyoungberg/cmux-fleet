@@ -726,7 +726,17 @@ def poll_claude(auth):
 
 
 def _codex_identity(home):
-    """The REAL codex account (email + plan) from the home's auth.json id_token. Best-effort; {} on failure."""
+    """The REAL codex account from the home's auth.json id_token. Best-effort; {} on failure.
+
+    TWO IDS, AND CONFLATING THEM IS A BUG WE ALREADY MADE (2026-07-12):
+      - `user_id` (chatgpt_user_id) is the PERSON. This is the identity the backend keys a device session on.
+      - `subscription` (chatgpt_account_id) is the TEAM PLAN, i.e. the bill. Several DIFFERENT PEOPLE share
+        one of these — that is what a team seat IS.
+
+    Berg's berglabs and sean-flat seats are two different people on ONE team subscription (77cd2846). A
+    collision guard keyed on the SUBSCRIPTION calls that a duplicate and blocks a perfectly valid setup; it
+    cried wolf on a correct login. The hazard is the SAME PERSON in two homes, because that mints a second
+    device for one identity and supersedes it. Key on `user_id`, never `subscription`."""
     import base64
     try:
         d = json.load(open(os.path.join(os.path.expanduser(home), "auth.json")))
@@ -734,10 +744,41 @@ def _codex_identity(home):
         p = idt.split(".")[1]
         p += "=" * (-len(p) % 4)
         c = json.loads(base64.urlsafe_b64decode(p))
+        auth = c.get("https://api.openai.com/auth") or {}
         return {"email": c.get("email"), "display": c.get("email"),
-                "plan": (c.get("https://api.openai.com/auth") or {}).get("chatgpt_plan_type")}
+                "plan": auth.get("chatgpt_plan_type"),
+                "user_id": auth.get("chatgpt_user_id") or c.get("sub"),   # the PERSON (device-session key)
+                "subscription": auth.get("chatgpt_account_id")}           # the TEAM PLAN (shared; never a key)
     except Exception:
         return {}
+
+
+def codex_seat_collision(acct, home):
+    """The SAME PERSON already logged into a DIFFERENT home? Returns the colliding seat's name, or ''.
+
+    A PURE READ — it parses auth.json and never runs codex. That is the whole point: the check must be an
+    INTERLOCK BEFORE any run, not a report after one. Verifying a seat means making the model SPEAK, and a
+    codex run is exactly what mints the home's `installation_id` (lazily, on first run). So a verification
+    pointed at a mis-logged-in home would MINT THE SECOND DEVICE AND DESTROY THE THING IT WAS VERIFYING.
+
+    Keyed on the PERSON (`user_id`), never the subscription: teammates legitimately share one team plan and
+    must be allowed to coexist. Same person in two homes = two devices for one identity = they supersede each
+    other, which is the whole bug this per-seat model exists to escape."""
+    me = (_codex_identity(home) or {}).get("user_id")
+    if not me:
+        return ""                                     # unseeded / unreadable — nothing to collide with
+    for tool, name, spec, _ in iter_providers():
+        if tool != "codex" or name == acct or spec.get("type") != "subscription":
+            continue
+        try:
+            other = codex_seat_home(name, spec)
+        except ProviderError:
+            continue                                  # that seat declares no home — not a collision, a gap
+        if os.path.realpath(os.path.expanduser(other)) == os.path.realpath(os.path.expanduser(home)):
+            continue                                  # the same home twice in config is a different problem
+        if (_codex_identity(other) or {}).get("user_id") == me:
+            return name
+    return ""
 
 
 def _newest_rollout(home, model_provider=None):
