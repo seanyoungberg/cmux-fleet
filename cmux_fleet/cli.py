@@ -353,30 +353,49 @@ def _codex_config_mcp_servers(config_text):
     return sorted(set(re.findall(r'^\s*\[mcp_servers\.([^\].]+)', config_text, re.M)))
 
 
-def _codex_clean_config_flags(config_path="~/.codex/config.toml"):
-    """Launch flags that strip the Codex DESKTOP-app cruft from a fleet codex worker WITHOUT ignoring the
-    config — so the fleet-owned `[model_providers.*]` blocks (and thus the unified-home env-token auth) still
-    load. The interactive `codex` TUI can't `--ignore-user-config` (exec-only), and `-c mcp_servers={}`
-    MERGES rather than clears, so each cruft surface is disabled explicitly (both verified on codex 0.144.1):
-      - `--disable plugins` — all enabled plugins + their contributed MCP servers + marketplaces, in one
-        feature flag. Leaves `features.hooks` alone, so the fleet's OWN codex lifecycle hooks still fire.
-      - `-c mcp_servers.<n>.enabled=false`, one per `[mcp_servers.<n>]` found in the LIVE config — so the 5
-        desktop servers (incl. the 2 dead ones that error every launch) never spawn. Read from the config at
-        launch, so it is drift-robust: a server Berg adds to his desktop config is auto-disabled for workers
-        too. Absent/unreadable config → just `--disable plugins` (nothing else to disable)."""
+CODEX_DEFAULT_HOME = "~/.codex"
+
+
+def _codex_clean_config_flags(home=CODEX_DEFAULT_HOME):
+    """Launch flags that keep a codex worker off the DESKTOP app's cruft — enumerated from the home the
+    launch will ACTUALLY USE.
+
+    THE BUG THIS SHAPE FIXES (2026-07-12, found only by launching a REAL AGENT): this used to always
+    enumerate `~/.codex/config.toml` (Berg's desktop, 6 MCP servers) and emit a
+    `-c mcp_servers.<n>.enabled=false` for each — but the flags were then applied to a SEAT's home, whose
+    config declares ZERO servers. Setting `enabled=false` on a server that does not exist there CREATES
+    `[mcp_servers.<n>]` with no transport, and codex then refuses to load its config at all:
+        Error loading config.toml: invalid transport in `mcp_servers.basic-memory`
+    The agent never started. `codex exec` never caught it because the fleet agent path is a different one.
+
+    And the deeper point, which makes this a DELETION rather than a patch: **a per-seat home is already
+    clean.** The whole cruft problem existed BECAUSE workers shared Berg's desktop `~/.codex`. A fresh seat
+    home has no desktop MCP servers and no desktop plugins, so the correct number of `-c mcp_servers.*` flags
+    for it is ZERO — and enumerating from the real home yields exactly that, with no special case.
+
+      - `--disable plugins` — one feature flag, harmless in a clean home, and it still strips the desktop's
+        13 plugins when a worker does run in `~/.codex`. Leaves `features.hooks` alone (fleet hooks still fire).
+      - `-c mcp_servers.<n>.enabled=false` — ONLY for servers this home actually declares. None declared
+        (a seat home, or no config at all) -> none emitted."""
     flags = ["--disable", "plugins"]
     try:
-        text = open(os.path.expanduser(config_path)).read()
+        text = open(os.path.join(os.path.expanduser(home), "config.toml")).read()
     except OSError:
-        return flags
+        return flags                                  # no config in this home (a fresh seat) -> nothing to strip
     for name in _codex_config_mcp_servers(text):
         flags += ["-c", f"mcp_servers.{name}.enabled=false"]
     return flags
 
 
-def adapter_compile(tool, spec, caller_tokens):
+def adapter_compile(tool, spec, caller_tokens, codex_home=None):
     """Compile {plugins, flags, env, settings} + caller passthrough -> (bin, arg_tokens, env_map)
-    for the given tool. Adding a tool = adding a branch here + a [tool.<t>] block."""
+    for the given tool. Adding a tool = adding a branch here + a [tool.<t>] block.
+
+    `codex_home` is the home the codex launch will ACTUALLY run in (from the resolved provider, when the
+    optional multi-seat feature is in use). It MUST be threaded in, because the codex cruft-stripping flags
+    are enumerated FROM that home's config — computing them against the default home and applying them to a
+    seat home is what broke the agent launch (see _codex_clean_config_flags). None = codex's own default
+    home, which is exactly right for a user who has configured no providers at all."""
     # spec['flags'] is already a token list (tool-floor<-role); layer the caller passthrough on top.
     merged = _layer_tokens([spec["flags"], list(caller_tokens or [])])
     env = {**_profile_env(), **dict(spec["env"])}            # build/profile pins first; a role's env wins
@@ -403,13 +422,13 @@ def adapter_compile(tool, spec, caller_tokens):
     if tool == "codex":
         # Stub: codex has its own plugin/settings vocabulary; flags+env passthrough work today. The index
         # can EXPRESS codex plugins (tools=["codex"] + [plugin.<n>.codex] blocks) but this phase does NOT
-        # provision CODEX_HOME (deferred) -> plugins/settings are still no-ops for codex, so warn.
+        # provision codex plugins -> plugins/settings are still no-ops for codex, so warn.
         if spec["plugins"] or spec["settings"]:
             print("[fleet] warn: 'plugins'/'settings' are not yet provisioned for codex; ignored")
-        # Clean config: fleet codex workers must not inherit the desktop app's MCP servers (2 dead) +
-        # plugins + marketplaces. Prepend the disable flags (they precede the provider's model_provider
-        # selector, appended in cmd_launch); config stays loaded so env-token auth is untouched.
-        return "codex", _codex_clean_config_flags() + _codex_flags(merged), env
+        # Cruft-stripping is enumerated from the home this launch will ACTUALLY use — a seat home is already
+        # clean and yields ZERO mcp flags. Computing them against the default home and applying them to a
+        # seat home CREATES transport-less server tables and codex refuses to start (the agent-path bug).
+        return "codex", _codex_clean_config_flags(codex_home or CODEX_DEFAULT_HOME) + _codex_flags(merged), env
 
     sys.exit(f"fleet: unknown tool '{tool}' (no adapter)")
 
@@ -1378,27 +1397,40 @@ def cmd_launch(argv):
             print("[fleet] note: stripped Claude -w/--worktree from passthrough (the fleet owns this worktree)")
         print(f"[fleet] worktree: {path} on branch {branch}")
 
-    bin_name, args, env = adapter_compile(spec["tool"], spec, caller)
-    # --- provider selection (the optional providers feature) -----------------------------------
-    # Resolve the inference provider for THIS launch and merge its auth into the spawn env. A claude
-    # subscription token is injected via raw_env ($(cat path) at spawn) so the secret is never printed;
-    # the config dir is untouched, so logs stay in the tool's default place. When [providers] is
-    # unconfigured, default_provider() returns "" and this whole block is inert (attribution stays empty).
+    # --- provider selection (the OPTIONAL providers feature) -----------------------------------
+    # Resolved BEFORE adapter_compile, because a codex provider names the HOME the launch runs in, and the
+    # codex adapter must enumerate its cruft-stripping flags from THAT home (flags computed against the
+    # default home and applied to a seat home break codex's config load — the agent-path bug).
+    #
+    # STRICTLY OPT-IN: with no [providers.codex] block at all, default_provider() returns "", this block is
+    # inert, codex_home stays None, and codex runs in its own ~/.codex with ZERO fleet configuration. A
+    # single-account user never has to think about any of this.
     from . import providers as pv
-    raw_env = {}
-    if a.provider:
-        pname = a.provider
-        if ":" in pname:
-            ptool, pname = pname.split(":", 1)
-            if ptool != spec["tool"]:
-                sys.exit(f"[fleet] --provider tool '{ptool}' != this launch's tool '{spec['tool']}'")
+    raw_env, pr, codex_home = {}, None, None
+    pname = a.provider or ""
+    if pname and ":" in pname:
+        ptool, pname = pname.split(":", 1)
+        if ptool != spec["tool"]:
+            sys.exit(f"[fleet] --provider tool '{ptool}' != this launch's tool '{spec['tool']}'")
+    if not pname and spec["tool"] == "codex":
+        # A configured codex DEFAULT is a real selection, not a label: for codex the provider names the HOME,
+        # and the home IS the account. Attributing the default without resolving it would print
+        # `provider: codex:sean-dot` on an agent actually running as whoever occupies ~/.codex. Claude is
+        # left alone (its default stays attribution-only) — there, the provider does not decide identity.
+        pname = pv.default_provider("codex")
+    if pname:
         try:
             pr = pv.resolve_launch(spec["tool"], pname)
         except pv.ProviderError as e:
             sys.exit(f"[fleet] --provider: {e}")
+        codex_home = (pr.get("env") or {}).get("CODEX_HOME")   # the home this codex launch will really use
+
+    bin_name, args, env = adapter_compile(spec["tool"], spec, caller, codex_home=codex_home)
+
+    if pr:
         env.update(pr["env"])
         raw_env.update(pr["raw_env"])
-        args = args + list(pr.get("args") or [])         # provider CLI tokens (codex `-c model_provider=<acct>`)
+        args = args + list(pr.get("args") or [])         # provider CLI tokens
         spec["provider"] = pr["label"]
         # pre-launch token guard (codex env-token): refresh if near expiry, ABORT loudly on a dead/revoked
         # account so an agent never spawns into a 401 (never a silent wrong-account fallback). Skip on dry-run.
@@ -5222,37 +5254,130 @@ def cmd_profile(argv):
 
 
 def cmd_codex_setup(argv):
-    """fleet codex-setup <acct> [--auth-json PATH] [--no-provision]   provision a codex env-token account.
-    Run ONCE per account, AFTER `codex login` for it: seeds the fleet cred store (access+refresh token,
-    identity) from the login's auth.json, and adds a fenced [model_providers.<acct>] block to
-    ~/.codex/config.toml. Then add `[providers.codex.<acct>] auth = "codex-token:providers/codex-<acct>.token"`
-    to fleet.toml and launch with `--provider codex:<acct>`."""
-    import argparse
-    from . import providers as pv
-    ap = argparse.ArgumentParser(prog="fleet codex-setup")
-    ap.add_argument("acct", help="the account name (becomes the model_provider id + the fleet.toml provider)")
-    ap.add_argument("--auth-json", default="~/.codex/auth.json",
-                    help="the `codex login` auth.json to seed from (default ~/.codex/auth.json — log the "
-                         "target account in first)")
-    ap.add_argument("--no-provision", action="store_true", help="seed only; skip the config.toml block")
-    a = ap.parse_args(argv)
+    """fleet codex-setup <acct>   SUPERSEDED by `fleet codex-login <acct>`.
+
+    It provisioned the shared-home env-token model (a fleet cred store + a fenced [model_providers.<acct>]
+    block in ~/.codex/config.toml). That model is the supersession BUG: it pinned every seat to the single
+    ~/.codex device, and the backend keys one active session per device. It refuses rather than hands out
+    config the launch resolver now rejects."""
+    acct = (argv[0] if argv and not argv[0].startswith("-") else "<acct>")
+    sys.exit(
+        f"[fleet] codex-setup is SUPERSEDED — use `fleet codex-login {acct}`.\n"
+        f"  It set up the shared-home env-token model (one ~/.codex for every seat). The ChatGPT backend\n"
+        f"  keys one active session per DEVICE, and the device id lives in the codex HOME — so seats sharing\n"
+        f"  a home revoke each other on every login. Each seat now needs its OWN home:\n"
+        f"      [providers.codex.{acct}]\n      type = \"subscription\"\n"
+        f"      auth = \"codex-home:~/.codex-{acct}\"\n"
+        f"  then: fleet codex-login {acct}")
+
+
+def _codex_login_surface(home, cwd):
+    """Open a cmux TERMINAL TAB with the login command TYPED BUT NOT EXECUTED. Returns the surface id, or ''.
+
+    A TAB, never a split: `new-surface --pane <uuid>` SPLITS the pane even when given a uuid, which would
+    carve up whatever the operator is looking at. Targeting the WORKSPACE makes a tab.
+
+    The command is sent WITHOUT a trailing \\r on purpose — the operator must sign out of chatgpt.com first,
+    and a login fired before that silently reuses the browser session and authenticates the WRONG account."""
+    ws = ""
     try:
-        cred = pv.codex_seed_from_authjson(a.acct, a.auth_json)
+        ws, _pane = surface_loc(os.environ.get("CMUX_SURFACE_ID", "") or "")
+    except Exception:
+        ws = ""
+    args = ["new-surface", "--type", "terminal", "--working-directory", cwd]
+    if ws:
+        args += ["--workspace", ws]                  # workspace => a TAB (a --pane would SPLIT)
+    surf = (cmuxq(*args) or "").strip().split("\n")[-1].strip()
+    if not surf:
+        return ""
+    cmuxq("send-panel", "--panel", surf, "--", f"CODEX_HOME={home} codex login")   # typed, NOT executed
+    return surf
+
+
+def cmd_codex_login(argv):
+    """fleet codex-login <acct> [--timeout N] [--verify-only]   log a codex SEAT into its OWN home.
+
+    Each codex seat needs its own CODEX_HOME: the ChatGPT backend keys one active session per DEVICE, and the
+    device id (installation_id) is a per-home file. Seats sharing a home supersede each other; seats in their
+    own homes run concurrently.
+
+    The cycle: resolve the seat's declared home (never invented) -> create it (codex refuses a home that does
+    not exist) -> open a terminal TAB with the login typed but NOT run -> wait for auth.json -> VERIFY HARD.
+
+    Verification is backend /me 200 AND the model actually SPEAKING (`codex exec -o`, which only an
+    authenticated run can write). It reports the email actually obtained, because a browser session that was
+    not signed out authenticates the WRONG account — and that must be caught, never celebrated."""
+    import argparse, time as _t
+    from . import providers as pv
+    ap = argparse.ArgumentParser(prog="fleet codex-login")
+    ap.add_argument("acct", help="the codex seat (must declare `auth = \"codex-home:<path>\"` in fleet.toml)")
+    ap.add_argument("--timeout", type=int, default=300, help="seconds to wait for the login (default 300)")
+    ap.add_argument("--verify-only", action="store_true",
+                    help="verify the seat as it stands; never open a login (safe: a login supersedes)")
+    a = ap.parse_args(argv)
+
+    spec = pv.get_provider("codex", a.acct)
+    if not spec:
+        sys.exit(f"[fleet] codex-login: no [providers.codex.{a.acct}] in fleet.toml")
+    try:
+        home = pv.codex_seat_home(a.acct, spec)      # loud + actionable when undeclared; NEVER guessed
     except pv.ProviderError as e:
-        sys.exit(f"[fleet] codex-setup: {e}")
-    ident = cred.get("identity") or {}
-    print(f"[fleet] seeded codex account '{a.acct}': {ident.get('email') or '(no email)'} "
-          f"plan={ident.get('plan') or '?'} -> {pv._codex_token_path(a.acct)} (0600)")
-    if not a.no_provision:
-        try:
-            path = pv.codex_provision_config(a.acct)
-            print(f"[fleet] provisioned [model_providers.{a.acct}] in {path} (fenced, idempotent)")
-        except pv.ProviderError as e:
-            sys.exit(f"[fleet] codex-setup: {e}")
-    print(f"[fleet] next: add to fleet.toml ->\n"
-          f"    [providers.codex.{a.acct}]\n    type = \"subscription\"\n"
-          f"    auth = \"codex-token:providers/codex-{a.acct}.token\"\n"
-          f"  then: fleet launch <role> --tool codex --provider codex:{a.acct}")
+        sys.exit(f"[fleet] codex-login: {e}")
+
+    # Already good? Then STOP. Every `codex login` supersedes that account's previous session, so re-logging
+    # a working seat is not a harmless no-op — it is a way to break the thing you were checking.
+    if pv.codex_home_token(home):
+        if pv.codex_probe_backend(pv.codex_home_token(home)) == "live":
+            ok, detail = pv.codex_seat_spoke(home)
+            if ok:
+                ident = pv._codex_identity(home) or {}
+                print(f"[fleet] codex seat '{a.acct}' is ALREADY authenticated — not logging in again "
+                      f"(a login would supersede it).")
+                print(f"  home        : {home}")
+                print(f"  account     : {ident.get('email') or '(unknown)'}")
+                print(f"  device id   : {pv.codex_home_installation_id(home)[:8] or '(not yet minted)'}")
+                print(f"  backend /me : live")
+                print(f"  model turn  : {detail}")
+                return 0
+    if a.verify_only:
+        sys.exit(f"[fleet] codex-login --verify-only: seat '{a.acct}' is NOT usable "
+                 f"(no live token in {home}). Re-run without --verify-only to log it in.")
+
+    os.makedirs(home, exist_ok=True)                 # codex ERRORS on a CODEX_HOME that does not exist
+    print(f"[fleet] codex-login '{a.acct}' -> home {home}")
+    print( "  1. SIGN OUT of chatgpt.com in your browser FIRST.")
+    print( "     A login that reuses the browser session authenticates the WRONG account, and the fleet")
+    print( "     cannot tell you asked for a different one — it can only tell you which one you got.")
+    print(f"  2. A terminal tab is opening with the command typed. Press Enter to run it, pick '{a.acct}'.")
+
+    surf = _codex_login_surface(home, os.getcwd())
+    if not surf:
+        print(f"  (could not open a cmux tab — run it yourself:  CODEX_HOME={home} codex login)")
+
+    authjson = os.path.join(home, "auth.json")
+    print(f"[fleet] waiting up to {a.timeout}s for {authjson} ...")
+    end = _t.time() + a.timeout
+    while _t.time() < end and not os.path.exists(authjson):
+        _t.sleep(2)
+    if not os.path.exists(authjson):
+        sys.exit(f"[fleet] codex-login: timed out — no auth.json in {home}. Nothing was changed.")
+
+    ident = pv._codex_identity(home) or {}
+    got = ident.get("email") or "(unknown)"
+    print(f"[fleet] auth.json appeared. account obtained: {got}")
+
+    tok = pv.codex_home_token(home)
+    probe = pv.codex_probe_backend(tok) if tok else "no-token"
+    ok, detail = pv.codex_seat_spoke(home) if probe == "live" else (False, "skipped (backend rejected it)")
+    print(f"  backend /me : {probe}")
+    print(f"  model turn  : {'YES — ' + detail if ok else 'NO — ' + detail}")
+    # installation_id is minted on the FIRST RUN, not at login — so it only exists now, after the verify run.
+    print(f"  device id   : {pv.codex_home_installation_id(home)[:8] or '(not yet minted)'}")
+    if not (probe == "live" and ok):
+        sys.exit(f"[fleet] codex-login: seat '{a.acct}' did NOT verify. It is not usable. "
+                 f"(A backend 200 AND the model speaking are both required.)")
+    print(f"[fleet] seat '{a.acct}' VERIFIED ({got}). Launch it: "
+          f"fleet launch <role> --tool codex --provider codex:{a.acct}")
     return 0
 
 
@@ -5290,7 +5415,8 @@ VERB_USAGE = {
           "                                                    close + archive a label (revivable; refuses mid-turn, --force overrides); --detach drops the row only; --kill adds worktree teardown; --with-group dissolves its workspace-group",
     "vitals": "  vitals [--scope mine|all|conductors|children] [--json] [--paint] [--watch [--interval N]] cheapest-first triage table + ctx-remaining % (default mine)",
     "usage": "  usage [--json]                                    per-provider subscription windows (5h + weekly bars, reset countdowns, metered/Fable flags, live attribution) from the daemon poller",
-    "codex-setup": "  codex-setup <acct> [--auth-json PATH] [--no-provision]  provision a codex env-token account (seed cred store + fenced ~/.codex/config.toml block); run once after `codex login`",
+    "codex-setup": "  codex-setup <acct>                       SUPERSEDED -> use `codex-login` (it set up the shared-home env-token model, which is the supersession bug)",
+    "codex-login": "  codex-login <acct> [--timeout N] [--verify-only]  log a codex SEAT into its OWN home (each seat needs one: the backend keys a session per device, and the device id is per-home). Opens a terminal tab with the login typed, waits, then VERIFIES with a backend 200 + the model actually speaking, and reports the account it really got",
     "find": "  find <query> [--turns N] [--json]                 content-aware session lookup (label/role/cwd or transcript)",
     "graph": "  graph [--scope mine|all|<label>] [--json] [--html] [--out FILE]  fleet parentage tree (text/JSON/HTML); default mine = your subtree; --scope all = full tree",
     "serve": "  serve [--port N]                                  thin read-only localhost view (graph HTML + vitals.json); no daemon",
@@ -5323,7 +5449,10 @@ INTERNAL_USAGE = {
 # worse, silently ignored — `fleet serve --help` STARTED THE HTTP SERVER and blocked).
 SELF_HELP_VERBS = frozenset({
     "launch", "config", "plugins", "revive", "register", "recycle", "move", "group", "unstick",
-    "reap-surfaces", "sessions", "worktree", "profile", "daemon", "find", "codex-setup",
+    "reap-surfaces", "sessions", "worktree", "profile", "daemon", "find", "codex-login",
+    # codex-setup is NOT here any more: it lost its ArgumentParser when it became a superseded-stub, so it
+    # can no longer render its own --help. The guard now serves it from VERB_USAGE (which is the whole point
+    # of the guard: a verb without a parser must never be RUN just to ask it for help).
 })
 
 
@@ -5349,6 +5478,7 @@ def verb_table():
             "rm": cmd_rm, "worktree": cmd_worktree, "profile": cmd_profile, "daemon": fd.cmd_daemon,
             "vitals": ff.cmd_vitals, "usage": ff.cmd_usage, "find": ff.cmd_find, "graph": ff.cmd_graph,
             "codex-setup": cmd_codex_setup,
+            "codex-login": cmd_codex_login,
             "serve": ff.cmd_serve, "paint": ff.cmd_paint,
             "drive-child": fh.cmd_drive_child, "peer-msg": fh.cmd_peer_msg,
             "child-digest": fh.cmd_child_digest, "inbox": fh.cmd_inbox, "inbox-ack": fh.cmd_inbox_ack}

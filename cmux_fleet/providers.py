@@ -204,6 +204,107 @@ CODEX_REFRESH_MARGIN_S = 1800          # refresh when the access token expires w
 # `userinfo` AND has a future JWT `exp`, yet returns 401 here. Expiry/refresh checks alone are false-healthy.
 CODEX_BACKEND_PROBE_URL = "https://chatgpt.com/backend-api/me"
 
+# --- per-seat codex homes (the model, settled by the 2026-07-11 coexistence test) ----------------
+# The ChatGPT backend enforces ONE ACTIVE SESSION PER DEVICE, and the device id is `installation_id` — a
+# uuid file living in each codex HOME (code-verified against codex-lb, which stamps a per-account one into
+# every upstream request). So seats SHARING a home are one device and supersede each other on every login;
+# seats in their OWN homes are distinct devices and run CONCURRENTLY. Verified end-to-end: two seats in
+# separate homes both produced real assistant output at the same time and neither killed the other.
+#
+# Consequence: a codex subscription's home IS its credential boundary. The fleet REQUIRES it to be declared
+# (`auth = "codex-home:<path>"`) and NEVER invents one — Berg's steer, and the safety property that matters:
+# a guessed home silently points a seat at ANOTHER seat's credentials.
+CODEX_HOME_CONVENTION = "~/.codex-{acct}"   # sibling of codex's own ~/.codex: visible, typeable
+
+
+def codex_home_hint(acct):
+    return CODEX_HOME_CONVENTION.format(acct=acct)
+
+
+def _codex_no_home_msg(acct, method=""):
+    superseded = ("\n  (was `codex-token:` — the shared-home env-token path. It pinned every seat to the ONE "
+                  "~/.codex device, which IS the supersession bug. It is superseded, not merely discouraged.)"
+                  if method == "codex-token" else "")
+    return (f"codex account '{acct}' declares no per-seat home.\n"
+            f"  Every codex subscription needs its OWN CODEX_HOME: the backend keys one active session per "
+            f"DEVICE (the per-home installation_id), so seats sharing a home revoke each other.\n"
+            f"  Declare it (the fleet will not guess — a wrong guess aims a seat at another seat's creds):\n"
+            f"      [providers.codex.{acct}]\n"
+            f"      type = \"subscription\"\n"
+            f"      auth = \"codex-home:{codex_home_hint(acct)}\"\n"
+            f"  then: fleet codex-login {acct}{superseded}")
+
+
+def codex_seat_home(acct, spec):
+    """The seat's OWN codex home, from `auth = "codex-home:<path>"`. REQUIRED — raises ProviderError with the
+    convention when unset (or still on the superseded shared-home token path). Never invents a default."""
+    method, arg = _parse_auth(spec.get("auth", ""))
+    if method == "codex-home" and (arg or "").strip():
+        return os.path.expanduser(arg.strip())
+    raise ProviderError(_codex_no_home_msg(acct, method))
+
+
+def codex_home_token(home):
+    """The seat's access token from ITS OWN home's auth.json ('' if absent). THIS is a per-seat home's
+    credential — not the fleet cred store, which was seeded from the shared ~/.codex and goes stale the
+    moment a seat moves into its own home. That staleness is exactly why a demonstrably-healthy seat kept
+    reading 'revoked'."""
+    try:
+        d = json.load(open(os.path.join(os.path.expanduser(home), "auth.json")))
+        return (d.get("tokens") or {}).get("access_token") or ""
+    except Exception:
+        return ""
+
+
+def codex_home_installation_id(home):
+    """The per-home DEVICE id ('' if not yet minted).
+
+    MINTED LAZILY, ON THE FIRST RUN — NOT AT LOGIN. A freshly logged-in home has auth.json but NO
+    installation_id until codex actually runs once. '' is therefore the NORMAL state of a new seat and must
+    never be read as a failure (it only means "this home has not run yet")."""
+    try:
+        return open(os.path.join(os.path.expanduser(home), "installation_id")).read().strip()
+    except Exception:
+        return ""
+
+
+def codex_seat_spoke(home, timeout=120):
+    """Make the model in `home` ACTUALLY SPEAK. Returns (ok, detail) — the ONLY sound proof a seat is usable.
+
+    THE FALSE POSITIVE THIS EXISTS TO KILL: `codex exec` echoes the PROMPT to stdout BEFORE it authenticates,
+    so a run that 401s and produces ZERO assistant output still has your nonce in its stdout. Grepping stdout
+    therefore PASSES A TOTAL FAILURE — it nearly shipped three times.
+
+    The sound discriminator (control-tested both directions): `codex exec -o <file>` writes ONLY the
+    assistant's final message. A 401 never produces an assistant message, so it never writes the file. The
+    failure mode structurally CANNOT counterfeit the success signal. Never grep stdout. Never accept
+    task_complete."""
+    import secrets, subprocess, tempfile
+    nonce = secrets.token_hex(4).upper()
+    fd, out = tempfile.mkstemp(prefix="fleet-codex-verify-", suffix=".txt")
+    os.close(fd)
+    os.unlink(out)                                   # codex must CREATE it; an existing file would be a lie
+    env = {**os.environ, "CODEX_HOME": os.path.expanduser(home)}
+    try:
+        subprocess.run(["codex", "exec", "--dangerously-bypass-approvals-and-sandbox",
+                        "--skip-git-repo-check", "-o", out,
+                        f"Reply with exactly this line and nothing else: {nonce}"],
+                       capture_output=True, text=True, timeout=timeout, env=env)
+    except subprocess.TimeoutExpired:
+        return False, "timed out"
+    except FileNotFoundError:
+        return False, "codex binary not found on PATH"
+    if not os.path.exists(out):                      # a 401 lands HERE: no assistant message was ever written
+        return False, "no assistant message written (the seat did not authenticate)"
+    said = open(out).read().strip()
+    try:
+        os.unlink(out)
+    except OSError:
+        pass
+    if nonce in said:
+        return True, f'the model spoke: "{said[:40]}"'
+    return False, f"assistant wrote something else: {said[:40]!r}"
+
 
 def _codex_token_path(acct):
     """The 0600 file a launch reads via $(cat): JUST the access token."""
@@ -314,42 +415,49 @@ def codex_probe_backend(access_token, timeout=15):
 
 
 def codex_health_check():
-    """Check each configured codex-token account's TOKEN health (not its usage). Two layers, because the
-    clock alone is FALSE-HEALTHY for a superseded token (future `exp`, but the backend has revoked it):
-      1. codex_ensure_fresh — silent refresh only if near expiry (a not-near-expiry token costs no network);
-         a dead refresh_token surfaces here as 'revoked'.
-      2. codex_probe_backend — a read-only GET against the ChatGPT backend that catches a token the clock
-         and refresh_token both still consider valid but the backend has revoked (the one-active-session
-         supersession; see CODEX_BACKEND_PROBE_URL). This is the gap the expiry-only check missed.
-    Classifies: 'healthy' | 'revoked' (needs re-login) | 'unseeded' (never set up — not an alert) | 'error'
-    (transient, no alert). Returns [{acct, email, status, detail, checked_at}]. Never raises."""
+    """Check every codex SUBSCRIPTION seat's credential health, reading each seat's OWN home.
+
+    THE BUG THIS FIXES: health used to read the fleet cred store (seeded from the shared `~/.codex`) and to
+    skip any seat that wasn't on the old `codex-token:` path entirely. Once a seat moved into its own home,
+    that stored token was a stale artifact of a device the seat no longer uses — so a seat that was
+    demonstrably healthy (backend /me 200, model speaking) kept being reported REVOKED. The seat's home is
+    now the single source of its credential.
+
+    The probe is still the backend, because it is the only layer that sees a superseded token: the JWT `exp`
+    and the IdP userinfo endpoint are BOTH false-healthy for a revoked seat.
+
+    Statuses: 'healthy' | 'revoked' (needs re-login) | 'unseeded' (home declared, never logged in) |
+    'needs-home' (no per-seat home declared — a CONFIG gap, actionable, never an alert) | 'error'
+    (transient). Never raises."""
     out = []
     for tool, name, spec, _ in iter_providers():
-        method, _m = _parse_auth(spec.get("auth", ""))
-        if tool != "codex" or method != "codex-token":
+        if tool != "codex" or spec.get("type") != "subscription":
             continue
-        rec = {"acct": name, "email": (_codex_token_identity(name) or {}).get("email"),
-               "checked_at": int(time.time())}
+        rec = {"acct": name, "email": None, "checked_at": int(time.time())}
         try:
-            tok = codex_ensure_fresh(name)
-            probe = codex_probe_backend(tok)         # layer 2: server truth, catches supersession
-            if probe == "revoked":
-                rec["status"] = "revoked"
-                rec["detail"] = ("token rejected by the ChatGPT backend (superseded / server-revoked "
-                                 "despite a future expiry — needs a re-login)")
-            elif probe == "live":
-                rec["status"], rec["detail"] = "healthy", ""
-            else:                                    # 'unreachable' — a transient probe blip. 'error' (no alert),
-                rec["status"] = "error"              # NOT a false-'healthy': we could not VERIFY the token, and
-                rec["detail"] = "backend probe unreachable; token unverified this tick"  # this matches the
-                #                                      transient-refresh branch below (both -> 'error', retry next tick).
-        except ProviderTransientError as e:          # network blip / 5xx — NOT offline; retry next tick, no alert
+            home = codex_seat_home(name, spec)        # raises (needs-home) when undeclared — never guessed
+            rec["home"] = home
+            rec["email"] = (_codex_identity(home) or {}).get("email")
+            tok = codex_home_token(home)
+            if not tok:
+                rec["status"] = "unseeded"
+                rec["detail"] = f"no auth.json in {home} — run `fleet codex-login {name}`"
+            else:
+                probe = codex_probe_backend(tok)     # server truth: the only layer that sees supersession
+                if probe == "revoked":
+                    rec["status"] = "revoked"
+                    rec["detail"] = (f"token in {home} rejected by the ChatGPT backend (superseded despite a "
+                                     f"future expiry) — run `fleet codex-login {name}`")
+                elif probe == "live":
+                    rec["status"], rec["detail"] = "healthy", ""
+                else:                                # 'unreachable' — transient. NOT a false-'healthy': we
+                    rec["status"] = "error"          # could not VERIFY, so we do not claim we did.
+                    rec["detail"] = "backend probe unreachable; token unverified this tick"
+        except ProviderTransientError as e:          # network blip / 5xx — retry next tick, no alert
             rec["status"], rec["detail"] = "error", str(e)
-        except ProviderError as e:                   # a genuine rejection (revoked) or an unseeded account
-            msg = str(e)
-            rec["status"] = "unseeded" if "not seeded" in msg else "revoked"
-            rec["detail"] = msg
-        except Exception as e:                        # unknown — never cry wolf
+        except ProviderError as e:                   # no home declared: a config gap, NOT a revocation
+            rec["status"], rec["detail"] = "needs-home", str(e)
+        except Exception as e:                       # unknown — never cry wolf
             rec["status"], rec["detail"] = "error", f"{type(e).__name__}"
         out.append(rec)
     return out
@@ -488,43 +596,31 @@ def codex_ensure_fresh(acct, force=False):
 
 
 def _resolve_codex(base, acct, method, arg):
-    """Codex per-launch account selection. Two methods (verdict settled 2026-07-07; env-token validated
-    live 2026-07-10, so it is now the PREFERRED path, not a stub):
+    """Codex per-launch account selection. ONE method, settled by the 2026-07-11 coexistence test:
 
-      codex-token:<file>  (PREFERRED, unified home, no session/config split) — inject the account's ChatGPT
-          OAuth token into `CODEX_TOKEN_ENV` at spawn (spawn-time $(cat), secret-safe) and select the account
-          with `-c model_provider=<acct>`. Requires a one-time `[model_providers.<acct>]` block in
-          ~/.codex/config.toml (name="OpenAI", base_url="https://chatgpt.com/backend-api/codex",
-          env_key="CMUX_FLEET_CODEX_TOKEN", wire_api="responses", requires_openai_auth=false). The token file
-          is fleet-owned and kept fresh by the refresh loop (SEPARATE, not yet wired — this resolver only
-          READS the file; a stale token fails the launch loudly at codex, it does not silently fall back).
+      codex-home:<path>   the seat's OWN home. Its `auth.json` IS the credential (codex refreshes it itself),
+          and its `installation_id` is the DEVICE the ChatGPT backend keys the session on. Two seats in their
+          own homes are two devices and run CONCURRENTLY (verified: both spoke at once, neither killed the
+          other). Two seats sharing a home are ONE device and supersede each other on every login.
 
-      codex-home:<path>   (FALLBACK/opt-in, self-refreshing, splits sessions per home) — select the account
-          by pointing CODEX_HOME at its own config dir + auth.json.
-    """
-    if method == "codex-token":
-        path = _token_path(arg)
-        if not os.path.exists(path):
-            raise ProviderError(f"codex provider '{acct}': token file not found: {path} "
-                                f"(the fleet-owned token; provision + refresh it there)")
-        base["raw_env"][CODEX_TOKEN_ENV] = f'"$(cat {shlex.quote(path)})"'
-        base["args"] = ["-c", f"model_provider={acct}"]
-        base["needs_refresh"] = acct                 # cmd_launch calls codex_ensure_fresh(acct) before spawn
-        base["note"] = (f"codex account '{acct}' via env-token (unified home; needs "
-                        f"[model_providers.{acct}] in ~/.codex/config.toml with env_key={CODEX_TOKEN_ENV})")
-        return base
+    `codex-token:<file>` (the old shared-home env-token path) is REFUSED, not merely deprecated: it pinned
+    every seat to the single ~/.codex device, which IS the supersession bug. A codex subscription that
+    declares no home fails LOUDLY here — the fleet never invents one, because a guessed home silently aims a
+    seat at another seat's credentials."""
     if method == "codex-home":
-        home = os.path.expanduser(arg)
-        if os.path.realpath(home) == os.path.realpath(os.path.expanduser("~/.codex")):
-            return base                              # default home = current account, no injection needed
+        home = os.path.expanduser((arg or "").strip())
+        if not home:
+            raise ProviderError(_codex_no_home_msg(acct, method))
         if not os.path.exists(os.path.join(home, "auth.json")):
-            raise ProviderError(f"codex provider '{acct}' home has no auth.json: {home} "
-                                f"(log it in once with `CODEX_HOME={home} codex login`)")
+            raise ProviderError(f"codex seat '{acct}': home {home} has no auth.json — it is not logged in.\n"
+                                f"  Run: fleet codex-login {acct}")
+        # Set CODEX_HOME EXPLICITLY, even when the home IS ~/.codex. The old code returned early there
+        # ("it's the default, no injection needed") — true, but it left the seat's identity IMPLICIT, and
+        # implicit identity is exactly what let three seats silently share one device.
         base["env"]["CODEX_HOME"] = home
-        base["note"] = f"codex account '{acct}' via CODEX_HOME={home} (fallback; splits sessions)"
+        base["note"] = f"codex seat '{acct}' via its OWN home {home} (that auth.json IS the credential)"
         return base
-    raise ProviderError(f"codex provider '{acct}' auth method '{method}' unsupported; use "
-                        f"codex-token:<file> (preferred) or codex-home:<path> (fallback)")
+    raise ProviderError(_codex_no_home_msg(acct, method))
 
 
 def _read_env_file(path):
@@ -821,14 +917,32 @@ def _poll_claude_provider(spec, name):
 
 
 def _poll_codex_provider(spec, name):
-    method, arg = _parse_auth(spec["auth"])
-    if method == "codex-token":
-        # unified ~/.codex home: filter rollouts by this account's model_provider (= the provider name),
-        # and take identity from the fleet cred store (env-token accounts are not ~/.codex/auth.json).
-        r = poll_codex("~/.codex", model_provider=name)
-        r["identity"] = _codex_token_identity(name)
-        return r
-    return poll_codex(arg or "~/.codex")             # codex-home: its own home, no filter
+    """Poll a codex SEAT from its OWN home — the same source health reads, so the two can never disagree.
+
+    Server-side first (`/backend-api/codex/usage` with the home's own token): terminal-independent, richer,
+    and correct for a seat that has not run recently. Falls back to that home's rollout scrape when the API
+    is unreachable, so a network blip degrades instead of blanking. A seat with no declared home reports the
+    config gap rather than silently polling the WRONG home (the failure that reported a healthy seat as
+    revoked)."""
+    try:
+        home = codex_seat_home(name, spec)
+    except ProviderError as e:
+        return {"ok": False, "error": "needs-home", "detail": str(e)}
+    tok = codex_home_token(home)
+    ident = _codex_identity(home)
+    if tok:
+        acct_id = None
+        try:                                          # the backend wants the account id alongside the token
+            acct_id = json.load(open(os.path.join(home, "auth.json"))).get("tokens", {}).get("account_id")
+        except Exception:
+            pass
+        r = poll_codex_api(tok, acct_id)
+        if r.get("ok"):
+            r["identity"] = ident
+            return r
+    r = poll_codex(home)                              # fallback: this home's own rollouts (no cross-seat filter)
+    r["identity"] = ident
+    return r
 
 
 _POLLERS = {"claude": _poll_claude_provider, "codex": _poll_codex_provider}

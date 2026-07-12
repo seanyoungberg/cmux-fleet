@@ -103,14 +103,22 @@ def test_resolve_missing_token_file_errors(providers_toml, monkeypatch):
         pv.resolve_launch("claude", "throwaway")
 
 
-def test_resolve_codex_home_default_noop(providers_toml):
-    r = pv.resolve_launch("codex", "berg-team")                       # codex-home:~/.codex = current home
-    assert r["env"] == {} and r["raw_env"] == {} and r["args"] == []
+# --- per-seat codex homes (the model, settled by the 2026-07-11 coexistence test) -----------------
+# The ChatGPT backend keys ONE ACTIVE SESSION PER DEVICE, and the device id (installation_id) is a PER-HOME
+# file. Seats sharing a home are one device and revoke each other; seats in their own homes coexist. So the
+# home IS the credential boundary, it is REQUIRED, and the fleet must NEVER invent one.
+
+def test_resolve_codex_home_sets_CODEX_HOME_even_when_it_is_the_default_home(providers_toml):
+    # berg-team's home IS ~/.codex. The old code returned early there ("default home, no injection needed"),
+    # which left the seat's identity IMPLICIT — and implicit identity is what let 3 seats share one device.
+    r = pv.resolve_launch("codex", "berg-team")
+    assert r["env"]["CODEX_HOME"] == os.path.expanduser("~/.codex")
+    assert r["raw_env"] == {} and r["args"] == []     # no token injection, no -c model_provider: the home IS the cred
 
 
 def test_resolve_codex_home_without_login_errors(providers_toml):
-    # fixture's acct2 = codex-home at a dir with no auth.json -> refuse loudly (never silent-fallback to ~/.codex)
-    with pytest.raises(pv.ProviderError, match="codex login"):
+    # a declared home with no auth.json -> refuse loudly and name the fix; NEVER silently fall back to ~/.codex
+    with pytest.raises(pv.ProviderError, match="fleet codex-login"):
         pv.resolve_launch("codex", "acct2")
 
 
@@ -122,36 +130,46 @@ def test_resolve_codex_home_with_login_sets_home(providers_toml):
     assert r["env"]["CODEX_HOME"] == str(home) and not r["provisional"] and r["args"] == []
 
 
-def test_resolve_codex_token_env_path(tmp_path, monkeypatch):
+def _codex_toml(tmp_path, monkeypatch, auth):
+    monkeypatch.setattr(pv, "FLEET_TOML", _toml(tmp_path, f"""
+        [providers.codex]
+        default = "acctx"
+        [providers.codex.acctx]
+        type = "subscription"
+        auth = "{auth}"
+    """))
+
+
+def test_resolve_codex_token_is_REFUSED_as_the_superseded_shared_home_model(tmp_path, monkeypatch):
+    # REGRESSION GUARD on the actual bug. `codex-token:` was the shared-home env-token path: it pinned every
+    # seat to the ONE ~/.codex device, so each login superseded the previous seat. It must not merely be
+    # discouraged — a launch on it must FAIL, and say what to do instead.
     tok = tmp_path / "codex-acctx.token"
-    tok.write_text("ya29-fake-chatgpt-oauth-token\n")
-    toml = _toml(tmp_path, f"""
-        [providers.codex]
-        default = "acctx"
-        [providers.codex.acctx]
-        type = "subscription"
-        auth = "codex-token:{tok}"
-    """)
-    monkeypatch.setattr(pv, "FLEET_TOML", toml)
-    r = pv.resolve_launch("codex", "acctx")
-    # per-launch account selection via -c model_provider, token read at spawn (secret not embedded)
-    assert r["args"] == ["-c", "model_provider=acctx"]
-    raw = r["raw_env"][pv.CODEX_TOKEN_ENV]
-    assert raw.startswith('"$(cat ') and str(tok) in raw and "ya29" not in raw
-    assert not r["provisional"]
-
-
-def test_resolve_codex_token_missing_file_errors(tmp_path, monkeypatch):
-    toml = _toml(tmp_path, """
-        [providers.codex]
-        default = "acctx"
-        [providers.codex.acctx]
-        type = "subscription"
-        auth = "codex-token:/nonexistent/x.token"
-    """)
-    monkeypatch.setattr(pv, "FLEET_TOML", toml)
-    with pytest.raises(pv.ProviderError, match="token file not found"):
+    tok.write_text("ya29-fake\n")
+    _codex_toml(tmp_path, monkeypatch, f"codex-token:{tok}")
+    with pytest.raises(pv.ProviderError) as ei:
         pv.resolve_launch("codex", "acctx")
+    msg = str(ei.value)
+    assert "codex-home:~/.codex-acctx" in msg          # names the convention...
+    assert "fleet codex-login acctx" in msg            # ...and the command that fixes it
+    assert "superseded" in msg
+
+
+def test_resolve_codex_without_any_home_is_refused_never_invented(tmp_path, monkeypatch):
+    # Berg's steer: "require explicit instead of making something up". A GUESSED home would silently aim a
+    # seat at another seat's credentials, so an undeclared home must fail, not default.
+    _codex_toml(tmp_path, monkeypatch, "codex-home:")
+    with pytest.raises(pv.ProviderError, match="declares no per-seat home"):
+        pv.resolve_launch("codex", "acctx")
+
+
+def test_codex_seat_home_never_guesses(tmp_path, monkeypatch):
+    with pytest.raises(pv.ProviderError):
+        pv.codex_seat_home("ghost", {"auth": ""})                      # no auth at all
+    with pytest.raises(pv.ProviderError):
+        pv.codex_seat_home("ghost", {"auth": "codex-token:/x.token"})  # the superseded path
+    assert pv.codex_seat_home("s", {"auth": "codex-home:~/.codex-s"}) == os.path.expanduser("~/.codex-s")
+    assert pv.codex_home_hint("s") == "~/.codex-s"                     # the stated convention
 
 
 def test_resolve_vertex_reads_env_file(providers_toml):
@@ -593,27 +611,65 @@ def test_poll_codex_filters_by_model_provider(tmp_path):
 
 
 # --- codex account health monitor (built on the refresh loop) ------------------------------------
-def _codex_health_toml(tmp_path, monkeypatch, accts, home_accts=()):
-    lines = ["[providers.codex]", f'default = "{accts[0]}"']
-    for a in accts:
-        lines += [f"[providers.codex.{a}]", 'type = "subscription"', f'auth = "codex-token:{tmp_path}/{a}.token"']
-    for a in home_accts:                              # a codex-HOME (fallback) provider: must NOT be monitored
-        lines += [f"[providers.codex.{a}]", 'type = "subscription"', f'auth = "codex-home:{tmp_path}/{a}"']
+def _seed_home(tmp_path, acct, email=None, iid=None, logged_in=True):
+    """A per-seat codex home on disk. `auth.json` IS the seat's credential. `installation_id` (the device id)
+    is minted LAZILY on the first RUN — so a freshly logged-in home legitimately has none, and its absence
+    must never read as a failure."""
+    home = tmp_path / f".codex-{acct}"
+    home.mkdir(parents=True, exist_ok=True)
+    if logged_in:
+        toks = {"access_token": f"tok-{acct}"}
+        if email:
+            toks["id_token"] = _jwt({"email": email})
+        (home / "auth.json").write_text(json.dumps({"tokens": toks}))
+    if iid:
+        (home / "installation_id").write_text(iid)
+    return home
+
+
+def _codex_health_toml(tmp_path, monkeypatch, seats):
+    """seats: {acct: home | None}. None = the seat declares NO home (the config gap, not a revocation)."""
+    lines = ["[providers.codex]", f'default = "{list(seats)[0]}"']
+    for a, home in seats.items():
+        lines += [f"[providers.codex.{a}]", 'type = "subscription"']
+        lines += [f'auth = "codex-home:{home}"'] if home else ['auth = "codex-token:/legacy/x.token"']
     monkeypatch.setattr(pv, "FLEET_TOML", _toml(tmp_path, "\n".join(lines)))
 
 
-def test_codex_health_check_classifies(tmp_path, monkeypatch):
-    _codex_health_toml(tmp_path, monkeypatch, ["good", "dead", "new"], home_accts=["home1"])
-    def fake_ensure(acct, force=False):
-        if acct == "good":
-            return "tok"
-        if acct == "new":
-            raise pv.ProviderError("codex account 'new' is not seeded (...missing)")
-        raise pv.ProviderError("codex account 'dead' token refresh failed; the account may be revoked")
-    monkeypatch.setattr(pv, "codex_ensure_fresh", fake_ensure)
-    monkeypatch.setattr(pv, "codex_probe_backend", lambda tok, **k: "live")   # 'good' passes the backend probe too
-    h = {r["acct"]: r["status"] for r in pv.codex_health_check()}
-    assert h == {"good": "healthy", "dead": "revoked", "new": "unseeded"}   # home1 (codex-home) is NOT monitored
+def test_codex_health_reads_the_SEATS_OWN_HOME_not_the_stale_cred_store(tmp_path, monkeypatch):
+    """THE regression this whole change exists for. Health used to read the fleet cred store (seeded from the
+    shared ~/.codex) and to SKIP any seat not on the old codex-token path. Once a seat moved into its own
+    home, that stored token was a stale artifact of a device the seat no longer uses — so a seat that was
+    demonstrably healthy (backend 200, model speaking) kept being reported REVOKED."""
+    live = _seed_home(tmp_path, "live", email="live@x.com")
+    dead = _seed_home(tmp_path, "dead", email="dead@x.com")
+    _codex_health_toml(tmp_path, monkeypatch, {"live": live, "dead": dead})
+    # the probe is keyed on the token, and each token is unique PER HOME -- so reading the wrong home (or a
+    # cred store) cannot accidentally produce the right answer.
+    verdict = {"tok-live": "live", "tok-dead": "revoked"}
+    monkeypatch.setattr(pv, "codex_probe_backend", lambda tok, **k: verdict[tok])
+    monkeypatch.setattr(pv, "codex_ensure_fresh",   # if health still reached for the cred store, fail loudly
+                        lambda *a, **k: pytest.fail("health must read the SEAT HOME, never the cred store"))
+    h = {r["acct"]: r for r in pv.codex_health_check()}
+    assert h["live"]["status"] == "healthy" and h["live"]["email"] == "live@x.com"
+    assert h["live"]["home"] == str(live)
+    assert h["dead"]["status"] == "revoked" and "codex-login dead" in h["dead"]["detail"]
+
+
+def test_codex_health_undeclared_home_is_needs_home_NOT_revoked(tmp_path, monkeypatch):
+    """A seat with no per-seat home is a CONFIG gap, not a revocation. Calling it 'revoked' would send the
+    operator off to re-login a seat whose credential is fine — and would fire the offline alert."""
+    _codex_health_toml(tmp_path, monkeypatch, {"nohome": None})
+    h = {r["acct"]: r for r in pv.codex_health_check()}
+    assert h["nohome"]["status"] == "needs-home"
+    assert "codex-home:~/.codex-nohome" in h["nohome"]["detail"]      # tells them exactly what to write
+
+
+def test_codex_health_declared_home_never_logged_in_is_unseeded(tmp_path, monkeypatch):
+    empty = _seed_home(tmp_path, "new", logged_in=False)
+    _codex_health_toml(tmp_path, monkeypatch, {"new": empty})
+    h = {r["acct"]: r for r in pv.codex_health_check()}
+    assert h["new"]["status"] == "unseeded" and "fleet codex-login new" in h["new"]["detail"]
 
 
 def test_codex_probe_backend_classifies(monkeypatch):
@@ -660,14 +716,10 @@ def test_codex_health_check_detects_backend_revocation(tmp_path, monkeypatch):
 
 
 def test_codex_health_scan_edge_triggers_and_rearms(tmp_path, monkeypatch):
-    _codex_health_toml(tmp_path, monkeypatch, ["a"])
+    home = _seed_home(tmp_path, "a")
+    _codex_health_toml(tmp_path, monkeypatch, {"a": home})
     st = {"v": "revoked"}
-    def fake_ensure(acct, force=False):
-        if st["v"] == "healthy":
-            return "t"
-        raise pv.ProviderError("refresh failed; may be revoked")
-    monkeypatch.setattr(pv, "codex_ensure_fresh", fake_ensure)
-    monkeypatch.setattr(pv, "codex_probe_backend", lambda tok, **k: "live")   # isolate: refresh-path revocation only
+    monkeypatch.setattr(pv, "codex_probe_backend", lambda tok, **k: st["v"] if st["v"] != "healthy" else "live")
     calls = []
     notify = lambda acct, email, msg: calls.append(acct)
     pv.codex_health_scan(notify); assert calls == ["a"]          # first revocation -> alert
@@ -696,36 +748,36 @@ def test_oauth_refresh_rejection_is_revoked_network_is_transient(monkeypatch):
         pv._oauth_refresh("rt")
 
 
-def test_health_transient_refresh_is_error_no_alert_revoked_alerts(tmp_path, monkeypatch):
-    # a near-expiry token so ensure_fresh actually attempts a refresh; the two refresh outcomes must diverge.
-    _codex_health_toml(tmp_path, monkeypatch, ["a"])
-    pv.codex_seed_from_authjson("a", _seed_authjson(tmp_path, int(time.time()) + 60))   # near expiry -> refreshes
+def test_health_unreachable_backend_is_error_no_alert_revoked_alerts(tmp_path, monkeypatch):
+    # an UNREACHABLE backend must never be reported as healthy (we did not verify) nor as revoked (we did not
+    # see a rejection). It is 'error': no alert, retry next tick. Only a real rejection alerts.
+    home = _seed_home(tmp_path, "a")
+    _codex_health_toml(tmp_path, monkeypatch, {"a": home})
     calls = []
-    # network blip -> transient -> status 'error', NO alert (the cry-wolf Berg wanted avoided)
-    monkeypatch.setattr(pv, "_oauth_refresh", lambda rt: (_ for _ in ()).throw(pv.ProviderTransientError("net")))
+    monkeypatch.setattr(pv, "codex_probe_backend", lambda tok, **k: "unreachable")
     h = {r["acct"]: r["status"] for r in pv.codex_health_scan(lambda *a: calls.append(a))}
-    assert h["a"] == "error" and calls == []
-    # genuine rejection -> revoked -> alert
-    monkeypatch.setattr(pv, "_oauth_refresh", lambda rt: (_ for _ in ()).throw(pv.ProviderError("rejected; revoked")))
+    assert h["a"] == "error" and calls == []                     # the cry-wolf Berg wanted avoided
+    monkeypatch.setattr(pv, "codex_probe_backend", lambda tok, **k: "revoked")
     h = {r["acct"]: r["status"] for r in pv.codex_health_scan(lambda *a: calls.append(a))}
     assert h["a"] == "revoked" and len(calls) == 1
 
 
-def test_codex_health_scan_unseeded_never_alerts(tmp_path, monkeypatch):
-    _codex_health_toml(tmp_path, monkeypatch, ["a"])
-    monkeypatch.setattr(pv, "codex_ensure_fresh",
-                        lambda acct, force=False: (_ for _ in ()).throw(pv.ProviderError("not seeded")))
+def test_codex_health_scan_unseeded_and_needs_home_never_alert(tmp_path, monkeypatch):
+    # both are SETUP states, not offline accounts. Alerting on them would page Berg about config.
+    new = _seed_home(tmp_path, "new", logged_in=False)
+    _codex_health_toml(tmp_path, monkeypatch, {"new": new, "nohome": None})
     calls = []
     pv.codex_health_scan(lambda *a: calls.append(a))
-    assert calls == []                                           # unseeded is a setup state, not an offline alert
+    assert calls == []
     from cmux_fleet import state as fs
-    assert fs.codex_health_read()["a"]["status"] == "unseeded"   # but the state is still persisted
+    st = fs.codex_health_read()
+    assert st["new"]["status"] == "unseeded" and st["nohome"]["status"] == "needs-home"   # still persisted
 
 
 def test_codex_health_scan_notify_failure_does_not_sink_scan(tmp_path, monkeypatch):
-    _codex_health_toml(tmp_path, monkeypatch, ["a"])
-    monkeypatch.setattr(pv, "codex_ensure_fresh",
-                        lambda acct, force=False: (_ for _ in ()).throw(pv.ProviderError("revoked")))
+    home = _seed_home(tmp_path, "a")
+    _codex_health_toml(tmp_path, monkeypatch, {"a": home})
+    monkeypatch.setattr(pv, "codex_probe_backend", lambda tok, **k: "revoked")
     def boom(*a):
         raise RuntimeError("cmux gone")
     h = pv.codex_health_scan(boom)                               # must not raise
