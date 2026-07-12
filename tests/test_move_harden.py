@@ -269,18 +269,54 @@ def test_codex_config_mcp_servers_parses_top_level_names(tmp_path):
     assert fleet._codex_config_mcp_servers(cfg) == ["basic-memory", "context7", "gemini-cli", "node_repl"]
 
 
-def test_codex_clean_config_flags_disables_plugins_and_each_server(tmp_path):
-    p = tmp_path / "config.toml"
-    p.write_text("[mcp_servers.context7]\ncommand=\"npx\"\n[mcp_servers.terraform]\ncommand=\"x\"\n")
-    flags = fleet._codex_clean_config_flags(str(p))
-    assert flags[:2] == ["--disable", "plugins"]
+def _codex_home(tmp_path, name, servers=()):
+    """A codex HOME (the dir), not a config path — that distinction IS the bug below."""
+    h = tmp_path / name
+    h.mkdir()
+    if servers:
+        h.joinpath("config.toml").write_text(
+            "".join(f"[mcp_servers.{s}]\ncommand=\"npx\"\n" for s in servers))
+    return h
+
+
+def test_codex_clean_config_flags_disables_plugins_and_each_server_IN_THAT_HOME(tmp_path):
+    # the arg is the HOME the launch will actually run in; the servers are read from ITS config.toml.
+    home = _codex_home(tmp_path, "dirty", ["context7", "terraform"])
+    flags = fleet._codex_clean_config_flags(str(home))
     assert flags == ["--disable", "plugins",
                      "-c", "mcp_servers.context7.enabled=false",
                      "-c", "mcp_servers.terraform.enabled=false"]
 
 
 def test_codex_clean_config_flags_missing_config_is_plugins_only(tmp_path):
-    assert fleet._codex_clean_config_flags(str(tmp_path / "nope.toml")) == ["--disable", "plugins"]
+    # a home that exists but has never been configured (a fresh seat) -> nothing to strip
+    assert fleet._codex_clean_config_flags(str(_codex_home(tmp_path, "fresh"))) == ["--disable", "plugins"]
+
+
+def test_codex_clean_config_flags_enumerate_the_SEAT_home_NOT_the_desktop(tmp_path):
+    """THE agent-launch bug (2026-07-12), pinned. The flags used to be enumerated from Berg's DESKTOP
+    ~/.codex (6 MCP servers) and then applied to a SEAT's home, which declares none. `enabled=false` on a
+    server the seat home never declared CREATES a transport-less `[mcp_servers.<n>]`, and codex then refuses
+    to load its config at all -- `Error loading config.toml: invalid transport in mcp_servers.basic-memory`.
+    The agent never started. Only a REAL agent launch caught it; `codex exec` takes a different path.
+
+    A per-seat home is ALREADY clean, so the correct mcp-flag count for it is ZERO."""
+    desktop = _codex_home(tmp_path, "desktop", ["basic-memory", "context7", "gemini-cli"])
+    seat = _codex_home(tmp_path, "seat")                      # a real seat home: logged in, no desktop cruft
+    spec = {"tool": "codex", "role": "w", "label": "w", "flags": [], "env": {},
+            "plugins": [], "settings": "", "setting_sources": ""}
+
+    _, seat_args, _ = fleet.adapter_compile("codex", spec, [], codex_home=str(seat))
+    assert [a for a in seat_args if a.startswith("mcp_servers.")] == []      # ZERO -- nothing to disable
+    assert seat_args[:2] == ["--disable", "plugins"]                          # still strips desktop plugins
+
+    # the control that makes the assertion above MEAN something: the same compile against the dirty desktop
+    # home DOES emit all three. So the zero is the seat home being read -- not the flags silently vanishing.
+    _, desk_args, _ = fleet.adapter_compile("codex", spec, [], codex_home=str(desktop))
+    assert [a for a in desk_args if a.startswith("mcp_servers.")] == [
+        "mcp_servers.basic-memory.enabled=false",
+        "mcp_servers.context7.enabled=false",
+        "mcp_servers.gemini-cli.enabled=false"]
 
 
 # ================= P0-4a: launch verification (a dead-on-arrival lazy child != DONE) ================

@@ -700,19 +700,25 @@ def test_codex_probe_backend_classifies(monkeypatch):
 
 
 def test_codex_health_check_detects_backend_revocation(tmp_path, monkeypatch):
-    """THE regression for the expiry-only gap: a token that ensure_fresh accepts (future exp, refresh not
-    even attempted) but the ChatGPT backend has REVOKED must classify 'revoked', not 'healthy'."""
-    _codex_health_toml(tmp_path, monkeypatch, ["superseded", "alive", "flaky"])
-    # ensure_fresh accepts all three (future exp; no refresh); return a per-acct token so the probe stub
-    # can render a distinct verdict without depending on iteration order.
-    monkeypatch.setattr(pv, "codex_ensure_fresh", lambda acct, force=False: f"tok-{acct}")
+    """THE regression for the expiry-only gap. A SUPERSEDED token still looks perfect locally — it is present,
+    well-formed, and its `exp` is in the future — and the IdP userinfo endpoint calls it fine too. Both those
+    layers are FALSE-HEALTHY. Only the ChatGPT backend sees the supersession, so the backend probe is the sole
+    thing allowed to return the verdict: local validity must never, on its own, produce 'healthy'.
+
+    All three seats below are locally indistinguishable; only the backend tells them apart."""
+    seats = {a: _seed_home(tmp_path, a) for a in ("superseded", "alive", "flaky")}
+    _codex_health_toml(tmp_path, monkeypatch, seats)
+    # keyed on the token, which _seed_home makes unique PER HOME -- so a verdict cannot land on the right seat
+    # by accident (e.g. by iteration order, or by reading some other home's credential).
     verdict = {"tok-superseded": "revoked", "tok-alive": "live", "tok-flaky": "unreachable"}
     monkeypatch.setattr(pv, "codex_probe_backend", lambda tok, **k: verdict[tok])
+    monkeypatch.setattr(pv, "codex_ensure_fresh",   # the cred store is the stale layer: touching it is the bug
+                        lambda *a, **k: pytest.fail("health must read the SEAT HOME, never the cred store"))
     h = {r["acct"]: r["status"] for r in pv.codex_health_check()}
-    assert h["superseded"] == "revoked"              # backend 401 despite a future expiry -> the gap, closed
+    assert h["superseded"] == "revoked"              # backend 401 despite a locally-valid token -> the gap, closed
     assert h["alive"] == "healthy"                   # backend 200 -> genuinely healthy
-    assert h["flaky"] == "error"                     # backend unreachable -> transient 'error' (no alert, no
-    #                                                  false-'healthy'), consistent with a transient refresh
+    assert h["flaky"] == "error"                     # unreachable -> we could not VERIFY, so we do not claim we
+    #                                                  did: 'error' (transient, no alert), never a false-'healthy'
 
 
 def test_codex_health_scan_edge_triggers_and_rearms(tmp_path, monkeypatch):
@@ -786,6 +792,76 @@ def test_codex_health_scan_notify_failure_does_not_sink_scan(tmp_path, monkeypat
     assert fs.codex_health_read()["a"]["status"] == "revoked"    # state still persisted despite notify blowing up
 
 
+# --- the false-positive class: what counts as PROOF that a seat spoke ----------------------------
+# This section exists to keep ONE specific bug from ever coming back. `codex exec` echoes the PROMPT to
+# stdout BEFORE it authenticates. So a run that 401s -- zero assistant output, a totally failed run --
+# still contains your nonce in its stdout. Grepping stdout therefore PASSES A TOTAL FAILURE, and it nearly
+# shipped three separate times.
+#
+# The rule these tests enforce: the ONLY admissible proof is an assistant message file (`codex exec -o`),
+# because a 401 never produces an assistant message and so structurally CANNOT write one. stdout, the exit
+# code, and a task_complete marker are all counterfeit-able by the failure and are therefore never trusted.
+def _fake_codex(monkeypatch, *, writes_assistant_message, says=None, exit_code=0):
+    """Stand in for `codex exec`, faithful on the one axis that matters: it echoes the prompt (hence the
+    nonce) to stdout no matter what, and writes an assistant-message file ONLY when authenticated.
+
+    `writes_assistant_message=False` IS the 401. It is deliberately hostile: it hands back every signal a
+    lazy implementation might be tempted to trust -- the nonce in stdout, exit 0, task_complete -- and
+    withholds only the assistant message. We do not get to assume codex flags the failure in its exit code."""
+    seen = {}
+    def run(argv, **kw):
+        prompt = argv[-1]
+        out = argv[argv.index("-o") + 1]
+        seen["nonce"] = prompt.split()[-1]                       # what codex_seat_spoke minted, recovered from argv
+        if writes_assistant_message:
+            open(out, "w").write(seen["nonce"] if says is None else says)
+        # the echo is not embellishment -- it is the actual observed behaviour that created the false positive
+        seen["stdout"] = f"codex exec\nprompt: {prompt}\ntask_complete\n"
+        return subprocess.CompletedProcess(argv, exit_code, seen["stdout"], "")
+    monkeypatch.setattr("subprocess.run", run)
+    return seen
+
+
+def test_codex_seat_spoke_REFUSES_a_401_whose_stdout_CONTAINS_the_nonce(tmp_path, monkeypatch):
+    """THE false-positive class, pinned. A failed (401) run whose stdout carries the nonce, exits 0, and says
+    task_complete must be judged NOT SPOKEN. Any implementation that grades on stdout, the exit code, or
+    task_complete returns True here and fails this test -- which is exactly the point of it existing."""
+    seen = _fake_codex(monkeypatch, writes_assistant_message=False)
+    ok, detail = pv.codex_seat_spoke(str(tmp_path))
+    # first prove the trap was actually ARMED: the counterfeit signal really is sitting in stdout. Without
+    # this, a fake that quietly failed to echo the nonce would make the test pass for the wrong reason.
+    assert seen["nonce"] in seen["stdout"] and "task_complete" in seen["stdout"]
+    assert ok is False                                           # <- the whole point
+    assert "did not authenticate" in detail
+
+
+def test_codex_seat_spoke_passes_only_when_the_model_ACTUALLY_speaks(tmp_path, monkeypatch):
+    """The reachable green. Without this, an always-False implementation would satisfy the test above and the
+    guard would be vacuous."""
+    _fake_codex(monkeypatch, writes_assistant_message=True)
+    ok, detail = pv.codex_seat_spoke(str(tmp_path))
+    assert ok is True and "the model spoke" in detail
+
+
+def test_codex_seat_spoke_rejects_an_assistant_message_that_is_not_the_nonce(tmp_path, monkeypatch):
+    """An assistant message is necessary but not sufficient: it must be OUR nonce. A stale or unrelated reply
+    (a resumed thread, a refusal) is not proof that THIS seat answered THIS prompt."""
+    _fake_codex(monkeypatch, writes_assistant_message=True, says="I cannot help with that.")
+    ok, detail = pv.codex_seat_spoke(str(tmp_path))
+    assert ok is False and "wrote something else" in detail
+
+
+def test_codex_seat_spoke_passes_the_seat_home_to_codex(tmp_path, monkeypatch):
+    """The verification must run in the SEAT's home, or it proves a different seat is healthy."""
+    seen = {}
+    def run(argv, **kw):
+        seen["home"] = kw["env"]["CODEX_HOME"]
+        return subprocess.CompletedProcess(argv, 1, "", "")
+    monkeypatch.setattr("subprocess.run", run)
+    pv.codex_seat_spoke(str(tmp_path / "seat"))
+    assert seen["home"] == str(tmp_path / "seat")
+
+
 # --- config.toml fenced provisioning (never clobber Berg's manual config) ------------------------
 def test_codex_provision_config_fenced_and_idempotent(tmp_path):
     cfg = tmp_path / "config.toml"
@@ -812,19 +888,20 @@ def test_codex_provision_refuses_manual_duplicate(tmp_path):
         pv.codex_provision_config("acctx", str(cfg))
 
 
-def test_codex_setup_cli_end_to_end(cli_env, tmp_path):
+def test_codex_setup_cli_REFUSES_and_points_at_codex_login(cli_env, tmp_path):
+    """codex-setup provisioned the shared-home env-token model, which IS the supersession bug: it pinned every
+    seat to the one ~/.codex device. It must REFUSE rather than hand out config the resolver now rejects — a
+    command that still 'worked' would keep rebuilding the exact bug we just spent a week finding."""
     aj = tmp_path / "auth.json"
-    aj.write_text(json.dumps({"tokens": {
-        "access_token": _jwt({"exp": int(time.time()) + 999999}),
-        "id_token": _jwt({"email": "acct@x.com", "https://api.openai.com/auth": {"chatgpt_plan_type": "team"}}),
-        "refresh_token": "r1", "account_id": "a1"}}))
-    # --no-provision keeps the test off the host's real ~/.codex/config.toml; seed goes to the throwaway STATE.
+    aj.write_text(json.dumps({"tokens": {"access_token": "t", "refresh_token": "r1"}}))
     p = subprocess.run([sys.executable, "-m", "cmux_fleet", "codex-setup", "acctx",
                         "--auth-json", str(aj), "--no-provision"],
                        env=dict(cli_env), capture_output=True, text=True)
-    assert p.returncode == 0, p.stderr
-    assert "seeded codex account 'acctx'" in p.stdout and "acct@x.com" in p.stdout
-    assert "codex-token:providers/codex-acctx.token" in p.stdout               # the fleet.toml hint
+    assert p.returncode != 0                                                    # refuses; never a silent no-op
+    out = p.stdout + p.stderr
+    assert "SUPERSEDED" in out and "fleet codex-login acctx" in out             # names the replacement
+    assert 'auth = "codex-home:~/.codex-acctx"' in out                          # and the config to write
+    assert "codex-token:" not in out                                            # never re-offers the broken model
 
 
 # --- render_send_cmd raw_env (secret stays out of the command string) -----------------------------
@@ -908,11 +985,8 @@ def test_launch_provider_dry_run_hides_token(cli_env, tmp_path, providers_toml):
     assert "$(cat " in p.stdout                              # injected as a spawn-time read
 
 
-def test_launch_codex_provider_env_token_threads_args(cli_env, tmp_path):
-    # codex env-token path: -c model_provider=<acct> threaded into the codex command, token via $(cat ...).
-    tokfile = tmp_path / "cx.token"
-    tokfile.write_text("CXSECRET-oauth-token\n")
-    toml = _toml(tmp_path, f"""
+def _codex_launch_toml(tmp_path, auth):
+    return _toml(tmp_path, f"""
         [tool.codex]
         flags = "-a never"
         [role.cxworker]
@@ -924,15 +998,38 @@ def test_launch_codex_provider_env_token_threads_args(cli_env, tmp_path):
         default = "acctx"
         [providers.codex.acctx]
         type = "subscription"
-        auth = "codex-token:{tokfile}"
+        auth = "{auth}"
     """)
-    env = dict(cli_env)
-    env["CMUX_FLEET_TOML"] = toml
+
+
+def test_launch_codex_env_token_is_REFUSED_as_the_superseded_shared_home_model(cli_env, tmp_path):
+    """A launch on the old `codex-token:` path must FAIL, not launch. That path runs every seat out of the one
+    ~/.codex, which is one DEVICE to the backend — so seats revoke each other. Launching anyway would hand
+    back an agent that silently kills another seat's session."""
+    tokfile = tmp_path / "cx.token"
+    tokfile.write_text("CXSECRET-oauth-token\n")
+    env = dict(cli_env, CMUX_FLEET_TOML=_codex_launch_toml(tmp_path, f"codex-token:{tokfile}"))
+    p = subprocess.run([sys.executable, "-m", "cmux_fleet", "launch", "cxworker",
+                        "--provider", "codex:acctx", "--dry-run"],
+                       env=env, capture_output=True, text=True)
+    assert p.returncode != 0                                            # refused, never launched
+    out = p.stdout + p.stderr
+    assert "codex-home:~/.codex-acctx" in out                           # says exactly what to write instead
+    assert "CXSECRET" not in out                                        # the token VALUE is still never printed
+
+
+def test_launch_codex_home_threads_CODEX_HOME_and_composes_ZERO_mcp_flags(cli_env, tmp_path):
+    """The end-to-end launch on the per-seat model, and the shape cmux-advisor accepted BUG 1 on: a seat home
+    is already clean, so the launch composes ZERO `-c mcp_servers.*` flags (main composed 3, which is what
+    made codex refuse to load its config and the agent never start)."""
+    home = tmp_path / ".codex-acctx"
+    home.mkdir()
+    (home / "auth.json").write_text(json.dumps({"tokens": {"access_token": "t"}}))   # the seat is logged in
+    env = dict(cli_env, CMUX_FLEET_TOML=_codex_launch_toml(tmp_path, f"codex-home:{home}"))
     p = subprocess.run([sys.executable, "-m", "cmux_fleet", "launch", "cxworker",
                         "--provider", "codex:acctx", "--dry-run"],
                        env=env, capture_output=True, text=True)
     assert p.returncode == 0, p.stderr
     assert "provider: codex:acctx" in p.stdout
-    assert "-c model_provider=acctx" in p.stdout             # per-launch account selection
-    assert f'CMUX_FLEET_CODEX_TOKEN="$(cat {tokfile})"' in p.stdout   # spawn-time token read
-    assert "CXSECRET" not in p.stdout                        # the token VALUE is never printed
+    assert f"CODEX_HOME={home}" in p.stdout                  # the seat's home is VISIBLE on the launch line
+    assert "mcp_servers." not in p.stdout                    # ZERO -- a seat home has no desktop cruft to strip
