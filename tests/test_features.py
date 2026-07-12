@@ -382,11 +382,11 @@ def test_snapshot_surfaces_effort_cwd_and_real_window(monkeypatch):
 
 # ── parentage tree (label-keyed, cycle-safe) ──────────────────────────────────────────────────
 def _row(label, parent="", state="idle", surface="", role="r", tool="claude",
-         ctx_used=None, ctx_pct_remaining=None, last_text=""):
+         ctx_used=None, ctx_pct_remaining=None, last_text="", blocked=False):
     return {"label": label, "parent": parent, "state": state, "surface": surface or label,
             "role": role, "tool": tool, "ctx_used": ctx_used, "ctx_pct_remaining": ctx_pct_remaining,
             "window": 200000, "last_text": last_text, "rank": 5, "last_age_s": 0, "ws": "", "model": "",
-            "muted": False, "kind": "child"}
+            "muted": False, "kind": "child", "blocked": blocked, "blocked_why": "", "unregistered": False}
 
 
 def test_tree_nests_by_label():

@@ -1,0 +1,12 @@
+  Running 1 shell command…
+
+✻ Simmering… (18m 5s · ↓ 63.4k tokens · thought for 8s)
+
+───────────────────────────────────────────────────────────────────────────────────────────────────
+❯ 
+───────────────────────────────────────────────────────────────────────────────────────────────────
+  📁 ~/tapestry/domains/ai-workflows/cmux/_code/cmux-fleet/.worktrees/codex-citizen  🌿 dev/codex…
+  🧠 Context Remaining: 83% [========--]
+  💰 $10.02 ($31.76/h)  📊 175801 tok (9286 tpm)
+  ⏵⏵ bypass permissions on (shift+tab to cycle) · ← for agents
+                                                                                               /rc

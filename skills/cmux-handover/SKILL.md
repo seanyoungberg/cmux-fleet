@@ -5,10 +5,6 @@ description: Write a point-in-time session handover for the next instance of thi
 
 # cmux-handover
 
-> **Defers to `loom:handover` when present.** If the `loom` plugin is loaded, its `loom:handover` skill is
-> the authority for this convention (tapestry-fleet's vault-seated agents) — use that one instead. This
-> skill is the standalone fallback for cmux-fleet used without loom (the productized-plugin path).
-
 A handover is a **point-in-time brain dump of this session** for whoever picks up this agent next — a relaunch of you, or the conductor reading you cold. It is NOT a vault entity and NOT maintained; it is working memory in the agent's own space.
 
 ## Where it lives
@@ -34,6 +30,19 @@ Hit what's relevant, skip what's empty, add what's yours. Write for a reader wit
 - **What went well / gotchas** — discoveries to reuse, traps to avoid.
 - **Fleet snapshot** *(conductors)* — paste `fleet ls` at handover + notes on children (who's archived/revivable, who's mid-task, who to clean up). Live truth is always `fleet ls` / `fleet.json`; this is just the picture at handover time, so the next instance isn't flying blind on boot. (No separate persistent state file — the registry already IS the live state.)
 - **Read on resume** — the 2-3 pointers (docs, memory, this file) to load first. For conductors, the boot ritual also includes **`fleet inbox`** (pending completions/alerts/peer-msgs that queued while you were down — the push path can't replay them across a recycle) + **`fleet ls --scope mine`** (know your fleet: you + your children).
+
+## Commit it — your own paths, and only your own
+A handover that lives only in your working tree does not survive the recycle that follows it. Commit it. **You are not alone in this repo** — siblings are committing to it while you write, so a handover commits **exactly the paths it wrote** and nothing else:
+
+```
+git -C <repo> add handover/2026-07-12.md docs/thing.md      # the paths YOU wrote, named
+git -C <repo> commit -m "handover: <label> 2026-07-12" -- handover/2026-07-12.md docs/thing.md
+```
+
+- **Never `git add -A`** (nor `git add .`, nor `commit -a`). It sweeps up whatever else is in the tree: a sibling's in-flight edit, a half-finished experiment, a stray artifact. You would be committing work you have not read, under your name, and the author of it will not find out until it breaks.
+- **Pass the paths to `commit` too** — `commit -- <paths>`. A bare `git commit` commits *everything already staged*, and the index is not exclusively yours. The `-- <paths>` is what makes the commit's contents equal to your intent rather than to the index's history.
+- **Never `--amend` under an active fleet.** A sibling may have committed underneath you between your commit and your amend; amending then rewrites a commit that is no longer the tip, and the sibling's work is what gets lost. If you need a fix, make a second commit. Amend is a solo-repo luxury.
+- **Use `git -C <repo>`, never `cd <repo> && git`.** Your cwd is your identity seat (it is how the fleet knows which agent you are, and where your `handover/` lives); a `cd` that outlives the command silently relocates you. `git -C` is stateless — it cannot leave you somewhere you did not mean to be.
 
 ## Optional final step: recycle yourself
 The natural tail of a handover is a **`fleet recycle --fresh`** — restart yourself into a fresh session in the same surface, shedding bloated context, and let the next instance boot and read the handover you just wrote. At handover time you want **`--fresh`** (shedding is the whole point). **Only do this when you are actually ready to relaunch** (most handovers don't recycle — you write one and keep going, or hand back to a human). Never recycle with a draft you haven't finished.
