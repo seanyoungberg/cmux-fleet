@@ -18,15 +18,59 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   <acct>` verb does the one-time seed + provision. **DORMANT** until a `codex-token:` provider is configured
   in `fleet.toml`; **REQUIRES one interactive `codex login` per account** before it can be relied upon (the
   first live refresh + agent turn are exercised then). `codex-home:<path>` per-profile remains as a fallback.
+  **KNOWN LIMITATION — seats cannot coexist in a unified home.** The ChatGPT backend enforces one active
+  session per account, keyed on the `installation_id` that lives in each codex *home* (not on the OAuth
+  client, which is shared, and not on `auth.json`). Seeding N seats by sequential `codex login` against one
+  shared `~/.codex` therefore yields ONE installation_id, so the backend supersedes every seat but the last.
+  Live state: of 3 seeded seats only the `auth.json`-resident one is live; the other two are backend-revoked
+  (the health monitor reports this correctly). Concurrent seats require a per-seat `CODEX_HOME`, which is
+  what the `codex-home:<path>` fallback exists for. Single-seat use of the unified home is unaffected.
 - **Codex account health monitor + offline alert.** The daemon checks each configured `codex-token` account
   hourly and, on the same refresh loop, silently refreshes a near-expiry token. It notifies (a surfaceless
-  desktop banner) ONLY when an account newly goes offline — its refresh_token is revoked/dead and needs a
-  human `codex login` + `fleet codex-setup <acct>`. Edge-triggered (one alert per outage, re-armed on
-  recovery; never a storm). Deliberately distinct from "usage stale" (no recent CLI activity — the account
-  is fine and is never alerted). `unseeded` accounts (configured but not yet set up) are not alerted either.
+  desktop banner) ONLY when an account newly goes offline and needs a human `codex login` +
+  `fleet codex-setup <acct>`. Edge-triggered (one alert per outage, re-armed on recovery; never a storm).
+  Deliberately distinct from "usage stale" (no recent CLI activity: the account is fine and is never
+  alerted). `unseeded` accounts (configured but not yet set up) are not alerted either. Health is decided
+  by **two layers**, because the clock alone is false-healthy (see Fixed): a refresh check, then a
+  read-only backend probe that catches a token the backend has revoked despite a still-future expiry.
 - **Real account identity in the usage accessor.** `identity` (`{email, display}`) and a ready-to-render
   `label` per provider, so the sidebar shows the actual oauth account (e.g. "Berg") instead of the config
   id; falls back to the config id when identity is unreadable.
+- **Codex agents are first-class in `fleet vitals`.** Context %, model, and effort were blank for codex
+  agents (`—` / `-`) because `_context_used` and `_launched_prefs` read the claude-shaped transcript, while
+  codex records all three in its rollout JSONL. `_codex_rollout_stats()` does one newest-wins pass over the
+  rollout the fleet already tracks as the agent's transcript: context from `token_count` ->
+  `last_token_usage.input_tokens` over the model's REAL `model_context_window` (e.g. gpt-5.5 = 258400, more
+  precise than the old keyword guess), and the EFFECTIVE model + effort from `turn_context` (populated even
+  when no `--effort` flag was passed; the field is `effort`, not `reasoning_effort`). A rollout with no
+  token count still shows `—`, exactly as claude does. The claude path is untouched.
+- **Codex turn completion is a real done-signal.** Codex fires no `SessionEnd`, so `turn_ended()` returned
+  False for every codex agent: a finished codex agent showed "working" forever, and a plain `fleet rm`
+  refused it as mid-turn (forcing `--force`). Codex does record the boundary in its rollout, so
+  `_codex_turn_ended()` closes the turn iff the last `event_msg` boundary is `task_complete` with no
+  `task_started`/`user_message` after it. Two consumers pick it up for free: observability flips the lagged
+  "working" to ready/idle, and `cmd_rm`'s mid-turn guard lets a finished codex agent through. It fails
+  closed, so it only ever NARROWS the refusal; a genuinely mid-turn agent still refuses.
+- **Clean codex config for fleet workers.** Fleet codex workers ran the interactive TUI against the unified
+  `~/.codex` and so inherited the Codex *desktop* app config: 5 MCP servers (2 of them dead), 13 plugins, 5
+  marketplaces, i.e. connection errors and boot latency on every launch, none of it wanted for a worker. The
+  interactive codex cannot `--ignore-user-config` (exec-only) and `-c mcp_servers={}` merges rather than
+  clears (both verified against codex 0.144.1), and the config must still load anyway so the fleet's own
+  `[model_providers.*]` blocks survive. So each cruft surface is disabled explicitly: `--disable plugins`
+  (plugins + their MCP servers + marketplaces in one flag, leaving `features.hooks` intact so fleet
+  lifecycle hooks still fire) plus one `-c mcp_servers.<n>.enabled=false` per server read from the LIVE
+  config at launch, which is drift-robust (a server added later is auto-disabled for workers too).
+- **Server-side codex usage API.** `GET /backend-api/codex/usage` with the seat's OAuth token, the codex
+  analog to `poll_claude`'s `/api/oauth/usage`. Terminal-independent (no agent need have run), and strictly
+  richer than the rollout scrape it replaces: a live reset countdown, email + plan in-call, and the
+  metered/hard-cap signals (credits, spend control, `limit_reached`). Windows are normalized by LENGTH so
+  the accessor renders codex identically to claude. Confirms the primary window is **5h exactly** (18000s,
+  server-authoritative, fixed-epoch).
+- **Usage accessor: badge, subscription grouping, hard-cap signal.** `usage_for_paint()` now carries a
+  `badge` (source chip per tool), a `subscription` grouping key so seats sharing one bill read as one
+  (codex seats share `account_id`; claude and api-key fall back to a `tool:account` singleton, so no
+  subscription-only shape is assumed), and `limit_reached`, the hard-cap boolean that is distinct from the
+  % bars. Additive fields; schema stays 1.
 
 ### Changed
 
@@ -50,6 +94,19 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   together), a larger font, real account names, and a single clean "usage stale" line for a stale provider.
 
 ### Fixed
+
+- **Codex health check saw an expired token but not a REVOKED one (false-healthy).** `codex_health_check`
+  short-circuited on the clock: `codex_ensure_fresh` returns the stored token with no server call whenever
+  it is more than 30 min from expiry, so a token the ChatGPT backend had already revoked still reported
+  `healthy`. Live-confirmed 2026-07-10: 2 of 3 seeded seats were backend-revoked (superseded, per the
+  unified-home limitation above) yet had a future JWT `exp` AND returned 200 from the IdP `userinfo`
+  endpoint. Expiry and userinfo are BOTH false-healthy; only the ChatGPT backend can see the revocation.
+  New `codex_probe_backend()` does a read-only `GET chatgpt.com/backend-api/me` (no refresh, no mint, no
+  token spend) returning live / revoked (401-403) / unreachable, and runs as layer 2 after `ensure_fresh`,
+  so a backend revocation despite a future expiry now edge-triggers the existing re-login alert. A follow-up
+  (`44bf1c8`, caught by a cross-model review) maps `unreachable` to `error` rather than `healthy`: a network
+  blip means the token could not be VERIFIED that tick, so calling it healthy overclaims and would falsely
+  signal recovery. Transient probe failures alert nobody and simply retry next tick.
 
 - **Stale usage line no longer draws twice in the sidebar.** A stale/failed provider rendered a
   "usage stale" line *over* a phantom "-% -%" row (two broken lines). The cmux-sidebar interpreter treats
