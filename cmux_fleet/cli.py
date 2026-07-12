@@ -1614,12 +1614,14 @@ def cmd_launch(argv):
         ptool, pname = pname.split(":", 1)
         if ptool != spec["tool"]:
             sys.exit(f"[fleet] --provider tool '{ptool}' != this launch's tool '{spec['tool']}'")
-    if not pname and spec["tool"] == "codex":
-        # A configured codex DEFAULT is a real selection, not a label: for codex the provider names the HOME,
-        # and the home IS the account. Attributing the default without resolving it would print
-        # `provider: codex:sean-dot` on an agent actually running as whoever occupies ~/.codex. Claude is
-        # left alone (its default stays attribution-only) — there, the provider does not decide identity.
-        pname = pv.default_provider("codex")
+    if not pname:
+        # A configured DEFAULT is a real SELECTION, not a label — resolve+inject it so a plain launch runs on
+        # a deliberate account, never on whatever happens to be ambient. For codex the provider names the HOME
+        # (home IS the account); for claude a securestorage default names the keychain namespace. A `keychain:`
+        # default resolves to nothing injected, so this stays byte-identical to today for the ambient case;
+        # only an explicit securestorage/home default changes the launch. (default_provider("") for a tool with
+        # no [providers.<tool>] block is "", so a single-account user still gets zero injection — opt-in holds.)
+        pname = pv.default_provider(spec["tool"])
     if pname:
         try:
             pr = pv.resolve_launch(spec["tool"], pname)
@@ -1647,10 +1649,8 @@ def cmd_launch(argv):
         if pr.get("provisional"):
             print(f"[fleet] WARN: {pr['label']} account selection is PROVISIONAL (codex mechanism "
                   f"verdict pending; not yet final)")
-    else:
-        dflt = pv.default_provider(spec["tool"])         # attribute default-account agents too
-        if dflt:
-            spec["provider"] = f"{spec['tool']}:{dflt}"
+    # no else: pr is None ONLY when no provider is configured at all (default_provider returned "") — a
+    # single-account launch with nothing to attribute or inject.
     send_cmd = render_send_cmd(bin_name, args, env, spec["abs_cwd"], raw_env)
 
     print(f"[fleet] tool={spec['tool']} role/label={spec['label']} kind={spec['kind']} place={spec['place']}"

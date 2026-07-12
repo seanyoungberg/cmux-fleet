@@ -1290,6 +1290,59 @@ def test_launch_provider_dry_run_hides_token(cli_env, tmp_path, providers_toml):
     assert "$(cat " in p.stdout                              # injected as a spawn-time read
 
 
+def test_launch_claude_default_securestorage_injects_without_a_flag(cli_env, tmp_path):
+    """The 'no flags' property Berg wants: a plain `fleet launch` (no --provider) must inject the CONFIGURED
+    default, not run on whatever is ambient in the keychain. A securestorage default puts its namespace var on
+    the launch line; nothing else does."""
+    toml = _toml(tmp_path, """
+        [tool.claude]
+        flags = "--effort high"
+        [role.worker]
+        kind = "child"
+        place = "tab"
+        cwd = "worker"
+        [providers.claude]
+        default = "acct2"
+        [providers.claude.acct2]
+        type = "subscription"
+        auth = "securestorage:~/.claude-acct2"
+    """)
+    env = dict(cli_env, CMUX_FLEET_TOML=toml)
+    p = subprocess.run([sys.executable, "-m", "cmux_fleet", "launch", "worker", "--dry-run"],
+                       env=env, capture_output=True, text=True)
+    assert p.returncode == 0, p.stderr
+    assert "provider: claude:acct2" in p.stdout                 # the default was RESOLVED, not just labelled
+    assert f"CLAUDE_SECURESTORAGE_CONFIG_DIR={os.path.expanduser('~/.claude-acct2')}" in p.stdout
+    assert "CLAUDE_CONFIG_DIR=" not in p.stdout                 # config dir (logs/hooks) untouched
+
+
+def test_launch_claude_default_keychain_injects_nothing(cli_env, tmp_path):
+    """The safety property that makes the default-injection change non-breaking: a `keychain:` default resolves
+    to an empty env, so a plain launch is byte-identical to the pre-change ambient behavior — no CONFIG_DIR,
+    no SECURESTORAGE var, no token. (This is the outage class; it must stay inert.)"""
+    toml = _toml(tmp_path, """
+        [tool.claude]
+        flags = "--effort high"
+        [role.worker]
+        kind = "child"
+        place = "tab"
+        cwd = "worker"
+        [providers.claude]
+        default = "berg-max"
+        [providers.claude.berg-max]
+        type = "subscription"
+        auth = "keychain:Claude Code-credentials"
+    """)
+    env = dict(cli_env, CMUX_FLEET_TOML=toml)
+    p = subprocess.run([sys.executable, "-m", "cmux_fleet", "launch", "worker", "--dry-run"],
+                       env=env, capture_output=True, text=True)
+    assert p.returncode == 0, p.stderr
+    assert "provider: claude:berg-max" in p.stdout
+    assert "CLAUDE_SECURESTORAGE_CONFIG_DIR" not in p.stdout     # keychain default injects NOTHING
+    assert "CLAUDE_CONFIG_DIR=" not in p.stdout
+    assert "OAUTH_TOKEN" not in p.stdout
+
+
 def _codex_launch_toml(tmp_path, auth):
     return _toml(tmp_path, f"""
         [tool.codex]
