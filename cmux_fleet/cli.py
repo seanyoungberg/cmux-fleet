@@ -4217,6 +4217,17 @@ def _compose_recycle_cmd(label, entry, caller_tokens, add_plugins, mode, explici
     return send_cmd, checkpoint
 
 
+def _codex_cfg_val(tokens, key):
+    """Value of a codex `-c <key>=<v>` config override in a composed command's tokens, else None. shlex
+    splits `-c model_reasoning_effort=xhigh` into ['-c', 'model_reasoning_effort=xhigh'], so matching the
+    `<key>=` token directly is unambiguous (the key prefix is distinctive) and covers every -c spelling."""
+    want = key + "="
+    for t in tokens:
+        if t.startswith(want):
+            return t.split("=", 1)[1]
+    return None
+
+
 def _sendcmd_session_prefs(send_cmd):
     """GROUND-TRUTH session prefs {'effort','model'} read off a COMPOSED send_cmd's own tokens (str
     value or None per key). This is the one source that sees a caller's one-off --effort/--model
@@ -4232,6 +4243,15 @@ def _sendcmd_session_prefs(send_cmd):
     for name in ("--effort", "--model"):
         val = _flag_val(toks, name)
         out[name[2:]] = val if isinstance(val, str) else None
+    # CODEX DIALECT (gap-5 #3): the codex adapter translates `--effort <lvl>` into
+    # `-c model_reasoning_effort=<lvl>`, so a composed CODEX command carries NO --effort token and this
+    # reader saw nothing -- codex effort was invisible to BOTH the provenance print AND the
+    # recycled/revived `effective` ledger, and the floor-effort warning could never fire for codex (its
+    # loop body only runs on a truthy value). Reading the translated form here repairs print + ledger +
+    # warning together, because this is deliberately the ONE shared source. `--model` needs no fallback:
+    # codex takes it natively, so it is already found above.
+    if out["effort"] is None:
+        out["effort"] = _codex_cfg_val(toks, "model_reasoning_effort")
     return out
 
 

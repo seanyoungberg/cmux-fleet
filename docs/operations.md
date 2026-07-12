@@ -211,6 +211,19 @@ when `worktree=true`) and does not hook `WorktreeCreate`/`WorktreeRemove`,
 running two owners on one tree causes double-cleanup, lock races, and branch
 collisions.
 
+**A codex worker does NOT commit its own branch.** Claude code-workers commit as
+they go; codex leaves the work **uncommitted in the worktree**. So before you
+merge a codex worker's branch, check the tree — a `git merge --ff-only` that says
+*"Already up to date"* is the tell that its work is still sitting there, unstaged:
+
+```bash
+git -C <worktree-path> status        # or: fleet worktree ls  → state = dirty
+# then stage/commit in the worktree yourself before merging
+```
+
+This is codex tool behavior, not a fleet defect, but it is silent — the merge
+"succeeds" and the work is simply absent.
+
 Lifecycle: `launch` creates the tree (idempotent, locked, pruned first);
 `recycle`/`revive` reuse it (the cwd is replayed, the tree persists); `archive`
 keeps it; `rm --kill` tears it down. Teardown **refuses if the tree is dirty**

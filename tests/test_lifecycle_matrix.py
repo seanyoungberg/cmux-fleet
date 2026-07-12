@@ -147,6 +147,42 @@ def test_provenance_adhoc_is_binding(monkeypatch):
     assert "effort=low (binding)" in line and "model=opus (binding)" in line and warn == ""
 
 
+# --- GATE 2b: the CODEX dialect — effort rides `-c model_reasoning_effort=`, not --effort (gap-5 #3) ----
+# The codex adapter translates `--effort <lvl>` into `-c model_reasoning_effort=<lvl>`, so a composed CODEX
+# command carries NO --effort token. Pre-fix, _sendcmd_session_prefs saw nothing: codex effort was invisible
+# in the provenance print AND in the recycled/revived `effective` ledger (both read this one source), and the
+# no-pin warning could never fire for codex (its loop body only runs on a truthy value).
+_CODEX_CMD = ("codex --disable plugins -c mcp_servers.terraform.enabled=false "
+              "--dangerously-bypass-approvals-and-sandbox -c model_reasoning_effort=xhigh "
+              "--model gpt-5.5 -c model_provider=berglabs")
+
+
+def test_sendcmd_session_prefs_reads_the_codex_effort_dialect():
+    prefs = cli._sendcmd_session_prefs(_CODEX_CMD)
+    assert prefs["effort"] == "xhigh"      # read from the TRANSLATED -c form (was None pre-fix)
+    assert prefs["model"] == "gpt-5.5"     # codex takes --model natively, so it was already found
+    # the other -c overrides must not be mistaken for the effort (mcp_servers/model_provider are noise)
+    assert cli._codex_cfg_val(_CODEX_CMD.split(), "model_provider") == "berglabs"
+    # claude is unchanged: native flags still win, no codex fallback needed (regression guard)
+    assert cli._sendcmd_session_prefs("claude --effort max --model opus") == {"effort": "max", "model": "opus"}
+    assert cli._sendcmd_session_prefs("claude --model opus")["effort"] is None   # genuinely absent stays None
+
+
+def test_provenance_codex_effort_resolves_source_and_rearms_the_no_pin_warning(monkeypatch):
+    # fleet.toml pins codex effort in CLAUDE syntax (--effort, the fleet's first-class flag); the adapter
+    # translates it at the boundary. Provenance must still resolve the SOURCE off the toml flags, and the
+    # floor/no-role-pin warning must now fire for codex exactly as it does for claude.
+    monkeypatch.setattr(cli, "_is_roster", lambda role: True)
+    monkeypatch.setattr(cli, "load_config", lambda: {
+        "tool": {"codex": {"flags": "--dangerously-bypass-approvals-and-sandbox "
+                                    "--model gpt-5.5 --effort xhigh"}},
+        "role": {"w": {"codex": {"flags": ""}}}})              # role pins NOTHING
+    line, warn = cli._session_pref_provenance("w", "codex", _CODEX_CMD, "", "")
+    assert "effort=xhigh (floor)" in line                       # was ENTIRELY ABSENT from the line pre-fix
+    assert "model=gpt-5.5 (floor)" in line
+    assert "no --effort pin" in warn                            # the warning could NEVER fire for codex pre-fix
+
+
 def test_provenance_empty_when_none(monkeypatch):
     monkeypatch.setattr(cli, "_is_roster", lambda role: False)
     assert cli._session_pref_provenance("x", "claude", "claude --dangerously-skip-permissions", "", "") == ("", "")

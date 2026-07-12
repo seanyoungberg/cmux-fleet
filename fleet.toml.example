@@ -50,6 +50,17 @@ flags   = "--effort high"
 
 [tool.codex]
 # flags = "-a never -s workspace-write"   # never-prompt but sandboxed; codex's autonomous-worker posture
+#
+# PIN THE MODEL + EFFORT HERE. With no --model/--effort on the codex floor, a codex agent falls through to
+# the Codex DESKTOP APP's own ~/.codex/config.toml (`model` / `model_reasoning_effort`) — so changing the
+# model in the desktop app silently moves your whole codex fleet, and a recycle rides whatever the ambient
+# default happens to be rather than a fixed identity. Pin it and the agent is reproducible:
+#
+#   flags = "--dangerously-bypass-approvals-and-sandbox --model gpt-5.5 --effort xhigh"
+#
+# Write it in CLAUDE syntax (--model/--effort): the codex adapter translates at the boundary
+# (--effort <lvl> -> `-c model_reasoning_effort=<lvl>`; --model passes through natively).
+# Roles override in [role.<name>.codex].flags.
 
 # --- example roles ----------------------------------------------------------------------------
 [role.worker]
