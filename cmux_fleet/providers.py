@@ -928,18 +928,29 @@ def _poll_codex_provider(spec, name):
         home = codex_seat_home(name, spec)
     except ProviderError as e:
         return {"ok": False, "error": "needs-home", "detail": str(e)}
-    tok = codex_home_token(home)
+
     ident = _codex_identity(home)
-    if tok:
-        acct_id = None
-        try:                                          # the backend wants the account id alongside the token
-            acct_id = json.load(open(os.path.join(home, "auth.json"))).get("tokens", {}).get("account_id")
-        except Exception:
-            pass
-        r = poll_codex_api(tok, acct_id)
-        if r.get("ok"):
-            r["identity"] = ident
-            return r
+    tok = codex_home_token(home)
+    if not tok:
+        # NEVER LOGGED IN. Report that, in health's own vocabulary. Falling through to the rollout scrape here
+        # is what this branch exists to prevent: an unseeded home has no rollouts either, so the scrape returns
+        # "no rollout sessions found in this CODEX_HOME" — which reads as "this seat just hasn't run lately"
+        # and sends the operator looking for work to do, when the truth is the seat was never logged in and the
+        # fix is one command. It is the original disease exactly: a true state ('unseeded') replaced by a
+        # plausible artifact of the wrong probe, pointing at the wrong remedy. It also made the poller and
+        # health disagree about the same seat, which this function's whole shape exists to make impossible.
+        return {"ok": False, "error": "unseeded", "identity": ident,
+                "detail": f"no auth.json in {home} — run `fleet codex-login {name}`"}
+
+    acct_id = None
+    try:                                              # the backend wants the account id alongside the token
+        acct_id = json.load(open(os.path.join(home, "auth.json"))).get("tokens", {}).get("account_id")
+    except Exception:
+        pass
+    r = poll_codex_api(tok, acct_id)
+    if r.get("ok"):
+        r["identity"] = ident
+        return r
     r = poll_codex(home)                              # fallback: this home's own rollouts (no cross-seat filter)
     r["identity"] = ident
     return r

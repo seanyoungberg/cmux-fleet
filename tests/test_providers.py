@@ -347,6 +347,12 @@ def test_poll_all_writes_snapshot(providers_toml, monkeypatch):
     home = str(providers_toml["tmp"] / "codex-acct2")
     now = int(time.time())
     _write_rollout(home, now + 100, now + 100)
+    # the seat must be LOGGED IN for its rollouts to mean anything: a home with no auth.json is 'unseeded',
+    # and scraping stale rollouts for a seat that cannot run would paint a usage bar for a dead seat. This
+    # test is about the API->rollout FALLBACK (a live seat whose API call blipped), so give it both halves.
+    os.makedirs(home, exist_ok=True)
+    open(os.path.join(home, "auth.json"), "w").write(json.dumps({"tokens": {"access_token": "tok-acct2"}}))
+    monkeypatch.setattr(pv, "poll_codex_api", lambda *a, **k: {"ok": False})   # API down -> rollout fallback
     # make the claude keychain read deterministically fail (no real security in the test env is fine, but
     # force it) so the test doesn't depend on the host keychain.
     monkeypatch.setattr(pv, "_read_oauth_token", lambda auth: None)
@@ -860,6 +866,46 @@ def test_codex_seat_spoke_passes_the_seat_home_to_codex(tmp_path, monkeypatch):
     monkeypatch.setattr("subprocess.run", run)
     pv.codex_seat_spoke(str(tmp_path / "seat"))
     assert seen["home"] == str(tmp_path / "seat")
+
+
+# --- the usage poller reads the SEAT's home, and agrees with health ------------------------------
+def test_poll_codex_provider_polls_each_seat_from_ITS_OWN_home(tmp_path, monkeypatch):
+    """The sidebar's numbers must come from the seat's OWN home. Polling one home for every seat would show
+    the same usage bar under three different names -- and, worse, attribute one account's spend to another."""
+    seats = {a: _seed_home(tmp_path, a, email=f"{a}@x.com") for a in ("dot", "labs")}
+    _codex_health_toml(tmp_path, monkeypatch, seats)
+    seen = {}
+    def fake_api(tok, acct_id=None):
+        seen[tok] = True                              # the token is unique per home -> proves which home was read
+        return {"ok": True, "windows": {"five_hour": {"pct": 1.0 if tok == "tok-dot" else 9.0}}}
+    monkeypatch.setattr(pv, "poll_codex_api", fake_api)
+    out = {n: pv._poll_codex_provider(s, n) for n, s in
+           [(n, pv.get_provider("codex", n)) for n in ("dot", "labs")]}
+    assert seen == {"tok-dot": True, "tok-labs": True}                  # each seat's OWN token, not a shared one
+    assert out["dot"]["windows"]["five_hour"]["pct"] == 1.0             # and distinct numbers per seat
+    assert out["labs"]["windows"]["five_hour"]["pct"] == 9.0
+    assert out["dot"]["identity"]["email"] == "dot@x.com"               # identity from that home too
+    assert out["labs"]["identity"]["email"] == "labs@x.com"
+
+
+def test_poll_codex_provider_unseeded_seat_says_UNSEEDED_not_no_rollouts(tmp_path, monkeypatch):
+    """FOUND LIVE against the real 3-seat config (sean-flat, mid-login). A seat that was never logged in used
+    to fall through to the rollout scrape, which reported `no rollout sessions found in this CODEX_HOME`.
+
+    That is the original disease in miniature: an unseeded home has no rollouts EITHER, so the wrong probe
+    returns a plausible artifact that reads as "this seat just hasn't run lately" -- sending the operator off
+    to look for work when the seat was simply never logged in and the fix is one command. It also made the
+    poller and HEALTH disagree about the very same seat, which _poll_codex_provider's shape exists to prevent.
+    The poller must speak health's vocabulary: 'unseeded', with the login command."""
+    home = _seed_home(tmp_path, "new", logged_in=False)                 # home exists, no auth.json
+    _codex_health_toml(tmp_path, monkeypatch, {"new": home})
+    monkeypatch.setattr(pv, "poll_codex", lambda *a, **k: pytest.fail(
+        "an unseeded seat must never be answered by the rollout scrape"))
+    r = pv._poll_codex_provider(pv.get_provider("codex", "new"), "new")
+    assert r["ok"] is False and r["error"] == "unseeded"                # the TRUE state...
+    assert "fleet codex-login new" in r["detail"]                       # ...and the one command that fixes it
+    # and the property that failing this test would have broken: the poller and health agree, seat by seat.
+    assert {x["acct"]: x["status"] for x in pv.codex_health_check()}["new"] == "unseeded"
 
 
 # --- codex-login cycles ALL seats, and SKIPS the ones already working ----------------------------
