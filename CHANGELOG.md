@@ -6,6 +6,42 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Changed
+
+- **`fleet move` REFUSES a live agent, and `--archive-revive` relocates it honestly.** Moving a live
+  surface across workspaces **permanently destroys that surface's agent-status registration inside the
+  cmux app** — surface-scoped, survives a process restart, and `fleet recycle` cannot repair it (it
+  re-execs the pane on the *same* surface and comes back dark; a dark agent usually cannot even pass
+  recycle's quiet-gate, which reads the very lifecycle the break freezes). The verb spent a day calling
+  itself "the one safe verb" — true at the fleet layer, false at the cmux layer — and then shipped a
+  WARNING printed next to the completed damage. A warning is not a guard.
+  - `fleet move <label> … --archive-revive` archives the agent and revives it onto a **FRESH surface** in
+    the target workspace (a fresh surface being the one thing that was broken), **resuming the full
+    session — never the compact summary**. The fresh surface is *born* in the destination, never
+    born-then-moved. Bystanders are safe: the teardown downgrades to `close-surface` and keeps the
+    workspace when a sibling agent lives there.
+  - Scope of the damage is **observability only** — a darkened agent still works, still receives its
+    inbox, still answers. Do not panic-wake one.
+  - Still allowed: a plain move of a **husk** surface (no live agent ⇒ no registration to destroy). An
+    **archived** label has no surface at all, so a plain move is refused and `--archive-revive` simply
+    does the revive half, landing it in the target.
+  - The liveness test behind the refusal is **PID-authoritative** (hook-store live pids ∪ process-table
+    seat-agent pids) and never reads `agentLifecycle` — the field a dark agent *freezes*, and the field
+    `fleet ls`'s STALE predicate ANDs in. A lifecycle-gated guard would go quiet exactly when it is
+    needed. A failed `ps` sweep reads as UNKNOWN and refuses, never as "nothing here".
+
+### Fixed
+
+- **`create_surface` resolved the parent surface's workspace from the hook store while resolving its pane
+  from the tree.** That split made `launch --place tab|pane` depend on the parent having a live hook-store
+  record — which a bare shell surface never has, and a *dark* agent's surface does not either. Measured on
+  this box: an agent sitting plainly in `cmux tree` could not host a single tab child ("cannot resolve
+  conductor workspace from --parent"). Both answers now come from one tree read (the visual ground truth),
+  with the store as fallback only when the tree cannot be read.
+- **`--place workspace` with no group aborted** instead of minting a standalone workspace, making a
+  groupless workspace-placed agent unreachable from `launch` and `revive` — though `move --own-workspace`
+  produced exactly that shape. It now mints one.
+
 ### Added
 
 - **Codex per-seat homes: concurrent codex seats, PROVEN.** Every codex seat declares its own

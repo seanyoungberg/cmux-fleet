@@ -12,8 +12,24 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 REPO = os.path.dirname(HERE)
 sys.path.insert(0, REPO)
 
-from cmux_fleet import cli as fleet  # noqa: E402
-from cmux_fleet import state as fs   # noqa: E402
+from cmux_fleet import cli as fleet     # noqa: E402
+from cmux_fleet import state as fs      # noqa: E402
+
+
+@pytest.fixture
+def rs():
+    """The in-process `resolve` module — imported INSIDE the fixture, and never bound at module import.
+
+    WHY THIS IS A FIXTURE AND NOT AN IMPORT: tests/test_features.py pops every `cmux_fleet.*` entry out of
+    sys.modules (and off the package object) so it can re-import them under a throwaway env. This file
+    sorts AFTER it, so a module-level `from cmux_fleet import resolve as rs` would hold the module object
+    from BEFORE that reset — a stale twin of the one `cli` actually imports at call time. Every
+    monkeypatch onto it would land on a module nothing under test reads, and the guard would silently run
+    against the REAL process table. (That is not a hypothetical: it is what these tests did on their first
+    run — green alone, six failures in the full suite.) The conftest `fs` fixture imports inside itself
+    for exactly this reason; this is its twin."""
+    from cmux_fleet import resolve
+    return resolve
 
 
 def _seq(*vals):
@@ -129,47 +145,277 @@ def test_group_add_refuses_without_conductor_group(fs, monkeypatch):
 
 
 # =============================== fleet move ====================================================
-
-def test_move_to_workspace_reconciles_registry(fs, monkeypatch):
-    fs.live_put("kid", {"role": "w", "kind": "child", "tool": "claude", "parent": "cond",
-                        "surface": "KID-S", "workspace": "WS-OLD", "place": "tab",
-                        "session": "claude-k", "status": "live"})
-    calls = []
-    monkeypatch.setattr(fleet, "cmuxq", lambda *a: (calls.append(a) or ""))
-    monkeypatch.setattr(fleet, "current_ws_for_surface",
-                        _seq("WS-OLD", "22222222-2222-2222-2222-222222222222"))  # cur, then new
-    monkeypatch.setattr(fs, "surface_has_live_agent", lambda s: True)
-
-    rc = fleet.cmd_move(["kid", "--to-workspace", "22222222-2222-2222-2222-222222222222"])
-    assert rc == 0
-    mv = [c for c in calls if c[0] == "move-surface"][0]
-    assert "KID-S" in mv and "22222222-2222-2222-2222-222222222222" in mv
-    kid = fs.live_get("kid")
-    assert kid["workspace"] == "22222222-2222-2222-2222-222222222222"  # reconciled from tree ground truth
-    assert kid["place"] == "workspace"
-    assert kid["surface"] == "KID-S" and kid["session"] == "claude-k"  # surface + session UNCHANGED
-    # the expected-close tombstone was stamped BEFORE the move (router archive-suppression belt)
-    assert fs.expected_close_recent("KID-S")
+# THE RULING (Berg, 2026-07-12): `fleet move` on a LIVE agent REFUSES. Moving a live surface across
+# workspaces PERMANENTLY destroys that surface's agent-status registration inside the cmux app —
+# surface-scoped, survives a process restart, and `recycle` (same surface) cannot repair it. The verb
+# spent a day calling itself "the one safe verb", which was true at the fleet layer and false at the cmux
+# layer, and then shipped a WARNING printed next to the completed damage. A warning is not a guard.
+#
+# The relocation that WORKS is `--archive-revive`: park the agent, revive it onto a FRESH surface in the
+# target (a fresh surface being the one thing that was broken), full-session resume.
+#
+# WHAT THE GUARD MAY NOT BE FOOLED BY, and why these tests inject a real `ps` table: the liveness test is
+# PID-AUTHORITATIVE. It may not consult `agentLifecycle` (the field a dark agent freezes) and may not
+# trust the hook store alone (which can hold NO record for a live agent at all — see the specimen test).
+TARGET_WS = "22222222-2222-2222-2222-222222222222"
+SIB_WS = "33333333-3333-3333-3333-333333333333"
 
 
-def test_move_own_workspace_joins_conductor_group(fs, monkeypatch):
-    fs.live_put("cond", {"role": "c", "kind": "conductor", "surface": "COND-S", "group": "G",
+def _ps_table(*rows):
+    """A real-shaped `ps axeww` sweep. Columns are PID TT STAT TIME COMMAND...env — the shape a
+    two-column fixture once faked, which is how a codex-blind pids_ps shipped green. Each row is
+    (pid, surface, claude_pid); `claude_pid == pid` marks THE seat agent (the cmux wrapper exports
+    CMUX_CLAUDE_PID=$$ then execs claude, so only the agent's own pid matches), and any other value is a
+    mere env-carrier (daemon, router, the `claude -p` summarizer) that must NOT read as an agent."""
+    out = ["  PID   TT  STAT      TIME COMMAND"]
+    for pid, surf, cpid in rows:
+        out.append(f"{pid} s001  S+     0:05.00 /Users/berg/.local/bin/claude --resume abc "
+                   f"CMUX_SURFACE_ID={surf} CMUX_WORKSPACE_ID=WS-OLD CMUX_CLAUDE_PID={cpid}")
+    return "\n".join(out) + "\n"
+
+
+# A sweep that RAN and found no agent. Distinct from "" — which means the sweep FAILED (rs._ps_axeww
+# swallows a timeout/exec error and returns ""), and a box always has processes. The two must not be
+# conflated: reading a failed sweep as "nothing here" is how a blind guard authorizes the destruction it
+# exists to prevent. conftest blanks the sweep by default, so every test below states which world it is in.
+NO_AGENT_PS = "  PID   TT  STAT      TIME COMMAND\n"
+
+
+@pytest.fixture
+def movable(fs, rs, monkeypatch):
+    """A live tab child 'kid' under conductor 'cond', an empty hook store, and a cmux that records calls."""
+    fs.live_put("cond", {"role": "c", "kind": "conductor", "surface": "COND-S", "workspace": "WS-OLD",
                          "status": "live"})
-    fs.live_put("kid", {"role": "w", "kind": "child", "tool": "claude", "parent": "cond",
-                        "surface": "KID-S", "workspace": "WS-OLD", "status": "live"})
+    fs.live_put("kid", {"role": "w", "kind": "child", "tool": "claude", "parent": "cond", "cwd": "/x",
+                        "surface": "KID-S", "workspace": "WS-OLD", "place": "tab", "session": "claude-k",
+                        "plugins": [], "flags": [], "settings": "", "status": "live"})
     calls = []
     monkeypatch.setattr(fleet, "cmuxq", lambda *a: (calls.append(a) or ""))
-    monkeypatch.setattr(fleet, "current_ws_for_surface", _seq("WS-OLD", "WS-NEW", "WS-NEW"))
-    monkeypatch.setattr(fleet, "_group_ref", lambda g: "workspace_group:5")
-    monkeypatch.setattr(fs, "surface_has_live_agent", lambda s: True)
+    monkeypatch.setattr(fleet, "_store", lambda: {"sessions": {}})       # store knows nothing (see specimen)
+    monkeypatch.setattr(fleet, "current_ws_for_surface", lambda s: "WS-OLD")
+    monkeypatch.setattr(rs, "workspace_surfaces", lambda ws, ws_map=None: ["SIB-S"])
+    return calls
 
-    assert fleet.cmd_move(["kid", "--own-workspace"]) == 0
-    assert [c for c in calls if c[0] == "move-tab-to-new-workspace"]   # fresh workspace
-    add = [c for c in calls if c[:2] == ("workspace-group", "add")][0]
-    assert "workspace_group:5" in add and "WS-NEW" in add             # joined the conductor's group
+
+def _no_move(calls):
+    """No cmux verb that RELOCATES A SURFACE was issued. The invariant the whole brief turns on."""
+    return not [c for c in calls if c[0] in ("move-surface", "move-tab-to-new-workspace")]
+
+
+# --- A. the refusal --------------------------------------------------------------------------------
+
+def test_move_REFUSES_a_live_agent_and_names_the_flag(fs, rs, movable, monkeypatch, capsys):
+    monkeypatch.setattr(rs, "_ps_axeww", lambda: _ps_table((4989, "KID-S", 4989)))
+    monkeypatch.setattr(rs.fs, "pid_alive", lambda p: p == 4989)
+
+    assert fleet.cmd_move(["kid", "--to-workspace", TARGET_WS]) == 1     # NON-ZERO, not a warning
+    out = capsys.readouterr().out
+    assert "REFUSED" in out and "4989" in out                            # names the evidence
+    assert "PERMANENTLY" in out and "recycle" in out.lower()             # says recycle cannot fix it
+    assert "fleet move kid --to-workspace 22222222-2222-2222-2222-222222222222 --archive-revive" in out
+    assert _no_move(movable)                                             # NOTHING was moved
+    assert fs.live_get("kid")["workspace"] == "WS-OLD"                   # registry untouched
+
+
+def test_move_refusal_is_PID_authoritative_not_agentLifecycle(fs, rs, movable, monkeypatch, capsys):
+    """THE MUTATION-PROOF TEST — the one that fails if someone 'simplifies' the guard to the obvious
+    helper. This models a REAL SPECIMEN: `move-refuse`, the agent that wrote this code, was demonstrably
+    alive (pid 4989, running the probe) while:
+
+        lifecycle('A63131E0…')            -> ''      (terminal)
+        surface_has_live_pid(…)           -> False   (the hook store held NO record for its surface)
+        surface_has_live_agent(…)         -> False   <- the `fleet ls` STALE predicate. It said DEAD.
+        rs.pids_ps(…)                     -> {4989}  <- only the process table saw the truth.
+
+    A guard built on `surface_has_live_agent` (= rs.present) would have said "not live" and cheerfully
+    destroyed that agent's registration. `agentLifecycle` is the field a dark agent FREEZES, so trusting
+    it means the guard goes quiet exactly when it is needed. Pid, or nothing."""
+    monkeypatch.setattr(fs, "surface_has_live_agent", lambda s: False)   # the ls/STALE predicate LIES
+    monkeypatch.setattr(fs, "surface_has_live_pid", lambda s: False)     # the store has no record at all
+    monkeypatch.setattr(fs, "lifecycle", lambda s: "")                   # terminal — the frozen lie
+    monkeypatch.setattr(rs, "_ps_axeww", lambda: _ps_table((4989, "KID-S", 4989)))
+    monkeypatch.setattr(rs.fs, "pid_alive", lambda p: p == 4989)
+
+    assert fleet.cmd_move(["kid", "--own-workspace"]) == 1               # REFUSED anyway — ps saw it
+    assert "REFUSED" in capsys.readouterr().out
+    assert _no_move(movable)
+
+
+def test_move_refuses_when_the_process_table_CANNOT_BE_READ(fs, rs, movable, monkeypatch, capsys):
+    """A failed sweep is UNKNOWN, never 'nothing here'. rs._ps_axeww swallows a timeout/exec error and
+    returns "" — and a box always has processes, so an empty sweep is a failed one. Fail CLOSED: a wrong
+    refusal costs one flag; a wrong allow costs a permanently dark agent."""
+    monkeypatch.setattr(rs, "_ps_axeww", lambda: "")                     # the sweep FAILED
+    assert fleet.cmd_move(["kid", "--own-workspace"]) == 1
+    out = capsys.readouterr().out
+    assert "possibly LIVE" in out and "process table" in out
+    assert _no_move(movable)
+
+
+def test_move_refusal_ignores_a_mere_env_carrier(fs, rs, movable, monkeypatch):
+    """A daemon/summarizer INHERITS the agent's surface env but is not the agent (its CMUX_CLAUDE_PID is
+    the agent's pid, not its own). If those counted, the guard would refuse forever on every husk — and
+    the unfiltered union is exactly what once wedged every conductor's teardown."""
+    monkeypatch.setattr(rs, "_ps_axeww", lambda: _ps_table((5001, "KID-S", 4989)))   # inherited, not the agent
+    monkeypatch.setattr(rs.fs, "pid_alive", lambda p: True)
+    monkeypatch.setattr(fleet, "_agent_surfaced", lambda s: False)
+    assert fleet.cmd_move(["kid", "--to-workspace", TARGET_WS]) == 0     # husk -> the move is allowed
+    assert [c for c in movable if c[0] == "move-surface"]
+
+
+def test_move_of_a_HUSK_surface_is_allowed(fs, rs, movable, monkeypatch, capsys):
+    """No agent process, no agent TUI -> no agent-status registration left to destroy -> the move is safe.
+    This is the one branch where a plain move survives, and it is stated out loud."""
+    monkeypatch.setattr(rs, "_ps_axeww", lambda: NO_AGENT_PS)
+    monkeypatch.setattr(fleet, "_agent_surfaced", lambda s: False)
+    monkeypatch.setattr(fleet, "current_ws_for_surface", _seq("WS-OLD", TARGET_WS))
+
+    assert fleet.cmd_move(["kid", "--to-workspace", TARGET_WS]) == 0
+    assert "nothing live to darken" in capsys.readouterr().out
+    mv = [c for c in movable if c[0] == "move-surface"][0]
+    assert "KID-S" in mv and TARGET_WS in mv
     kid = fs.live_get("kid")
-    assert kid["workspace"] == "WS-NEW" and kid["group"] == "G" and kid["place"] == "workspace"
+    assert kid["workspace"] == TARGET_WS and kid["surface"] == "KID-S"   # reconciled from tree ground truth
+    assert fs.expected_close_recent("KID-S")                             # router archive-suppression belt
 
+
+def test_move_of_a_husk_still_refuses_if_the_pane_paints_a_TUI(fs, rs, movable, monkeypatch):
+    """The backstop for a tool whose seat-agent rule we do not have: no pid matched, but the pane is
+    painting an agent. It can only ever push toward REFUSING — the safe way to be wrong."""
+    monkeypatch.setattr(rs, "_ps_axeww", lambda: NO_AGENT_PS)
+    monkeypatch.setattr(fleet, "_agent_surfaced", lambda s: True)        # a TUI is up
+    assert fleet.cmd_move(["kid", "--to-workspace", TARGET_WS]) == 1
+    assert _no_move(movable)
+
+
+# --- B. --archive-revive: the honest relocation ------------------------------------------------------
+
+def _fake_revive(calls, new_surf="FRESH-S", new_ws=TARGET_WS):
+    """Stand-in for cmd_revive: records its argv and lands the label live on a FRESH surface."""
+    def rev(argv):
+        from cmux_fleet import state as _fs             # CURRENT module — see the `rs` fixture's docstring
+        calls.append(argv)
+        e = _fs.archive_get(argv[0]) or {}
+        _fs.live_put(argv[0], {**e, "surface": new_surf, "workspace": new_ws, "status": "live",
+                               "session": "claude-k"})
+        _fs.archive_del(argv[0])
+        return 0
+    return rev
+
+
+@pytest.fixture
+def live_kid(movable, rs, monkeypatch):
+    """A LIVE kid (pid 4989 on its surface) — the case a plain move must refuse."""
+    monkeypatch.setattr(rs, "_ps_axeww", lambda: _ps_table((4989, "KID-S", 4989)))
+    monkeypatch.setattr(rs.fs, "pid_alive", lambda p: p == 4989)
+    return movable
+
+
+def test_archive_revive_relocates_onto_a_FRESH_surface_resuming_the_FULL_session(fs, live_kid, monkeypatch,
+                                                                                 capsys):
+    archived, revived = [], []
+    monkeypatch.setattr(fleet, "cmd_archive", lambda argv: (archived.append(argv) or 0))
+    monkeypatch.setattr(fleet, "cmd_revive", _fake_revive(revived))
+
+    assert fleet.cmd_move(["kid", "--to-workspace", TARGET_WS, "--archive-revive"]) == 0
+
+    assert archived == [["kid"]]                                         # parked first
+    rv = revived[0]
+    assert rv[0] == "kid" and "--place" in rv and "tab" in rv
+    assert "--parent" in rv and "SIB-S" in rv                            # born IN the target workspace
+    assert "--fresh" not in rv                                           # <- CONTEXT PRESERVED: resume, not shed
+    kid = fs.live_get("kid")
+    assert kid["surface"] == "FRESH-S" and kid["workspace"] == TARGET_WS
+    assert "FRESH surface" in capsys.readouterr().out
+
+
+def test_archive_revive_NEVER_MOVES_THE_LIVE_SURFACE(fs, live_kid, monkeypatch):
+    """The invariant the whole brief turns on. The fresh surface is BORN in the destination — never
+    born-then-moved, which would darken it with the very move this verb refuses. So the archive-revive
+    path must issue ZERO surface-relocation verbs to cmux."""
+    monkeypatch.setattr(fleet, "cmd_archive", lambda argv: 0)
+    monkeypatch.setattr(fleet, "cmd_revive", _fake_revive([]))
+    assert fleet.cmd_move(["kid", "--own-workspace", "--archive-revive"]) == 0
+    assert _no_move(live_kid)                                            # not one move-surface. not one.
+
+
+def test_archive_revive_own_workspace_carries_the_conductors_group(fs, live_kid, monkeypatch):
+    """`move --own-workspace` always gave the child its conductor's group membership. The relocation must
+    not silently drop it: revive reads placement off the SHELF row, so the shelf is retargeted before it."""
+    fs.live_put("cond", {**fs.live_get("cond"), "group": "G"})
+    revived = []
+    monkeypatch.setattr(fleet, "cmd_archive",
+                        lambda argv: (fs.archive_put("kid", dict(fs.live_get("kid"), place="tab")),
+                                      fs.live_del("kid"), 0)[-1])
+    monkeypatch.setattr(fleet, "cmd_revive", lambda argv: (revived.append(dict(fs.archive_get("kid"))) or
+                                                           _fake_revive([])(argv)))
+    assert fleet.cmd_move(["kid", "--own-workspace", "--archive-revive"]) == 0
+    shelf = revived[0]                                                   # what revive actually read
+    assert shelf["place"] == "workspace" and shelf["group"] == "G"
+
+
+def test_archive_revive_ABORTS_LIVE_when_the_archive_refuses(fs, live_kid, monkeypatch, capsys):
+    """archive REFUSES when a live agent on the surface will not die (the never-orphan gate): registry
+    untouched, surface still open. So nothing moved and the agent is exactly where it was — LIVE. The
+    recovery state must be stated, not inferred."""
+    monkeypatch.setattr(fleet, "cmd_archive", lambda argv: 1)            # refused; shelf stays empty
+    monkeypatch.setattr(fleet, "cmd_revive", lambda argv: pytest.fail("revive ran after a refused archive"))
+
+    assert fleet.cmd_move(["kid", "--own-workspace", "--archive-revive"]) == 1
+    out = capsys.readouterr().out
+    assert "NOTHING was moved" in out and "still LIVE" in out
+    assert fs.live_get("kid") is not None                                # still live in the registry
+    assert fs.archive_get("kid") is None                                 # and NOT parked
+    assert _no_move(live_kid)
+
+
+def test_archive_revive_leaves_the_label_PARKED_when_the_revive_fails(fs, live_kid, monkeypatch, capsys):
+    """revive aborts BEFORE archive_del by construction, so a failed revive leaves the label parked WITH
+    its session — context intact, command re-runnable. Nothing is lost, and we say so."""
+    monkeypatch.setattr(fleet, "cmd_archive",
+                        lambda argv: (fs.archive_put("kid", dict(fs.live_get("kid"))),
+                                      fs.live_del("kid"), 0)[-1])
+    monkeypatch.setattr(fleet, "cmd_revive",
+                        lambda argv: (_ for _ in ()).throw(SystemExit("[fleet] ABORT: menu wedged")))
+
+    assert fleet.cmd_move(["kid", "--own-workspace", "--archive-revive"]) == 1
+    out = capsys.readouterr().out
+    assert "stays PARKED" in out and "nothing is lost" in out
+    assert "fleet revive kid" in out                                     # the exact recovery command
+    assert fs.archive_get("kid") is not None                             # recoverable, session intact
+
+
+# --- C. the ARCHIVED agent (Berg: "decide, and make the code say it out loud") ------------------------
+
+def test_move_of_an_ARCHIVED_label_refuses_because_there_is_no_surface(fs, monkeypatch, capsys):
+    """An archived agent has NO surface — there is nothing to relocate, and where it lands is a decision
+    made when it comes back. So a plain move has no referent. Refuse, and hand over the command that
+    expresses what they actually want."""
+    fs.archive_put("kid", {"role": "w", "tool": "claude", "cwd": "/x", "last_session": "S1"})
+    monkeypatch.setattr(fleet, "cmuxq", lambda *a: "")
+    with pytest.raises(SystemExit) as ex:
+        fleet.cmd_move(["kid", "--own-workspace"])
+    assert "ARCHIVED" in str(ex.value) and "no surface" in str(ex.value)
+    assert "fleet move kid --own-workspace --archive-revive" in str(ex.value)
+
+
+def test_move_of_an_ARCHIVED_label_with_the_flag_does_the_revive_half(fs, rs, monkeypatch, capsys):
+    """--archive-revive names an END STATE ('live on a fresh surface in the target'). For an already-parked
+    agent that state is reached by the revive half alone, so the flag stays meaningful and idempotent."""
+    fs.archive_put("kid", {"role": "w", "tool": "claude", "cwd": "/x", "last_session": "S1", "place": "tab"})
+    revived = []
+    monkeypatch.setattr(fleet, "cmuxq", lambda *a: "")
+    monkeypatch.setattr(fleet, "cmd_archive", lambda argv: pytest.fail("must NOT re-archive a parked agent"))
+    monkeypatch.setattr(fleet, "cmd_revive", _fake_revive(revived))
+    monkeypatch.setattr(rs, "workspace_surfaces", lambda ws, ws_map=None: ["SIB-S"])
+
+    assert fleet.cmd_move(["kid", "--to-workspace", TARGET_WS, "--archive-revive"]) == 0
+    assert "already archived" in capsys.readouterr().out
+    assert revived[0][0] == "kid" and "--fresh" not in revived[0]        # full-session resume, still
+    assert fs.live_get("kid")["workspace"] == TARGET_WS
+
+
+# --- D. argument handling (unchanged contracts) -------------------------------------------------------
 
 def test_move_refuses_when_surface_not_in_tree(fs, monkeypatch):
     fs.live_put("kid", {"role": "w", "kind": "child", "surface": "KID-S", "workspace": "WS-OLD",
@@ -199,6 +445,22 @@ def test_move_noop_when_already_in_target(fs, monkeypatch):
     assert fleet.cmd_move(["kid", "--to-workspace", "11111111-1111-1111-1111-111111111111"]) == 0
     assert not [c for c in calls if c[0] == "move-surface"]              # nothing moved
     assert not fs.expected_close_recent("KID-S")                        # and no tombstone stamped
+
+
+# --- E. the liveness authority itself ------------------------------------------------------------------
+
+def test_live_agent_pids_unions_the_store_and_the_process_table(fs, rs, monkeypatch):
+    """Neither source is sufficient alone. The STORE misses an agent whose record SessionEnd already
+    reaped (~0.3s before the process exits) or never wrote; the PROCESS TABLE needs the seat-agent rule to
+    tell the agent from its env-inheriting children. The union is the authority both the teardown gate and
+    the move refusal spend, so they can never disagree about who is alive."""
+    monkeypatch.setattr(fleet, "_store",
+                        lambda: {"sessions": {"s1": {"surfaceId": "KID-S", "pid": 111,
+                                                     "agentLifecycle": "running"}}})
+    monkeypatch.setattr(rs, "_ps_axeww", lambda: _ps_table((222, "KID-S", 222),      # the agent, per ps
+                                                           (333, "KID-S", 222)))     # its summarizer -> NOT
+    monkeypatch.setattr(rs.fs, "pid_alive", lambda p: True)
+    assert fleet._live_agent_pids("KID-S", "claude") == [111, 222]       # store ∪ ps-seat-agent; 333 excluded
 
 
 # ================= P0-3: tool-aware launch flags (claude-isms must not kill codex) ==================
