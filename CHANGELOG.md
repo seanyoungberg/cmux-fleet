@@ -95,6 +95,40 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Fixed
 
+- **fleet-doctor: a LIVE agent is never called DOWN, and never handed a destructive remedy.** The doctor
+  told the fleet that conductor `berg-sandbox` "appears DOWN (stall); check it and `fleet revive
+  berg-sandbox` if it is". It was not down — Berg was sitting in it *typing*: pid up, 88% context. Obeying
+  the alert would have destroyed the live session, because `revive` archives the agent and relands it on a
+  FRESH surface: the advertised remedy for the false positive kills the thing it falsely accused. Root
+  cause: `_alert_conductor_peers` hardcoded the DOWN script for every reason routed through it — but two of
+  them (`stall`, `detached`) fire ONLY on a surface the sweep just proved PRESENT, and their positive signal
+  ("the bound 'running' record stopped advancing") is exactly what a human typing produces. The alert also
+  contradicted its own inbox header ("still LIVE — a health alert, not an archive"). The wording now comes
+  from `router.conductor_alert_text()`, gated on a fresh pid read (**PID authority**, not the `agentLifecycle`
+  string): live → INSPECT, and it says outright that a human may simply be typing; dead → the DOWN text,
+  `revive` included, unchanged. Deriving it in the one place the words are written makes it structural — no
+  reason, present or future, can hand a live agent a revive/archive/--force. `tests/test_fleet_doctor.py`
+  pins the invariant on every channel the advice travels (peer wake, desktop banner, inbox row).
+
+- **A launch could bind an agent's registry row to a completely unrelated live surface.** `fleet launch
+  --label doctor-stall` created and launched onto surface `E4CED20C…`, then bound the registry to
+  `3F2CDDD4…` — an idle staging shell that had been sitting there for a week. Because a conductor drives the
+  *registry's* surface, `fleet drive-child` typed an entire brief into a bare zsh, which wedged at a
+  `dquote>` prompt while the real agent sat idle with no instructions. (`fleet vitals` read it `detached`,
+  which was correct: there was no agent on the surface the registry believed in.) The note it printed —
+  "reconciled via AGENT_LABEL/cwd match in the hook store" — was false about itself: fleet passes
+  `AGENT_LABEL` as an ENV VAR, while cmux records `launchCommand` as the exec'd binary's **argv**, which by
+  construction excludes the `KEY=val` prefixes the shell consumes — so the precise label arm is structurally
+  dead and every discovery silently degraded to the loose **cwd** arm, which is not an identity (every shell
+  in a worktree shares it) and which returns the record's `surfaceId` — a hook-time attribution that was, in
+  this case, simply wrong. **Invariant I5: the launched surface is authoritative.** `_bind_launched_session`
+  now returns `(ws, surf)` exactly as they came in; a reconciliation may only FILL IN the missing session id,
+  and only against proof from the live process's own environment (`resolve.proc_ident` → `ps eww` →
+  `CMUX_SURFACE_ID`/`AGENT_LABEL`), never from the store's `surfaceId` and never from cwd. When that proof is
+  unavailable the sid stays empty and `cmd_launch` aborts safely without registering, leaving the surface up
+  and signposting `fleet register --surface <launched>`: an empty sid is a recoverable gap; a registry row
+  pointing at someone else's terminal is not. `tests/test_launch_surface_authority.py` pins it.
+
 - **`fleet <verb> --help` no longer RUNS the verb.** Only the verbs that happened to build an
   `ArgumentParser` got `--help` for free. The 18 hand-rolled ones either swallowed it as a positional label
   (`fleet rm --help` → "no such label '--help'") or — the dangerous half — ignored it and executed:
