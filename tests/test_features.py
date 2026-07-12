@@ -294,6 +294,20 @@ def test_context_window_keyword_map():
     assert ff._context_window("totally-unknown") == 200000         # safe default (no override set)
 
 
+def test_gpt_5_6_is_a_372k_model_and_the_gpt_5_PREFIX_does_not_swallow_it():
+    """ORDER IS THE BUG HERE, and it is silent: every gpt-5.6 slug CONTAINS "gpt-5", so listed after the
+    "gpt-5" -> 272k entry, `gpt-5.6-sol` resolves to 272_000 — understating a 372_000 window by 100k and
+    manufacturing false "near-full, recycle now" alarms on the very model we moved to FOR its extra room.
+
+    Windows are codex's own, read out of the model registry embedded in the codex-cli 0.144.1 binary:
+    gpt-5.6-{sol,terra,luna} = 372_000; gpt-5.5 / 5.4 / 5.2 = 272_000."""
+    ff = _ff()
+    for slug in ("gpt-5.6-sol", "gpt-5.6-terra", "gpt-5.6-luna"):
+        assert ff._context_window(slug) == 372_000, f"{slug} was swallowed by the gpt-5 prefix"
+    assert ff._context_window("gpt-5.5") == 272_000                 # the model we are moving OFF
+    assert ff._context_window("gpt-5-codex") == 272_000             # unchanged
+
+
 def test_context_window_override_beats_keyword_below_flavor(monkeypatch):
     # Corrected precedence: an explicit [flavor] wins; else the fleet's DECLARED window (the override) —
     # it sits ABOVE the keyword guess because a bare model string can't disambiguate opus-4-8's 200k vs

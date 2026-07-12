@@ -229,8 +229,18 @@ def _context_window(model):
     if _CFG_WINDOW:                                       # the fleet's DECLARED window — beats the keyword
         return int(_CFG_WINDOW)                           # guess (a bare model can't disambiguate 200k vs 1M)
     m = (model or "").lower()
+    # ORDER IS LOAD-BEARING: first match wins, and every gpt-5.6 slug CONTAINS "gpt-5". Listed after it,
+    # `gpt-5.6-sol` resolves to 272k — understating a 372k window by 100k and manufacturing false
+    # "near-full, recycle now" alarms on the very model we moved to FOR its extra room. Windows are
+    # codex's own, read out of the model registry embedded in the codex-cli 0.144.1 binary: every
+    # gpt-5.6-* variant (sol/terra/luna) is 372_000; gpt-5.5 and the 5.4/5.2 line are 272_000.
+    # NOTE this map is only the LAST-RESORT floor: a codex agent's REAL window comes from its rollout
+    # (`info.model_context_window`, live-measured 353_400 for gpt-5.6-sol — the server's effective window,
+    # which is smaller than the registry's nominal 372_000), and on a fleet that declares
+    # [fleet].context_window the declared value outranks this map entirely.
     for key, win in (("haiku", 200000), ("sonnet", 200000), ("opus", 200000),
-                     ("gpt-5", 272000), ("o3", 200000), ("codex", 272000), ("gemini", 1000000)):
+                     ("gpt-5.6", 372000), ("gpt-5", 272000), ("o3", 200000),
+                     ("codex", 272000), ("gemini", 1000000)):
         if key in m:
             return win
     return 200000

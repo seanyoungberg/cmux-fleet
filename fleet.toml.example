@@ -56,11 +56,34 @@ flags   = "--effort high"
 # model in the desktop app silently moves your whole codex fleet, and a recycle rides whatever the ambient
 # default happens to be rather than a fixed identity. Pin it and the agent is reproducible:
 #
-#   flags = "--dangerously-bypass-approvals-and-sandbox --model gpt-5.5 --effort xhigh"
+#   flags = "--dangerously-bypass-approvals-and-sandbox --model gpt-5.6-sol --effort xhigh"
 #
 # Write it in CLAUDE syntax (--model/--effort): the codex adapter translates at the boundary
 # (--effort <lvl> -> `-c model_reasoning_effort=<lvl>`; --model passes through natively).
 # Roles override in [role.<name>.codex].flags.
+#
+# THE CONTEXT WINDOW IS A PROPERTY OF THE MODEL — there is no window flag and no window config key to set.
+# codex-cli ships a model registry (embedded in the binary; read it with:
+#   strings $(readlink -f $(which codex)) | grep -A30 '"slug": "gpt-5.6-sol"'
+# ) and each slug fixes its own window. In codex-cli 0.144.1:
+#
+#   slug            nominal ctx   max ctx    notes
+#   gpt-5.6-sol       372_000     372_000    "Latest frontier agentic coding model" — the 5.5 replacement
+#   gpt-5.6-terra     372_000     372_000    balanced/everyday
+#   gpt-5.6-luna      372_000     372_000    fast + affordable
+#   gpt-5.5           272_000     272_000    the previous frontier pin
+#   gpt-5.4           272_000   1_000_000    the ONLY slug with headroom past its default — but a weaker model
+#
+# Two things that bite:
+#   1. For every gpt-5.6-* variant, nominal == max, so there is NOTHING to raise: you get the window by
+#      CHOOSING THE MODEL. (`model_context_window` exists as a codex config field, but on 5.6 it has no
+#      headroom to buy, and setting it above the true window only lies to codex's own compaction/display.)
+#   2. NOMINAL IS NOT EFFECTIVE. The window the server actually grants is smaller than the registry's
+#      number and is reported per-turn in the rollout as `info.model_context_window` — live-measured
+#      353_400 for gpt-5.6-sol (vs 258_400 for gpt-5.5). `fleet vitals` reads that rollout value, so it
+#      shows the REAL denominator, not the brochure one. Trust vitals over this table.
+#
+# Efforts: 5.6-sol/terra also accept `max` and `ultra` above `xhigh` (5.5 topped out at xhigh).
 
 # --- example roles ----------------------------------------------------------------------------
 [role.worker]
