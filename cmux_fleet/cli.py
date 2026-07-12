@@ -6032,6 +6032,7 @@ VERB_USAGE = {
     "vitals": "  vitals [--scope mine|all|conductors|children] [--json] [--paint] [--no-probe] [--watch [--interval N]] cheapest-first triage table: blocked (waiting on YOU: yes/no/?) + ctx-remaining % (default mine)",
     "usage": "  usage [--json]                                    per-provider subscription windows (5h + weekly bars, reset countdowns, metered/Fable flags, live attribution) from the daemon poller",
     "codex-setup": "  codex-setup <acct>                       SUPERSEDED -> use `codex-login` (it set up the shared-home env-token model, which is the supersession bug)",
+    "conformance": "  conformance [--json] [--trials N] [--tool claude|codex|both] [--keep]   does THIS cmux build actually DO what the fleet depends on? Exercises every cmux capability the fleet uses against a LIVE cmux and reports PASS/FAIL/UNKNOWN — each check proving the EFFECT, never the invocation (exit 0 is not a pass; `capture-pane` returns an error and exits 0). Run it on stable, run it on nightly, DIFF the two: that diff is the breaking-change report. Safe by construction: its own workspace, its own agents, its own throwaway fleet state, and structurally incapable of touching a fleet member",
     "codex-sync": "  codex-sync [acct] [--check]                      bring each codex seat's HOME up to fleet spec, in one pass: the CITIZENSHIP doc ($CODEX_HOME/AGENTS.md — the only file a codex worker reads whatever its cwd, since it loads no claude plugins; fenced, so your own text survives) AND cmux's HOOK WIRING, installed and TRUSTED together (an untrusted hook does not run and does not say so, so no completion ever reaches the router). `fleet launch --tool codex` syncs the home it launches into, so this is for auditing (--check) and seeding",
     "codex-login": "  codex-login [acct] [--timeout N] [--verify-only]  log codex SEATS into their OWN homes (each seat needs one: the backend keys a session per device, and the device id is per-home). NO acct = cycle every seat, SKIPPING any that already verify (a login supersedes, so re-logging a working seat breaks it). Opens a terminal tab with the login typed, waits, then VERIFIES with a backend 200 + the model actually speaking, and reports the account it really got",
     "find": "  find <query> [--turns N] [--json]                 content-aware session lookup (label/role/cwd or transcript)",
@@ -6055,6 +6056,7 @@ USAGE_ALIAS = {"unmute": "mute"}
 # they are not human verbs), but they are in the verb table, so they need a usage entry of their own or
 # `--help` would hand '--help' to json.load(open(...)) and traceback.
 INTERNAL_USAGE = {
+    "_conformance-exec": "  _conformance-exec [flags]                        internal: the ISOLATED child of `fleet conformance` (it refuses to run unless `fleet conformance` set up its throwaway state)",
     "_recycle-exec": "  _recycle-exec <payload.json>                      internal: the detached single-recycle worker (spawned by `fleet recycle`)",
     "_recycle-bulk-exec": "  _recycle-bulk-exec <payloads.json>               internal: the detached sequential bulk-recycle orchestrator (spawned by `fleet recycle --scope`)",
 }
@@ -6085,6 +6087,7 @@ def verb_table():
     from . import features as ff
     from . import daemon as fd
     from . import helpers as fh
+    from . import conformance as cf
     return {"launch": cmd_launch, "config": cmd_config, "ls": cmd_ls, "plugins": cmd_plugins,
             "archive": cmd_archive, "revive": cmd_revive, "register": cmd_register, "recycle": cmd_recycle,
             "move": cmd_move, "group": cmd_group,
@@ -6094,6 +6097,7 @@ def verb_table():
             "mute": lambda a: cmd_mute(a, mute=True), "unmute": lambda a: cmd_mute(a, mute=False),
             "rm": cmd_rm, "worktree": cmd_worktree, "profile": cmd_profile, "daemon": fd.cmd_daemon,
             "vitals": ff.cmd_vitals, "usage": ff.cmd_usage, "find": ff.cmd_find, "graph": ff.cmd_graph,
+            "conformance": cf.cmd_conformance, "_conformance-exec": cf.cmd_conformance_exec,
             "codex-setup": cmd_codex_setup,
             "codex-login": cmd_codex_login,
             "codex-sync": cmd_codex_sync,
