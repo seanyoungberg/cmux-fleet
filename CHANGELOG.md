@@ -6,6 +6,25 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Added
+
+- **`fleet conformance` — an instrument that tells you whether a cmux build actually WORKS.** Berg is about
+  to run nightly (1100+ commits ahead) beside stable and does not want to read 1100 commits to find out
+  what breaks. Run it on stable, run it on nightly, `diff` the two JSON reports: that diff IS the
+  breaking-change report, derived empirically instead of inferred from commit subjects. 17 checks, tri-state
+  (PASS/FAIL/UNKNOWN — an UNKNOWN is never laundered into a pass), each proving the **effect** and never the
+  invocation. Every result names the cmux build it ran against.
+  - **Safe by construction, not by care.** It creates its own workspace, its own agents and its own
+    throwaway fleet state, and it is *structurally incapable* of touching a fleet member: it may only
+    destroy UUIDs it created (recorded at creation — never name- or prefix-matched), production's registry
+    is read once and made untouchable, and an AST test pins that no destructive cmux verb is invoked
+    anywhere outside the sandbox. It refuses to run at all if its state resolves onto production's.
+  - **A deliberate break exposed a FALSE PASS in the suite itself.** The first `paint` check asserted
+    "the label appears in cmux's sidebar snapshot" — and passed against a doctored cmux whose `set-status`
+    was a no-op, because the label was in the snapshot anyway *as the workspace's name*. The suite built to
+    catch "the artifact looks right but the effect never happened" contained exactly that bug. It now writes
+    a nonce into the field the fleet really uses (the workspace description) and reads it back.
+
 ### Fixed
 
 - **`fleet revive` could land an agent on a dark surface — the cure reproduced the disease.** `revive` is

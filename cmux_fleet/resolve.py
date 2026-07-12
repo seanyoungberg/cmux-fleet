@@ -302,6 +302,29 @@ def stamps_since(surface, cursor):
     return n
 
 
+def store_record_sample(st=None):
+    """The freshest raw session record in cmux's hook store ({} if none) — FOR SCHEMA INSPECTION ONLY.
+
+    `fleet conformance` has to answer "does cmux's store still carry the field names the fleet reads?", and
+    that question is unanswerable through the hardened predicates: they exist precisely to hide the raw
+    record. So the raw read lives HERE, in the one module allowed to have one, and the validator consumes an
+    interface instead of growing a seventh raw read of its own. (The ratchet caught exactly that when this
+    was first written in conformance.py. It was right to.)
+
+    NOT for judging anything. It applies no liveness rule and never should — it is a shape sample."""
+    st = fs.read_hook_store() if st is None else st
+    sessions = (st.get("sessions") or {})
+    if not sessions:
+        return {}
+    return max(sessions.values(), key=lambda s: s.get("updatedAt") or 0)
+
+
+def store_record_count(st=None):
+    """How many session records cmux's store holds (schema-inspection companion to store_record_sample)."""
+    st = fs.read_hook_store() if st is None else st
+    return len(st.get("sessions") or {})
+
+
 def dark(surface, tool=None):
     """A LIVE agent that cmux is not filing under this surface.
 
