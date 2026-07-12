@@ -387,7 +387,7 @@ def _codex_clean_config_flags(home=CODEX_DEFAULT_HOME):
     return flags
 
 
-def adapter_compile(tool, spec, caller_tokens, codex_home=None):
+def adapter_compile(tool, spec, caller_tokens, codex_home=None, conductor=""):
     """Compile {plugins, flags, env, settings} + caller passthrough -> (bin, arg_tokens, env_map)
     for the given tool. Adding a tool = adding a branch here + a [tool.<t>] block.
 
@@ -395,12 +395,19 @@ def adapter_compile(tool, spec, caller_tokens, codex_home=None):
     optional multi-seat feature is in use). It MUST be threaded in, because the codex cruft-stripping flags
     are enumerated FROM that home's config — computing them against the default home and applying them to a
     seat home is what broke the agent launch (see _codex_clean_config_flags). None = codex's own default
-    home, which is exactly right for a user who has configured no providers at all."""
+    home, which is exactly right for a user who has configured no providers at all.
+
+    `conductor` is the LABEL of the agent this one reports to. A child was told its own name and its role
+    but never who launched it — and `fleet peer-msg` addresses by label, so a worker that cannot name its
+    conductor cannot report to it. The fleet knows the parent at launch; this hands it to the child instead
+    of making it go digging."""
     # spec['flags'] is already a token list (tool-floor<-role); layer the caller passthrough on top.
     merged = _layer_tokens([spec["flags"], list(caller_tokens or [])])
     env = {**_profile_env(), **dict(spec["env"])}            # build/profile pins first; a role's env wins
     env["AGENT_ROLE"] = spec["role"]                          # behavioral type (exposed to the agent)
     env["AGENT_LABEL"] = spec["label"]                        # unique instance -> routing/recycle
+    if conductor:
+        env["AGENT_CONDUCTOR"] = conductor                   # who to report to (peer-msg addresses by label)
 
     if tool == "claude":
         args = []
@@ -1425,7 +1432,9 @@ def cmd_launch(argv):
             sys.exit(f"[fleet] --provider: {e}")
         codex_home = (pr.get("env") or {}).get("CODEX_HOME")   # the home this codex launch will really use
 
-    bin_name, args, env = adapter_compile(spec["tool"], spec, caller, codex_home=codex_home)
+    from . import state as _fs
+    bin_name, args, env = adapter_compile(spec["tool"], spec, caller, codex_home=codex_home,
+                                          conductor=_fs.label_for_surface(a.parent) if a.parent else "")
 
     if pr:
         env.update(pr["env"])
@@ -1504,6 +1513,11 @@ def cmd_launch(argv):
         note = _codex_update_preflight()                 # allow the update); the pane scan below is the
         if note:                                         # backstop, not the primary
             print(f"[fleet] {note}")
+        # Citizenship, refreshed on EVERY launch — this is what makes the doc fleet-owned rather than
+        # hand-maintained. Sync-on-launch means a worker cannot boot with a stale copy, a home added later
+        # cannot miss it, and nobody has to remember a setup step. It is idempotent and writes only when
+        # the text actually changed, so the normal case touches nothing.
+        _codex_sync_home(codex_home or CODEX_DEFAULT_HOME)
     ws, surf = create_surface(spec, a.parent, a.direction)
     if not ws or not surf:
         sys.exit(1)
@@ -4167,6 +4181,16 @@ def _binding_argv(command):
     return argv
 
 
+def _conductor_of(label):
+    """The LABEL of the agent this one reports to, from the registry (live, else archived). The registry is
+    the authority on parentage, so a recycle/revive re-derives $AGENT_CONDUCTOR instead of trusting a
+    captured binding's env — which is exactly how a restarted child would otherwise lose track of its
+    conductor. '' when unknown (an orphan, or a row that predates this)."""
+    from . import state as fs
+    e = fs.live_get(label) or fs.archive_get(label) or {}
+    return e.get("parent") or ""
+
+
 def _prepend_resume(args, tool, sid):
     """Prefix a resume directive per tool: claude takes a `--resume <id>` FLAG, codex a `resume <id>`
     SUBCOMMAND. No sid (or an unknown tool) -> no-op = a fresh launch."""
@@ -4204,7 +4228,10 @@ def _replay_binding_argv(argv, tool, role, label, cwd, caller_tokens, add_plugin
     base = _layer_tokens([base, list(caller_tokens or [])])      # flag overrides
     base = _prepend_resume(base, tool, resume_session)           # claude --resume flag | codex resume subcmd
     # profile-pin a recycled/revived child too (bindings capture null env -> re-inject the build env)
-    return render_send_cmd(tool, base, {**_profile_env(), "AGENT_ROLE": role, "AGENT_LABEL": label}, abs_cwd)
+    env = {**_profile_env(), "AGENT_ROLE": role, "AGENT_LABEL": label}
+    if _conductor_of(label):
+        env["AGENT_CONDUCTOR"] = _conductor_of(label)            # survives a recycle: parentage is in the registry
+    return render_send_cmd(tool, base, env, abs_cwd)
 
 
 def _compose_from_registry(label, entry, caller_tokens, add_plugins, resume_session):
@@ -4219,7 +4246,7 @@ def _compose_from_registry(label, entry, caller_tokens, add_plugins, resume_sess
             "abs_cwd": abs_cwd, "plugins": _dedup(list(entry.get("plugins", [])) + list(add_plugins or [])),
             "flags": _layer_tokens([list(entry.get("flags", [])), list(caller_tokens or [])]),
             "env": {}, "settings": entry.get("settings", "")}
-    bin_name, args, env = adapter_compile(tool, spec, [])
+    bin_name, args, env = adapter_compile(tool, spec, [], conductor=_conductor_of(label))
     args = _prepend_resume(args, tool, resume_session)           # claude --resume flag | codex resume subcmd
     return render_send_cmd(bin_name, args, env, abs_cwd)
 
@@ -4246,7 +4273,7 @@ def _compose_from_roster(role, tool, label, caller_tokens, add_plugins, resume_s
         spec["plugins"] = _dedup(spec["plugins"] + list(add_plugins))
     cwd = cwd_override or spec["cwd"]
     abs_cwd = cwd if os.path.isabs(cwd) else os.path.join(ROOT, cwd)
-    bin_name, args, env = adapter_compile(tool, spec, caller_tokens)
+    bin_name, args, env = adapter_compile(tool, spec, caller_tokens, conductor=_conductor_of(label))
     args = _prepend_resume(args, tool, resume_session)
     return render_send_cmd(bin_name, args, env, abs_cwd)
 
@@ -5253,6 +5280,78 @@ def cmd_profile(argv):
     return 0
 
 
+def _codex_seats():
+    """Every declared codex subscription seat: [(acct, spec)]. The one filter, shared by the codex verbs."""
+    from . import providers as pv
+    return [(n, s) for tool, n, s, _ in pv.iter_providers()
+            if tool == "codex" and s.get("type") == "subscription"]
+
+
+def _codex_sync_home(home, quiet=False):
+    """Install/refresh the citizenship doc in ONE codex home. Returns (path, status).
+
+    FAIL-OPEN, deliberately: a launch must never die because a doc could not be written. An uncitizened
+    worker is a worse worker; a failed launch is no worker at all."""
+    from . import providers as pv
+    try:
+        path, status = pv.codex_install_citizenship(home)
+    except Exception as e:
+        print(f"[fleet] warn: could not sync codex citizenship into {home} ({e}) — launching anyway")
+        return "", "failed"
+    if status != "current" and not quiet:
+        print(f"[fleet] codex citizenship {status}: {path}")
+    return path, status
+
+
+def cmd_codex_sync(argv):
+    """fleet codex-sync [acct] [--check]   install/refresh the citizenship doc in every codex seat's home.
+
+    A codex worker does not load claude plugins, so nothing the fleet ships to a claude agent — the ground
+    skill, the dispatch conventions — reaches it. It boots knowing nothing about the fleet it is a child of.
+    This installs the one file it always reads (`$CODEX_HOME/AGENTS.md`, or the operator's AGENTS.override.md
+    if they wrote one, since an override REPLACES AGENTS.md rather than merging with it).
+
+    You should rarely need to run this: `fleet launch --tool codex` syncs the home it is about to launch
+    into, so a worker cannot boot with a stale doc. It is here for auditing (`--check`) and for seeding homes
+    ahead of time. Writes a FENCED block — anything you wrote outside the fence is left alone."""
+    import argparse
+    from . import providers as pv
+    ap = argparse.ArgumentParser(prog="fleet codex-sync")
+    ap.add_argument("acct", nargs="?", help="one codex seat; OMIT for every declared seat")
+    ap.add_argument("--check", action="store_true",
+                    help="report drift and write NOTHING (exit 1 if any home is out of date)")
+    a = ap.parse_args(argv)
+
+    seats = _codex_seats()
+    if a.acct:
+        seats = [(n, s) for n, s in seats if n == a.acct]
+        if not seats:
+            sys.exit(f"[fleet] codex-sync: no [providers.codex.{a.acct}] in fleet.toml")
+    # No seats declared at all = the single-account user, whose codex workers run in codex's own home.
+    # That worker needs citizenship exactly as much as a seated one does.
+    homes = []
+    for acct, spec in seats:
+        try:
+            homes.append((acct, pv.codex_seat_home(acct, spec)))
+        except pv.ProviderError:
+            print(f"[fleet] seat '{acct}': no home declared — skipping (config gap, not a sync failure)")
+    if not seats:
+        homes = [("(default)", os.path.expanduser(CODEX_DEFAULT_HOME))]
+
+    drift = 0
+    for acct, home in homes:
+        path, status = (pv.codex_citizenship_status(home) if a.check else pv.codex_install_citizenship(home))
+        if a.check and status != "current":
+            drift += 1
+        note = "  <- your AGENTS.override.md (it REPLACES AGENTS.md, so citizenship goes there)" \
+            if os.path.basename(path) == "AGENTS.override.md" else ""
+        print(f"  {acct:<14} {status:<10} {path}{note}")
+    if a.check and drift:
+        print(f"[fleet] codex-sync --check: {drift} home(s) out of date — `fleet codex-sync` to fix")
+        return 1
+    return 0
+
+
 def cmd_codex_setup(argv):
     """fleet codex-setup <acct>   SUPERSEDED by `fleet codex-login <acct>`.
 
@@ -5316,6 +5415,8 @@ def _codex_login_seat(acct, home, timeout):
     import time as _t
     from . import providers as pv
     os.makedirs(home, exist_ok=True)                 # codex ERRORS on a CODEX_HOME that does not exist
+    _codex_sync_home(home)                           # a seat is a citizen from birth: the verify run below is
+                                                     # this home's FIRST codex run, and it should already know
     print(f"\n[fleet] codex-login '{acct}' -> home {home}")
     print( "  1. SIGN OUT of chatgpt.com in your browser FIRST.")
     print( "     A login that reuses the browser session authenticates the WRONG account, and the fleet")
@@ -5377,8 +5478,7 @@ def cmd_codex_login(argv):
                     help="verify the seat(s) as they stand; never open a login (safe: a login supersedes)")
     a = ap.parse_args(argv)
 
-    seats = [(n, s) for tool, n, s, _ in pv.iter_providers()
-             if tool == "codex" and s.get("type") == "subscription"]
+    seats = _codex_seats()
     if a.acct:
         seats = [(n, s) for n, s in seats if n == a.acct]
         if not seats:
@@ -5486,6 +5586,7 @@ VERB_USAGE = {
     "vitals": "  vitals [--scope mine|all|conductors|children] [--json] [--paint] [--watch [--interval N]] cheapest-first triage table + ctx-remaining % (default mine)",
     "usage": "  usage [--json]                                    per-provider subscription windows (5h + weekly bars, reset countdowns, metered/Fable flags, live attribution) from the daemon poller",
     "codex-setup": "  codex-setup <acct>                       SUPERSEDED -> use `codex-login` (it set up the shared-home env-token model, which is the supersession bug)",
+    "codex-sync": "  codex-sync [acct] [--check]                      install/refresh the CITIZENSHIP doc in each codex seat's home ($CODEX_HOME/AGENTS.md — the one file a codex worker reads whatever its cwd, since it loads no claude plugins). Fleet-owned + fenced (your own text is left alone); `fleet launch --tool codex` syncs the home it launches into, so this is for auditing (--check) and seeding",
     "codex-login": "  codex-login [acct] [--timeout N] [--verify-only]  log codex SEATS into their OWN homes (each seat needs one: the backend keys a session per device, and the device id is per-home). NO acct = cycle every seat, SKIPPING any that already verify (a login supersedes, so re-logging a working seat breaks it). Opens a terminal tab with the login typed, waits, then VERIFIES with a backend 200 + the model actually speaking, and reports the account it really got",
     "find": "  find <query> [--turns N] [--json]                 content-aware session lookup (label/role/cwd or transcript)",
     "graph": "  graph [--scope mine|all|<label>] [--json] [--html] [--out FILE]  fleet parentage tree (text/JSON/HTML); default mine = your subtree; --scope all = full tree",
@@ -5519,7 +5620,7 @@ INTERNAL_USAGE = {
 # worse, silently ignored — `fleet serve --help` STARTED THE HTTP SERVER and blocked).
 SELF_HELP_VERBS = frozenset({
     "launch", "config", "plugins", "revive", "register", "recycle", "move", "group", "unstick",
-    "reap-surfaces", "sessions", "worktree", "profile", "daemon", "find", "codex-login",
+    "reap-surfaces", "sessions", "worktree", "profile", "daemon", "find", "codex-login", "codex-sync",
     # codex-setup is NOT here any more: it lost its ArgumentParser when it became a superseded-stub, so it
     # can no longer render its own --help. The guard now serves it from VERB_USAGE (which is the whole point
     # of the guard: a verb without a parser must never be RUN just to ask it for help).
@@ -5549,6 +5650,7 @@ def verb_table():
             "vitals": ff.cmd_vitals, "usage": ff.cmd_usage, "find": ff.cmd_find, "graph": ff.cmd_graph,
             "codex-setup": cmd_codex_setup,
             "codex-login": cmd_codex_login,
+            "codex-sync": cmd_codex_sync,
             "serve": ff.cmd_serve, "paint": ff.cmd_paint,
             "drive-child": fh.cmd_drive_child, "peer-msg": fh.cmd_peer_msg,
             "child-digest": fh.cmd_child_digest, "inbox": fh.cmd_inbox, "inbox-ack": fh.cmd_inbox_ack}

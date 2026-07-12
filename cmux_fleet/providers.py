@@ -324,15 +324,15 @@ def _codex_cred_path(acct):
     return os.path.join(STATE, "providers", f"codex-{acct}.cred.json")
 
 
-def _atomic_write_secret(path, data):
-    """Write-temp-then-rename at 0600 (refinement 1: a concurrent spawn-time $(cat) can never read a
-    half-written token). mkstemp is 0600; os.replace is atomic within a filesystem."""
+def _atomic_write(path, data, mode=0o644):
+    """Write-temp-then-rename (refinement 1: a concurrent spawn-time $(cat) can never read a half-written
+    token). mkstemp is 0600; os.replace is atomic within a filesystem."""
     os.makedirs(os.path.dirname(path), exist_ok=True)
     fd, tmp = tempfile.mkstemp(dir=os.path.dirname(path))
     try:
         with os.fdopen(fd, "w") as f:
             f.write(data)
-        os.chmod(tmp, 0o600)
+        os.chmod(tmp, mode)
         os.replace(tmp, path)
     except Exception:
         try:
@@ -340,6 +340,11 @@ def _atomic_write_secret(path, data):
         except OSError:
             pass
         raise
+
+
+def _atomic_write_secret(path, data):
+    """A credential: same write, 0600."""
+    _atomic_write(path, data, 0o600)
 
 
 def _jwt_exp(token):
@@ -562,6 +567,85 @@ def codex_provision_config(acct, config_path="~/.codex/config.toml"):
     new = (body + "\n\n" + fence) if body else fence
     _atomic_write_secret(path, new)                  # ~/.codex/config.toml is 0600 already
     return path
+
+
+# --- citizenship: the doc every codex worker boots with (fleet-owned, FENCED, idempotent) ---------
+# A codex worker does not load claude plugins, so none of the fleet's skills reach it: it boots knowing
+# nothing about the fleet it is a child of. The one file it reads no matter WHERE it is running is the
+# global instructions file in its own CODEX_HOME — so that is where citizenship goes.
+#
+# THE HOME IS THE ONLY SLOT THAT WORKS. A worker's cwd varies (an agent home, a repo worktree, an ad-hoc
+# dir), and codex's other instruction sources are all cwd-relative — the project chain from the git root
+# down. No file in that chain covers every cwd a worker might launch in. `$CODEX_HOME/AGENTS.md` covers
+# all of them (verified against codex-cli 0.144.1: read from a non-git cwd with no project AGENTS.md
+# anywhere in it).
+CITIZEN_FENCE_BEGIN = "<!-- >>> cmux-fleet: codex citizenship (managed — `fleet codex-sync` rewrites this block) -->"
+CITIZEN_FENCE_END = "<!-- <<< cmux-fleet -->"
+
+
+def codex_citizenship_text():
+    """The doc itself. Packaged INSIDE cmux_fleet, so an installed wheel reads it exactly like a checkout
+    does — and so ONE source of truth feeds every home."""
+    from importlib import resources
+    return resources.files("cmux_fleet").joinpath("codex_citizenship.md").read_text()
+
+
+def codex_agents_file(home):
+    """The global instructions file codex will ACTUALLY read in this home.
+
+    Codex reads exactly ONE file at the global level: `AGENTS.override.md` if it exists, else `AGENTS.md`.
+    An override does not merge with AGENTS.md — it REPLACES it (verified against codex-cli 0.144.1: with
+    both files present, only the override's content reached the model). So when an operator has written an
+    override, the citizenship block belongs THERE. Writing it to AGENTS.md in that case would be a silently
+    VOID install: the file would sit in the home looking installed, and codex would never read a line of
+    it — the worst failure available here, because it looks exactly like success."""
+    home = os.path.expanduser(home)
+    override = os.path.join(home, "AGENTS.override.md")
+    try:
+        if open(override).read().strip():
+            return override
+    except OSError:
+        pass
+    return os.path.join(home, "AGENTS.md")
+
+
+def _codex_citizen_plan(home):
+    """(path, status, new_text) for `home` — WITHOUT writing. status: current | installed | updated.
+
+    FENCED, never a whole-file overwrite: whatever the operator wrote outside the fence survives, and the
+    fleet's own text is regenerated from the packaged doc every time. That is the whole point — N homes
+    that are hand-edited are N files that drift, and drift is what this exists to prevent."""
+    path = codex_agents_file(home)
+    try:
+        text = open(path).read()
+    except OSError:
+        text = ""
+    block = f"{CITIZEN_FENCE_BEGIN}\n{codex_citizenship_text().strip()}\n{CITIZEN_FENCE_END}\n"
+    b, e = text.find(CITIZEN_FENCE_BEGIN), text.find(CITIZEN_FENCE_END)
+    if b != -1 and e != -1 and e > b:
+        if text[b:e + len(CITIZEN_FENCE_END)] + "\n" == block:
+            return path, "current", None             # byte-identical: nothing to write, nothing to touch
+        outside, status = text[:b] + text[e + len(CITIZEN_FENCE_END):], "updated"
+    else:
+        outside, status = text, "installed"          # no fence yet (a new home, or a hand-written file)
+    body = outside.strip()
+    return path, status, ((body + "\n\n" + block) if body else block)
+
+
+def codex_citizenship_status(home):
+    """(path, status) as it stands. A pure READ — safe on any home, including one holding the wrong
+    account (nothing here runs codex, so nothing can mint a device id)."""
+    path, status, _ = _codex_citizen_plan(home)
+    return path, status
+
+
+def codex_install_citizenship(home):
+    """Install/refresh the citizenship block in `home`. Returns (path, status). Idempotent: an already-current
+    home is not written to at all, which is what makes this safe to call on every launch."""
+    path, status, new = _codex_citizen_plan(home)
+    if new is not None:
+        _atomic_write(path, new)
+    return path, status
 
 
 def _oauth_refresh(refresh_token):

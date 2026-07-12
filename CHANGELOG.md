@@ -8,6 +8,29 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- **Codex citizenship: a codex worker now boots knowing it is in a fleet.** A codex worker loads no claude
+  plugins, so nothing the fleet ships to a claude agent — the `ground` skill, the dispatch conventions —
+  ever reached it. It booted knowing nothing about the fleet it was a child of, and (the sharp end) nothing
+  told it that it must announce its own completion: an agent that finishes and goes quiet is, to its
+  conductor, indistinguishable from one still thinking. The fleet now installs a citizenship doc into every
+  codex home and refreshes it on every launch.
+  - **`$CODEX_HOME/AGENTS.md` is the slot**, because it is the only instruction file a worker reads
+    *regardless of its cwd* — and a worker's cwd varies (an agent home, a repo worktree, an ad-hoc dir).
+    Codex's other instruction source is a project chain walked from the git root down to the cwd, and no
+    file in that chain covers every worker. Verified against codex-cli 0.144.1, not assumed.
+  - **An `AGENTS.override.md` REPLACES `AGENTS.md`; it does not merge with it.** So when an operator has
+    written an override, citizenship is installed *there*. Writing to `AGENTS.md` in that case would produce
+    a file that sits in the home looking installed and that codex never reads a line of — a failure that is
+    invisible on both ends. Pinned by a mutation-tested test.
+  - **The fleet owns the file, not a human.** `fleet launch --tool codex` syncs the home it is about to
+    launch into, so a worker cannot boot with a stale doc and a home added later cannot miss it. The write is
+    FENCED (anything you wrote outside the fence survives) and idempotent (an already-current home is not
+    written to at all). `fleet codex-sync [acct] [--check]` audits or seeds homes on demand.
+  - **`$AGENT_CONDUCTOR`** is now in every agent's launch env. `fleet peer-msg` addresses by label, and a
+    child knew its own label and its role but never who launched it — so it could not report to its
+    conductor even when it wanted to. Re-derived from the registry on recycle/revive, so it survives a
+    restart.
+
 - **Codex per-seat homes: concurrent codex seats, PROVEN.** Every codex seat declares its own
   `auth = "codex-home:<path>"` and runs as its own device. Three seats (two of them on ONE shared team
   subscription) ran concurrently and each produced real assistant output; none revoked another. This replaces

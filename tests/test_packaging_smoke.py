@@ -119,6 +119,19 @@ def test_wheel_python_m_entrypoint(installed, tmp_path):
     assert p.returncode == 0 and "launch" in p.stdout, p.stderr
 
 
+def test_wheel_ships_the_codex_citizenship_doc(installed, tmp_path):
+    """The citizenship doc is DATA inside the package, not code — exactly the class of file a wheel silently
+    drops. If it does, `fleet codex-sync` and every codex launch raise on a missing resource, and the only
+    place that shows up is a real install. Drive it through the CLI so the packaged-read path is what's
+    under test, not a checkout-relative one."""
+    home = str(tmp_path / "home"); os.makedirs(home)
+    p = _run(installed["fleet"], home, "codex-sync")          # no seats declared -> codex's own home
+    assert "installed" in p.stdout, p.stdout + p.stderr
+    doc = os.path.join(home, ".codex", "AGENTS.md")
+    assert os.path.exists(doc), "the wheel dropped codex_citizenship.md"
+    assert "fleet peer-msg" in open(doc).read()
+
+
 def test_wheel_ls_empty(installed, tmp_path):
     home = str(tmp_path / "home"); os.makedirs(home)
     p = _run(installed["fleet"], home, "ls")
