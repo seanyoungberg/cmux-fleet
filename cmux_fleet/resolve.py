@@ -75,6 +75,7 @@ import subprocess
 import time
 
 from . import state as fs
+from .config import HOOKSTORE          # cmux's own dir: the hook stores + events.jsonl (the stamp log)
 
 # --- attachment thresholds -----------------------------------------------------------------------
 # ATTACH_SKEW_S: the behavioral signal fires when the record has been frozen at least this much
@@ -148,8 +149,97 @@ def has_live_pid(surface):
 
 
 def present(surface):
-    """THE liveness answer (invariant I2): a genuinely-live agent occupies the surface."""
+    """cmux's OWN answer: does its hook store file a genuinely-live agent under this surface (invariant I2)?
+
+    NOT the process table. Every input here — the lifecycle string and the record pids — comes from the
+    store, so this answers "can cmux SEE an agent here", which is a different question from "is one HERE".
+    They diverge, permanently, and the gap has a name: see `dark()`. Anything whose verdict must survive
+    that gap has to ask `alive()` instead."""
     return fs.surface_has_live_agent(surface)
+
+
+# --- the two authorities, kept apart on purpose ---------------------------------------------------
+# Every destructive misfire in this codebase so far is one confusion: reading a NON-authoritative signal
+# and acting as though it settled the question. The pane text said "error", so a healthy codex was
+# condemned with `rm --kill`. The store said "no agent", so a live conductor was reported DOWN with a
+# `revive` that would have destroyed it. Both signals were answering a question nobody asked.
+#
+#   alive()      — the PROCESS TABLE. Is a seat agent actually running here? This is the ONLY signal that
+#                  can condemn, because it is the only one that cannot be counterfeited by cosmetics.
+#   present()    — cmux's STORE. Can cmux see it? This is observability, not existence.
+#
+# A verdict ("it failed", "it is down") may rest ONLY on `alive`. A heuristic — pane text, a lifecycle
+# string, a missing store record — may WARN, and may never condemn. And the remedy must be proportionate
+# to the confidence of the alarm: before shipping a check, ask what its cure does WHEN THE ALARM IS WRONG.
+def alive(surface, tool=None):
+    """THE authoritative liveness answer: a live seat-agent process is on this surface, per `ps`.
+
+    Store-independent by construction — which is the entire point. It sees the agent cmux has lost track
+    of, the agent whose SessionEnd already reaped its record, and the agent that has not bound a session
+    yet. Pass `tool` when the registry knows it (the per-tool seat rule is exact); omit it and every known
+    seat rule is tried (`occupants`)."""
+    return bool(pids_ps(surface, tool=tool) if tool else occupants(surface))
+
+
+# --- is cmux STAMPING this surface? (the observability proof, from cmux's own event log) ----------
+# cmux narrates every agent-status update it makes into ~/.cmuxterm/events.jsonl:
+#
+#   {"name":"sidebar.metadata.updated","payload":{"command":"set_status",
+#    "args":"claude_code Running --icon=bolt.fill --tab=<WORKSPACE> --panel=<SURFACE> --pid=<PID>"}}
+#
+# `--panel=` IS THE SURFACE. `--tab=` is the WORKSPACE, and keying on it inverts the answer — every agent
+# in a conductor's workspace would look like it was stamping every other agent's surface.
+#
+# This is the SECOND, independent read of observability, and it is a POSITIVE one: `present()` says cmux's
+# store has a record, this says cmux is actively narrating the surface. A launch that cannot show either
+# has not proven its agent is visible, and an agent nobody can see has not really been launched.
+def stamp_cursor():
+    """Where cmux's event log ends right now — the 'count only what happens AFTER this' mark. Taken before
+    the launch is delivered, so a surface's stamp count is never inflated by some earlier tenant's."""
+    try:
+        return os.path.getsize(os.path.join(HOOKSTORE, "events.jsonl"))
+    except OSError:
+        return 0
+
+
+def stamps_since(surface, cursor):
+    """How many agent-status stamps cmux has written FOR `surface` since `cursor`."""
+    surf = (surface or "").upper()
+    if not surf:
+        return 0
+    n = 0
+    try:
+        with open(os.path.join(HOOKSTORE, "events.jsonl"), errors="replace") as f:
+            f.seek(max(0, int(cursor or 0)))
+            for line in f:
+                if "sidebar.metadata.updated" not in line:
+                    continue
+                try:
+                    e = json.loads(line)
+                except Exception:
+                    continue
+                args = ((e.get("payload") or {}).get("args") or "").upper()
+                if f"--PANEL={surf}" in args:              # --panel = surface. NOT --tab (that is the workspace)
+                    n += 1
+    except OSError:
+        return 0
+    return n
+
+
+def dark(surface, tool=None):
+    """A LIVE agent that cmux is not filing under this surface.
+
+    It runs, serves `read-screen`, receives inbox messages and completes turns — and is invisible to
+    `vitals`, to `ls`, and to the sidebar, permanently: cmux files its session (and stamps its status)
+    under some other surfaceId, so everything keyed by surface looks straight through it.
+
+    THIS IS THE DANGEROUS STATE, because it reads exactly like death to every store-derived check, and
+    the reflex cure for death is to relaunch — which lands a SECOND agent on the same worktree and the
+    same branch as the first, which is still very much alive. Never condemn a dark agent. At LAUNCH the
+    repair is cheap and safe (no context exists yet): close the surface and re-seat. Afterwards it is
+    `archive` + `revive` onto a fresh surface — never `recycle`, which re-execs onto the same dark
+    surface and changes nothing."""
+    return alive(surface, tool) and not present(surface)
 
 
 def busy(surface, now=None):

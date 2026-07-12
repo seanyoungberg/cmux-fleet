@@ -6,6 +6,55 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Fixed
+
+- **`fleet launch` was unsound in BOTH directions. One principle fixes both: only an authoritative signal
+  may condemn.** The house rule is now in the code (`resolve.alive` vs `resolve.present`), not just in a
+  commit message: **the process table decides verdicts; a heuristic may WARN and may never CONDEMN; and the
+  remedy must be proportionate to the confidence of the alarm.** Before shipping a check, ask what its cure
+  does *when the alarm is wrong* — that is the question this codebase kept failing to ask.
+  - **It invented failures, and handed you a destructive cure.** A perfectly healthy codex worker was
+    reported `!!! LAUNCH FAILED — the process exited on spawn`, with `fleet rm --kill` as the printed
+    remedy, because the first line of its pane was rc noise from the operator's `~/.zshrc` — printed
+    *before codex was even exec'd*. Both existing guards missed it: `agent_tui_visible` looks for
+    `Context N% left`, which codex only paints after its first turn, and the "scan below the launch line"
+    rule assumed exec delivery has no shell (it runs `zsh -ilc`, which sources the rc file like any other).
+    The verdict is now **pid-authoritative** (`launch_verdict`, pure + mutation-tested): a live process is
+    never a failed launch, whatever the pane says. A live process with an ugly pane gets a *note* and an
+    inspect command. `failed` requires BOTH no live process AND a startup error — and only then may the
+    remedy be destructive, because by then there is nothing alive left to destroy.
+  - **It missed real failures: the DARK SURFACE.** On 2 of 4 launches cmux files the agent's session under
+    a surfaceId that is not the one it seated the agent on, and keeps stamping that phantom. The fleet
+    already kept the *registry* right (it adopts the session against the live process's own env), but
+    everything cmux keys by surface — `vitals`, `ls`, the sidebar — then looks straight through the agent.
+    It runs, takes work, and completes turns, permanently invisible. Two specimens stamped 94 and 66 status
+    updates onto surfaces that do not exist in the cmux tree, and 0 onto their own. A dark agent reads
+    exactly like a dead one to every store-derived check, and the reflex cure for death is to relaunch —
+    which lands a SECOND agent on the same worktree and branch as the first, which is still alive.
+    Launch now **proves observability before it reports DONE** and re-seats onto a fresh surface when it
+    cannot — at t=0, where the agent holds no context and the repair is free. Bounded, and non-destructive
+    when it gives up: a still-dark agent is kept, registered, and explained (`archive` + `revive`, never
+    `recycle` — that re-execs onto the same dark surface). *(An in-place store repair was tried and
+    falsified: the hook re-created the phantom mapping and stamped it anyway. A fresh surface is the only
+    repair.)*
+  - **The router could tell a live agent it was dead.** `_alert_conductor_peers` gated its wording on
+    `rs.present()` under a comment claiming "PID authority" that it did not have — `present()` reads cmux's
+    *store*, so a dark conductor would be announced to its peers as "appears DOWN … `fleet revive`", and
+    revive archives and relands it. The gate now asks the process table.
+
+- **Codex seat workers can report completion again — the per-seat-home migration had severed them.** cmux
+  wires a codex worker's `Stop` hook by writing a `hooks.json` into the codex home, and only ever wrote one
+  into `~/.codex`. Moving every seat into its own `CODEX_HOME` moved every codex worker out of the one home
+  that had hooks, so they fired `Stop` into a void: no bus event, no router, no completion, and a conductor
+  waiting forever on an agent that finished minutes ago. (Codex was never the problem — it *has* a Stop
+  hook, and it fires. `SessionEnd` does not.) `fleet launch --tool codex` now installs and **trusts** cmux's
+  hook wiring in the home it is about to launch into. Trust is the half that fails silently: codex will not
+  run an untrusted hook and, under `exec`, does not prompt and does not complain — it just skips it. It is a
+  content-bound `trusted_hash` in the home's own `config.toml`, so hooks installed without re-trusting are
+  exactly as dead as no hooks, while looking installed. Delegated to `cmux hooks codex install` (which
+  honours `$CODEX_HOME` and writes both halves) rather than re-implementing cmux's hash format — and with
+  **no `--dangerously-bypass-hook-trust`**, which runs *untrusted* hooks and would be the real regression.
+
 ### Added
 
 - **Codex per-seat homes: concurrent codex seats, PROVEN.** Every codex seat declares its own

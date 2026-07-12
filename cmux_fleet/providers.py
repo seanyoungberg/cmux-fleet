@@ -251,6 +251,56 @@ def codex_seat_home(acct, spec):
     raise ProviderError(_codex_no_home_msg(acct, method))
 
 
+# --- cmux hook wiring, per seat home (restoring the completion push the seat migration severed) ---
+# A codex worker's Stop hook is how its conductor ever learns it finished. cmux wires that hook by writing
+# a `hooks.json` into the codex home — but it only ever wrote one into `~/.codex`. When the fleet moved
+# every seat into its OWN home (the per-seat CODEX_HOME model), it moved every codex worker OUT of the one
+# home that had hooks. Seat workers have fired Stop into a home with no hooks ever since: no bus event, no
+# router, no completion. The conductor waits forever on an agent that finished minutes ago.
+#
+# TRUST IS THE OTHER HALF, and it fails SILENTLY. Codex will not run a hook it has not been told to trust:
+# in `exec` there is no prompt and no error — the hook is simply skipped. Trust is a `trusted_hash` under
+# `[hooks.state]` in the home's own config.toml, and it is CONTENT-BOUND (change the command, the timeout,
+# even the matcher, and the hash no longer matches and the hook goes quiet again). So installing hooks.json
+# without re-trusting it is indistinguishable from not installing it at all.
+#
+# `cmux hooks codex install` writes BOTH halves and honours $CODEX_HOME, so the fleet delegates rather than
+# re-implementing cmux's hash format — which would rot the moment cmux changed a timeout. And it is what
+# lets us do this WITHOUT `--dangerously-bypass-hook-trust`: that flag runs untrusted hooks, which is a
+# strictly worse thing to normalise in a launch path than simply granting the trust cmux itself grants.
+def codex_hooks_ok(home):
+    """True if `home` has cmux's codex hooks AND they are trusted. BOTH halves — an untrusted hook is a
+    hook that does not run, and it does not say so."""
+    home = os.path.expanduser(home)
+    hooks = os.path.join(home, "hooks.json")
+    if not os.path.exists(hooks):
+        return False
+    try:
+        cfg = open(os.path.join(home, "config.toml")).read()
+    except OSError:
+        return False
+    return f'[hooks.state."{os.path.realpath(hooks)}:' in cfg
+
+
+def codex_install_hooks(home):
+    """Install + trust cmux's codex hooks in `home`. Returns (ok, detail). Idempotent (cmux re-trusts on
+    every run), so it is safe to call before every launch."""
+    home = os.path.expanduser(home)
+    os.makedirs(home, exist_ok=True)                 # codex ERRORS on a CODEX_HOME that does not exist
+    env = {**os.environ, "CODEX_HOME": home}
+    try:
+        p = subprocess.run([CMUX, "hooks", "codex", "install", "--yes"],
+                           capture_output=True, text=True, timeout=60, env=env)
+    except FileNotFoundError:
+        return False, "the `cmux` binary is not on PATH"
+    except subprocess.TimeoutExpired:
+        return False, "`cmux hooks codex install` timed out"
+    if not codex_hooks_ok(home):
+        tail = (p.stderr or p.stdout or "").strip().splitlines()
+        return False, f"cmux hooks codex install rc={p.returncode} ({tail[-1][:100] if tail else 'no output'})"
+    return True, "hooks installed and trusted"
+
+
 def codex_home_token(home):
     """The seat's access token from ITS OWN home's auth.json ('' if absent). THIS is a per-seat home's
     credential — not the fleet cred store, which was seeded from the shared ~/.codex and goes stale the

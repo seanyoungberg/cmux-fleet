@@ -1037,17 +1037,36 @@ def launch_error_line(pane_text):
        is no shell whose noise could be mistaken for the tool's.
 
     Positional, not a denylist of benign strings: it needs no upkeep as rc files and MCP servers change."""
+    lines = launch_error_lines(pane_text)
+    return lines[0] if lines else ""
+
+
+def launch_error_lines(pane_text, cap=3):
+    """EVERY startup-error-looking line in the pane (up to `cap`), in order. PURE.
+
+    The plural exists because the FIRST match is so often the wrong one to show a human. On this box a
+    pane that really did die on a bad flag reads:
+
+        /Users/berg/.zshrc:.:65: no such file or directory: /Users/berg/.local/bin/env   <- rc noise
+        error: unexpected argument '--effort' found                                      <- the actual cause
+
+    Printing only the first hands the operator the innocent line and hides the guilty one — which is how a
+    diagnosis becomes a red herring. So when the launch does condemn (and by then the PID has already
+    settled that it is dead — see launch_verdict), show the whole list and let the human read it."""
     if agent_tui_visible(pane_text):                       # rule 1: a live agent, whatever else it printed
-        return ""
+        return []
     lines = (pane_text or "").splitlines()
     sig = [i for i, l in enumerate(lines) if _FLEET_LAUNCH_SIG.search(l)]
     if sig:
         lines = lines[sig[-1] + 1:]                        # rule 2: strictly below the LAST launch line
+    out = []
     for line in lines:
         low = line.lower()
         if any(m.lower() in low for m in _LAUNCH_ERROR_MARKERS):
-            return line.strip()[:200]
-    return ""
+            out.append(line.strip()[:200])
+            if len(out) >= cap:
+                break
+    return out
 
 
 # codex's interactive "update available" modal. An out-of-date codex paints this INSTEAD of its TUI and
@@ -1065,6 +1084,50 @@ def codex_update_modal(pane_text):
 def _launch_failure_line(surf):
     """launch_error_line applied to `surf`'s live pane (captured via cmuxq)."""
     return launch_error_line(cmuxq("capture-pane", "--surface", surf) or "")
+
+
+def launch_verdict(live_pids, pane_text):
+    """PURE. What happened to a LAZY launch that bound no session? -> one of:
+
+        'running'      a live seat-agent process is on the surface. The launch worked.
+        'running-odd'  a live process AND something ugly on the pane. STILL WORKED — warn, hand it back.
+        'failed'       NO live process AND a startup error on the pane. The only verdict that may condemn.
+        'unbound'      no process yet, nothing wrong on screen. Unknown, not dead: say nothing, let the
+                       registry show it PENDING and the daemon's never-bound sweep be the backstop.
+
+    THE RULE, and the reason this is a function rather than three ifs in cmd_launch: **only the pid may
+    condemn.** `live_pids` comes from the process table; the pane is text an agent, a shell, an rc file or
+    an MCP server can print for any reason. A pane-only verdict convicted a healthy codex of dying on spawn
+    and printed `fleet rm --kill` as the cure — the alarm's remedy would have destroyed the patient. Note
+    that 'failed' needs BOTH halves: no pid alone is 'unbound' (a cold start), and an error line alone,
+    with the process up, is 'running-odd'. Neither half convicts on its own."""
+    err = launch_error_line(pane_text)
+    wedged = codex_update_modal(pane_text)
+    if live_pids:
+        return ("running-odd" if (err or wedged) else "running"), err, wedged
+    if err or wedged:
+        return "failed", err, wedged
+    return "unbound", err, wedged
+
+
+_SEAT_ALIVE_TIMEOUT_S = 10        # a cold codex on a loaded box takes a few seconds to exec through zsh
+
+
+def _seat_agent_alive(surf, tool, timeout=_SEAT_ALIVE_TIMEOUT_S):
+    """Live seat-agent pids on `surf` (empty set if none) — THE launch verdict's authority.
+
+    POLLED, not sampled once. The launch reaches here seconds after spawn, and the delivery chain is
+    `zsh -ilc '... codex ...'`: until the shell finishes sourcing its rc files and execs, there is no
+    agent process yet. A single ps sweep at t+8s would read an empty table on a slow box and call a
+    perfectly healthy launch DEAD — swapping the old false-positive for a new one, from the other side.
+    So poll, and return the moment a pid appears; only a full window of nothing counts as nothing."""
+    from . import resolve as rs
+    end = time.time() + timeout
+    while True:
+        pids = rs.pids_ps(surf, tool=tool)
+        if pids or time.time() >= end:
+            return pids
+        time.sleep(0.5)
 
 
 _CODEX_UPDATE_TIMEOUT_S = 120     # `codex update` shells `brew upgrade --cask codex`; ~1.5s when current
@@ -1277,6 +1340,83 @@ def _bind_launched_session(ws, surf, send_cmd, tool, label, abs_cwd, caller, laz
             print(f"[fleet] note: cmux filed this session under a different surfaceId; adopted session "
                   f"{sid[:8]} for the LAUNCHED surface {surf} (proven via the agent's own "
                   f"CMUX_SURFACE_ID/AGENT_LABEL env). The registry keeps the launched surface.")
+    return ws, surf, sid
+
+
+_OBSERVABLE_TIMEOUT_S = 8         # cmux files the session, then stamps; both are prompt when they happen at all
+
+
+def _observable_within(surf, cursor, timeout=_OBSERVABLE_TIMEOUT_S):
+    """POSITIVE proof that cmux can see an agent on `surf`, within a bounded window.
+
+    TWO INDEPENDENT READS, either of which is proof: cmux's hook STORE files a live agent here
+    (rs.present), or cmux is actively STAMPING this surface in its own event log (rs.stamps_since — the
+    `--panel=<surface>` status updates that drive vitals and the sidebar). A dark surface produces neither,
+    ever, so the window can be short: waiting longer never turns a dark surface bright, it only delays the
+    repair. Requiring proof rather than the absence of a complaint is the point — a launch that cannot show
+    its agent is visible has not succeeded, whatever the pane says."""
+    from . import resolve as rs
+    end = time.time() + timeout
+    while True:
+        if rs.present(surf) or rs.stamps_since(surf, cursor):
+            return True
+        if time.time() >= end:
+            return False
+        time.sleep(0.5)
+
+
+def _reseat_if_dark(ws, surf, sid, spec, parent, direction, send_cmd, caller, lazy, cursor, attempts=1):
+    """Hand back a surface cmux is ACTUALLY FILING. Returns (ws, surf, sid).
+
+    THE DARK SURFACE. cmux sometimes files a freshly-launched agent's session under a surfaceId that is not
+    the one it put the agent on. The fleet already survives the registry half of that (it adopts the session
+    against the live process's OWN env and keeps the launched surface — invariant I5). But cmux keeps
+    stamping the PHANTOM: the agent runs, serves read-screen, takes inbox messages and completes turns,
+    while `vitals`, `ls` and the sidebar — all keyed by surface — look straight through it. Permanently.
+    Observed on 2 of 4 launches; the specimens stamped 94 and 66 status updates onto surfaces the fleet
+    (and the agents' own env) had never heard of, and 0 onto their own.
+
+    A dark agent reads exactly like a dead one to every store-derived check, and the reflex cure for death
+    is to relaunch — which puts a SECOND agent on the same worktree and the same branch as the first, which
+    is still alive and working. That is the trap this exists to keep anyone from ever walking into.
+
+    So repair it AT t=0, where the repair is free: the agent has done no work, holds no context, and owns
+    nothing worth saving. Close the surface, take the process down with it, and seat a fresh one. (After
+    t=0 the remedy is `archive` + `revive` onto a new surface — never `recycle`, which re-execs onto the
+    same dark surface and fixes nothing.)
+
+    Bounded, and NON-DESTRUCTIVE when it gives up: if a re-seat is still dark we keep the agent, register
+    it, and say plainly that it is invisible and how to repair it. An alarm that cannot fix a thing does
+    not get to destroy it."""
+    from . import resolve as rs
+    for attempt in range(attempts + 1):
+        if _observable_within(surf, cursor):
+            return ws, surf, sid                         # PROVEN visible: nothing to repair
+        if not rs.alive(surf, spec["tool"]):
+            return ws, surf, sid                         # not dark — just nothing alive; the caller's problem
+        print(f"\n[fleet] DARK SURFACE: {spec['label']} is alive on {surf[:8]} but cmux is not filing it "
+              f"there (it filed the session elsewhere).")
+        print(f"[fleet]   Left alone, this agent works perfectly and is INVISIBLE to vitals/ls/the sidebar, "
+              f"forever.")
+        if attempt >= attempts:
+            print(f"[fleet]   The re-seat did not clear it, so the agent is being KEPT (it is alive and "
+                  f"healthy — killing it would be the worse error).")
+            print(f"[fleet]   It is registered and drivable, but it will not appear in vitals/ls. To repair: "
+                  f"`fleet archive {spec['label']}` then `fleet revive {spec['label']}` (NOT `recycle` — "
+                  f"that re-execs onto this same dark surface).")
+            return ws, surf, sid
+        print(f"[fleet]   Re-seating now, at t=0 — no context exists yet, so this costs nothing.")
+        _signal_agent_pids(surf, spec["tool"], lambda m: print(f"[fleet]   {m}"), "reseat")
+        cmuxq("close-surface", "--surface", surf, "--workspace", ws)
+        cursor = rs.stamp_cursor()                       # only stamps for the NEW surface may count
+        ws2, surf2 = create_surface(spec, parent, direction)
+        if not ws2 or not surf2:
+            print(f"[fleet]   could not create a replacement surface; keeping the dark one.")
+            return ws, surf, sid
+        ws, surf = ws2, surf2
+        print(f"[fleet]   re-seated onto surface {surf}")
+        ws, surf, sid = _bind_launched_session(ws, surf, send_cmd, spec["tool"], spec["label"],
+                                               spec["abs_cwd"], caller, lazy, timeout=8 if lazy else 60)
     return ws, surf, sid
 
 
@@ -1504,7 +1644,9 @@ def cmd_launch(argv):
         note = _codex_update_preflight()                 # allow the update); the pane scan below is the
         if note:                                         # backstop, not the primary
             print(f"[fleet] {note}")
-    ws, surf = create_surface(spec, a.parent, a.direction)
+        _codex_hooks_preflight(codex_home or CODEX_DEFAULT_HOME)
+    stamp_cursor = rs.stamp_cursor()                     # BEFORE the surface exists: a stamp counted after
+    ws, surf = create_surface(spec, a.parent, a.direction)   # this mark can only be OUR agent's
     if not ws or not surf:
         sys.exit(1)
     print(f"[fleet] target ws={ws} surface={surf}")
@@ -1526,6 +1668,12 @@ def cmd_launch(argv):
                  f"may still be booting (heavy loadout) or never started. The surface is NOT torn down. "
                  f"If it comes up, adopt it:\n[fleet]     fleet register {spec['label']} --surface {surf}\n"
                  f"[fleet]   (inspect first: cmux capture-pane --surface {surf})")
+    # A surface cmux is not FILING is a surface the fleet cannot see. Check before we register it, and
+    # repair it here — at t=0 the agent holds nothing, so a re-seat is free. Only when a session actually
+    # bound: a lazy tool has none yet, and there is nothing for cmux to have misfiled.
+    if sid:
+        ws, surf, sid = _reseat_if_dark(ws, surf, sid, spec, a.parent, a.direction, send_cmd, caller, lazy,
+                                        stamp_cursor)
     register(surf, spec, a.parent, sid or "", ws)
     log_launch(spec, a.parent, surf, sid or "", send_cmd)
     # post-launch placement reconciliation: confirm the surface actually came up IN the worktree (a
@@ -1553,25 +1701,38 @@ def cmd_launch(argv):
     # the normal lazy path (the row is already registered, so a silent death still shows PENDING in
     # `fleet ls` and the daemon never-bound sweep is the backstop).
     if lazy and not sid:
+        # THE VERDICT IS PID-AUTHORITATIVE. A lazy tool binds no session at launch, so "no session" says
+        # nothing at all about whether the process is alive — and the pane cannot answer it either. Ask the
+        # process table, which is the only thing here that cannot be counterfeited by cosmetics.
+        #
+        # This block used to convict on pane text alone, and it convicted the innocent: a fleet-launched
+        # codex, running perfectly, was reported `!!! LAUNCH FAILED ... the process exited on spawn` with
+        # `fleet rm --kill` as the printed cure — because the pane's FIRST line was rc noise from the
+        # operator's ~/.zshrc (a `.` of a file uv never created), printed before codex was even exec'd.
+        # Both existing guards missed it: `agent_tui_visible` looks for `Context N% left`, which a codex
+        # paints only AFTER its first turn (never at t=0), and the positional guard assumed exec delivery
+        # has no shell — but exec delivery runs `zsh -ilc`, which sources the rc file like any other login
+        # shell. Rather than chase markers, stop asking the pane a question it cannot answer.
+        live_pids = _seat_agent_alive(surf, spec["tool"])
         pane = cmuxq("capture-pane", "--surface", surf) or ""
-        # BACKSTOP to _codex_update_preflight: an unbound lazy seat sitting in codex's update modal is
-        # indistinguishable from a healthy unbound one by session alone, so it used to report DONE and
-        # sit there forever. The preflight should have prevented this; say so, because reaching here
-        # means the preflight could not run (offline box, missing binary).
-        if codex_update_modal(pane):
-            print(f"\n[fleet] !!! LAUNCH WEDGED for {spec['label']} (tool {spec['tool']}): the seat is "
-                  f"sitting in codex's interactive update modal and will never bind a session.")
-            print(f"[fleet]   the pre-launch `codex update` did not run or did not take. Fix + retry:")
-            print(f"[fleet]     fleet rm {spec['label']} --kill")
-            print(f"[fleet]     codex update && fleet launch {a.role or ('--adhoc ' + a.adhoc)} ...")
-            return 2
-        errline = launch_error_line(pane)
-        if errline:
-            print(f"\n[fleet] !!! LAUNCH FAILED for {spec['label']} (tool {spec['tool']}): the process "
-                  f"exited on spawn -- it never came up.")
-            print(f"[fleet]   pane error : {errline}")
-            print(f"[fleet]   likely a tool/flag mismatch (a claude-ism forwarded to {spec['tool']}?); "
-                  f"inspect: cmux capture-pane --surface {surf}")
+        verdict, errline, wedged = launch_verdict(live_pids, pane)
+        if verdict == "running-odd":
+            # ALIVE. Whatever the pane says, this launch did not fail. The heuristic WARNS — it hands the
+            # agent back and asks a human to look. It never condemns, and it never gets a kill command.
+            what = ("the pane looks like codex's interactive update modal, which binds no session"
+                    if wedged else f"the pane shows unexpected text: {errline}")
+            print(f"\n[fleet] note: {spec['label']} is RUNNING (pid {sorted(live_pids)[0]}), but {what}.")
+            print(f"[fleet]   The process is alive, so this is NOT a failed launch — that text may be "
+                  f"harmless startup noise (an rc file, an MCP server).")
+            print(f"[fleet]   Look before you touch it: cmux capture-pane --surface {surf}")
+        elif verdict == "failed":
+            # No live process AND a startup error. NOW the pane line is a diagnosis rather than a guess,
+            # and only now may a remedy be destructive — there is nothing alive left to destroy.
+            print(f"\n[fleet] !!! LAUNCH FAILED for {spec['label']} (tool {spec['tool']}): no live "
+                  f"{spec['tool']} process is on the surface, and the pane shows a startup error.")
+            for line in (launch_error_lines(pane) or ["sitting in codex's update modal"]):
+                print(f"[fleet]   pane says  : {line}")   # every candidate: the first is often rc noise
+            print(f"[fleet]   inspect    : cmux capture-pane --surface {surf}")
             print(f"[fleet]   clean up + retry:")
             print(f"[fleet]     fleet rm {spec['label']} --kill")
             print(f"[fleet]     fleet launch {a.role or ('--adhoc ' + a.adhoc)} ...   # fix the flags first")
@@ -5251,6 +5412,26 @@ def cmd_profile(argv):
         sys.stderr.write("[fleet profile] warning: could not resolve THIS build's fleet bin dir; PATH not pinned "
                          "(set $CMUX_FLEET_BIN to the installed fleet path)\n")
     return 0
+
+
+def _codex_hooks_preflight(home):
+    """Make sure the home this codex launch is about to run in has cmux's hooks, and that they are TRUSTED.
+
+    Without them the worker's Stop hook fires into a void: no bus event, no router, no completion — the
+    conductor never learns the agent finished, and waits on it forever. Checked (cheap: two file reads) on
+    every codex launch and installed when missing, because a seat home added next month must not have to
+    remember a setup step. FAIL-OPEN: an agent with no completion push is still an agent; a launch aborted
+    over hook wiring is not."""
+    from . import providers as pv
+    if pv.codex_hooks_ok(home):
+        return
+    ok, detail = pv.codex_install_hooks(home)
+    if ok:
+        print(f"[fleet] codex hooks: installed + trusted in {home} (completions can reach the router)")
+    else:
+        print(f"[fleet] warn: codex hooks are NOT wired in {home} ({detail}).")
+        print(f"[fleet]   This agent will run, but NOTHING will tell its conductor when it finishes — it "
+              f"must report by hand (`fleet peer-msg`). Repair: CODEX_HOME={home} cmux hooks codex install")
 
 
 def cmd_codex_setup(argv):
