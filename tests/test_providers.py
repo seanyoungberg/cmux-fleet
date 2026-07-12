@@ -328,6 +328,25 @@ def test_poll_codex_api_success(monkeypatch):
     assert captured["ua"]                               # non-empty UA is required (empty -> 403 at the edge)
 
 
+def test_poll_codex_api_identifies_as_codex_not_as_the_anthropic_poller(monkeypatch):
+    """The usage call was borrowing the ANTHROPIC poller's User-Agent for a Cloudflare-fronted CHATGPT
+    endpoint. Cloudflare now blocks it, so the call 403'd, the caller fell back to the rollout scrape, and the
+    sidebar rendered a healthy-looking usage bar built from STALE rollout files for a seat the API was refusing
+    to talk to. A false-healthy, and one nobody would have questioned -- the bar looked fine."""
+    seen = {}
+    class _Resp:
+        def __enter__(self): return self
+        def __exit__(self, *a): return False
+        def read(self): return json.dumps({"rate_limits": {}}).encode()
+    def _f(req, timeout=None):
+        seen["ua"] = req.get_header("User-agent")
+        return _Resp()
+    monkeypatch.setattr("urllib.request.urlopen", _f)
+    pv.poll_codex_api("tok")
+    assert "codex" in seen["ua"].lower()
+    assert "cmux" not in seen["ua"].lower() and "anthropic" not in seen["ua"].lower()
+
+
 def test_poll_codex_api_401_is_soft_error(monkeypatch):
     import urllib.request, urllib.error
     def fake_urlopen(req, timeout=None):
@@ -684,6 +703,15 @@ def test_codex_health_declared_home_never_logged_in_is_unseeded(tmp_path, monkey
     assert h["new"]["status"] == "unseeded" and "fleet codex-login new" in h["new"]["detail"]
 
 
+def _http_error(code, ctype):
+    """An HTTPError carrying a real content-type, because content-type is now load-bearing: it is what tells
+    'the API rejected this token' (JSON) from 'a WAF blocked this client' (HTML)."""
+    import email.message, urllib.error
+    h = email.message.Message()
+    h["content-type"] = ctype
+    return urllib.error.HTTPError("u", code, "no", h, None)
+
+
 def test_codex_probe_backend_classifies(monkeypatch):
     import urllib.error
     class _Resp:                                    # minimal context-manager stand-in for urlopen's return
@@ -699,16 +727,51 @@ def test_codex_probe_backend_classifies(monkeypatch):
     # 200 = the backend accepts the token -> live
     monkeypatch.setattr("urllib.request.urlopen", urlopen_status(200))
     assert pv.codex_probe_backend("tok") == "live"
-    # 401/403 = the backend REJECTED a token the clock still thinks is valid -> revoked (THE gap this closes)
-    monkeypatch.setattr("urllib.request.urlopen", urlopen_raise(urllib.error.HTTPError("u", 401, "no", None, None)))
+    # 401/403 WITH A JSON BODY = the API itself REJECTED a token the clock still thinks is valid -> revoked
+    monkeypatch.setattr("urllib.request.urlopen", urlopen_raise(_http_error(401, "application/json")))
     assert pv.codex_probe_backend("tok") == "revoked"
-    monkeypatch.setattr("urllib.request.urlopen", urlopen_raise(urllib.error.HTTPError("u", 403, "no", None, None)))
+    monkeypatch.setattr("urllib.request.urlopen", urlopen_raise(_http_error(403, "application/json")))
     assert pv.codex_probe_backend("tok") == "revoked"
     # 5xx and network errors are TRANSIENT -> unreachable (never cry wolf)
-    monkeypatch.setattr("urllib.request.urlopen", urlopen_raise(urllib.error.HTTPError("u", 503, "busy", None, None)))
+    monkeypatch.setattr("urllib.request.urlopen", urlopen_raise(_http_error(503, "text/html")))
     assert pv.codex_probe_backend("tok") == "unreachable"
     monkeypatch.setattr("urllib.request.urlopen", urlopen_raise(urllib.error.URLError("connection refused")))
     assert pv.codex_probe_backend("tok") == "unreachable"
+
+
+def test_codex_probe_backend_a_CLOUDFLARE_403_IS_NOT_A_REVOCATION(monkeypatch):
+    """CAUGHT LIVE on Berg's fleet, 2026-07-12. chatgpt.com sits behind Cloudflare, which 403s an unrecognized
+    client with an HTML challenge page. The probe identified as 'cmux-fleet-health' and mapped every 403 to
+    'revoked' -- so a bot block became a REVOCATION VERDICT against three demonstrably healthy seats (all three
+    had just spoken; all three returned HTTP 200 the instant a codex User-Agent was used).
+
+    And the verdict is not merely wrong, it is DESTRUCTIVE: the remedy it prints is `fleet codex-login <acct>`,
+    and a login SUPERSEDES the seat. The false alarm would have killed the working seat it misdiagnosed.
+
+    Only the API may condemn a token. An HTML body is the network refusing to carry the question, not the
+    backend rejecting the credential -- we learned NOTHING about the token, so the honest answer is
+    'unreachable' (transient, no alert)."""
+    import urllib.error
+    for code in (401, 403):
+        monkeypatch.setattr("urllib.request.urlopen",
+                            lambda req, timeout=None, c=code: (_ for _ in ()).throw(_http_error(c, "text/html; charset=UTF-8")))
+        assert pv.codex_probe_backend("tok") == "unreachable", f"an HTML {code} must never read as 'revoked'"
+
+
+def test_codex_probe_backend_identifies_as_codex(monkeypatch):
+    """The other half: do not get blocked in the first place. Our own UA is what Cloudflare was rejecting."""
+    seen = {}
+    class _Resp:
+        status = 200
+        def __enter__(self): return self
+        def __exit__(self, *a): return False
+    def _f(req, timeout=None):
+        seen["ua"] = req.get_header("User-agent")
+        return _Resp()
+    monkeypatch.setattr("urllib.request.urlopen", _f)
+    pv.codex_probe_backend("tok")
+    assert "codex" in seen["ua"].lower()                      # identify as codex...
+    assert "cmux" not in seen["ua"].lower()                   # ...never as ourselves (that is what got blocked)
 
 
 def test_codex_health_check_detects_backend_revocation(tmp_path, monkeypatch):

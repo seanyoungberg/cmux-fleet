@@ -204,6 +204,13 @@ CODEX_REFRESH_MARGIN_S = 1800          # refresh when the access token expires w
 # `userinfo` AND has a future JWT `exp`, yet returns 401 here. Expiry/refresh checks alone are false-healthy.
 CODEX_BACKEND_PROBE_URL = "https://chatgpt.com/backend-api/me"
 
+# EVERY chatgpt.com call must identify as codex. That host is behind Cloudflare, which 403s an unrecognized
+# client with an HTML challenge page — and a 403 read as a token rejection is a FALSE REVOCATION whose printed
+# remedy (`fleet codex-login`) SUPERSEDES the healthy seat it just misdiagnosed. Our own UAs
+# ("cmux-fleet-health", and the Anthropic poller's, which the codex usage call was borrowing) are both blocked
+# today: all three seats 403'd, and all three returned HTTP 200 the instant this UA was used instead.
+CODEX_PROBE_UA = "codex_cli_rs/0.44.0 (Mac OS 15.5.0; arm64)"
+
 # --- per-seat codex homes (the model, settled by the 2026-07-11 coexistence test) ----------------
 # The ChatGPT backend enforces ONE ACTIVE SESSION PER DEVICE, and the device id is `installation_id` — a
 # uuid file living in each codex HOME (code-verified against codex-lb, which stamps a per-account one into
@@ -399,17 +406,39 @@ def codex_probe_backend(access_token, timeout=15):
                       token superseded by a later `codex login` on the shared codex OAuth client keeps a
                       FUTURE JWT `exp` and still passes the IdP `userinfo`, yet the backend 401s it
                       (unified-home one-active-session-per-client; verified 2026-07-10).
-      'unreachable' — network error / timeout / 5xx: TRANSIENT, never cry wolf.
-    No refresh, no mint, no token spend — a pure GET. (Kept separate from _oauth_refresh, which MUTATES.)"""
+      'unreachable' — network error / timeout / 5xx / A WAF BLOCK: TRANSIENT, never cry wolf.
+    No refresh, no mint, no token spend — a pure GET. (Kept separate from _oauth_refresh, which MUTATES.)
+
+    ONLY THE API ITSELF MAY CONDEMN A TOKEN (2026-07-12, caught live on Berg's fleet).
+    chatgpt.com is behind Cloudflare. Our probe used to identify as `cmux-fleet-health`, which Cloudflare
+    blocks — it answers 403 with an HTML challenge page. The old code mapped any 403 to 'revoked', so a bot
+    block became a REVOCATION VERDICT: three demonstrably healthy seats (all three had just spoken, and all
+    three returned HTTP 200 the moment a real User-Agent was used) were reported REVOKED. And the remedy that
+    verdict prints is `fleet codex-login <acct>` — which SUPERSEDES the seat. The false alarm would have
+    destroyed the working seat it misdiagnosed.
+
+    So: (1) identify as codex does, and (2) a 401/403 only means 'revoked' when the API ANSWERED IT — a JSON
+    body. An HTML body is a WAF block page: the network refusing to carry the question, not the backend
+    rejecting the credential. That is 'unreachable' (transient, no alert), because we did not learn anything
+    about the token."""
     import urllib.request, urllib.error, socket
     req = urllib.request.Request(CODEX_BACKEND_PROBE_URL,
                                  headers={"Authorization": f"Bearer {access_token}",
-                                          "User-Agent": "cmux-fleet-health"})
+                                          "User-Agent": CODEX_PROBE_UA})
     try:
         with urllib.request.urlopen(req, timeout=timeout) as r:
             return "live" if r.status < 400 else "unreachable"
     except urllib.error.HTTPError as e:
-        return "revoked" if e.code in (401, 403) else "unreachable"   # 5xx/other = transient, not offline
+        if e.code not in (401, 403):
+            return "unreachable"                          # 5xx/other = transient, not offline
+        ctype = ""
+        try:
+            ctype = (e.headers.get("content-type") or "").lower()
+        except Exception:
+            pass
+        if "json" not in ctype:                           # an HTML/WAF block page is NOT a verdict on the token
+            return "unreachable"
+        return "revoked"                                  # the API itself rejected the credential
     except (urllib.error.URLError, socket.timeout, OSError):
         return "unreachable"
 
@@ -926,14 +955,17 @@ def _normalize_codex_usage(data):
 def poll_codex_api(token, account_id=None):
     """Server-side codex usage via GET /backend-api/codex/usage with `Authorization: Bearer <access token>`
     (+ the `chatgpt-account-id` header when known; the token scopes the account either way). Returns the
-    normalized poll record; never raises. A non-empty User-Agent is REQUIRED — the backend edge 403s an
-    empty UA. A 401 means the token is invalidated/rotated (the unified-home clobber case); the caller falls
-    back to the rollout scrape (keep-stale)."""
+    normalized poll record; never raises. The User-Agent must be CODEX'S — this host is behind Cloudflare, and
+    it 403s an unrecognized client. This call used to borrow the ANTHROPIC poller's UA, which is now blocked:
+    the usage call silently 403'd and the caller fell back to the rollout scrape, so the sidebar showed a
+    healthy-looking bar built from STALE rollout files for a seat the API was refusing to talk to. A 401 means
+    the token is invalidated/rotated (the unified-home clobber case); the caller falls back to the rollout
+    scrape (keep-stale)."""
     import urllib.request, urllib.error
     if not token:
         return {"ok": False, "error": "no token"}
     hdrs = {"Authorization": f"Bearer {token}", "Accept": "application/json",
-            "User-Agent": _OAUTH_HEADERS["User-Agent"]}
+            "User-Agent": CODEX_PROBE_UA}
     if account_id:
         hdrs["chatgpt-account-id"] = account_id
     try:
