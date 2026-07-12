@@ -336,6 +336,35 @@ def place_of(entry, parent_entry=None, ws_map=None):
     return "workspace"
 
 
+# --- process identity (invariant I5: the launched surface is authoritative) -------------------------
+def proc_ident(pid):
+    """(CMUX_SURFACE_ID, AGENT_LABEL) read from a LIVE process's own environment (`ps eww`); ('', '')
+    if unreadable. THE answer to "which surface is this agent actually on, and which fleet member is
+    it" — cmux stamps CMUX_SURFACE_ID into the process it spawns onto a surface, and fleet stamps
+    AGENT_LABEL into every launch it renders. A live process's env cannot be rewritten, which is what
+    makes this EVIDENCE rather than one more cache to distrust (the same property _env_workspace leans
+    on for the I4 detector).
+
+    Contrast the cmux hook store's `surfaceId`, which is a hook-TIME ATTRIBUTION and can be flatly
+    wrong: on 2026-07-11 a live agent (pid 78004, CMUX_SURFACE_ID=E4CED20C…, AGENT_LABEL=doctor-stall)
+    had its session record filed under 3F2CDDD4… — an unrelated idle staging shell it had never run
+    on — and cmux's activeSessionsBySurface pointed that foreign surface straight back at it. Every
+    store-derived answer inherits that lie; the process env did not.
+
+    Note AGENT_LABEL is an ENV var, so it is absent from the record's `launchCommand` on builds where
+    cmux captures argv structurally (argv excludes the `KEY=val` prefixes the shell consumes) — which
+    is exactly why the store-side label match in _discover_surface_for silently never fires. Read the
+    label HERE and it is present."""
+    try:
+        out = subprocess.run(["ps", "eww", "-p", str(int(pid))],
+                             capture_output=True, text=True, timeout=5).stdout or ""
+    except Exception:
+        return "", ""
+    ms = re.search(r"\bCMUX_SURFACE_ID=([0-9A-Fa-f-]{36})", out)
+    ml = re.search(r"\bAGENT_LABEL=(\S+)", out)
+    return (ms.group(1) if ms else ""), (ml.group(1) if ml else "")
+
+
 # --- attachment (invariant I4) ---------------------------------------------------------------------
 def _env_workspace(pid):
     """CMUX_WORKSPACE_ID from the live process's environment (`ps eww`), '' if unreadable. This is

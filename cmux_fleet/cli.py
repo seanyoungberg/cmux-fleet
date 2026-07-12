@@ -1168,6 +1168,37 @@ def _deliver_launch(ws, surf, send_cmd):
         cmuxq("send", "--workspace", ws, "--surface", surf, send_cmd + "\n")
 
 
+def _session_on_launched_surface(surf, label):
+    """The session id of the agent WE JUST LAUNCHED onto `surf`, recovered from the hook store when cmux
+    filed its record under a DIFFERENT surfaceId. Returns '' when nothing PROVES a match.
+
+    Identity is proven from the live process's own environment (rs.proc_ident -> CMUX_SURFACE_ID /
+    AGENT_LABEL), never from the record's `surfaceId` (the field that lies) and never from cwd (which is
+    not an identity at all -- every shell and agent sitting in the same worktree shares it). A record is
+    adopted only if its pid is ALIVE and that pid's own env says it is on the surface we launched, and
+    (when the env carries a label) that it is OUR label.
+
+    This function can only ever hand back a SESSION ID. It is structurally incapable of returning a
+    surface, which is the whole point: see _bind_launched_session for the invariant."""
+    from . import resolve as rs
+    from . import state as fs
+    for s in (_store().get("sessions") or {}).values():
+        if (s.get("agentLifecycle") or "") in ("-", "ended"):
+            continue
+        pid = s.get("pid")
+        if not pid or not fs.pid_alive(pid):
+            continue                                       # a dead pid cannot be the agent we just started
+        env_surf, env_label = rs.proc_ident(pid)
+        if not env_surf or env_surf.upper() != (surf or "").upper():
+            continue                                       # this process is NOT on the surface we launched
+        if label and env_label and env_label != label:
+            continue                                       # our surface, someone else's label -> not ours
+        sid = fs.bare_uuid(s.get("sessionId") or "")
+        if sid:
+            return sid
+    return ""
+
+
 def _bind_launched_session(ws, surf, send_cmd, tool, label, abs_cwd, caller, lazy, timeout):
     """The resume-aware bind step for `cmd_launch`. Delivers via exec (default; step 2) or the paste
     path (CMUX_FLEET_EXEC_LAUNCH=0 soak fallback), then, when the caller passthrough carries a claude `--resume <id>`, gates
@@ -1175,12 +1206,40 @@ def _bind_launched_session(ws, surf, send_cmd, tool, label, abs_cwd, caller, laz
     as-is', never the lossy cursor-default 'resume from summary') instead of trusting a blind re-kick to
     land correctly on the menu. Aborts via sys.exit on a resume-gate timeout, same as cmd_revive: NOT
     binding/registering behind an undismissed menu, surface left alone (nothing torn down -- it may still
-    be salvageable). Finally, if the direct poll still came up empty, reconciles against the hook store by
-    AGENT_LABEL/cwd (_discover_surface_for) instead of trusting the pre-bind surface uuid unconditionally
-    -- claude occasionally binds its session to a DIFFERENT surface than the one launched into (its
-    workspace is re-resolved too, so a swapped surface never leaves a mismatched (surface, workspace)
-    pair in the registry). Returns (ws, surf, sid); sid is '' if unresolved (the caller decides whether
-    that's fatal, e.g. lazy tools expect it)."""
+    be salvageable). Returns (ws, surf, sid); sid is '' if unresolved (the caller decides whether that's
+    fatal, e.g. lazy tools expect it).
+
+    INVARIANT I5 -- THE LAUNCHED SURFACE IS AUTHORITATIVE. `ws`/`surf` are returned exactly as they came
+    in. We created that surface and delivered the process onto it; cmux told the process so itself
+    (CMUX_SURFACE_ID in its env). Nothing in a hook store may CONTRADICT that. A reconciliation may only
+    FILL IN what is missing -- the session id.
+
+    It used to do the opposite. If the post-launch poll came up empty, it asked the hook store "where is
+    the agent with this AGENT_LABEL/cwd?" (_discover_surface_for) and, on a hit, OVERWROTE the launched
+    surface and re-resolved the workspace to match. Two things made that catastrophic on 2026-07-11:
+
+      1. The label arm cannot fire. Fleet passes AGENT_LABEL as an ENV VAR (render_send_cmd emits
+         `cd <cwd> && AGENT_LABEL=x claude ...`), but cmux records `launchCommand` as a structured
+         object holding the exec'd binary's ARGV -- and argv never contains the `KEY=val` prefixes, which
+         the shell consumes into the environment. So the "exact AGENT_LABEL match wins outright" arm is
+         structurally dead on this build, and EVERY discovery silently degrades to the loose arm.
+      2. The loose arm matches on CWD, and returns the matched record's `surfaceId` -- a hook-time
+         attribution that can be wrong. It was: cmux had filed the freshly-launched agent's session
+         (pid 78004, env CMUX_SURFACE_ID=E4CED20C…, the surface fleet launched) under 3F2CDDD4… -- an
+         unrelated idle staging shell. poll_session(E4CED20C…) therefore saw nothing (the store knew the
+         session only under the wrong surface), the reconcile fired, believed the store, and bound the
+         registry row to the staging shell.
+
+    A conductor then drives the registry's surface, so `fleet drive-child doctor-stall` typed an entire
+    brief into a bare zsh, which wedged at a `dquote>` continuation prompt. It was luck that the foreign
+    surface was an idle orphan and not a live session. `fleet vitals` read the agent `detached`, which
+    was CORRECT: there was no agent on the surface the registry believed in.
+
+    Now: the surface never moves, and the sid is adopted only against PROOF from the live process's own
+    env (_session_on_launched_surface). If that proof is unavailable the sid stays '' -- and cmd_launch
+    already handles that safely: it aborts WITHOUT registering, leaves the surface up, and signposts
+    `fleet register <label> --surface <the launched surface>`. An empty sid is a recoverable gap; a
+    registry row pointing at someone else's terminal is not."""
     if _exec_launch_enabled():
         sid = _exec_send_and_confirm(ws, surf, send_cmd, lazy, timeout)
     else:
@@ -1194,13 +1253,11 @@ def _bind_launched_session(ws, surf, send_cmd, tool, label, abs_cwd, caller, laz
                      f"settles. Inspect: cmux capture-pane --surface {surf}")
         sid = poll_session(surf)
     if not sid and not lazy:
-        real_surf, _ = _discover_surface_for(label, abs_cwd)
-        if real_surf and real_surf.upper() != surf.upper():
-            real_sid = poll_session(real_surf, timeout=5)
-            if real_sid:
-                print(f"[fleet] note: session bound to surface {real_surf}, not the launched {surf} "
-                      f"-- reconciled via AGENT_LABEL/cwd match in the hook store")
-                ws, surf, sid = (ws_uuid_for_surface(real_surf) or ws), real_surf, real_sid
+        sid = _session_on_launched_surface(surf, label)
+        if sid:
+            print(f"[fleet] note: cmux filed this session under a different surfaceId; adopted session "
+                  f"{sid[:8]} for the LAUNCHED surface {surf} (proven via the agent's own "
+                  f"CMUX_SURFACE_ID/AGENT_LABEL env). The registry keeps the launched surface.")
     return ws, surf, sid
 
 
