@@ -251,6 +251,56 @@ def codex_seat_home(acct, spec):
     raise ProviderError(_codex_no_home_msg(acct, method))
 
 
+# --- cmux hook wiring, per seat home (restoring the completion push the seat migration severed) ---
+# A codex worker's Stop hook is how its conductor ever learns it finished. cmux wires that hook by writing
+# a `hooks.json` into the codex home — but it only ever wrote one into `~/.codex`. When the fleet moved
+# every seat into its OWN home (the per-seat CODEX_HOME model), it moved every codex worker OUT of the one
+# home that had hooks. Seat workers have fired Stop into a home with no hooks ever since: no bus event, no
+# router, no completion. The conductor waits forever on an agent that finished minutes ago.
+#
+# TRUST IS THE OTHER HALF, and it fails SILENTLY. Codex will not run a hook it has not been told to trust:
+# in `exec` there is no prompt and no error — the hook is simply skipped. Trust is a `trusted_hash` under
+# `[hooks.state]` in the home's own config.toml, and it is CONTENT-BOUND (change the command, the timeout,
+# even the matcher, and the hash no longer matches and the hook goes quiet again). So installing hooks.json
+# without re-trusting it is indistinguishable from not installing it at all.
+#
+# `cmux hooks codex install` writes BOTH halves and honours $CODEX_HOME, so the fleet delegates rather than
+# re-implementing cmux's hash format — which would rot the moment cmux changed a timeout. And it is what
+# lets us do this WITHOUT `--dangerously-bypass-hook-trust`: that flag runs untrusted hooks, which is a
+# strictly worse thing to normalise in a launch path than simply granting the trust cmux itself grants.
+def codex_hooks_ok(home):
+    """True if `home` has cmux's codex hooks AND they are trusted. BOTH halves — an untrusted hook is a
+    hook that does not run, and it does not say so."""
+    home = os.path.expanduser(home)
+    hooks = os.path.join(home, "hooks.json")
+    if not os.path.exists(hooks):
+        return False
+    try:
+        cfg = open(os.path.join(home, "config.toml")).read()
+    except OSError:
+        return False
+    return f'[hooks.state."{os.path.realpath(hooks)}:' in cfg
+
+
+def codex_install_hooks(home):
+    """Install + trust cmux's codex hooks in `home`. Returns (ok, detail). Idempotent (cmux re-trusts on
+    every run), so it is safe to call before every launch."""
+    home = os.path.expanduser(home)
+    os.makedirs(home, exist_ok=True)                 # codex ERRORS on a CODEX_HOME that does not exist
+    env = {**os.environ, "CODEX_HOME": home}
+    try:
+        p = subprocess.run([CMUX, "hooks", "codex", "install", "--yes"],
+                           capture_output=True, text=True, timeout=60, env=env)
+    except FileNotFoundError:
+        return False, "the `cmux` binary is not on PATH"
+    except subprocess.TimeoutExpired:
+        return False, "`cmux hooks codex install` timed out"
+    if not codex_hooks_ok(home):
+        tail = (p.stderr or p.stdout or "").strip().splitlines()
+        return False, f"cmux hooks codex install rc={p.returncode} ({tail[-1][:100] if tail else 'no output'})"
+    return True, "hooks installed and trusted"
+
+
 def codex_home_token(home):
     """The seat's access token from ITS OWN home's auth.json ('' if absent). THIS is a per-seat home's
     credential — not the fleet cred store, which was seeded from the shared ~/.codex and goes stale the
@@ -646,6 +696,98 @@ def codex_install_citizenship(home):
     if new is not None:
         _atomic_write(path, new)
     return path, status
+
+
+# --- THE seat-home sync: everything a codex home needs, in ONE pass ------------------------------
+# A codex home needs two things from the fleet, and they were failing for the same reason — nobody owned
+# them. Keeping them in one function, called from one place, is the whole point: two syncs on adjacent
+# lines is how the next one gets forgotten.
+class CodexSeatReport:
+    """What a seat home needed and what was done about it. `ok` = fully up to spec."""
+
+    def __init__(self, home, doc_path, doc_status, hooks_ok, hooks_detail):
+        self.home, self.doc_path, self.doc_status = home, doc_path, doc_status
+        self.hooks_ok, self.hooks_detail = hooks_ok, hooks_detail
+
+    @property
+    def hooks_status(self):
+        return "ok" if self.hooks_ok else "NOT WIRED"
+
+    @property
+    def ok(self):
+        # NB: "installed"/"updated" mean a SYNC did the work; a --check reports MISSING/STALE instead, which
+        # are not ok — so the same property answers both callers honestly.
+        return self.hooks_ok and self.doc_status in ("current", "installed", "updated")
+
+    def notes(self):
+        """The lines worth saying out loud — and NOTHING when the home is already right (this runs on every
+        launch; a preflight that narrates itself when it did nothing is a preflight people stop reading)."""
+        out = []
+        if os.path.basename(self.doc_path or "") == "AGENTS.override.md":
+            out.append("citizenship went into your AGENTS.override.md — an override REPLACES AGENTS.md, so "
+                       "that is the file codex will actually read")
+        if not self.hooks_ok:
+            out.append(f"hooks are NOT wired ({self.hooks_detail}). This worker will RUN, but nothing will "
+                       f"tell its conductor when it finishes.")
+            out.append(f"repair: CODEX_HOME={self.home} cmux hooks codex install")
+        return out
+
+    def report(self):
+        """What a LAUNCH prints: what it CHANGED, and anything still wrong. A home that was already correct
+        prints nothing at all — a preflight that narrates its own no-ops is one people stop reading."""
+        out = []
+        if self.doc_status in ("installed", "updated"):
+            out.append(f"codex citizenship {self.doc_status}: {self.doc_path}")
+        elif self.doc_status.startswith("FAILED"):
+            out.append(f"warn: citizenship doc not written: {self.doc_status} — this worker will not know "
+                       f"it is in a fleet")
+        if self.hooks_detail == "installed":
+            out.append(f"codex hooks: installed + trusted in {self.home} (completions can reach the router)")
+        if not self.hooks_ok:
+            out.append(f"warn: codex hooks are NOT wired in {self.home} ({self.hooks_detail}). The worker "
+                       f"will RUN, but nothing will tell its conductor when it finishes.")
+            out.append(f"  repair: CODEX_HOME={self.home} cmux hooks codex install")
+        return out
+
+
+# A pure read must not speak in the past tense. `codex_install_citizenship` says what it DID ("installed");
+# a --check that says the same thing while writing nothing is claiming credit for work it did not do — and
+# an operator who reads "installed" and moves on has been told the exact opposite of the truth. Same class
+# of lie as a docstring calling a store read "THE liveness answer". Say what is THERE, not what would be.
+_CHECK_WORDS = {"installed": "MISSING", "updated": "STALE", "current": "current"}
+
+
+def codex_seat_status(home):
+    """What `home` needs, WITHOUT touching it. A pure read — safe on any home, including one holding the
+    wrong account (nothing here runs codex, so nothing can mint a device id)."""
+    path, status = codex_citizenship_status(home)
+    ok = codex_hooks_ok(home)
+    return CodexSeatReport(os.path.expanduser(home), path, _CHECK_WORDS.get(status, status), ok,
+                           "already wired" if ok else "no hooks.json, or its trust entry is missing/stale")
+
+
+def codex_seat_sync(home):
+    """Bring `home` up to spec: the citizenship doc AND cmux's hook wiring, TRUSTED. Idempotent — a home that
+    is already correct is not written to at all, which is what makes this safe on every launch.
+
+    THE TRUST IS NOT OPTIONAL AND IT IS NOT SEPARATE. Codex will not run a hook it has not been told to
+    trust, and under `exec` it does not prompt and does not complain — it just skips it, silently, on both
+    ends. Trust is a CONTENT-BOUND hash, so hooks written without re-trusting in the SAME PASS are exactly
+    as dead as no hooks at all, while looking perfectly installed. `cmux hooks codex install` writes both
+    halves together and re-trusts on every run, which is precisely why the fleet delegates to it instead of
+    re-implementing cmux's hash format — a format we would silently fall out of sync with the first time
+    cmux changed a timeout.
+
+    FAIL-OPEN: an under-equipped worker is still a worker; a launch aborted over a doc or a hook is not."""
+    home = os.path.expanduser(home)
+    try:
+        path, status = codex_install_citizenship(home)
+    except Exception as e:
+        path, status = "", f"FAILED ({e})"
+    if codex_hooks_ok(home):
+        return CodexSeatReport(home, path, status, True, "already wired")
+    ok, detail = codex_install_hooks(home)
+    return CodexSeatReport(home, path, status, ok, "installed" if ok else detail)
 
 
 def _oauth_refresh(refresh_token):

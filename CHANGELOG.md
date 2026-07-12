@@ -6,30 +6,75 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Fixed
+
+- **`fleet launch` was unsound in BOTH directions. One principle fixes both: only an authoritative signal
+  may condemn.** The house rule is now in the code (`resolve.alive` vs `resolve.present`), not just in a
+  commit message: **the process table decides verdicts; a heuristic may WARN and may never CONDEMN; and the
+  remedy must be proportionate to the confidence of the alarm.** Before shipping a check, ask what its cure
+  does *when the alarm is wrong* — that is the question this codebase kept failing to ask.
+  - **It invented failures, and handed you a destructive cure.** A perfectly healthy codex worker was
+    reported `!!! LAUNCH FAILED — the process exited on spawn`, with `fleet rm --kill` as the printed
+    remedy, because the first line of its pane was rc noise from the operator's `~/.zshrc` — printed
+    *before codex was even exec'd*. Both existing guards missed it: `agent_tui_visible` looks for
+    `Context N% left`, which codex only paints after its first turn, and the "scan below the launch line"
+    rule assumed exec delivery has no shell (it runs `zsh -ilc`, which sources the rc file like any other).
+    The verdict is now **pid-authoritative** (`launch_verdict`, pure + mutation-tested): a live process is
+    never a failed launch, whatever the pane says. A live process with an ugly pane gets a *note* and an
+    inspect command. `failed` requires BOTH no live process AND a startup error — and only then may the
+    remedy be destructive, because by then there is nothing alive left to destroy.
+  - **It missed real failures: the DARK SURFACE.** On 2 of 4 launches cmux files the agent's session under
+    a surfaceId that is not the one it seated the agent on, and keeps stamping that phantom. The fleet
+    already kept the *registry* right (it adopts the session against the live process's own env), but
+    everything cmux keys by surface — `vitals`, `ls`, the sidebar — then looks straight through the agent.
+    It runs, takes work, and completes turns, permanently invisible. Two specimens stamped 94 and 66 status
+    updates onto surfaces that do not exist in the cmux tree, and 0 onto their own. A dark agent reads
+    exactly like a dead one to every store-derived check, and the reflex cure for death is to relaunch —
+    which lands a SECOND agent on the same worktree and branch as the first, which is still alive.
+    Launch now **proves observability before it reports DONE** and re-seats onto a fresh surface when it
+    cannot — at t=0, where the agent holds no context and the repair is free. Bounded, and non-destructive
+    when it gives up: a still-dark agent is kept, registered, and explained (`archive` + `revive`, never
+    `recycle` — that re-execs onto the same dark surface). *(An in-place store repair was tried and
+    falsified: the hook re-created the phantom mapping and stamped it anyway. A fresh surface is the only
+    repair.)*
+  - **The router could tell a live agent it was dead.** `_alert_conductor_peers` gated its wording on
+    `rs.present()` under a comment claiming "PID authority" that it did not have — `present()` reads cmux's
+    *store*, so a dark conductor would be announced to its peers as "appears DOWN … `fleet revive`", and
+    revive archives and relands it. The gate now asks the process table.
+
 ### Added
 
-- **Codex citizenship: a codex worker now boots knowing it is in a fleet.** A codex worker loads no claude
-  plugins, so nothing the fleet ships to a claude agent — the `ground` skill, the dispatch conventions —
-  ever reached it. It booted knowing nothing about the fleet it was a child of, and (the sharp end) nothing
-  told it that it must announce its own completion: an agent that finishes and goes quiet is, to its
-  conductor, indistinguishable from one still thinking. The fleet now installs a citizenship doc into every
-  codex home and refreshes it on every launch.
-  - **`$CODEX_HOME/AGENTS.md` is the slot**, because it is the only instruction file a worker reads
-    *regardless of its cwd* — and a worker's cwd varies (an agent home, a repo worktree, an ad-hoc dir).
-    Codex's other instruction source is a project chain walked from the git root down to the cwd, and no
-    file in that chain covers every worker. Verified against codex-cli 0.144.1, not assumed.
-  - **An `AGENTS.override.md` REPLACES `AGENTS.md`; it does not merge with it.** So when an operator has
-    written an override, citizenship is installed *there*. Writing to `AGENTS.md` in that case would produce
-    a file that sits in the home looking installed and that codex never reads a line of — a failure that is
-    invisible on both ends. Pinned by a mutation-tested test.
-  - **The fleet owns the file, not a human.** `fleet launch --tool codex` syncs the home it is about to
-    launch into, so a worker cannot boot with a stale doc and a home added later cannot miss it. The write is
-    FENCED (anything you wrote outside the fence survives) and idempotent (an already-current home is not
-    written to at all). `fleet codex-sync [acct] [--check]` audits or seeds homes on demand.
+- **The codex seat home is now a fleet-owned thing, synced in ONE pass — `fleet codex-sync [acct] [--check]`,
+  and on every `fleet launch --tool codex`.** A codex worker loads no claude plugins, so nothing the fleet
+  ships to a claude agent — the `ground` skill, the dispatch conventions, the completion hook — ever reached
+  it. It booted knowing nothing about the fleet it was a child of, and nothing carried its completion home.
+  Two gaps, one cause: **nobody owned the home.** So one function owns it now, called from one place; a home
+  that is already correct is not written to at all, and a seat added next month cannot miss either half.
+  - **Citizenship: `$CODEX_HOME/AGENTS.md`.** The only instruction file a worker reads *regardless of its
+    cwd* — and a worker's cwd varies (an agent home, a repo worktree, an ad-hoc dir). Codex's other source
+    is a project chain walked from the git root down, and no file in that chain covers every worker.
+    Verified against codex-cli 0.144.1, not assumed.
+  - **An `AGENTS.override.md` REPLACES `AGENTS.md`; it does not merge with it.** So citizenship is installed
+    *there* when an operator has one. Writing to `AGENTS.md` in that case yields a file that sits in the home
+    looking installed and that codex never reads a line of — invisible on both ends. Mutation-tested.
+  - **Hooks, installed and TRUSTED together — the completion push the seat migration had severed.** cmux
+    wires a worker's `Stop` hook by writing `hooks.json` into the codex home, and only ever wrote one into
+    `~/.codex`; moving every seat into its own `CODEX_HOME` moved every worker out of the one home that had
+    hooks, so they fired `Stop` into a void. (Codex was never the problem — it *has* a Stop hook and it
+    fires. `SessionEnd` does not.) **Trust is the half that fails silently:** codex will not run an untrusted
+    hook and, under `exec`, does not prompt and does not complain — it just skips it. Trust is a
+    content-bound `trusted_hash` in the home's own `config.toml`, so **hooks written without re-trusting in
+    the same pass are exactly as dead as no hooks, while looking installed** — the same shape as the
+    `AGENTS.override.md` trap. Delegated to `cmux hooks codex install`, which honours `$CODEX_HOME` and
+    writes both halves, rather than re-implementing cmux's hash format. **No
+    `--dangerously-bypass-hook-trust`**: it runs *untrusted* hooks, which is not the problem we had.
   - **`$AGENT_CONDUCTOR`** is now in every agent's launch env. `fleet peer-msg` addresses by label, and a
     child knew its own label and its role but never who launched it — so it could not report to its
     conductor even when it wanted to. Re-derived from the registry on recycle/revive, so it survives a
     restart.
+  - `--check` is a pure read, and it says so: it reports `MISSING`/`STALE`, never `installed`. A check that
+    claims credit for work it did not do is the same class of lie as a store read documented as "THE
+    liveness answer".
 
 - **Codex per-seat homes: concurrent codex seats, PROVEN.** Every codex seat declares its own
   `auth = "codex-home:<path>"` and runs as its own device. Three seats (two of them on ONE shared team

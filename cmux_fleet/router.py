@@ -373,8 +373,14 @@ def _alert_conductor_peers(reason, down_label, down_entry, surface, payload, now
     now = time.time() if now is None else now
     members = fs.live_all() if members is None else members
     woke = set() if woke is None else woke
-    live = bool(rs.present(surface))            # PID authority, re-read AT ALERT TIME (not the lifecycle
-    wake, title, body = conductor_alert_text(   # string, and not the predicate's older reading of it)
+    # PID AUTHORITY, and it must be the PROCESS TABLE. This used to read rs.present() — cmux's STORE — under
+    # a comment claiming pid authority it did not have. A DARK agent (alive, but filed by cmux under another
+    # surfaceId) is absent from the store, so it would be announced to its peers as "appears DOWN ... `fleet
+    # revive`" — and revive archives and relands it, destroying a live agent on the strength of a signal that
+    # simply could not see it. rs.alive() asks `ps`, which can. A genuinely dead agent still has no pid and
+    # still gets the DOWN text; nothing that is actually running can ever be called down again.
+    live = bool(rs.alive(surface, (down_entry or {}).get("tool")))
+    wake, title, body = conductor_alert_text(
         reason, down_label, surface, live)
     peers = [(lbl, e) for lbl, e in members.items()
              if e.get("kind") == "conductor" and lbl != down_label and e.get("surface")]
