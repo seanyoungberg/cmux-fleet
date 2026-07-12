@@ -379,7 +379,12 @@ def _alert_conductor_peers(reason, down_label, down_entry, surface, payload, now
     # revive`" — and revive archives and relands it, destroying a live agent on the strength of a signal that
     # simply could not see it. rs.alive() asks `ps`, which can. A genuinely dead agent still has no pid and
     # still gets the DOWN text; nothing that is actually running can ever be called down again.
-    live = bool(rs.alive(surface, (down_entry or {}).get("tool")))
+    # ...and UNKNOWN is not GONE. `alive()` collapses "I could not look" into False, and the DOWN script's
+    # remedy is `fleet revive`, which archives and relands the agent — destructive. So ask for the tri-state
+    # and treat anything short of a PROVEN absence as live: only an agent we can actually see is not there
+    # may be told it is not there.
+    verdict, _pids, _ = rs.liveness(surface, tool=(down_entry or {}).get("tool"))
+    live = verdict != rs.GONE
     wake, title, body = conductor_alert_text(
         reason, down_label, surface, live)
     peers = [(lbl, e) for lbl, e in members.items()

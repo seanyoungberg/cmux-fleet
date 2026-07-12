@@ -8,6 +8,29 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Fixed
 
+- **ONE liveness authority, and it is `resolve`.** Two branches independently built a pid-authoritative
+  liveness guard — one in `resolve.py`, one in `cli.py` — and they did not textually conflict, which is
+  *worse* than if they had: two authorities that never collide are two authorities that drift, silently.
+  It is the same "nobody owned it, so two places implemented it" disease both branches were written to
+  cure, and `resolve.py`'s own header already forbade it ("do not add a new raw hook-store read anywhere
+  outside this module"). They are now one: `resolve.agent_pids` / `liveness` / `alive` / `dark`, with `move`
+  and `launch` and the router all asking the same question of the same code.
+  - **Liveness is a TRI-STATE, because "I could not look" is not "nothing is there".** `_ps_axeww` swallows
+    a timeout or an exec error and returns `""` — and a box always has processes, so an empty sweep is a
+    **failed** sweep. A guard that reads it as "nothing is running here" authorizes, on the strength of its
+    own blindness, exactly the destruction it exists to prevent. `liveness()` returns `LIVE`/`GONE`/
+    `UNKNOWN`; anything with a destructive remedy refuses on `UNKNOWN`. `alive()` is the boolean
+    convenience for callers that only *warn*, and says so in its own docstring.
+  - **The merge closed a hole in the launch path too.** `launch_verdict` could previously convict on an
+    empty sweep — its printed cure is `fleet rm --kill`. It now returns `unproven` and refuses to condemn
+    on a blind eye. That fix came from `move`'s guard being the stronger one; unifying let it flow both ways.
+  - **Positive evidence of life needs one witness; only the negative conclusion needs a working sweep.** A
+    live store pid now settles `LIVE` without consulting the process table at all. Checking the sweep first
+    threw away a record that already proved the agent was running — and told a live conductor it was DOWN.
+  - The suite's hermetic `ps` stub returned `""`, which under the corrected semantics means *the sweep
+    failed*. Every test was silently simulating a broken `ps`. It now returns a real-shaped table with no
+    agent in it, so "swept and found nothing" is the default and `UNKNOWN` means what it says.
+
 - **`fleet launch` was unsound in BOTH directions. One principle fixes both: only an authoritative signal
   may condemn.** The house rule is now in the code (`resolve.alive` vs `resolve.present`), not just in a
   commit message: **the process table decides verdicts; a heuristic may WARN and may never CONDEMN; and the
@@ -41,6 +64,39 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
     `rs.present()` under a comment claiming "PID authority" that it did not have — `present()` reads cmux's
     *store*, so a dark conductor would be announced to its peers as "appears DOWN … `fleet revive`", and
     revive archives and relands it. The gate now asks the process table.
+### Changed
+
+- **`fleet move` REFUSES a live agent, and `--archive-revive` relocates it honestly.** Moving a live
+  surface across workspaces **permanently destroys that surface's agent-status registration inside the
+  cmux app** — surface-scoped, survives a process restart, and `fleet recycle` cannot repair it (it
+  re-execs the pane on the *same* surface and comes back dark; a dark agent usually cannot even pass
+  recycle's quiet-gate, which reads the very lifecycle the break freezes). The verb spent a day calling
+  itself "the one safe verb" — true at the fleet layer, false at the cmux layer — and then shipped a
+  WARNING printed next to the completed damage. A warning is not a guard.
+  - `fleet move <label> … --archive-revive` archives the agent and revives it onto a **FRESH surface** in
+    the target workspace (a fresh surface being the one thing that was broken), **resuming the full
+    session — never the compact summary**. The fresh surface is *born* in the destination, never
+    born-then-moved. Bystanders are safe: the teardown downgrades to `close-surface` and keeps the
+    workspace when a sibling agent lives there.
+  - Scope of the damage is **observability only** — a darkened agent still works, still receives its
+    inbox, still answers. Do not panic-wake one.
+  - Still allowed: a plain move of a **husk** surface (no live agent ⇒ no registration to destroy). An
+    **archived** label has no surface at all, so a plain move is refused and `--archive-revive` simply
+    does the revive half, landing it in the target.
+  - The liveness test behind the refusal is **PID-authoritative** (hook-store live pids ∪ process-table
+    seat-agent pids) and never reads `agentLifecycle` — the field a dark agent *freezes*, and the field
+    `fleet ls`'s STALE predicate ANDs in. A lifecycle-gated guard would go quiet exactly when it is
+    needed. A failed `ps` sweep reads as UNKNOWN and refuses, never as "nothing here".
+
+- **`create_surface` resolved the parent surface's workspace from the hook store while resolving its pane
+  from the tree.** That split made `launch --place tab|pane` depend on the parent having a live hook-store
+  record — which a bare shell surface never has, and a *dark* agent's surface does not either. Measured on
+  this box: an agent sitting plainly in `cmux tree` could not host a single tab child ("cannot resolve
+  conductor workspace from --parent"). Both answers now come from one tree read (the visual ground truth),
+  with the store as fallback only when the tree cannot be read.
+- **`--place workspace` with no group aborted** instead of minting a standalone workspace, making a
+  groupless workspace-placed agent unreachable from `launch` and `revive` — though `move --own-workspace`
+  produced exactly that shape. It now mints one.
 
 ### Added
 

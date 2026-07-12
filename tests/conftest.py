@@ -95,8 +95,18 @@ def cli_env(cmux_stub, tmp_path):
 def _hermetic_ps_sweep(monkeypatch):
     """resolve.pids_ps (the never-orphan union source) shells one `ps axeww` per call. A REAL sweep
     inside the suite is slow, box-dependent, and — when the suite runs inside a live fleet agent —
-    can see the dev's own agents' environments. Hermetic default: an empty sweep, patched at the raw
-    text seam so pids_ps's PARSING stays real code under test. Tests that exercise the union inject
-    `ps_out` explicitly or re-patch resolve.pids_ps (tests/test_resolve.py)."""
+    can see the dev's own agents' environments. Hermetic default: a sweep that WORKED and found no agent,
+    patched at the raw text seam so pids_ps's PARSING stays real code under test. Tests that exercise the
+    union inject `ps_out` explicitly or re-patch resolve.pids_ps (tests/test_resolve.py).
+
+    IT MUST NOT BE `""`. An empty sweep is a FAILED sweep — a box always has processes — and
+    `resolve.liveness` reads it as UNKNOWN and refuses, which is the whole point of that state. Returning
+    "" here would make every test in the suite silently simulate a broken `ps`, quietly converting every
+    "nothing is running there" into "I could not look", and the one test that means to exercise a genuinely
+    dead agent would stop being able to. So: a real-shaped table, with real processes, and no agent on the
+    surface under test."""
     import cmux_fleet.resolve as _resolve
-    monkeypatch.setattr(_resolve, "_ps_axeww", lambda: "")
+    # PID TT STAT TIME COMMAND... — the columns pids_ps actually parses. No CMUX_SURFACE_ID, so no seat agent.
+    no_agents = ("  501   ??  Ss     0:01.23 /sbin/launchd\n"
+                 "  777   ??  S      0:00.10 /usr/sbin/cfprefsd agent\n")
+    monkeypatch.setattr(_resolve, "_ps_axeww", lambda: no_agents)

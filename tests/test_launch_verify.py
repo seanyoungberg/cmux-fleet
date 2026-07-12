@@ -204,3 +204,52 @@ def test_alive_never_consults_the_store(monkeypatch):
     monkeypatch.setattr(rs, "present", lambda s: (_ for _ in ()).throw(
         AssertionError("alive() read the hook store")))
     assert rs.alive("S", "claude") is True
+
+
+# --- the tri-state: "I could not look" is not "nothing is there" ----------------------------------
+# The two branches that got merged here each had a liveness authority, and move-refuse's was the stronger
+# one: it knew that an empty `ps` sweep is a FAILED sweep (a box always has processes), and refused. Mine
+# did not — `alive()` collapsed it to False, so a broken sweep could have driven a `LAUNCH FAILED` whose
+# printed cure is `fleet rm --kill`. One authority now, and the strength flows both ways.
+def test_a_FAILED_sweep_can_never_condemn_a_launch():
+    """The hole the merge closed. Sweep failed -> we did not look -> we do not get to convict. Absence of
+    evidence is not evidence of absence, least of all when the remedy prints `rm --kill`."""
+    verdict, err, _ = cli.launch_verdict(set(), PANE_REAL_DEATH, swept=False)
+    assert verdict == "unproven"
+    assert verdict != "failed", "a blind sweep condemned a launch"
+    assert err, "the pane error is still reported — we warn, we just do not convict"
+
+
+def test_a_WORKING_sweep_that_finds_nothing_still_condemns():
+    """Reachable-green: the refusal must not swallow the real failure it was built around. A sweep that ran
+    and found no process, with a startup error on the pane, is still a dead launch."""
+    assert cli.launch_verdict(set(), PANE_REAL_DEATH, swept=True)[0] == "failed"
+
+
+def test_liveness_is_a_TRI_state_and_UNKNOWN_is_not_GONE(monkeypatch):
+    monkeypatch.setattr(rs, "ps_sweep", lambda: "")                       # the sweep FAILED
+    monkeypatch.setattr(rs, "pids", lambda s, st=None: set())             # and the store knows nothing
+    verdict, pids, why = rs.liveness("S", tool="claude")
+    assert verdict == rs.UNKNOWN and verdict != rs.GONE
+    assert "could not read the process table" in why
+    assert rs.alive("S", "claude") is False        # the BOOLEAN loses the state — which is why it must
+                                                   # never gate a destructive act. Documented, and pinned.
+
+
+def test_a_live_STORE_pid_proves_life_without_the_process_table(monkeypatch):
+    """Order is load-bearing. Proving a thing ALIVE needs one witness; only the NEGATIVE conclusion needs a
+    working sweep. Checking the sweep first would answer UNKNOWN about an agent the store already proved was
+    running — and it did, until this was fixed (a live conductor got the DOWN script)."""
+    monkeypatch.setattr(rs, "ps_sweep", lambda: "")                       # blind...
+    monkeypatch.setattr(rs, "pids", lambda s, st=None: {4989})            # ...but the store SAW it
+    verdict, pids, _ = rs.liveness("S", tool="claude")
+    assert verdict == rs.LIVE and pids == [4989]
+
+
+def test_the_store_can_only_ever_push_toward_LIVE(monkeypatch):
+    """move-refuse's non-negotiable: the store must never be able to AUTHORIZE a destructive act. It can add
+    life (refuse), never subtract it (allow) — the process table alone decides GONE."""
+    monkeypatch.setattr(rs, "pids", lambda s, st=None: set())             # store: nothing
+    monkeypatch.setattr(rs, "ps_sweep", lambda: "  1 ?? Ss 0:01 /sbin/launchd\n")
+    monkeypatch.setattr(rs, "pids_ps", lambda s, ps_out=None, tool=None: {4989})   # ps: ALIVE
+    assert rs.liveness("S", tool="claude")[0] == rs.LIVE, "an empty store overrode a live process"

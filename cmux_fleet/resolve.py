@@ -171,14 +171,90 @@ def present(surface):
 # A verdict ("it failed", "it is down") may rest ONLY on `alive`. A heuristic — pane text, a lifecycle
 # string, a missing store record — may WARN, and may never condemn. And the remedy must be proportionate
 # to the confidence of the alarm: before shipping a check, ask what its cure does WHEN THE ALARM IS WRONG.
-def alive(surface, tool=None):
-    """THE authoritative liveness answer: a live seat-agent process is on this surface, per `ps`.
+#
+# AND "I COULD NOT TELL" IS A THIRD ANSWER, not a flavour of "no". `_ps_axeww` swallows a timeout or an
+# exec error and returns "" — and a box ALWAYS has processes, so an empty sweep is a FAILED sweep. A guard
+# that reads it as "nothing is running here" would authorize, on the strength of its own blindness, exactly
+# the destruction it exists to prevent. Hence the tri-state below; `alive()` is the boolean convenience for
+# callers that only WARN, and anything with a destructive remedy must ask `liveness()` and refuse on UNKNOWN.
+LIVE, GONE, UNKNOWN = "live", "gone", "unknown"
 
-    Store-independent by construction — which is the entire point. It sees the agent cmux has lost track
-    of, the agent whose SessionEnd already reaped its record, and the agent that has not bound a session
-    yet. Pass `tool` when the registry knows it (the per-tool seat rule is exact); omit it and every known
-    seat rule is tried (`occupants`)."""
-    return bool(pids_ps(surface, tool=tool) if tool else occupants(surface))
+
+def ps_sweep():
+    """One process-table sweep, shareable across surfaces. '' means the sweep FAILED — never 'no processes'."""
+    return _ps_axeww()
+
+
+def agent_pids(surface, tool=None, ps_out=None, st=None, store_pids=None):
+    """THE pid set for a surface: cmux's store's live pids UNION the process table's seat-agent pids.
+
+    `store_pids` lets a caller hand in its OWN view of the store half (cli passes `_surface_pids`, the
+    accessor its teardown gate already reads through). That is dependency injection, not a second
+    implementation: the UNION — what "an agent is running here" actually means — is defined once, here.
+
+    NEITHER SOURCE IS SUFFICIENT ALONE, and the union is not belt-and-braces — each covers a hole the other
+    has:
+      * the STORE misses an agent whose record SessionEnd already reaped (~0.3s before the process actually
+        exits, measured), and one whose record was never written at all. Not hypothetical: the `move-refuse`
+        agent was live (pid 4989, working) with ZERO store records for its own surface.
+      * the PROCESS TABLE misses nothing that runs, but needs the seat-agent rule (`pids_ps` ->
+        `_line_is_seat_agent`) to tell the agent from the 3-5 processes that legitimately inherit its
+        surface env (the daemon, the router, node servers, the `claude -p` summarizer).
+
+    NOTE WHAT IS ABSENT: `agentLifecycle`. It is the field a dark agent FREEZES and a SessionEnd-less death
+    freezes — a permanent lie in both directions. `present()` ANDs it in, which is right for "should `ls`
+    show this row as live" and WRONG for "may I destroy this seat": it reads a working agent as dead."""
+    store = set(store_pids) if store_pids is not None else set(pids(surface, st=st))
+    if ps_out is None:
+        ps_out = ps_sweep()                            # ONE sweep, shared across the tool rules below
+    table = set()
+    for t in ((tool,) if tool else KNOWN_TOOLS):       # tool unknown -> try every seat rule (superset = safe)
+        table |= pids_ps(surface, ps_out=ps_out, tool=t)
+    return sorted(store | table)
+
+
+def liveness(surface, tool=None, st=None, store_pids=None):
+    """(verdict, pids, evidence) — the tri-state, and the ONLY thing a destructive act may gate on.
+
+    LIVE     an agent process is on the surface (`agent_pids`).
+    UNKNOWN  the process-table sweep came back EMPTY, which means it FAILED (a box always has processes).
+             We cannot prove the surface is safe to destroy, so we must not claim we can.
+    GONE     the sweep worked and no agent pid is on the surface.
+
+    THE ASYMMETRY THAT SETS THE DEFAULT: a wrong "live" costs the operator an extra flag. A wrong "gone"
+    costs a healthy agent. The two errors are not remotely equal, so every uncertain branch resolves toward
+    live, and UNKNOWN is a refusal, never a shrug.
+
+    NOTE THE ORDER, IT IS LOAD-BEARING. Positive evidence of life is checked FIRST, from either source, and
+    a live store pid settles it without the process table being consulted at all — proving a thing is ALIVE
+    needs only one witness. It is the NEGATIVE conclusion that needs a working sweep, because "I saw nothing"
+    is worth exactly as much as your ability to see. Checking the sweep first would have thrown away a store
+    record that already proved the agent was alive, and answered UNKNOWN about an agent we knew was running.
+    (This cuts only toward safety: the store can push a verdict to LIVE, which merely REFUSES, and it can
+    never push one to GONE, which is the answer that destroys.)"""
+    store = set(store_pids) if store_pids is not None else set(pids(surface, st=st))
+    if store:
+        return LIVE, sorted(store), (f"live agent pid(s) {', '.join(str(p) for p in sorted(store))} on "
+                                     f"surface {(surface or '')[:8]}")
+    ps_out = ps_sweep()
+    if not (ps_out or "").strip():
+        return UNKNOWN, [], ("could not read the process table (`ps axeww` returned nothing), so I cannot "
+                             "prove no live agent is on this surface")
+    found = agent_pids(surface, tool=tool, ps_out=ps_out, st=st, store_pids=store)
+    if found:
+        return LIVE, found, (f"live agent pid(s) {', '.join(str(p) for p in found)} on surface "
+                             f"{(surface or '')[:8]}")
+    return GONE, [], f"no agent process on surface {(surface or '')[:8]}"
+
+
+def alive(surface, tool=None, st=None):
+    """True iff a live seat agent is PROVEN on this surface.
+
+    THE BOOLEAN LOSES A STATE, SO READ THIS BEFORE YOU USE IT: an UNKNOWN sweep returns False here — not
+    because nothing is there, but because we could not look. That is safe for a caller that only WARNS, and
+    catastrophic for one that DESTROYS. If a wrong answer costs an agent, call `liveness()` and refuse on
+    UNKNOWN; do not ask a yes/no question when "I could not tell" is a possible truth."""
+    return liveness(surface, tool=tool, st=st)[0] == LIVE
 
 
 # --- is cmux STAMPING this surface? (the observability proof, from cmux's own event log) ----------
