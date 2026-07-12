@@ -106,9 +106,15 @@ worktree = true                    # opt in. default false. CLI: --worktree / --
 #   file:<path>         a long-lived token from `claude setup-token`; relative → under the state dir
 #                       (e.g. providers/<name>.token, chmod 0600). Injected at launch as
 #                       CLAUDE_CODE_OAUTH_TOKEN via a spawn-time $(cat …) so the secret is never printed.
-#   codex-home:<path>   CODEX_HOME for a codex account. NOTE: codex account SELECTION is PROVISIONAL — a
-#                       verdict (CODEX_HOME-per-profile vs an env-token path) is pending; the READ poller
-#                       is final, the switch mechanism is a stub. Do not treat as settled.
+#   codex-home:<path>   CODEX_HOME for a codex account. REQUIRED for every codex seat, and never guessed.
+#                       SETTLED 2026-07-12 (three seats ran concurrently, none killed another): the ChatGPT
+#                       backend keys one active session per DEVICE, the device id (installation_id) is a file
+#                       in the codex HOME, so a home IS a credential boundary. Seats sharing a home are one
+#                       device and REVOKE EACH OTHER on every login; seats in their own homes coexist.
+#                       Convention ~/.codex-<acct>; ~/.codex itself is a legal, first-class value for one seat.
+#                       Different PEOPLE may share one team subscription — that is what a team seat is, and it
+#                       is fine. The same person in two homes is not. Then: `fleet codex-login <acct>`.
+#                       (The old `codex-token:` shared-home path IS the supersession bug and is now refused.)
 #   env-file:<path>     source KEY=VALUE lines (vertex: CLAUDE_CODE_USE_VERTEX, project, region).
 #
 # SECRETS ROADMAP (not built): the file: tokens are a prototype stopgap stored as plain 0600 files.
@@ -130,8 +136,18 @@ worktree = true                    # opt in. default false. CLI: --worktree / --
 # track = "none"
 
 # [providers.codex]
-# default = "berg-team"
-# [providers.codex.berg-team]                        # current CODEX_HOME (~/.codex); READ poller is live
+# default = "worker-a"
+# Every codex seat gets its OWN home, or it will supersede the others. `fleet codex-login` (no acct) cycles
+# them all and SKIPS any that already verify — a login supersedes, so re-logging a working seat breaks it.
+# [providers.codex.worker-a]
+# type = "subscription"
+# auth = "codex-home:~/.codex-worker-a"
+# track = "windows"
+# [providers.codex.worker-b]                         # a DIFFERENT PERSON; may share worker-a's team plan
+# type = "subscription"
+# auth = "codex-home:~/.codex-worker-b"
+# track = "windows"
+# [providers.codex.desktop]                          # ~/.codex itself is a legal home for exactly ONE seat
 # type = "subscription"
 # auth = "codex-home:~/.codex"
 # track = "windows"

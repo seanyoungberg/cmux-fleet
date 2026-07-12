@@ -8,27 +8,35 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
-- **Codex env-token account switching (unified home).** `fleet launch --provider codex:<acct>` selects a
-  ChatGPT account per launch via `-c model_provider=<acct>` + a fleet-owned OAuth token injected at spawn,
-  against one shared `~/.codex` (no per-account `CODEX_HOME`, no session/config split). The fleet owns the
-  token lifecycle: refresh before expiry (atomic writes; the rotated refresh_token is persisted), a
-  pre-launch guard that aborts loudly on a revoked account (never spawns into a 401), per-account usage
-  attribution (`fleet usage` filters the unified home's rollouts by `model_provider`), and idempotent,
-  *fenced* `~/.codex/config.toml` provisioning that never touches hand-written config. New `fleet codex-setup
-  <acct>` verb does the one-time seed + provision. **DORMANT** until a `codex-token:` provider is configured
-  in `fleet.toml`; **REQUIRES one interactive `codex login` per account** before it can be relied upon (the
-  first live refresh + agent turn are exercised then). `codex-home:<path>` per-profile remains as a fallback.
-  **KNOWN LIMITATION — seats cannot coexist in a unified home.** The ChatGPT backend enforces one active
-  session per account, keyed on the `installation_id` that lives in each codex *home* (not on the OAuth
-  client, which is shared, and not on `auth.json`). Seeding N seats by sequential `codex login` against one
-  shared `~/.codex` therefore yields ONE installation_id, so the backend supersedes every seat but the last.
-  Live state: of 3 seeded seats only the `auth.json`-resident one is live; the other two are backend-revoked
-  (the health monitor reports this correctly). Concurrent seats require a per-seat `CODEX_HOME`, which is
-  what the `codex-home:<path>` fallback exists for. Single-seat use of the unified home is unaffected.
-- **Codex account health monitor + offline alert.** The daemon checks each configured `codex-token` account
-  hourly and, on the same refresh loop, silently refreshes a near-expiry token. It notifies (a surfaceless
-  desktop banner) ONLY when an account newly goes offline and needs a human `codex login` +
-  `fleet codex-setup <acct>`. Edge-triggered (one alert per outage, re-armed on recovery; never a storm).
+- **Codex per-seat homes: concurrent codex seats, PROVEN.** Every codex seat declares its own
+  `auth = "codex-home:<path>"` and runs as its own device. Three seats (two of them on ONE shared team
+  subscription) ran concurrently and each produced real assistant output; none revoked another. This replaces
+  and DELETES the env-token unified-home model, which was not merely limited but actively broken: the ChatGPT
+  backend keys one active session per DEVICE, the device id (`installation_id`) is a file inside the codex
+  *home* (not the OAuth client, which is shared, and not `auth.json`), so N seats sharing one `~/.codex` are
+  ONE device and every login supersedes the last. A home is therefore a credential boundary, and the fleet
+  now REQUIRES one per seat and NEVER guesses (a guessed home silently aims a seat at another seat's
+  credentials). `~/.codex` itself is a legal, first-class home for exactly one seat.
+  - `fleet codex-login [acct]` — with no acct it CYCLES every seat, and SKIPS any that already verifies. The
+    skip is a safety property, not an optimization: a login supersedes, so re-logging a working seat is how
+    you break it. Verification is a backend 200 **and the model actually speaking**.
+  - **Wrong-account interlock**, keyed on the PERSON (`chatgpt_user_id`) and never the SUBSCRIPTION
+    (`chatgpt_account_id`). Different people legitimately share one team plan — that is what a team seat is —
+    so a subscription-keyed guard blocks a valid setup. The same person in two homes is the hazard, and it
+    happens for real: a login that reuses a signed-in chatgpt.com session authenticates whoever the browser
+    already was. The check is a PURE READ that runs BEFORE anything touches the home, because verifying a
+    home RUNS codex, and a codex run is what mints the second device — the check would otherwise destroy the
+    thing it was checking.
+  - `fleet codex-setup` and `auth = "codex-token:…"` are **refused**, not deprecated. They provisioned the
+    shared-home model, which IS the supersession bug; leaving them selectable invites its return.
+  - Health and the usage poller both read each seat's OWN home, so they cannot disagree, and every seat
+    reports its own identity and its own usage to `fleet usage` and the sidebar.
+- **Codex account health monitor + offline alert.** The daemon checks each codex seat hourly, reading that
+  seat's OWN home (never the fleet cred store, which was seeded from the shared `~/.codex` and goes stale the
+  moment a seat moves into its own home — that staleness is exactly why a demonstrably healthy seat kept
+  reporting `revoked`). It notifies (a surfaceless desktop banner) ONLY when an account newly goes offline and
+  needs a human `fleet codex-login <acct>`.
+  Edge-triggered (one alert per outage, re-armed on recovery; never a storm).
   Deliberately distinct from "usage stale" (no recent CLI activity: the account is fine and is never
   alerted). `unseeded` accounts (configured but not yet set up) are not alerted either. Health is decided
   by **two layers**, because the clock alone is false-healthy (see Fixed): a refresh check, then a
@@ -95,6 +103,29 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Fixed
 
+- **A Cloudflare 403 is not a revocation: only the API may condemn a token.** `chatgpt.com` sits behind
+  Cloudflare, which 403s an unrecognized client with an HTML challenge page — and the health probe (which
+  identified as `cmux-fleet-health`) mapped ANY 401/403 to `revoked`. So a bot block became a REVOCATION
+  VERDICT, and it condemned all three of Berg's seats minutes after each had demonstrably spoken; every one
+  returned HTTP 200 the instant a codex User-Agent was used. The verdict was also DESTRUCTIVE, which is what
+  makes it severe rather than merely wrong: the remedy it prints is `fleet codex-login <acct>`, and a login
+  SUPERSEDES that seat — the false alarm would have killed the healthy seat it misdiagnosed. Fixed on both
+  halves: every `chatgpt.com` call now identifies as codex (the usage poller was borrowing the *Anthropic*
+  poller's UA, so it 403'd too and silently fell back to the ROLLOUT SCRAPE — painting a healthy-looking
+  sidebar bar from stale files for a seat the API was refusing to talk to), and a 401/403 now means `revoked`
+  only when the API *answered* it (a JSON body). An HTML body is the network refusing to carry the question,
+  not the backend rejecting the credential: that is `unreachable` (transient, no alert).
+- **An unseeded codex seat says `unseeded`, not "no rollout sessions found".** A seat that was never logged
+  in fell through to the rollout scrape, which reported a scrape artifact — an unseeded home has no rollouts
+  *either*, so the wrong probe returned a plausible answer that reads as "this seat just hasn't run lately",
+  sending the operator to look for work when the seat simply needed one `fleet codex-login`. It also made the
+  poller and health disagree about the same seat. The poller now speaks health's vocabulary.
+- **The codex cruft-stripping flags are enumerated from the home the launch will ACTUALLY use.** They were
+  always enumerated from Berg's desktop `~/.codex` (6 MCP servers) and then applied to a *seat's* home, which
+  declares none — and `-c mcp_servers.<n>.enabled=false` on a server that home never declared CREATES a
+  transport-less `[mcp_servers.<n>]`, so codex refuses to load its config at all (`invalid transport in
+  mcp_servers.basic-memory`) and the agent never starts. A per-seat home is already clean, so the correct
+  count of mcp flags for it is ZERO. Found only by launching a REAL agent; `codex exec` takes another path.
 - **fleet-doctor: a LIVE agent is never called DOWN, and never handed a destructive remedy.** The doctor
   told the fleet that conductor `berg-sandbox` "appears DOWN (stall); check it and `fleet revive
   berg-sandbox` if it is". It was not down — Berg was sitting in it *typing*: pid up, 88% context. Obeying
