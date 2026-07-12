@@ -37,9 +37,13 @@
 #                long after its last turn, so mtime advances while the agent sits at the prompt. The
 #                mtime rule shipped in step 1 and read usage-ops and sidebar-build as detached while
 #                both were merely idle; the turn timestamp is the signal, the mtime is noise;
-#   env        — the one nameable deterministic CAUSE: ps eww shows a CMUX_WORKSPACE_ID different
-#                from the tree's workspace (Gap A, the moved-live-process mechanism; conclusive at
-#                any idleness).
+#   env        — a deterministic DETECTOR, not the cause: ps eww shows a CMUX_WORKSPACE_ID different
+#                from the tree's workspace, which proves the surface was MOVED while live, and a moved
+#                surface is dark (conclusive at any idleness). Do NOT read it as the mechanism: the
+#                stale env was falsified as the cause on 2026-07-10 (probed post-move with the CORRECT
+#                current workspace id -> still no stamp). The break is surface-scoped, inside the cmux
+#                app; the env is a fellow-traveller of the move, which is why re-exporting it fixes
+#                nothing. See the remedy below.
 # The active-session pointer is NOT a signal in either direction (cmux-advisor, measured twice,
 # self-corrected once): its write is PATH-DEPENDENT — absent on a fresh-surface launch until the
 # first completed turn, yet replaced at SessionStart on an exec respawn — so it can be legitimately
@@ -47,7 +51,17 @@
 # (false negative). It is exposed as a forensic breadcrumb (`ever_heard`), never as proof. Consequence, stated honestly: a
 # genuinely idle, genuinely detached, env-correct agent is PASSIVELY UNDETECTABLE; settling it needs
 # a driven probe, which belongs to the agent's PARENT (dispatch doctrine applies to diagnostics).
-# Remedy for detached is a reseat (recycle resume); the fleet never auto-reseats.
+# REMEDY (corrected 2026-07-10, root-caused end-to-end; the earlier "reseat" answer here was WRONG):
+# a reseat does NOT fix detachment. `fleet recycle` re-execs the pane process on the SAME surface, and
+# the surface is what is dark, so it comes back dark (live-proven: an exec-launch respawn left the seat
+# with zero stamps for five hours). Worse, a dark agent usually FAILS the recycle quiet-gate ("surface
+# never went quiet within 180s") because the gate reads the very lifecycle the break freezes, so the
+# reseat cannot even RUN without --force. THE remedy is `fleet archive <label>` then `fleet revive
+# <label>`: revive lands the agent on a FRESH surface, which re-registers (verified on berg-sandbox).
+# The fleet never does this automatically -- archiving is the parent's call.
+# Scope, so nobody panics: detachment is an OBSERVABILITY break (ls/vitals/lifecycle, cmux's own
+# sidebar). Liveness, completion routing and inbox delivery are UNAFFECTED; a detached agent still
+# works and still answers. Full write-up: _meta/agents/conductors/cmux-advisor/detachment-root-cause-2026-07-10.md
 #
 # NEVER-ORPHAN (the teardown floor, measured 2026-07-10): SessionEnd REMOVES the hook-store record
 # ~0.3s BEFORE the process exits, so "no record" does NOT imply "no process" — the converse of the

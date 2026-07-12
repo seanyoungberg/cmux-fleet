@@ -95,6 +95,23 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Fixed
 
+- **`fleet move` told operators to run the one command that cannot fix a moved surface.** Its post-move
+  WARNING blamed the stale `CMUX_WORKSPACE_ID` and directed the operator to `fleet recycle <label>` "to
+  re-export the env and rebind the hooks"; `resolve.py` likewise recorded the remedy for a detached agent
+  as "a reseat (recycle resume)". The 2026-07-10 root-cause falsified both. The break is **surface-scoped**:
+  moving a live surface permanently destroys its agent-status registration inside the cmux app, it survives
+  a process restart, and the stale env is a fellow-traveller of the move rather than its cause (probed
+  post-move with the CORRECT current workspace id: still no stamp). A `recycle` re-execs the pane on the
+  SAME surface, so the agent comes back dark, and a dark agent usually cannot even complete a recycle (it
+  fails the quiet-gate, which reads the very lifecycle the break freezes, so `--force` is needed just to
+  attempt the thing that will not work). The guidance now states the real remedy, `fleet archive` +
+  `fleet revive` (revive lands on a FRESH surface, verified live), states the real scope (an OBSERVABILITY
+  break: liveness, completion routing, and inbox delivery are all UNAFFECTED, so nobody should panic-wake a
+  detached agent), and points at prevention (launch children straight into their final workspace). The env
+  mismatch is retained where it was actually load-bearing: as a deterministic *detector* of a moved surface
+  in the attachment axis. Text and diagnostics only, no behavior change; the write-only `move_env_stale`
+  event is renamed `move_surface_detached` to stop encoding the falsified theory.
+
 - **Codex health check saw an expired token but not a REVOKED one (false-healthy).** `codex_health_check`
   short-circuited on the clock: `codex_ensure_fresh` returns the stored token with no server call whenever
   it is more than 30 min from expiry, so a token the ChatGPT backend had already revoked still reported

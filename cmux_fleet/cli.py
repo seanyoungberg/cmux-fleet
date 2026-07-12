@@ -3617,24 +3617,28 @@ def cmd_move(argv):
     # registry session), so warn rather than fail.
     live_note = ""
     if not fs.surface_has_live_agent(surf):
-        live_note = (f"\n[fleet]   note: cmux's hook store reads {a.label} as not-live post-move (a known "
-                     f"binding desync). Completions still route via the registry session; if `fleet ls` "
-                     f"shows STALE, `fleet recycle {a.label}` rebinds it.")
-    # The agent PROCESS keeps the CMUX_WORKSPACE_ID it was launched with — a live process's env cannot be
-    # rewritten. cmux's hooks resolve by that env, so after a move they silently no-op: agentLifecycle
-    # freezes at its last value, `fleet ls`/vitals read the agent as stale, and cmux's OWN sidebar loses the
-    # agent's metadata for that workspace. Verified 2026-07-10: usage-ops sat 82min frozen at 'unknown'
-    # while answering prompts; a recycle (fresh env) made the very next turn stamp 'idle'. Nothing in fleet
-    # can fix this in-process — only a relaunch re-exports the env. Say so rather than let it rot silently.
-    env_note = (f"\n[fleet]   WARNING: {a.label}'s process still exports the OLD CMUX_WORKSPACE_ID "
-                f"({cur_ws[:8]}); a running process's env cannot be rewritten. cmux's hooks resolve by it, "
-                f"so they will silently stop updating this agent (lifecycle freezes; ls/vitals read STALE; "
-                f"cmux's own sidebar drops its metadata). Run `fleet recycle {a.label}` to re-export the "
-                f"env and rebind the hooks — it keeps the session and context.")
+        live_note = (f"\n[fleet]   note: cmux's hook store reads {a.label} as not-live post-move. "
+                     f"Completions still route via the registry session; the agent is fine.")
+    # A move PERMANENTLY destroys the surface's agent-status registration inside the cmux APP. This is
+    # surface-scoped and survives a process restart, so nothing the fleet does in-process can undo it.
+    # Root-caused end-to-end 2026-07-10 (detachment-root-cause-2026-07-10.md), CORRECTING the earlier
+    # env-based story this warning used to tell: the stale CMUX_WORKSPACE_ID is a fellow-traveller of the
+    # move, NOT the cause (probed post-move with the correct current workspace id -> still no stamp), and
+    # so `fleet recycle` -- which only re-execs the pane on the SAME surface -- does NOT fix it and usually
+    # cannot even run (a dark agent fails the quiet-gate that reads the frozen lifecycle). Recommending a
+    # recycle here sent operators down a dead end. The remedy is archive + revive (revive = FRESH surface).
+    env_note = (f"\n[fleet]   WARNING: moving a live surface PERMANENTLY breaks {a.label}'s agent-status "
+                f"registration in cmux (surface-scoped; survives a restart). Lifecycle freezes, ls/vitals "
+                f"read STALE, and cmux's own sidebar drops its metadata. This is an OBSERVABILITY break "
+                f"only: {a.label} is still live, still working, and still receives its inbox -- do not "
+                f"panic-wake it. `fleet recycle` does NOT fix this (same surface, comes back dark). To "
+                f"restore observability: `fleet archive {a.label}` then `fleet revive {a.label}`, which "
+                f"lands it on a fresh surface. Better: never move a live surface -- launch children "
+                f"straight into their final workspace.")
     print(f"[fleet] moved {a.label}: surface {surf[:8]} {cur_ws[:8]} -> {new_ws[:8]}"
           + (f" (group '{new_group}')" if new_group else "")
           + f"; same session, still live.{live_note}{env_note}")
-    fs.log_event("move_env_stale", label=a.label, surface=surf, old_ws=cur_ws, new_ws=new_ws)
+    fs.log_event("move_surface_detached", label=a.label, surface=surf, old_ws=cur_ws, new_ws=new_ws)
     return 0
 
 
