@@ -30,7 +30,22 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
     that can tell them apart. A healthy fleet probes a handful of rows, not the board.
   - An **unregistered seat** (a live process with no hook-store record) never trusts a closed turn: that
     transcript belongs to a PRIOR session. This is the `claude --resume` picker window — hung at a dialog,
-    having never taken a turn.
+    having never taken a turn. `BOUND` is the visible guard at the short-circuit, and it is not redundant.
+  - **Both TUIs, captured not guessed.** Codex draws nothing like claude (caret `›` U+203A vs `❯` U+276F;
+    "Would you like to run the following command?" / "Press enter to confirm"), so its markers come from a
+    real codex seat driven into a genuine approval prompt. The structural claim the whole pane read rests on
+    — *a dialog REPLACES the normal chrome rather than rendering above it* — is now **measured** for both
+    tools (16 live codex frames: 7 pre-gate carry the chrome and no gate, 9 gated carry the gate and no
+    chrome). Had it been false for codex, "chrome present" would prove nothing and every gated codex seat
+    would have read `no`. Note the fleet's codex floor pins `--dangerously-bypass-approvals-and-sandbox`
+    (and codex refuses to combine it with `-a`/`-s`), so **no fleet-launched codex agent can raise an
+    approval dialog** — the markers matter the moment one runs without the bypass.
+  - **The `--watch` probe is debounced, not weakened.** A probe is a READ — it cannot wedge anything, only a
+    SEND can — so accuracy is never behind a flag. Cheapness comes from not repeating work: a surface whose
+    advance marker (session | record `updatedAt` | transcript mtime+size) has not moved reuses its verdict
+    rather than re-reading the pane each tick, so a stable blocked agent costs ONE probe. The marker cannot
+    sit still while a dialog appears, because every way a gate can ARRIVE writes first. Never cached: an
+    unregistered seat (no marker → a frozen verdict) or an inconclusive pane (`?` is not a finding).
   - Verified end-to-end against the live 16-agent fleet by raising a REAL gate and reading the board from
     outside: `blocked=True (feed: unreplied gate row for this session)` naming exactly one agent, zero false
     positives across the other 16 in six consecutive samples.
