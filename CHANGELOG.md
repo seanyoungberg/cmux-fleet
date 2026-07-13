@@ -27,6 +27,30 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Fixed
 
+- **Subscription-usage sidebar: split by provider, email labels, per-window resets, Fable, codex handled.**
+  The footer now reads correctly per account once the fleet polls several claude/codex subscriptions at once.
+  Six things were wrong or missing, all verified by RUNNING the interpreter (the `sidebar-probe` harness)
+  against the live board, not reasoning about it:
+  - **Colliding account name.** `usage_for_paint`'s display label preferred the claude `display_name`, which
+    is "Berg" for *both* of Berg's accounts (one capital-B, one lower) — so two rows rendered as "Berg"/"berg".
+    It now prefers the **email** (`seanyoungberg@gmail.com` vs `sean@berglabs.net`), unique and matching what
+    codex already does. A dim `·config-id` tag (`·berg-max`) ties the email back to the config/dir naming.
+  - **Split by provider.** Every usage line now carries a provider chip (claude ✻ / codex ‹∕›), reusing the
+    per-row tool-icon vocabulary, so a claude and a codex subscription are never confused.
+  - **Per-window reset timers.** The line carried ONE countdown (the shortest window's). Each rolling window
+    (5h, 7d) now shows its OWN `resets in`, so a 5h reset and a 7d reset are independent.
+  - **The claude weekly scoped sub-limit (Fable/Opus) is now surfaced** with its own %+reset — it was being
+    dropped from the footer entirely (Berg's berg-max was sitting at 95% on it, invisible).
+  - **Codex 5h window.** Confirmed the codex `/backend-api/codex/usage` payload exposes only a 7-day window
+    for these team seats (`secondary_window` is null); the sidebar correctly shows 7d only. Nothing dropped —
+    the length-labelled normalizer will surface a 5h automatically if the server ever returns one.
+  - The `_usage_lines` record is an **append-only superset** of the old 7-field shape (0-6 unchanged, 7-12
+    new), so `fleet.swift` (live via symlink the moment it's committed) and the daemon painter (live only
+    after `uv tool install --force`) degrade gracefully in both directions during the adopt window — proven
+    by rendering both shapes through the interpreter.
+  - Also folds in the per-row tool-type icon for agent rows (every row declares its tool; a new tool is one
+    line in `toolSpec`), previously stranded on `dev/sidebar-tool-icon`.
+
 - **`fleet revive` could land an agent on a dark surface — the cure reproduced the disease.** `revive` is
   the *prescribed remedy* for a dark surface, and it had no dark check of its own. It bit production an hour
   after the launch fix shipped: `cmux-custom` was archived and revived, the revive landed it dark, and it

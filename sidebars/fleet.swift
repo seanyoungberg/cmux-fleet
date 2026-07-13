@@ -12,8 +12,9 @@
 // repaint never clobbers the choice.
 //
 // USAGE FOOTER: fleet-global subscription usage has no per-workspace channel, so it rides every conductor's
-// description after a `⧗` (`…⧗label~stale~5h~44~7d~34~2h⧗…`, one line per subscription); the footer reads it
-// off the first conductor. `⧗` is stripped from record text, so the record parse above is never affected.
+// description after a `⧗` (one line per subscription; append-only superset shape documented at usageField
+// below, e.g. `…⧗email~0~5h~15~7d~94~56m~claude~berg-max~2d~Fable~95~2d⧗…`). The footer reads it off the
+// first conductor. `⧗` is stripped from record text, so the record parse above is never affected.
 //
 // INTERPRETER RULES (each fails SILENTLY — a wrong guard just renders nothing, no error anywhere):
 //   • reach optionals with `if let`, never `== nil` / `!= nil` (those evaluate to nothing);
@@ -119,11 +120,30 @@ func metaText(_ w) -> String {
   if ee == "" { return mm }
   return "\(mm) · \(ee)"
 }
-// tool (field 6) — a small SF Symbol, no box. Only mark non-claude; claude is the default and stays bare.
-func toolIcon(_ w) -> some View {
-  if toolOf(w) == "codex" {
-    return AnyView(Image(systemName: "chevron.left.forwardslash.chevron.right")
-      .font(.system(size: 10)).foregroundColor("#D0A46C"))
+// tool — EVERY agent row (field 6) and every usage line (field 7) declares which tool it runs. Not "mark the
+// exception, leave claude bare": a bare row silently means "claude", which stops being readable the moment a
+// third tool exists AND leaves the split-by-provider usage footer with no way to tell claude from codex.
+//
+// ADDING A TOOL IS ONE LINE HERE. The spec is "<sf-symbol>~<hex>" and `toolGlyph` below is tool-agnostic.
+// Verify a new symbol NAME resolves before trusting it: a bogus systemName draws NOTHING, silently — the
+// same failure family as the interpreter bugs this file's rules are about (cmux#7943). Check it with:
+//   swift -e 'import AppKit; print(NSImage(systemSymbolName: "your.symbol", accessibilityDescription: nil) != nil)'
+func toolSpec(_ t) -> String {
+  if t == "claude" { return "asterisk~#C96442" }
+  if t == "codex"  { return "chevron.left.forwardslash.chevron.right~#D0A46C" }
+  if t == "pi"     { return "circle.hexagongrid.fill~#6C8FD0" }
+  if t == "-"      { return "" }                  // no tool for this row: draw nothing
+  if t == ""       { return "" }
+  return "questionmark.circle~#6F6E77"            // UNKNOWN tool: SHOW it. Never silently omit a row's tool.
+}
+// the chip for a tool STRING — the ONE builder, shared by agent rows and the usage footer. POSITIVE guard,
+// one branch, falls through to EmptyView; bind the split to a `let` before indexing it (interpreter rules).
+func toolGlyph(_ t) -> some View {
+  let spec = toolSpec(t)
+  if spec != "" {
+    let p = spec.split(separator: "~")
+    return AnyView(Image(systemName: String(p[0]))
+      .font(.system(size: 10)).foregroundColor(String(p[1])))
   }
   return AnyView(EmptyView())
 }
@@ -195,9 +215,15 @@ func extraBadge(_ w) -> some View {                          // "+N" when agents
 
 // ── fleet-global subscription usage ────────────────────────────────────────────────────────────
 // cmux gives a custom sidebar NO global channel, so `fleet paint` rides the usage panel on every
-// conductor's description after a ⧗: "FLEET4;<rec>⧗label~stale~5h~44~7d~34~2h⧗…". ONE line per
-// subscription: the REAL account, each rolling window's CONSUMED %, and when the soonest window resets.
-// A '1' stale flag renders one clean "usage stale" line instead of confident-looking garbage.
+// conductor's description after a ⧗, ONE line per subscription. The line is an APPEND-ONLY superset of the
+// original 7-field shape — fields 0-6 keep their old meaning, 7-12 are new:
+//   0 label  1 stale  2 w1L  3 w1P  4 w2L  5 w2P  6 w1reset  7 tool  8 acct  9 w2reset  10 scL  11 scP  12 scReset
+//   "…⧗seanyoungberg@gmail.com~0~5h~15~7d~94~56m~claude~berg-max~2d~Fable~95~2d⧗…"
+// So it renders each subscription SPLIT BY PROVIDER (a claude/codex chip), keyed by the unambiguous EMAIL
+// (display_name collides — both of Berg's are "Berg"), with EACH window's own reset and the scoped weekly
+// sub-limit (Fable). Reading fewer fields is safe: an un-adopted painter emits only 0-6, and this sidebar's
+// positive guards make 7-12 render nothing when absent — no garble either direction. A '1' stale flag
+// renders one clean "usage stale" line instead of confident-looking garbage.
 func hasUsage(_ w) -> Bool { return descOf(w).contains("⧗") }
 func usageField(_ s, _ i) -> String {
   let t = s.split(separator: "~")
@@ -209,24 +235,32 @@ func usageColor(_ used) -> String {                           // by CONSUMED sha
   if used > 60 { return "#F5A623" }
   return "#30A46C"
 }
-// one window as "5h 44%" — the label dim, the % colored by consumption. POSITIVE guard: render only when
-// the window is present, fall through to EmptyView (an absent window must add NOTHING to the row).
-func usageWindow(_ label, _ pctS) -> some View {
+// one window as "5h 15% ↻56m" — label dim, % colored by consumption, its OWN reset trailing (dim). POSITIVE
+// guard: render only when the window is present, fall through to EmptyView (an absent window adds NOTHING).
+// The reset is per-window: a 5h window and a 7d window each show when THEY refresh, not one shared countdown.
+func usageWinReset(_ label, _ pctS, _ reset) -> some View {
   if label != "-" && label != "" && pctS != "-" {
     let used = Double(pctS)
     return AnyView(HStack(spacing: 3) {
       Text(label).font(.system(size: 11, design: .monospaced)).foregroundColor("#8B8D98")
       Text("\(Int(used))%").font(.system(size: 12, design: .monospaced)).foregroundColor(usageColor(used))
+      usageReset(reset)
     })
   }
   return AnyView(EmptyView())
 }
-func resetView(_ reset) -> some View {                       // "↻ 2h" — when the soonest window refreshes
+func usageReset(_ reset) -> some View {                       // "↻56m" — trails its own window; dim
   if reset != "-" && reset != "" {
-    return AnyView(HStack(spacing: 2) {
-      Image(systemName: "arrow.clockwise").font(.system(size: 8)).foregroundColor("#6F6E77")
-      Text(reset).font(.system(size: 11, design: .monospaced)).foregroundColor("#6F6E77")
+    return AnyView(HStack(spacing: 1) {
+      Image(systemName: "arrow.clockwise").font(.system(size: 7)).foregroundColor("#6F6E77")
+      Text(reset).font(.system(size: 10, design: .monospaced)).foregroundColor("#6F6E77")
     })
+  }
+  return AnyView(EmptyView())
+}
+func usageAccount(_ acct) -> some View {                      // dim "·berg-max" — ties the email to config/dir naming
+  if acct != "-" && acct != "" {
+    return AnyView(Text("·\(acct)").font(.system(size: 9, design: .monospaced)).foregroundColor("#5A5A63").lineLimit(1))
   }
   return AnyView(EmptyView())
 }
@@ -236,6 +270,7 @@ func resetView(_ reset) -> some View {                       // "↻ 2h" — whe
 func usageStale(_ s) -> some View {
   if usageField(s, 1) == "1" {
     return AnyView(HStack(spacing: 6) {
+      toolGlyph(usageField(s, 7))                             // provider chip (claude/codex) even when stale
       Text(usageField(s, 0)).font(.system(size: 12, design: .monospaced)).foregroundColor("#B8B8C0").lineLimit(1)
       Text("· usage stale").font(.system(size: 12)).foregroundColor("#6F6E77")
       Spacer()
@@ -243,14 +278,23 @@ func usageStale(_ s) -> some View {
   }
   return AnyView(EmptyView())
 }
+// Two lines per subscription: [chip · email · dim config-id], then the windows each with their own reset.
+// A single-window provider (codex 7d) just draws one window; the Fable scoped sub-limit draws only when set.
 func usageFresh(_ s) -> some View {
   if usageField(s, 1) != "1" {
-    return AnyView(HStack(spacing: 9) {
-      Text(usageField(s, 0)).font(.system(size: 12, design: .monospaced)).foregroundColor("#D8D8E0").lineLimit(1)
-      usageWindow(usageField(s, 2), usageField(s, 3))        // 5h
-      usageWindow(usageField(s, 4), usageField(s, 5))        // 7d
-      Spacer()
-      resetView(usageField(s, 6))
+    return AnyView(VStack(alignment: .leading, spacing: 1) {
+      HStack(spacing: 6) {
+        toolGlyph(usageField(s, 7))
+        Text(usageField(s, 0)).font(.system(size: 12, design: .monospaced)).foregroundColor("#D8D8E0").lineLimit(1)
+        usageAccount(usageField(s, 8))
+        Spacer()
+      }
+      HStack(spacing: 10) {
+        usageWinReset(usageField(s, 2), usageField(s, 3), usageField(s, 6))     // w1 (5h / 7d) + its reset
+        usageWinReset(usageField(s, 4), usageField(s, 5), usageField(s, 9))     // w2 (7d) + its reset
+        usageWinReset(usageField(s, 10), usageField(s, 11), usageField(s, 12))  // scoped weekly sub-limit (Fable)
+        Spacer()
+      }.padding(.leading, 16)
     })
   }
   return AnyView(EmptyView())
@@ -274,7 +318,7 @@ func agentRow(_ w, _ isCon) -> some View {
             .fontWeight(isCon ? .bold : .semibold)
             .foregroundColor(isCon ? colorFor(stateOf(w)) : "#E8E8EC")
             .lineLimit(1).truncationMode(.tail)
-          toolIcon(w)
+          toolGlyph(toolOf(w))
           Spacer()
           extraBadge(w)
           unreadDot(w)

@@ -864,21 +864,24 @@ def test_paint_clears_the_blob_when_the_sidebar_is_disabled(monkeypatch):
 
 # ── subscription-usage panel (per subscription, NOT per agent) — from the stable usage_for_paint() ──
 def test_usage_lines_from_the_accessor(monkeypatch):
-    # ONE line per subscription: the REAL account (label), each rolling window's %, and the soonest reset.
+    # ONE line per subscription, append-only superset shape (0-6 legacy, 7-12 new):
+    #   label~stale~w1L~w1P~w2L~w2P~w1reset~tool~acct~w2reset~scL~scP~scReset
+    # Each rolling window AND the scoped weekly sub-limit (Fable) carry their OWN reset; `tool` drives the
+    # provider chip; `acct` is the config/dir id.
     ff = _ff()
     from cmux_fleet import providers as pv
     monkeypatch.setattr(pv, "usage_for_paint", lambda: {"schema": 1, "providers": [
-        {"kind": "subscription", "account": "berg-max", "label": "Berg", "ok": True, "stale": False,
+        {"kind": "subscription", "account": "berg-max", "label": "Berg", "tool": "claude", "ok": True, "stale": False,
          "windows": [{"label": "5h", "pct": 44.0, "resets_in_s": 7200},
                      {"label": "7d", "pct": 34.0, "resets_in_s": 500000},
-                     {"label": "Fable", "pct": 90, "scoped": True}]},           # scoped -> skipped
-        {"kind": "subscription", "account": "berg-team", "label": "sean@x.com", "ok": True, "stale": True,
+                     {"label": "Fable", "pct": 90, "resets_in_s": 86400, "scoped": True}]},   # scoped -> its OWN line-tail
+        {"kind": "subscription", "account": "berg-team", "label": "sean@x.com", "tool": "codex", "ok": True, "stale": True,
          "windows": [{"label": "5h", "pct": 1.0, "resets_in_s": 900}]},         # stale -> one clean line
         {"kind": "api", "account": "vertex-x", "ok": True, "stale": False, "windows": []},   # not a sub -> skip
     ]})
     assert ff._usage_lines() == [
-        "Berg~0~5h~44~7d~34~2h",           # label from `label`, 5h+7d %, reset of the shortest window
-        "sean@x.com~1~-~-~-~-~-",          # stale -> stale flag, no numbers (renders one clean line)
+        "Berg~0~5h~44~7d~34~2h~claude~berg-max~5d~Fable~90~1d",  # 5h+7d each own reset; claude chip; Fable surfaced
+        "sean@x.com~1~-~-~-~-~-~codex~berg-team~-~-~-~-",        # stale -> flag+tool+acct, no numbers (one clean line)
     ]
 
 
@@ -887,10 +890,11 @@ def test_usage_lines_use_label_not_config_id_and_one_window(monkeypatch):
     ff = _ff()
     from cmux_fleet import providers as pv
     monkeypatch.setattr(pv, "usage_for_paint", lambda: {"schema": 1, "providers": [
-        {"kind": "subscription", "account": "berg-team", "label": "sean.youngberg@gmail.com",
+        {"kind": "subscription", "account": "berg-team", "label": "sean.youngberg@gmail.com", "tool": "codex",
          "ok": True, "stale": False, "windows": [{"label": "30d", "pct": 12.0, "resets_in_s": 200000}]},
     ]})
-    assert ff._usage_lines() == ["sean.youngberg@gmail.com~0~30d~12~-~-~2d"]   # label shown; 2nd window '-'
+    assert ff._usage_lines() == [
+        "sean.youngberg@gmail.com~0~30d~12~-~-~2d~codex~berg-team~-~-~-~-"]   # label shown; 2nd window + Fable '-'
 
 
 def test_usage_lines_gate_on_schema(monkeypatch):

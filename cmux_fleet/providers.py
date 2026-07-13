@@ -1409,8 +1409,11 @@ def usage_for_paint():
         ca = r.get("checked_at")
         ident = r.get("identity") or {}
         # `account` = config id (stable key, e.g. "berg-max"); `identity`/`label` = the REAL account for
-        # display (email + name), so the sidebar shows "Berg (seanyoungberg@gmail.com)" not "berg-max".
-        label = ident.get("display") or ident.get("email") or r.get("name", "")
+        # display. EMAIL FIRST, deliberately: a claude account's `display_name` is a free-text handle the
+        # user picked, and Berg's two subscriptions BOTH set it to "Berg"/"berg" — so display collides while
+        # the emails (seanyoungberg@gmail.com vs sean@berglabs.net) are unique. Codex already labels by email
+        # for the same reason; matching that makes the sidebar's identity unambiguous across every provider.
+        label = ident.get("email") or ident.get("display") or r.get("name", "")
         provs.append({
             "id": pid, "tool": r.get("tool", ""), "account": r.get("name", ""),
             "badge": _provider_badge(r.get("tool", "")),        # §3: source chip (Claude Code / Codex / …)

@@ -486,9 +486,9 @@ def test_usage_for_paint_surfaces_real_identity():
     p = {x["id"]: x for x in pv.usage_for_paint()["providers"]}
     # `account` stays the config id (stable key); `label`/`identity` carry the REAL account for display
     assert p["claude:berg-max"]["account"] == "berg-max"
-    assert p["claude:berg-max"]["label"] == "Berg"                          # display preferred
+    assert p["claude:berg-max"]["label"] == "seanyoungberg@gmail.com"       # EMAIL preferred (display "Berg" collides)
     assert p["claude:berg-max"]["identity"]["email"] == "seanyoungberg@gmail.com"
-    assert p["codex:acct2"]["label"] == "other@example.com"                 # email when no display
+    assert p["codex:acct2"]["label"] == "other@example.com"                 # email (also the only identity here)
     assert p["claude:noident"]["label"] == "noident"                        # falls back to config id
 
 

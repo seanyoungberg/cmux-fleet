@@ -1583,14 +1583,22 @@ def _fmt_reset(secs):
 
 def _usage_lines():
     """Compact per-SUBSCRIPTION usage for the sidebar footer, from the STABLE `usage_for_paint()` accessor
-    (schema 1). ONE record per subscription provider, rendered on ONE line:
-        label~stale~w1label~w1pct~w2label~w2pct~reset
-    `label` is the REAL account (accessor's `label` = oauth display/email, falling back to the config id),
-    never the config-id `account`. The first two NON-scoped windows (shortest first — typically 5h + 7d)
-    carry their CONSUMED %; `reset` is the shortest window's 'resets in' (the soonest-refreshing limit).
-    A poll that FAILED or is STALE serializes stale '1' and no numbers, so it renders as one clean line
-    instead of confident-looking garbage. Provider-agnostic (skips api/vertex rows with no windows).
-    Returns [] on no snapshot OR a schema mismatch — an unknown schema renders nothing, never mis-parses."""
+    (schema 1). ONE record per subscription provider, rendered on ONE line. The record is an APPEND-ONLY
+    superset of the v1 shape — fields 0-6 keep their exact v1 meaning, 7-12 are new:
+        0 label    1 stale   2 w1label  3 w1pct  4 w2label  5 w2pct  6 w1reset
+        7 tool     8 account 9 w2reset  10 scLabel 11 scPct 12 scReset
+    Why append-only: `fleet.swift` deploys the instant it's committed (it's symlinked live), but this
+    painter only reaches the daemon after an `uv tool install --force` adopt. So the two sides skew for a
+    window. Because 0-6 are unchanged, an un-adopted sidebar renders 5h/7d/reset off a new-shape line, and
+    a not-yet-updated sidebar ignores 7-12 off any line — neither garbles. NEVER reorder or repurpose 0-6.
+
+    `label` is the REAL account (accessor's `label`, now EMAIL-first — unique where display_name collides).
+    `tool` drives the per-provider chip (claude vs codex) so the split-by-provider footer is legible. Each
+    rolling window (5h, 7d) AND the scoped weekly sub-limit (Fable/Opus) carry their OWN 'resets in', so a
+    5h reset and a 7d reset are shown independently instead of one shared countdown. A poll that FAILED or
+    is STALE serializes stale '1' and no numbers -> one clean line, not confident-looking garbage.
+    Provider-agnostic (skips api/vertex rows with no windows). Returns [] on no snapshot OR a schema
+    mismatch — an unknown schema renders nothing, never mis-parses."""
     try:
         from . import providers as pv
         view = pv.usage_for_paint()
@@ -1598,26 +1606,35 @@ def _usage_lines():
         return []
     if view.get("schema") != 1:                              # gate on the shape THIS code was written against
         return []
+    E = "-"                                                  # the empty-field sentinel (swift split drops "")
 
     def pct(x):
-        return str(int(x)) if isinstance(x, (int, float)) else "-"
+        return str(int(x)) if isinstance(x, (int, float)) else E
 
     lines = []
     for p in view.get("providers", []):
         if p.get("kind") != "subscription":
             continue
         label = _blob_clean(p.get("label") or p.get("account") or "?", 32)   # fits a full email; swift truncates
-        wins = [w for w in (p.get("windows") or []) if not w.get("scoped")]   # rolling windows, not scoped (Fable)
+        tool = _blob_clean(p.get("tool") or "", 8)
+        acct = _blob_clean(p.get("account") or "", 24)       # config/dir id (dim tag; ties display to naming)
+        allw = p.get("windows") or []
+        wins = [w for w in allw if not w.get("scoped")]      # rolling windows (5h, 7d), shortest first
+        sc = next((w for w in allw if w.get("scoped")), None)  # the scoped weekly sub-limit (Fable/Opus)
         if (not p.get("ok")) or p.get("stale") or not wins:
-            lines.append("~".join([label, "1", "-", "-", "-", "-", "-"]))     # untrusted -> one clean stale line
+            lines.append("~".join([label, "1", E, E, E, E, E, tool, acct, E, E, E, E]))  # untrusted -> stale line
             continue
         w1 = wins[0]
         w2 = wins[1] if len(wins) > 1 else {}
         lines.append("~".join([
             label, "0",
             _blob_clean(w1.get("label") or "", 6), pct(w1.get("pct")),
-            _blob_clean(w2.get("label") or "", 6) if w2 else "-", pct(w2.get("pct")) if w2 else "-",
+            _blob_clean(w2.get("label") or "", 6) if w2 else E, pct(w2.get("pct")) if w2 else E,
             _fmt_reset(w1.get("resets_in_s")),
+            tool, acct,
+            _fmt_reset(w2.get("resets_in_s")) if w2 else E,
+            _blob_clean(sc.get("label") or "", 8) if sc else E, pct(sc.get("pct")) if sc else E,
+            _fmt_reset(sc.get("resets_in_s")) if sc else E,
         ]))
     return lines
 
