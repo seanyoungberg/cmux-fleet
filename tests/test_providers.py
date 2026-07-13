@@ -86,6 +86,99 @@ def test_absent_providers_block_is_inert(tmp_path, monkeypatch):
     assert pv.default_provider("claude") == ""
 
 
+# --- fix 2: a malformed [providers] table must REFUSE loudly, not silently disable the feature -----
+# `_providers_doc` used to return {} on ANY parse error — the SAME value as a legitimately-absent table —
+# so one bad TOML character made `default_provider` return "", launches inject nothing, and the WHOLE fleet
+# silently routes to the ambient account (the unknown-is-not-absence bug class). Now: absent stays {},
+# unreadable RAISES.
+def test_valid_toml_without_providers_table_is_inert(tmp_path, monkeypatch):
+    # a toml that EXISTS and parses but has no [providers] table -> legal single-account opt-out -> {}.
+    p = tmp_path / "fleet.toml"
+    p.write_text('[fleet]\nstate_dir = "/tmp/x"\n')
+    monkeypatch.setattr(pv, "FLEET_TOML", str(p))
+    assert pv._providers_doc() == {}
+    assert pv.default_provider("claude") == ""                   # inert, exactly like before
+
+
+def test_malformed_toml_raises_named_error_not_empty(tmp_path, monkeypatch):
+    p = tmp_path / "fleet.toml"
+    p.write_text('[providers.claude]\ndefault = "berg   # <- unterminated string: a parse error\n')
+    monkeypatch.setattr(pv, "FLEET_TOML", str(p))
+    with pytest.raises(pv.ProviderError) as ei:
+        pv._providers_doc()                                      # RAISES, does not collapse to {}
+    assert "unparseable" in str(ei.value)                        # names the parse failure
+    with pytest.raises(pv.ProviderError):
+        pv.default_provider("claude")                            # the "" that rerouted the fleet can't happen
+    with pytest.raises(pv.ProviderError):
+        pv.resolve_launch("claude", "")                          # launch-time resolution refuses too
+
+
+def test_poll_all_paints_a_config_error_and_never_raises(tmp_path, monkeypatch):
+    # THE daemon-survival property: a broken toml must not sink the poll (the daemon's generic catch would
+    # leave the LAST snapshot lingering = "all fine") NOR silently empty it. poll_all paints ONE loud
+    # ok=False config-error row and returns normally.
+    p = tmp_path / "fleet.toml"
+    p.write_text('[providers.claude]\ndefault = "berg  # unterminated\n')
+    monkeypatch.setattr(pv, "FLEET_TOML", str(p))
+    snap = pv.poll_all()                                         # does NOT raise
+    assert set(snap) == {"_config:toml"}
+    rec = snap["_config:toml"]
+    assert rec["ok"] is False and rec.get("config_error") and "unparseable" in rec["error"]
+    from cmux_fleet import state as fs
+    assert fs.provider_usage_read()["_config:toml"]["ok"] is False   # persisted for `fleet usage` to surface
+
+
+def test_codex_health_check_survives_a_broken_toml(tmp_path, monkeypatch):
+    # codex_health_check runs on the daemon timer and documents "Never raises" — the broken-toml raise from
+    # iter_providers must not break that contract (poll_all already paints the loud row; this returns []).
+    p = tmp_path / "fleet.toml"
+    p.write_text('[providers.codex]\ndefault = "berg  # unterminated\n')
+    monkeypatch.setattr(pv, "FLEET_TOML", str(p))
+    assert pv.codex_health_check() == []
+
+
+def test_launch_aborts_loudly_on_malformed_toml(tmp_path, monkeypatch):
+    # the end-to-end safety property: a broken toml must never let a launch proceed silently onto the
+    # ambient account. cmd_launch aborts (SystemExit) naming the unreadable file — a loud refusal.
+    p = tmp_path / "fleet.toml"
+    p.write_text('[providers.claude]\ndefault = "berg  # unterminated\n[role.x]\n')
+    monkeypatch.setattr(cli, "FLEET_TOML", str(p))
+    monkeypatch.setattr(pv, "FLEET_TOML", str(p))
+    with pytest.raises(SystemExit) as ei:
+        cli.cmd_launch(["x", "--parent", "P", "--dry-run"])
+    assert str(p) in str(ei.value) or "unparseable" in str(ei.value)   # names the failure; never silent
+
+
+def test_sidebar_footer_surfaces_a_broken_toml_row(tmp_path, monkeypatch):
+    # fix 2, the SECOND surface: the config-error row poll_all paints must be VISIBLE in the sidebar footer,
+    # not silently dropped with the other non-subscription rows (a blank footer reads as "everything fine").
+    p = tmp_path / "fleet.toml"
+    p.write_text('[providers.claude]\ndefault = "berg  # unterminated\n')
+    monkeypatch.setattr(pv, "FLEET_TOML", str(p))
+    pv.poll_all()                                               # writes the config-error snapshot
+    view = pv.usage_for_paint()
+    assert view["providers"] and view["providers"][0]["config_error"] is True   # exposed on the paint accessor
+    lines = ff._usage_lines()
+    assert any("fleet.toml unreadable" in ln for ln in lines)   # ...and rendered loudly in the footer
+
+
+def test_main_converts_provider_error_to_a_clean_abort(monkeypatch):
+    # fix 2, finding 4: a ProviderError from a provider-iterating verb (the codex operator verbs iterate
+    # unwrapped) becomes a NAMED refusal via main()'s handler, not a raw traceback. Unrelated exceptions
+    # still propagate untouched.
+    monkeypatch.setattr(cli.sys, "argv", ["fleet", "codex-login"])
+    monkeypatch.setattr(cli, "verb_table",
+                        lambda: {"codex-login": lambda rest: (_ for _ in ()).throw(
+                            pv.ProviderError("the fleet toml is unparseable (x): bad"))})
+    with pytest.raises(SystemExit) as ei:
+        cli.main()
+    assert "ABORT" in str(ei.value) and "unparseable" in str(ei.value)
+    monkeypatch.setattr(cli, "verb_table",
+                        lambda: {"codex-login": lambda rest: (_ for _ in ()).throw(ValueError("unrelated"))})
+    with pytest.raises(ValueError):
+        cli.main()                                              # a non-ProviderError is NOT swallowed
+
+
 # --- launch-time auth resolution ------------------------------------------------------------------
 def test_resolve_default_claude_keychain_is_noop(providers_toml):
     r = pv.resolve_launch("claude", "berg-max")

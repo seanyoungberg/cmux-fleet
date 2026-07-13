@@ -89,16 +89,31 @@ class ProviderTransientError(ProviderError):
 
 # --- config parse -------------------------------------------------------------------------------
 def _providers_doc():
-    """Parse the top-level [providers] table from the fleet toml. Absent/malformed → {} (the feature is
-    optional; a fleet with no [providers] behaves exactly as before). Shape returned:
-        {tool: {"default": <name|"">, "providers": {name: {type, auth, track}}}}"""
+    """Parse the top-level [providers] table from the fleet toml. Shape returned:
+        {tool: {"default": <name|"">, "providers": {name: {type, auth, track}}}}
+
+    ABSENT (no toml reader, file missing, or no [providers] table) → {}: the feature is optional, and a
+    fleet with no [providers] behaves exactly as before (single-account opt-in). UNREADABLE (a TOML parse
+    error, or the file can't be read) is NOT absent — collapsing it to {} is the unknown-is-not-absence bug
+    (`default_provider` returns "", every launch injects nothing, and the WHOLE fleet silently routes to the
+    ambient account off one bad character). So a parse/read failure RAISES ProviderError, named; callers
+    (launch, recycle/revive, poll_all) turn that into a loud abort or a painted error, never a silent {}."""
     if not tomllib or not os.path.exists(FLEET_TOML):
         return {}
     try:
         with open(FLEET_TOML, "rb") as f:
-            root = tomllib.load(f).get("providers") or {}
-    except (OSError, ValueError):
-        return {}
+            raw = tomllib.load(f)
+    except tomllib.TOMLDecodeError as e:
+        # A parse error is all-or-nothing: tomllib can't tell us whether it was the [providers] table or an
+        # unrelated block that broke, so we can't tell "no accounts configured" from "the accounts config is
+        # broken". Refuse rather than guess — collapsing to {} would silently route a multi-account fleet to
+        # the ambient credential. Fix the syntax and the recycle/launch proceeds.
+        raise ProviderError(f"the fleet toml is unparseable ({FLEET_TOML}): {e}. Fix the TOML syntax; the "
+                            f"provider feature refuses to guess whether accounts are configured off a broken "
+                            f"parse.")
+    except OSError as e:
+        raise ProviderError(f"could not read the fleet toml ({FLEET_TOML}): {e}")
+    root = raw.get("providers") or {}                # absent table → {} (legal single-account opt-out)
     out = {}
     for tool, block in root.items():
         if not isinstance(block, dict):
@@ -547,7 +562,11 @@ def codex_health_check():
     'needs-home' (no per-seat home declared — a CONFIG gap, actionable, never an alert) | 'error'
     (transient). Never raises."""
     out = []
-    for tool, name, spec, _ in iter_providers():
+    try:
+        provs = list(iter_providers())               # _providers_doc raises on a broken toml — keep the
+    except ProviderError:                            # never-raises contract (poll_all paints the loud
+        return out                                   # config-error row; this timer needn't double-alert)
+    for tool, name, spec, _ in provs:
         if tool != "codex" or spec.get("type") != "subscription":
             continue
         rec = {"acct": name, "email": None, "checked_at": int(time.time())}
@@ -1306,7 +1325,20 @@ def poll_all():
     with `track = none` (e.g. vertex) or no registered poller is skipped."""
     from . import state as fs
     out = {}
-    for tool, name, spec, is_default in iter_providers():
+    try:
+        provs = list(iter_providers())               # materialize: _providers_doc raises on a broken toml
+    except ProviderError as e:
+        # A broken fleet toml must NOT sink the daemon poll (a raise here would empty this tick — the
+        # generic daemon catch logs it, but the LAST snapshot lingers and reads as "everything's fine")
+        # NOR silently empty the snapshot. Paint ONE loud config-error row (`ok=False` + `config_error`):
+        # `fleet usage` renders it as "!! not readable: …", and the sidebar footer renders a stale error
+        # line ("fleet.toml unreadable"), so the operator SEES the config is the problem on BOTH surfaces
+        # instead of the sidebar silently going blank. The daemon stays alive (this returns normally).
+        rec = {"tool": "_config", "name": "toml", "type": "config", "is_default": False,
+               "ok": False, "error": str(e), "config_error": True, "checked_at": int(time.time())}
+        fs.provider_usage_write({"_config:toml": rec})
+        return {"_config:toml": rec}
+    for tool, name, spec, is_default in provs:
         if spec.get("track") == "none":
             continue
         poller = _POLLERS.get(spec.get("poller") or tool)
@@ -1423,6 +1455,9 @@ def usage_for_paint():
             "kind": r.get("type", ""), "plan": r.get("plan", ""),
             "is_default": bool(r.get("is_default")),
             "ok": bool(r.get("ok")), "error": r.get("error"), "stale": bool(r.get("stale")),
+            # config_error: the broken-toml row poll_all paints (fix 2) — carried through so the sidebar
+            # footer can render it loudly instead of silently dropping a non-subscription row.
+            "config_error": bool(r.get("config_error")),
             "checked_at": ca, "age_s": (int(time.time()) - int(ca)) if ca else None,
             "windows": windows, "headline": _headline(windows), "budget": r.get("budget"),
             # §2 keep-stale-grayed: hard-cap signal + the metered-spend cap distinct from the % bars

@@ -1613,6 +1613,13 @@ def _usage_lines():
 
     lines = []
     for p in view.get("providers", []):
+        if p.get("config_error"):
+            # the broken-toml row poll_all paints (fix 2): render a LOUD stale line rather than dropping it
+            # with the non-subscription rows below — a silently blank footer on a broken toml is the exact
+            # "reads as fine" failure the refuse-loudly fix exists to kill. Format-preserving (a normal
+            # stale line); fleet.swift shows it as an untrusted entry named "fleet.toml unreadable".
+            lines.append("~".join(["fleet.toml unreadable", "1", E, E, E, E, E, E, E, E, E, E, E]))
+            continue
         if p.get("kind") != "subscription":
             continue
         label = _blob_clean(p.get("label") or p.get("account") or "?", 32)   # fits a full email; swift truncates

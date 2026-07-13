@@ -1621,7 +1621,12 @@ def cmd_launch(argv):
         # default resolves to nothing injected, so this stays byte-identical to today for the ambient case;
         # only an explicit securestorage/home default changes the launch. (default_provider("") for a tool with
         # no [providers.<tool>] block is "", so a single-account user still gets zero injection — opt-in holds.)
-        pname = pv.default_provider(spec["tool"])
+        # default_provider raises ProviderError on an UNREADABLE toml (fix 2): abort loudly rather than
+        # let a broken parse fall through to "" (zero injection = the whole fleet on the ambient account).
+        try:
+            pname = pv.default_provider(spec["tool"])
+        except pv.ProviderError as e:
+            sys.exit(f"[fleet] ABORT: {e}")
     if pname:
         try:
             pr = pv.resolve_launch(spec["tool"], pname)
@@ -3334,7 +3339,10 @@ def _build_archive_entry(e, b):
     `fleet rm --kill` (force-archive-on-kill: --kill was the one removal path that left no recovery
     trace)."""
     arch = {k: e[k] for k in ("role", "kind", "tool", "cwd", "parent", "place",
-                              "plugins", "flags", "settings", "group", "worktree") if k in e}
+                              # `provider` (fix 1): the account recorded at launch, carried so a REVIVE can
+                              # compare against the re-resolved account and warn loudly when it moved (else
+                              # the archived row has no provider and the move-warn can never fire).
+                              "plugins", "flags", "settings", "group", "worktree", "provider") if k in e}
     # last_session = the id `fleet revive` will `--resume`. Prefer cmux's CHECKPOINT (ground truth, read
     # off the binding above) over the registry `session`, which can be a stale bridge id from bind time
     # (the registry-vs-real divergence -> "No conversation found" on revive). Falls back to the registry
@@ -3477,23 +3485,33 @@ def cmd_revive(argv):
         print(f"[fleet] warn: revive {a.label} resolved no cwd (sparse shelf, not a roster role, no "
               f"binding) -> abs_cwd falls back to ROOT root; claude --resume may not find the session")
 
+    # ACCOUNT re-resolution (fix 1): a revive FOLLOWS CONFIG for the account too, identically to recycle —
+    # the archived binding dropped the account env, so re-resolve + inject it here (and record it on the
+    # registry row via spec["provider"] so `fleet usage` attributes the revived agent correctly). Aborts on
+    # an unresolvable/unreadable account; a moved default prints the loud change warn.
+    pr, provider_announce, provider_warn = _resolve_recycle_provider(tool, e.get("role"), e.get("provider", ""))
+    if pr:
+        spec["provider"] = pr["label"]
+
     binding_argv = _binding_argv(e.get("binding_cmd", ""))
     if _is_roster(e.get("role")):                                 # ROSTER -> re-resolve the toml (truth)
         # RESUME pins the archived (original) cwd so the session is findable; FRESH adopts the toml cwd.
         send_cmd = _compose_from_roster(e.get("role"), tool, a.label, caller, add_plugins, sess,
-                                        cwd_override=(cwd if sess else ""))
+                                        cwd_override=(cwd if sess else ""), provider=pr)
         source = "toml"
     elif binding_argv:                                            # AD-HOC: replay the captured binding
         cwd = e.get("binding_cwd") or spec["cwd"]
         send_cmd = _replay_binding_argv(binding_argv, tool, spec["role"], a.label, cwd,
-                                        caller, add_plugins, sess)   # _prepend_resume gates per tool
+                                        caller, add_plugins, sess, provider=pr)   # _prepend_resume gates per tool
         source = "binding"
     else:                                                         # registry-spec fallback
-        bin_name, args, env = adapter_compile(tool, spec, caller)
+        codex_home = (pr.get("env") or {}).get("CODEX_HOME") if pr else None
+        bin_name, args, env = adapter_compile(tool, spec, caller, codex_home=codex_home)
         args = _prepend_resume(args, tool, sess)                  # claude --resume flag | codex resume subcmd
         if sess and tool not in ("claude", "codex"):
             print(f"[fleet] note: tool '{tool}' has no resume in this flow; fresh launch")
-        send_cmd = render_send_cmd(bin_name, args, env, spec["abs_cwd"])
+        env, args, raw_env = _apply_provider(env, args, pr)       # fix 1: inject the re-resolved account env
+        send_cmd = render_send_cmd(bin_name, args, env, spec["abs_cwd"], raw_env)
         source = "registry-spec"
     if a.fresh:
         # PERSIST: a fresh revive creates a NEW session under the cwd the send cmd uses (the re-resolved
@@ -3505,6 +3523,10 @@ def cmd_revive(argv):
             spec["abs_cwd"] = fresh_cwd if os.path.isabs(fresh_cwd) else os.path.join(ROOT, fresh_cwd)
     disp = "FRESH (no resume)" if a.fresh else f"resume {sess[:12] or '-'}"
     print(f"[fleet] revive {a.label} (tool={tool}, {disp}, source={source})\n[fleet] launch: {send_cmd}")
+    if provider_announce:
+        print(provider_announce)                                 # fix 1: tool:account (+ note), like launch
+    if provider_warn:
+        print(provider_warn)                                     # fix 1: LOUD warn when the account moved
     # session-prefs provenance on the live output, for parity with launch/recycle (revive was the one
     # launch-composing verb that never printed it).
     _eff = _flag_val(caller, "--effort"); _mdl = _flag_val(caller, "--model")
@@ -3519,6 +3541,16 @@ def cmd_revive(argv):
         print("[fleet] dry-run"); return 0
     if not a.parent:
         sys.exit("[fleet] ABORT: no --parent and no $CMUX_SURFACE_ID")
+    # PRE-SPAWN account-token guard (fix 1), mirroring cmd_launch / recycle: refresh the account token
+    # before minting a surface so a revived seat never spawns into a dead/revoked token (inert in today's
+    # codex-home model — resolve_launch sets no needs_refresh — but wired for parity). Never dry-run here.
+    if pr and pr.get("needs_refresh"):
+        from . import providers as pv
+        try:
+            pv.codex_ensure_fresh(pr["needs_refresh"])
+        except pv.ProviderError as ex:
+            sys.exit(f"[fleet] revive ABORT: account token refresh failed for '{pr['needs_refresh']}' "
+                     f"({ex}); re-login the account, then re-run fleet revive.")
     from . import resolve as rs
     _pc = _count_plugin_dirs(send_cmd)
 
@@ -4644,7 +4676,8 @@ def _prepend_resume(args, tool, sid):
     return args
 
 
-def _replay_binding_argv(argv, tool, role, label, cwd, caller_tokens, add_plugins, resume_session):
+def _replay_binding_argv(argv, tool, role, label, cwd, caller_tokens, add_plugins, resume_session,
+                         provider=None):
     """Recompose a launch command from a captured binding's argv — the SHARED core of recycle (reads a
     LIVE surface binding) and revive (reads the binding captured at archive time). Strips the binding's
     own --resume (callers control it), unions `add_plugins` through the index, layers caller flag overrides,
@@ -4672,13 +4705,85 @@ def _replay_binding_argv(argv, tool, role, label, cwd, caller_tokens, add_plugin
     env = {**_profile_env(), "AGENT_ROLE": role, "AGENT_LABEL": label}
     if _conductor_of(label):
         env["AGENT_CONDUCTOR"] = _conductor_of(label)            # survives a recycle: parentage is in the registry
-    return render_send_cmd(tool, base, env, abs_cwd)
+    # ACCOUNT re-resolution (fix 1): a captured binding drops the account env (its own docstring: env is NOT
+    # recoverable), so re-inject the re-resolved account env/args here — this is exactly why an ad-hoc
+    # recycle used to revert to the ambient credential. render carries raw_env (spawn-time secret channel).
+    env, base, raw_env = _apply_provider(env, base, provider)
+    return render_send_cmd(tool, base, env, abs_cwd, raw_env)
 
 
-def _compose_from_registry(label, entry, caller_tokens, add_plugins, resume_session):
+def _resolve_account_name(tool, role):
+    """The account NAME a recycle/revive resolves for `tool`, FOLLOWING CONFIG — the same precedence
+    `fleet launch` uses MINUS the one-off `--provider` flag (one-off flags are one-off by design):
+    role account-pin → tool default. Role pins are not parsed yet (that is review #7, out of scope here),
+    so today this is the tool default. It resolves THROUGH default_provider — the same seam launch
+    resolves through — rather than hardcoding "default", so once #7 lands and layers a
+    [role.<role>.<tool>].account pin ABOVE the tool default, both recycle and revive pick it up here for
+    free. Raises ProviderError on an unreadable toml (fix 2), same as the launch path."""
+    from . import providers as pv
+    _ = role                                                    # review #7 seam: role account-pin layers here
+    return pv.default_provider(tool)
+
+
+def _resolve_recycle_provider(tool, role, recorded_provider):
+    """Resolve the account env a recycle/revive must inject, FOLLOWING CONFIG — invariant 5: account
+    resolution is part of the ONE composed spec every spawn path shares, exactly as `_compose_from_roster`
+    already re-resolves the loadout from the current toml. This is the chokepoint the launch path had to
+    itself; recycle/revive join it here so a recycled agent no longer silently reverts to the ambient
+    credential (the securestorage/CODEX_HOME drop).
+
+    Returns (pr | None, announce_line, change_warn). `pr` is providers.resolve_launch's dict
+    (env/raw_env/args + label + any needs_refresh), or None when no [providers.<tool>] is configured
+    (single-account opt-in: nothing to inject, byte-identical to before). ABORTS (SystemExit) if a NAMED
+    account fails to resolve — NEVER a silent fall back to the ambient account, exactly as cmd_launch does
+    (and refuses on an unreadable toml, fix 2)."""
+    from . import providers as pv
+    try:
+        pname = _resolve_account_name(tool, role)
+    except pv.ProviderError as e:
+        sys.exit(f"[fleet] ABORT: {e}")
+    if not pname:
+        # No [providers.<tool>] configured now → nothing to inject (single-account opt-in). But if this
+        # agent was LAUNCHED under a named account and the operator has since REMOVED the table, "follow
+        # config" means it reverts to the AMBIENT credential — a real account move that must not be silent
+        # (the same "you see it move" guarantee as a default flip, for the removal case).
+        if recorded_provider:
+            warn = (f"[fleet] WARN: account DROPPED — the registry recorded '{recorded_provider}', but no "
+                    f"[providers.{tool}] is configured now, so this respawn reverts to the AMBIENT "
+                    f"credential (following config). Re-add the account, or confirm ambient is intended.")
+            return None, "", warn
+        return None, "", ""                                    # never had one → truly single-account, silent
+    try:
+        pr = pv.resolve_launch(tool, pname)
+    except pv.ProviderError as e:
+        sys.exit(f"[fleet] ABORT: provider resolution failed for {tool}: {e}")
+    announce = f"[fleet] provider: {pr['label']}" + (f"  ({pr['note']})" if pr.get("note") else "")
+    warn = ""
+    if recorded_provider and recorded_provider != pr["label"]:
+        warn = (f"[fleet] WARN: account MOVED since launch — the registry recorded '{recorded_provider}', "
+                f"re-resolving to '{pr['label']}' (following config). The agent resumes on the NEW account; "
+                f"intended if you flipped the default/pin, a surprise otherwise.")
+    return pr, announce, warn
+
+
+def _apply_provider(env, args, provider):
+    """Fold a resolved provider (from _resolve_recycle_provider) into a compose's (env, args, raw_env),
+    mirroring cmd_launch (cli ~1636-1639): plain env updated, provider CLI tokens appended, raw_env (the
+    spawn-time $(cat …) secret channel) carried separately for render_send_cmd. No provider → unchanged
+    (empty raw_env), so a single-account recycle composes byte-identically to before."""
+    raw_env = {}
+    if provider:
+        env.update(provider.get("env") or {})
+        raw_env.update(provider.get("raw_env") or {})
+        args = args + list(provider.get("args") or [])
+    return env, args, raw_env
+
+
+def _compose_from_registry(label, entry, caller_tokens, add_plugins, resume_session, provider=None):
     """Fallback compose from our registry spec (used only when cmux has no binding for the surface).
     `add_plugins` (the `--plugin` names) unions onto the spec's `plugins`, so adapter_compile routes them
-    through the index into --plugin-dir / enabledPlugins exactly like the roster path."""
+    through the index into --plugin-dir / enabledPlugins exactly like the roster path. `provider` (fix 1)
+    injects the re-resolved account env/args."""
     tool = entry.get("tool", "claude")
     cwd = entry.get("cwd", "")
     abs_cwd = cwd if os.path.isabs(cwd) else os.path.join(ROOT, cwd)
@@ -4687,12 +4792,15 @@ def _compose_from_registry(label, entry, caller_tokens, add_plugins, resume_sess
             "abs_cwd": abs_cwd, "plugins": _dedup(list(entry.get("plugins", [])) + list(add_plugins or [])),
             "flags": _layer_tokens([list(entry.get("flags", [])), list(caller_tokens or [])]),
             "env": {}, "settings": entry.get("settings", "")}
-    bin_name, args, env = adapter_compile(tool, spec, [], conductor=_conductor_of(label))
+    codex_home = (provider.get("env") or {}).get("CODEX_HOME") if provider else None
+    bin_name, args, env = adapter_compile(tool, spec, [], codex_home=codex_home, conductor=_conductor_of(label))
     args = _prepend_resume(args, tool, resume_session)           # claude --resume flag | codex resume subcmd
-    return render_send_cmd(bin_name, args, env, abs_cwd)
+    env, args, raw_env = _apply_provider(env, args, provider)
+    return render_send_cmd(bin_name, args, env, abs_cwd, raw_env)
 
 
-def _compose_from_roster(role, tool, label, caller_tokens, add_plugins, resume_session, cwd_override=""):
+def _compose_from_roster(role, tool, label, caller_tokens, add_plugins, resume_session, cwd_override="",
+                         provider=None):
     """TOML-AUTHORITATIVE compose for a ROSTER role: re-resolve the CURRENT toml (floor + role config,
     incl. plugins / setting_sources), compile it exactly as `fleet launch` does, then prepend the
     resume per tool. This is the source-of-truth path -- a recycle/revive of a rostered agent PICKS UP
@@ -4714,9 +4822,14 @@ def _compose_from_roster(role, tool, label, caller_tokens, add_plugins, resume_s
         spec["plugins"] = _dedup(spec["plugins"] + list(add_plugins))
     cwd = cwd_override or spec["cwd"]
     abs_cwd = cwd if os.path.isabs(cwd) else os.path.join(ROOT, cwd)
-    bin_name, args, env = adapter_compile(tool, spec, caller_tokens, conductor=_conductor_of(label))
+    # thread the re-resolved codex home into adapter_compile so a codex seat's cruft-stripping flags are
+    # enumerated from THAT home (same reason cmd_launch passes codex_home; a mismatch breaks codex start).
+    codex_home = (provider.get("env") or {}).get("CODEX_HOME") if provider else None
+    bin_name, args, env = adapter_compile(tool, spec, caller_tokens, codex_home=codex_home,
+                                          conductor=_conductor_of(label))
     args = _prepend_resume(args, tool, resume_session)
-    return render_send_cmd(bin_name, args, env, abs_cwd)
+    env, args, raw_env = _apply_provider(env, args, provider)    # fix 1: inject the re-resolved account env
+    return render_send_cmd(bin_name, args, env, abs_cwd, raw_env)
 
 
 def _is_roster(role):
@@ -4728,14 +4841,15 @@ def _is_roster(role):
         return False
 
 
-def _compose_recycle_cmd(label, entry, caller_tokens, add_plugins, mode, explicit_session=""):
+def _compose_recycle_cmd(label, entry, caller_tokens, add_plugins, mode, explicit_session="", provider=None):
     """Recompose the recycle launch. ROSTER agents (role in the toml) are TOML-AUTHORITATIVE: re-resolve
     the current toml so a recycle picks up floor/role changes since launch. AD-HOC / off-roster agents
     have no toml to resolve -> reproduce from cmux's ground-truth binding (registry spec as last resort).
     Identity + session come from the registry; FRESH drops the resume, RESUME re-adds it per tool.
     One-off caller `--` flags apply this invocation only. `add_plugins` (the `--plugin` names) unions into
     whichever compose path runs (roster/binding/registry) — routed through the index, reaching BOTH plugin
-    channels. Returns (send_cmd, checkpoint)."""
+    channels. `provider` (fix 1) is the re-resolved account (env/args) injected into every compose path so
+    the account FOLLOWS CONFIG on a recycle, identically to the loadout. Returns (send_cmd, checkpoint)."""
     tool = entry.get("tool", "claude")
     role = entry.get("role")
     b = _resume_binding(entry.get("surface", ""))
@@ -4763,14 +4877,15 @@ def _compose_recycle_cmd(label, entry, caller_tokens, add_plugins, mode, explici
         # its session actually lives; FRESH adopts the current toml cwd (picks up an intentional move).
         cwd_override = entry.get("cwd", "") if mode == "resume" else ""
         return (_compose_from_roster(role, tool, label, caller_tokens, add_plugins, resume_session,
-                                     cwd_override),
+                                     cwd_override, provider),
                 checkpoint)
     argv = _binding_argv(b.get("command", ""))                    # AD-HOC / off-roster -> reproduce
     if not argv:                                                  # no cmux binding -> registry fallback
-        return _compose_from_registry(label, entry, caller_tokens, add_plugins, resume_session), checkpoint
+        return _compose_from_registry(label, entry, caller_tokens, add_plugins, resume_session,
+                                      provider), checkpoint
     cwd = b.get("cwd") or entry.get("cwd", "")
     send_cmd = _replay_binding_argv(argv, tool, role, label, cwd, caller_tokens, add_plugins,
-                                    resume_session)
+                                    resume_session, provider)
     return send_cmd, checkpoint
 
 
@@ -4871,14 +4986,17 @@ def _cwd_of_sendcmd(send_cmd):
     return toks[1] if len(toks) >= 2 and toks[0] == "cd" else ""
 
 
-def _recycle_plan(label, entry, caller, add_plugin, mode, session, force, prime_override, no_prime):
+def _recycle_plan(label, entry, caller, add_plugin, mode, session, force, prime_override, no_prime,
+                  provider=None):
     """Compose ONE recycle payload (the dict the detached exec consumes). Shared by single + bulk recycle
     so the mode/session/prime logic lives in exactly one place. FRESH boots clean -> auto-prime from the
     latest handover; RESUME carries its context -> no prime unless asked. `add_plugin` unions the `--plugin`
-    names into the composed loadout, routed through the index (reaching BOTH plugin channels)."""
+    names into the composed loadout, routed through the index (reaching BOTH plugin channels). `provider`
+    (fix 1) is the re-resolved account, injected into the composed send_cmd AND recorded on the payload so
+    the detached exec re-binds the registry's `provider` field to the account the agent NOW runs under."""
     surf = entry.get("surface", "")
     old_sid = (entry.get("session") or "").replace("claude-", "")
-    send_cmd, _checkpoint = _compose_recycle_cmd(label, entry, caller, add_plugin, mode, session)
+    send_cmd, _checkpoint = _compose_recycle_cmd(label, entry, caller, add_plugin, mode, session, provider)
     prime = None
     if not no_prime:
         if prime_override:
@@ -4896,7 +5014,11 @@ def _recycle_plan(label, entry, caller, add_plugin, mode, session, force, prime_
             "cwd": _cwd_of_sendcmd(send_cmd),          # effective launch cwd, persisted after a FRESH bind
             # deterministic plugin set (entry + add_plugin union) for the recycled event's `effective`
             # field -- no token-scan needed for this part, unlike effort/model.
-            "plugins": _dedup(list(entry.get("plugins", [])) + list(add_plugin or []))}
+            "plugins": _dedup(list(entry.get("plugins", [])) + list(add_plugin or [])),
+            # fix 1: the re-resolved account (registry `provider` re-bind + `fleet usage` attribution) and
+            # the codex pre-launch refresh guard's target. "" when no [providers] (opt-in holds).
+            "provider": (provider or {}).get("label", ""),
+            "provider_needs_refresh": (provider or {}).get("needs_refresh") or ""}
 
 
 def _bulk_targets(target, from_surface, from_label, include_muted):
@@ -5023,13 +5145,22 @@ def cmd_recycle(argv):
                      f"checkpoint for surface {surf[:8]} and the registry has no recorded session. Nothing "
                      f"to resume. Shed into a fresh one: `fleet recycle {label} --fresh`; or pick a prior "
                      f"id: `fleet sessions {label}` then `fleet recycle {label} --session <id>`.")
+    # ACCOUNT re-resolution (fix 1): follow config on the recycle, exactly like the loadout — the account
+    # joins the composed spec instead of being dropped to ambient. Aborts on an unresolvable/unreadable
+    # account (never a silent ambient fall-back). Announced below; a moved default prints a loud warn.
+    pr, provider_announce, provider_warn = _resolve_recycle_provider(
+        entry.get("tool", "claude"), entry.get("role"), entry.get("provider", ""))
     payload = _recycle_plan(label, entry, caller, _flatten_csv(a.plugin), mode, a.session, a.force,
-                            a.prime, a.no_prime)
+                            a.prime, a.no_prime, pr)
     provline, provwarn = _session_pref_provenance(entry.get("role"), entry.get("tool", "claude"),
                                                    payload["send_cmd"], a.effort, a.model)
 
     print(f"[fleet] recycle {label} (mode={mode}, tool={entry.get('tool','claude')}, surface={surf})")
     print(f"[fleet] launch: {payload['send_cmd']}")
+    if provider_announce:
+        print(provider_announce)                                 # fix 1: tool:account (+ note), like launch
+    if provider_warn:
+        print(provider_warn)                                     # fix 1: LOUD warn when the account moved
     if provline:
         print(provline)                                          # effort/model + provenance (source)
     if provwarn:
@@ -5078,8 +5209,14 @@ def _recycle_bulk(target, mode, caller, a):
     print(f"[fleet] recycle --scope {scope} (mode={mode}{ov}) from {from_label}: {len(sel)} target(s), sequential + gated")
     payloads = []
     for label, entry in sel:
+        # per-target account re-resolution (fix 1): a bulk recycle after a default flip is exactly the
+        # "flip the default, recycle the fleet, it MOVES — and you see it move" story, so resolve + announce
+        # + warn per agent. Aborts the whole sweep on an unreadable/unresolvable config (a shared toml
+        # problem affects every target equally — better to refuse loudly than move some agents wrong).
+        pr, provider_announce, provider_warn = _resolve_recycle_provider(
+            entry.get("tool", "claude"), entry.get("role"), entry.get("provider", ""))
         payload = _recycle_plan(label, entry, caller, _flatten_csv(a.plugin), mode, "", a.force,
-                                a.prime, a.no_prime)
+                                a.prime, a.no_prime, pr)
         payloads.append(payload)
         # per-agent RESOLVED effort/model (provenance) — mirror the single-target print so an operator
         # watching a bulk recycle sees what each agent is actually coming back on (a bulk recycle is
@@ -5087,6 +5224,10 @@ def _recycle_bulk(target, mode, caller, a):
         provline, provwarn = _session_pref_provenance(
             entry.get("role"), entry.get("tool", "claude"), payload["send_cmd"], a.effort, a.model)
         print(f"   {label:<24}{entry.get('kind','-'):<11}{(entry.get('surface') or '')[:8]}  mode={mode}")
+        if provider_announce:
+            print(f"      {provider_announce}")                 # fix 1: tool:account (+ note)
+        if provider_warn:
+            print(f"      {provider_warn}")                     # fix 1: LOUD warn when the account moved
         if provline:
             print(f"      {provline}")                          # effort/model + provenance (source)
         if provwarn:
@@ -5288,6 +5429,23 @@ def _recycle_exec_one(p):
     if not _quiet_gate(surf, 180, force):
         log("ABORT: surface never went quiet within 180s; NOT respawning (no half-kill). Re-run when idle or pass --force.")
         return 1
+    # PRE-LAUNCH account-token guard (fix 1), mirroring cmd_launch (cli ~1643-1647): if the re-resolved
+    # account carries a refresh target, refresh it BEFORE we tear the old agent down (a dead/revoked token
+    # aborts loudly instead of spawning a seat into a 401 — and never a silent ambient fall-back). Inert in
+    # today's codex-home model (resolve_launch sets no needs_refresh — the home's auth.json IS the cred and
+    # codex refreshes it itself); wired for parity so the env-token path, if it returns, stays covered.
+    needs_refresh = p.get("provider_needs_refresh") or ""
+    if needs_refresh:
+        from . import providers as pv
+        try:
+            pv.codex_ensure_fresh(needs_refresh)
+        except pv.ProviderError as e:
+            log(f"ABORT: account token refresh failed for '{needs_refresh}' ({e}); NOT respawning (the "
+                f"old session is untouched). Re-login the account, then re-run fleet recycle.")
+            fs.log_event("recycle_abort", label=label, surface=surf, mode=mode, reason="token-refresh-failed")
+            _escalate_recycle_failure(label, surf, mode, "token-refresh-failed",
+                                      f"account '{needs_refresh}' token refresh failed at recycle; re-login it")
+            return 1
     # respawn-pane natively tears down the old agent + restarts the pane in the SAME seat. We restart
     # it as a fresh INTERACTIVE login shell (not the agent directly): cmux exposes `claude` as a zsh
     # FUNCTION via its shell integration, so the agent must launch from a shell that sourced ~/.zshrc
@@ -5386,6 +5544,8 @@ def _recycle_exec_one(p):
             e["session"] = ""                            # a NEW session binds on 1st turn -> router backfills
             if p.get("cwd"):
                 e["cwd"] = p["cwd"]                      # PERSIST the fresh cwd so the next RESUME finds the new session
+        if "provider" in p:
+            e["provider"] = p["provider"]                # fix 1: record the account the agent NOW runs under
         fs.live_put(label, e)
         fs.log_event("recycled", label=label, role=e.get("role"), surface=surf,
                      session=e.get("session") or "", mode=mode, effective=effective)
@@ -5447,6 +5607,8 @@ def _recycle_exec_one(p):
             e["session"] = f"claude-{sid}" if e.get("tool", "claude") == "claude" else sid
             if mode == "fresh" and p.get("cwd"):
                 e["cwd"] = p["cwd"]                      # PERSIST the fresh cwd (a role move -> new session lives here)
+            if "provider" in p:
+                e["provider"] = p["provider"]            # fix 1: record the account the agent NOW runs under
             fs.live_put(label, e)
             fs.log_event("recycled", label=label, role=e.get("role"), surface=surf, session=sid,
                          mode=mode, effective=effective)
@@ -6126,7 +6288,17 @@ def main():
             return 0
     fns = verb_table()
     if sub in fns:
-        return fns[sub](rest)
+        try:
+            return fns[sub](rest)
+        except Exception as e:
+            # A broken fleet toml raises ProviderError from any provider-reading verb (the codex operator
+            # verbs iterate providers unwrapped). Turn it into a clean, named refusal instead of a raw
+            # traceback — consistent with the graceful aborts launch/recycle/poll_all already give. (Import
+            # locally: providers is a heavy optional import and this is the cold error path.)
+            from . import providers as pv
+            if isinstance(e, pv.ProviderError):
+                sys.exit(f"[fleet] ABORT: {e}")
+            raise
     sys.exit(f"fleet: unknown subcommand '{sub}'")
 
 
