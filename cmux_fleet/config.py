@@ -96,7 +96,13 @@ ROOT        = _resolve_path("CMUX_FLEET_ROOT",        "root",           os.path.
 STATE       = _resolve_path("CMUX_STATE_DIR",         "state_dir",      os.path.join(_xdg("XDG_STATE_HOME", "~/.local/state"), "cmux-fleet"))
 CMUX        = _resolve("CMUX_BIN",                    "cmux_bin",       _default_cmux())                # bare command name OK -> NOT anchored
 FLOOR       = _resolve_path("CMUX_FLEET_FLOOR",       "floor_claudemd", "")          # "" -> no ad-hoc CLAUDE.md symlink
-HOOKSTORE   = _resolve_path("CMUX_HOOKSTORE_DIR",     "hookstore_dir",  os.path.expanduser("~/.cmuxterm"))   # cmux-owned, $HOME-relative
+HOOKSTORE   = _resolve_path("CMUX_HOOKSTORE_DIR",     "hookstore_dir",  os.path.expanduser("~/.cmuxterm"))   # FLEET-owned var; points at cmux's hook store (default ~/.cmuxterm)
+# Was the hookstore dir EXPLICITLY pinned (env or [fleet].hookstore_dir), or is it the ~/.cmuxterm default?
+# The launcher keys hook-state WRITE isolation off this one bit: it pins cmux's own CMUX_AGENT_HOOK_STATE_DIR
+# for launched children ONLY when an operator opted into a private store, so a default (prod) launch env is
+# left byte-identical and cmux's hooks keep writing to their own default. One knob -> read-side and write-side
+# cannot drift onto different dirs. (cmux's default write dir IS ~/.cmuxterm — confirmed against the binary.)
+HOOKSTORE_EXPLICIT = bool((os.environ.get("CMUX_HOOKSTORE_DIR") or "").strip() or str(_fleet.get("hookstore_dir") or "").strip())
 ADHOC_SUBDIR = _resolve("CMUX_FLEET_ADHOC_SUBDIR",   "adhoc_subdir",   "_meta/agents/ad-hoc")          # relative to ROOT (intentionally not anchored)
 # `fleet vitals` context-remaining % denominator. 0 -> fleet_features guesses from the model string
 # (a fleet usually runs one window, so one knob is right; the model string can't tell 200k from 1M).

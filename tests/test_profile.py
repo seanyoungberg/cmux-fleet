@@ -38,3 +38,27 @@ def test_profile_env_injection_is_absolute_and_complete():
     assert {"CMUX_STATE_DIR", "CMUX_FLEET_TOML", "CMUX_FLEET_ROOT", "CMUX_BIN", "CMUX_FLEET_PLUGIN_INDEX"} <= set(e)
     for k in ("CMUX_STATE_DIR", "CMUX_FLEET_TOML", "CMUX_FLEET_ROOT", "CMUX_FLEET_PLUGIN_INDEX"):
         assert os.path.isabs(e[k])                             # hermetic: never a relative/ambiguous path
+
+
+# --- hook-state WRITE isolation: the launcher pins cmux's write-side var, but ONLY on an explicit pin ----
+def test_profile_env_omits_hook_state_at_default(monkeypatch):
+    # At the ~/.cmuxterm default (no pin) the launcher must NOT set cmux's write-side var — prod's launch
+    # env stays byte-identical and cmux keeps its own default hook dir. Zero blast radius.
+    monkeypatch.setattr(fleet, "HOOKSTORE_EXPLICIT", False)
+    assert "CMUX_AGENT_HOOK_STATE_DIR" not in fleet._profile_env()
+
+
+def test_profile_env_pins_hook_state_when_hookstore_explicit(monkeypatch):
+    # With a private hookstore pinned, cmux's WRITE var is injected at the SAME dir fleet READS from,
+    # so read-side and write-side share one knob and cannot drift onto different dirs.
+    monkeypatch.setattr(fleet, "HOOKSTORE_EXPLICIT", True)
+    monkeypatch.setattr(fleet, "HOOKSTORE", "/tmp/private-hookstore")
+    assert fleet._profile_env()["CMUX_AGENT_HOOK_STATE_DIR"] == "/tmp/private-hookstore"
+
+
+def test_profile_emits_per_profile_hookstore(capsys):
+    # "share nothing" must cover cmux's hooks too, or side-by-side stacks still share ~/.cmuxterm and a
+    # test stack could SEE prod's agents. The write-side then follows via _profile_env in the activated shell.
+    fleet.cmd_profile(["p", "--base", "/tmp/cf-hs"])
+    out = capsys.readouterr().out
+    assert "export CMUX_HOOKSTORE_DIR=/tmp/cf-hs/state/hookstore" in out

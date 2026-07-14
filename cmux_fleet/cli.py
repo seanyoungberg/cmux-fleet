@@ -27,7 +27,7 @@
 # [defaults] (orchestration) -> [role] scalars -> tool config [tool.<t>] -> [role.<t>] -> caller `--`.
 import argparse, json, os, re, shlex, subprocess, sys, tempfile, time
 
-from .config import ROOT, STATE, CMUX, FLOOR, FLEET_TOML, ADHOC_SUBDIR, PLUGIN_INDEX, load_plugin_index  # path resolver
+from .config import ROOT, STATE, CMUX, FLOOR, FLEET_TOML, ADHOC_SUBDIR, PLUGIN_INDEX, HOOKSTORE, HOOKSTORE_EXPLICIT, load_plugin_index  # path resolver
 
 # The checkout/build root: the dir that holds bin/, .claude-plugin/, fleet.toml.example next to the
 # cmux_fleet package. In a repo/editable install this is the repo root (unchanged from the flat layout,
@@ -102,6 +102,14 @@ def _profile_env():
          # dirs themselves are absolute paths declared IN the index) — the successor to the old
          # $CMUX_FLEET_MARKETPLACE pin now that marketplaces live in the index, not an env var.
          "CMUX_FLEET_PLUGIN_INDEX": PLUGIN_INDEX}
+    # Hook-state WRITE isolation (the read/write pair): fleet READS hook-session records from HOOKSTORE
+    # (CMUX_HOOKSTORE_DIR); cmux WRITES them to CMUX_AGENT_HOOK_STATE_DIR (cmux-owned — its hook CLI's var,
+    # NOT ours to rename). When an operator pinned a private hookstore, tell cmux's hooks to write to the
+    # SAME dir fleet reads from, so a test env's liveness is fully separate from prod's ~/.cmuxterm and the
+    # two sides share one knob (they cannot drift onto different dirs). Gated on the explicit-pin bit so a
+    # default (prod) launch injects NOTHING and cmux keeps its own default write dir — zero blast radius.
+    if HOOKSTORE_EXPLICIT:
+        e["CMUX_AGENT_HOOK_STATE_DIR"] = HOOKSTORE
     return e
 
 try:
@@ -5829,6 +5837,7 @@ def cmd_profile(argv):
       CMUX_FLEET_TOML         <base>/fleet.toml (default $XDG_CONFIG_HOME/cmux-fleet-<name>/fleet.toml)
       CMUX_FLEET_ROOT         --root or $HOME
       CMUX_FLEET_PLUGIN_INDEX <base>/plugins.toml (so the profile's plugins resolve from ITS index)
+      CMUX_HOOKSTORE_DIR      <base>/state/hookstore (per-profile hook store; write-side follows via _profile_env)
       CMUX_BIN                the resolved cmux
     --init also creates the state dir and seeds the toml from fleet.toml.example if it's missing.
     The launcher injects these same paths into every child it spawns (see _profile_env), so a conductor
@@ -5850,10 +5859,12 @@ def cmd_profile(argv):
         toml = os.path.join(xdg_cfg, f"cmux-fleet-{a.name}", "fleet.toml")
     root = os.path.abspath(os.path.expanduser(a.root)) if a.root else os.path.expanduser("~")
     index = os.path.join(os.path.dirname(toml), "plugins.toml")   # the profile's index sits next to its toml
+    hookstore = os.path.join(state, "hookstore")   # per-profile hook store: "share nothing" must cover cmux's hooks too
     binp = _fleet_bin_dir()                        # THIS build's fleet dir (checkout bin/ or installed script)
 
     if a.init:
         os.makedirs(state, exist_ok=True)
+        os.makedirs(hookstore, exist_ok=True)      # must exist before any launch or the first hook write fails silently
         os.makedirs(os.path.dirname(toml), exist_ok=True)
         if not os.path.exists(toml):
             seed = _seed_example_text()
@@ -5874,6 +5885,11 @@ def cmd_profile(argv):
     if not os.path.exists(index):
         sys.stderr.write(f"[fleet profile] note: no plugin index at {index} yet — declare "
                          f"[marketplace.<name>] there (see plugins.toml.example) if you use plugins=[...]\n")
+    # Emit the READ-side hookstore pin; the WRITE-side (cmux's CMUX_AGENT_HOOK_STATE_DIR) then flows to every
+    # child through _profile_env(), which fires because this export makes HOOKSTORE_EXPLICIT true. This is what
+    # makes a profile's hook liveness private too — without it, side-by-side stacks would still share ~/.cmuxterm
+    # and a test stack could SEE prod's agents. `--init` created the dir above.
+    print(f'export CMUX_HOOKSTORE_DIR={shlex.quote(hookstore)}')
     print(f'export CMUX_BIN={shlex.quote(CMUX)}')
     if binp:
         print(f'export PATH={shlex.quote(binp)}:"$PATH"')

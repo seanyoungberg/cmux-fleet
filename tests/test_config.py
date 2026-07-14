@@ -16,7 +16,7 @@ from conftest import REPO
 _DUMP = textwrap.dedent("""
     import json
     from cmux_fleet import config
-    keys = ["ROOT","STATE","CMUX","FLOOR","HOOKSTORE","ADHOC_SUBDIR","FLEET_TOML","TOML_DIR","SIDEBAR_PAINT"]
+    keys = ["ROOT","STATE","CMUX","FLOOR","HOOKSTORE","HOOKSTORE_EXPLICIT","ADHOC_SUBDIR","FLEET_TOML","TOML_DIR","SIDEBAR_PAINT"]
     print(json.dumps({k: getattr(config, k) for k in keys}))
 """)
 
@@ -71,6 +71,28 @@ def test_root_default_is_home(tmp_path):
 def test_floor_default_empty():
     c, _ = _resolve()
     assert c["FLOOR"] == ""
+
+
+# --- hookstore explicit-pin bit (drives launch-path hook-state WRITE isolation) -----------------
+def test_hookstore_default_is_cmuxterm_and_not_explicit():
+    # The prod shape: no pin -> ~/.cmuxterm, and HOOKSTORE_EXPLICIT False so the launcher injects no
+    # write-side var and prod's launch env is untouched.
+    c, _ = _resolve()
+    assert c["HOOKSTORE"].endswith("/.cmuxterm")
+    assert c["HOOKSTORE_EXPLICIT"] is False
+
+
+def test_hookstore_explicit_true_via_env(tmp_path):
+    hs = str(tmp_path / "private-hs")
+    c, _ = _resolve(env={"CMUX_HOOKSTORE_DIR": hs})
+    assert c["HOOKSTORE"] == hs
+    assert c["HOOKSTORE_EXPLICIT"] is True
+
+
+def test_hookstore_explicit_true_via_toml(tmp_path):
+    c, _ = _resolve(toml_text='[fleet]\nhookstore_dir = "/private/hs"\n', toml_dir=str(tmp_path))
+    assert c["HOOKSTORE"] == "/private/hs"
+    assert c["HOOKSTORE_EXPLICIT"] is True
 
 
 def test_adhoc_subdir_default_under_meta():
