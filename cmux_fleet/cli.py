@@ -102,14 +102,17 @@ def _profile_env():
          # dirs themselves are absolute paths declared IN the index) — the successor to the old
          # $CMUX_FLEET_MARKETPLACE pin now that marketplaces live in the index, not an env var.
          "CMUX_FLEET_PLUGIN_INDEX": PLUGIN_INDEX}
-    # Hook-state WRITE isolation (the read/write pair): fleet READS hook-session records from HOOKSTORE
-    # (CMUX_HOOKSTORE_DIR); cmux WRITES them to CMUX_AGENT_HOOK_STATE_DIR (cmux-owned — its hook CLI's var,
-    # NOT ours to rename). When an operator pinned a private hookstore, tell cmux's hooks to write to the
-    # SAME dir fleet reads from, so a test env's liveness is fully separate from prod's ~/.cmuxterm and the
-    # two sides share one knob (they cannot drift onto different dirs). Gated on the explicit-pin bit so a
-    # default (prod) launch injects NOTHING and cmux keeps its own default write dir — zero blast radius.
+    # Hook-store isolation (BOTH sides, so a nested sub-fleet is isolated too). When an operator pinned a
+    # private hookstore, propagate it to every child:
+    #   - CMUX_AGENT_HOOK_STATE_DIR (cmux-owned — its hook CLI's WRITE var, NOT ours to rename): the child's
+    #     cmux hooks WRITE session records to the private dir instead of prod's ~/.cmuxterm.
+    #   - CMUX_HOOKSTORE_DIR (fleet's own READ var): a child that itself runs `fleet` (a sub-conductor) READS
+    #     the SAME private dir — without this it would fall back to ~/.cmuxterm and SEE prod's liveness.
+    # Same resolved dir for both => read-side and write-side share one knob and cannot drift. Gated on the
+    # explicit-pin bit, so a default (prod) launch injects NEITHER and keeps its own default — zero blast radius.
     if HOOKSTORE_EXPLICIT:
         e["CMUX_AGENT_HOOK_STATE_DIR"] = HOOKSTORE
+        e["CMUX_HOOKSTORE_DIR"] = HOOKSTORE
     return e
 
 try:

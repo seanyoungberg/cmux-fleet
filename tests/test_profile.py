@@ -41,19 +41,24 @@ def test_profile_env_injection_is_absolute_and_complete():
 
 
 # --- hook-state WRITE isolation: the launcher pins cmux's write-side var, but ONLY on an explicit pin ----
-def test_profile_env_omits_hook_state_at_default(monkeypatch):
-    # At the ~/.cmuxterm default (no pin) the launcher must NOT set cmux's write-side var — prod's launch
-    # env stays byte-identical and cmux keeps its own default hook dir. Zero blast radius.
+def test_profile_env_omits_hook_vars_at_default(monkeypatch):
+    # At the ~/.cmuxterm default (no pin) the launcher must inject NEITHER hook var — prod's launch env
+    # stays byte-identical and cmux keeps its own default hook dir. Zero blast radius.
     monkeypatch.setattr(fleet, "HOOKSTORE_EXPLICIT", False)
-    assert "CMUX_AGENT_HOOK_STATE_DIR" not in fleet._profile_env()
+    e = fleet._profile_env()
+    assert "CMUX_AGENT_HOOK_STATE_DIR" not in e
+    assert "CMUX_HOOKSTORE_DIR" not in e
 
 
-def test_profile_env_pins_hook_state_when_hookstore_explicit(monkeypatch):
-    # With a private hookstore pinned, cmux's WRITE var is injected at the SAME dir fleet READS from,
-    # so read-side and write-side share one knob and cannot drift onto different dirs.
+def test_profile_env_pins_both_hook_vars_when_hookstore_explicit(monkeypatch):
+    # With a private hookstore pinned, BOTH sides are injected at the SAME dir: cmux's WRITE var
+    # (CMUX_AGENT_HOOK_STATE_DIR) and fleet's READ var (CMUX_HOOKSTORE_DIR, so a nested sub-fleet reads
+    # the private store too). One knob -> the two sides cannot drift onto different dirs.
     monkeypatch.setattr(fleet, "HOOKSTORE_EXPLICIT", True)
     monkeypatch.setattr(fleet, "HOOKSTORE", "/tmp/private-hookstore")
-    assert fleet._profile_env()["CMUX_AGENT_HOOK_STATE_DIR"] == "/tmp/private-hookstore"
+    e = fleet._profile_env()
+    assert e["CMUX_AGENT_HOOK_STATE_DIR"] == "/tmp/private-hookstore"
+    assert e["CMUX_HOOKSTORE_DIR"] == "/tmp/private-hookstore"
 
 
 def test_profile_emits_per_profile_hookstore(capsys):
