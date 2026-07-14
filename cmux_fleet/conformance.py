@@ -928,7 +928,19 @@ def check_recycle(sb, agent, tool):
 
     PROVE THE EFFECT three ways, none of them the exit code: the recycled agent must come back (a) LIVE and
     (b) OBSERVABLE on its surface, and (c) still REMEMBER a token seeded before the recycle — a resume that
-    sheds context is a relaunch wearing the name, and recycle's default resume exists to keep it."""
+    sheds context is a relaunch wearing the name, and recycle's default resume exists to keep it.
+
+    KNOWN LIMITATION — CODEX (2026-07-14, deferred). This check is claude-shaped in two ways that make its
+    codex verdict UNRELIABLE, and codex recycle is an open pre-adopt question, not a settled PASS:
+      * codex binds its session LAZILY (only on the first turn), so after an in-place respawn there is no
+        hook record — and thus no new pid — until codex is DRIVEN. The pid-change re-bind poll below never
+        fires for codex. A codex-correct check must drive the respawned pane to force the re-bind, then read
+        recall. (claude binds at boot, so the pid-change poll works for it.)
+      * observed on 0.64.19-nightly: `fleet recycle` on a codex agent ABORTED at respawn with
+        `respawn-pane -> not_found: Surface not found` — the codex surface did not survive the process kill,
+        so the same-surface respawn could not proceed. claude recycles cleanly on the same build. Whether
+        this is a 0.64.18 regression or pre-existing needs a 0.64.17 codex-recycle comparison. See
+        _meta/agents/cmux-dev/fleet-0.64.18-verdicts.md (row 5)."""
     from . import cli
     from . import resolve as rs
     label, surf = agent["label"], agent["surface"]
