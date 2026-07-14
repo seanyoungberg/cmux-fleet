@@ -637,14 +637,37 @@ def check_stamping(agent):
                       depends="`vitals` / `ls` / the cmux sidebar (all keyed by surface)")
     time.sleep(2)
     n = rs.stamps_since(surf, cursor)
-    ev = {"surface": surf[:8], "stamps_after_a_real_turn": n, "agent_said": said}
+    # The stamp log (events.jsonl) is written by the APP, not the per-launch hook CLI, so
+    # CMUX_AGENT_HOOK_STATE_DIR does NOT redirect it: in an ISOLATED test env that shares the cmux app, the
+    # stamps go to the app's own ~/.cmuxterm/events.jsonl and this HOOKSTORE has no events.jsonl at all. That
+    # is 'I could not observe the stamp channel here', which the house doctrine forbids rendering as a FAIL —
+    # a total-log-absent read is UNKNOWN, not the dark-surface verdict. (On prod, HOOKSTORE == ~/.cmuxterm, so
+    # the log is always present and this branch never fires.)
+    log = os.path.join(HOOKSTORE, "events.jsonl")
+    total_stamps = 0
+    if os.path.exists(log):
+        try:
+            with open(log, errors="replace") as f:
+                total_stamps = sum(1 for line in f if "sidebar.metadata.updated" in line)
+        except OSError:
+            total_stamps = 0
+    ev = {"surface": surf[:8], "stamps_after_a_real_turn": n, "agent_said": said,
+          "stamp_log": log, "stamp_log_present": os.path.exists(log), "total_stamps_in_log": total_stamps}
     if n > 0:
         return Result("stamping", PASS, f"cmux stamped --panel=<our surface> {n}x during a real turn", ev,
                       depends="`vitals`/`ls`/the sidebar — a surface that stops being stamped is a DARK "
                               "agent: alive, working, and invisible")
+    if total_stamps == 0:
+        return Result("stamping", UNKNOWN,
+                      "the stamp log (events.jsonl) is not present under this HOOKSTORE, so the stamp channel "
+                      "is UNOBSERVABLE here — the app writes events.jsonl to its own ~/.cmuxterm, and "
+                      "CMUX_AGENT_HOOK_STATE_DIR does not redirect it (isolated test env sharing the app). "
+                      "This is 'could not observe', never proof of a dark surface", ev,
+                      depends="`vitals`/`ls`/the sidebar (keyed by surface) — provable only where the app's "
+                              "own events.jsonl is readable (prod, or an isolated env with its own app)")
     return Result("stamping", FAIL,
-                  "the agent completed a real turn and cmux stamped our surface ZERO times (this is the "
-                  "dark-surface signature)", ev,
+                  "the agent completed a real turn and cmux stamped our surface ZERO times, though the stamp "
+                  "log has stamps for OTHER surfaces (this is the dark-surface signature)", ev,
                   depends="`vitals`/`ls`/the sidebar go blind to this agent, permanently")
 
 
@@ -746,6 +769,246 @@ def check_lifecycle(sb, agent, parent_surf):
                   "the agent came back live and observable but LOST ITS CONTEXT (a relaunch, not a resume)",
                   ev,
                   depends="`fleet revive` — every restart would silently discard the agent's work")
+
+
+# =================================================================================================
+# The 0.64.18 needs-test checks (fleet-0.64.18-ledger.md). Each still ends in an observation of the
+# CONSEQUENCE, tri-state, and — where it creates or mutates surfaces — passes through the Sandbox gate.
+# =================================================================================================
+def check_pane_move_healing(sb, agent, parent_surf):
+    """THE DELETE-GATE (ledger row 9). Does this cmux keep filing a LIVE agent under its surface after that
+    surface is MOVED to another workspace — the operation that, on 0.64.17, permanently darkens it?
+
+    This is the single test that licenses deleting three fleet workarounds: `_reseat_if_dark`,
+    `_adopt_misfiled_session`, and the archive-revive-to-relocate necessity. On 0.64.17, moving a live
+    surface across workspaces destroys cmux's agent-status registration for that surface: `agentLifecycle`
+    and `updatedAt` FREEZE, `present()` goes false, and the agent — still alive, still answering — goes
+    invisible to `ls`/`vitals`/the sidebar forever (detachment-root-cause-2026-07-10.md; reproduced +
+    live-verified, so the not-healed-on-17 half is already established). cmux 0.64.18 added
+    `agent.resolve_delivery_target` (CMUXCLI+ClaudeHookDeliveryTarget.swift, issues #7939/#7391/#5781),
+    which promotes live pid/surface identity over the persisted record and HEALS the record via upsert.
+
+    We move via the RAW `cmux move-surface` primitive on a LIVE agent ON PURPOSE. `fleet move` REFUSES a
+    live agent precisely because this darkens it (cli.cmd_move) — that refusal IS one of the workarounds
+    under test — so we bypass it and drive the underlying cmux operation the fleet is protecting against.
+
+    PROVE THE EFFECT, never the artifact: after the move AND a real post-move turn, the record's `updatedAt`
+    must keep ADVANCING while the agent's own transcript shows it answered — so a frozen clock can only mean
+    'cmux stopped filing this surface', never 'the agent stopped working'. Advancing + present() == HEALED
+    == the three workarounds are deletable. Frozen / not-present / dark == STILL the root cause == keep them.
+
+    NB the semantics are a version DIFF, not a breakage verdict: on 0.64.17 this reads FAIL (still dark) and
+    on a healed 0.64.18 it reads PASS. FAIL-on-old -> PASS-on-new IS the delete license."""
+    from . import cli
+    from . import resolve as rs
+    surf, tool = agent["surface"], agent["tool"]
+    if not rs.present(surf):                              # precondition: bright BEFORE the move, or a dark
+        return Result("pane_move_healing", UNKNOWN,       # result after it proves nothing about the move
+                      "the agent was already not observable BEFORE the move, so a dark result after it "
+                      "cannot be attributed to the move", {"surface": surf[:8]},
+                      depends="the DELETE gate for _reseat_if_dark/_adopt_misfiled_session/archive-revive")
+    before = rs.freshest(surf)                            # raw record, ANY liveness (a dark record survives)
+    t0 = before.get("updatedAt") or 0
+    try:
+        target_ws = sb.new_workspace(f"conf-move-target-{os.getpid()}")   # gated + torn down like all we make
+    except NotDisposable as e:
+        return Result("pane_move_healing", UNKNOWN, f"could not create a target workspace to move into: {e}",
+                      {"surface": surf[:8]}, depends="the DELETE gate")
+    rc_mv, out_mv = _cmux("move-surface", "--surface", surf, "--workspace", target_ws, "--focus", "false")
+    try:
+        moved_ws = cli.current_ws_for_surface(surf)       # tree ground truth: where the surface landed
+    except Exception:
+        moved_ws = ""
+    token = "MOVED-" + str(os.getpid())[-4:]              # a REAL turn: what a healthy build re-stamps on
+    _drive(surf, f"Reply with exactly: {token}")
+    answered, said = _wait_answer(surf, token, timeout=120)
+    time.sleep(3)                                         # let any heal upsert land after the turn completes
+    after = rs.freshest(surf)
+    t1 = after.get("updatedAt") or 0
+    ev = {"surface": surf[:8], "moved_to_ws": (target_ws or "")[:8],
+          "surface_now_in_ws": (moved_ws or "")[:8], "move_landed": bool(moved_ws),
+          "record_surfaceId": (after.get("surfaceId") or "")[:8],
+          "updatedAt_before": t0, "updatedAt_after": t1, "updatedAt_advanced": t1 > t0,
+          "agent_answered_post_move": answered, "agent_said": said,
+          "present_after": rs.present(surf), "dark_after": rs.dark(surf, tool), "alive_after": rs.alive(surf, tool)}
+    if not ev["alive_after"]:                             # the move must not have KILLED it — different failure
+        return Result("pane_move_healing", UNKNOWN,
+                      "the agent is not alive after the move, so the move darkening it can't be told apart "
+                      "from the move killing it (a different failure)", ev, depends="the DELETE gate")
+    if not answered:
+        return Result("pane_move_healing", UNKNOWN,
+                      "the agent did not answer a turn after the move, so a frozen clock can't be pinned on "
+                      "cmux rather than a wedged agent", ev, depends="the DELETE gate")
+    surfaceid_ok = (after.get("surfaceId") or "").upper() == surf.upper()
+    if t1 > t0 and ev["present_after"] and not ev["dark_after"] and surfaceid_ok:
+        return Result("pane_move_healing", PASS,
+                      "after moving the live surface to another workspace and a real turn, cmux KEPT filing "
+                      "the agent under its surface (updatedAt advanced, present, not dark) — the dark-on-move "
+                      "root cause is HEALED on this build", ev,
+                      depends="DELETE-GATE OPEN: _reseat_if_dark + _adopt_misfiled_session + the "
+                              "archive-revive-to-relocate necessity are obsolete on this build")
+    return Result("pane_move_healing", FAIL,
+                  "after the move, cmux STOPPED filing the live agent under its surface (updatedAt frozen / "
+                  "not present / dark) though it answered a real turn — the dark-on-move root cause is STILL "
+                  "PRESENT on this build", ev,
+                  depends="DELETE-GATE CLOSED: _reseat_if_dark, _adopt_misfiled_session and the "
+                          "archive-revive-to-relocate necessity are all STILL REQUIRED on this build")
+
+
+def check_resume_argv_parse(agent):
+    """Row 6 — THE one real breaking candidate. cmux 0.64.18 rewrote the resume-command wrapper
+    (AgentResumeArgv / +Relaunch.swift): the `/bin/sh -c '<payload>'` payload now carries an exec-check token
+
+        "$([ -x "${CMUX_CLAUDE_WRAPPER_SHIM:-}" ] && printf '%s' "$CMUX_CLAUDE_WRAPPER_SHIM" || printf claude)"
+
+    whose INNER single quotes, once the whole payload is POSIX single-quoted for the outer `sh -c '...'`,
+    collapse into the very `'\\''`-escape sequence cli._binding_argv's claude regex keys on. If the regex
+    over-matches, a shell fragment (`%s`, `-x`, `printf`, `[`, `]`) lands in the extracted argv and
+    recycle/revive re-exec with a bogus flag that dead-ends the relaunch.
+
+    Proven against a REAL build-generated command (`cmux surface resume get`), never a synthetic fixture —
+    the whole risk lives in cmux's exact encoding, so a hand-written command would test the wrong thing."""
+    from . import cli
+    surf = agent["surface"]
+    command = (cli._resume_binding(surf) or {}).get("command", "")
+    if not command:
+        return Result("resume_argv_parse", UNKNOWN,
+                      "cmux returned no resume_binding.command for this surface — the extractor can't be "
+                      "exercised", {"surface": surf[:8]},
+                      depends="`fleet recycle`/`revive` argv extraction (cli._binding_argv)")
+    argv = cli._binding_argv(command)
+    # Discrete shell-wrapper fragments that must NEVER surface as an argv token: the exact artifacts the
+    # 0.64.18 exec-check/printf encoding leaks if the single-quote tokenizer tears it apart.
+    CONTAMINANTS = {"%s", "printf", "[", "]", "-x", "/bin/sh", "&&", "||",
+                    "${CMUX_CLAUDE_WRAPPER_SHIM:-}", "$CMUX_CLAUDE_WRAPPER_SHIM"}
+    leaked = [t for t in argv if t in CONTAMINANTS or t.startswith("$(") or t.startswith('"$(') or "printf " in t]
+    # Empty / whitespace-only tokens are the OTHER failure signature: they mean the single-quote pairing
+    # mis-split a token (e.g. a flag value that itself contained a `'`, which the `'\''` escaping doubles).
+    degenerate = [repr(t) for t in argv if t == "" or (t and t.isspace())]
+    ev = {"surface": surf[:8], "resume_command_head": command[:140], "resume_command_tail": command[-140:],
+          "extracted_argv": argv, "argv_len": len(argv), "leaked_fragments": leaked,
+          "degenerate_tokens": degenerate}
+    if not argv:
+        return Result("resume_argv_parse", FAIL,
+                      "the extractor returned an EMPTY argv from a non-empty resume command — recycle/revive "
+                      "would re-exec with no flags at all", ev,
+                      depends="`fleet recycle`/`revive`: the re-composed launch loses every flag")
+    if leaked:
+        return Result("resume_argv_parse", FAIL,
+                      f"the extractor LEAKED shell-wrapper fragment(s) into the argv: {leaked} — 0.64.18's "
+                      f"exec-check encoding broke cli._binding_argv's single-quote tokenizer", ev,
+                      depends="`fleet recycle`/`revive`: a wrapper fragment becomes a bogus flag that "
+                              "dead-ends the relaunch")
+    if degenerate:
+        return Result("resume_argv_parse", FAIL,
+                      f"the extractor produced empty/whitespace token(s) {degenerate} — a flag value was "
+                      f"mis-split by the single-quote tokenizer (a value containing a literal quote)", ev,
+                      depends="`fleet recycle`/`revive`: a mangled flag value re-execs a broken command")
+    # Positive coherence: feed it into the recycle path exactly as recycle does, and confirm a clean,
+    # runnable claude arg list (leads with the resume flag; still no fragment anywhere).
+    relaunch = cli._prepend_resume(list(argv), "claude", "TEST-SID")
+    ev["relaunch_preview"] = relaunch[:12]
+    if relaunch[:2] != ["--resume", "TEST-SID"] or any(t in CONTAMINANTS for t in relaunch):
+        return Result("resume_argv_parse", FAIL,
+                      "the extracted argv does not re-compose into a coherent claude relaunch", ev,
+                      depends="`fleet recycle`/`revive`: the recomposed command would not relaunch claude")
+    return Result("resume_argv_parse", PASS,
+                  "cli._binding_argv tokenized the REAL resume command into a clean flag list (no shell "
+                  "fragments) that re-composes into a runnable claude relaunch", ev,
+                  depends="`fleet recycle`/`revive` — the argv they re-exec stays correct under 0.64.18's "
+                          "new wrapper encoding")
+
+
+def check_recycle(sb, agent, tool):
+    """Row 5 — recycle round-trip, claude AND codex. `fleet recycle` restarts an agent IN PLACE on the SAME
+    surface, re-composing its launch from cmux's resume_binding (the row-5/6 contract) and resuming the
+    session — distinct from archive->revive (check_lifecycle), which lands on a FRESH surface. The resolver
+    behind the binding changed in 0.64.18 (ControlCommandCoordinator+Surface), so what command it hands back
+    is needs-test.
+
+    PROVE THE EFFECT three ways, none of them the exit code: the recycled agent must come back (a) LIVE and
+    (b) OBSERVABLE on its surface, and (c) still REMEMBER a token seeded before the recycle — a resume that
+    sheds context is a relaunch wearing the name, and recycle's default resume exists to keep it."""
+    from . import cli
+    from . import resolve as rs
+    label, surf = agent["label"], agent["surface"]
+    sb.assert_disposable("surface", surf)                # gate: we only recycle what we created
+    token = "RECYCLE-" + str(os.getpid())[-4:]
+    _drive(surf, f"Remember this token, I will ask after a restart: {token}. Reply with exactly: STORED")
+    if not _wait_answer(surf, "STORED", timeout=120)[0]:
+        return Result(f"recycle[{tool}]", UNKNOWN, "could not seed a token before recycling",
+                      {"label": label}, depends="`fleet recycle` (in-place resume restart)")
+    old_pid = (rs.freshest_live(surf) or {}).get("pid")  # the PRE-recycle process, to detect the respawn
+    rc = cli.cmd_recycle([label, "--force"])             # resume mode (default): preserve context
+    # recycle dispatches a DETACHED worker that waits for the surface to go IDLE, then respawns the pane. So
+    # `alive+present` is TRUE of the still-running OLD agent for a while — polling on it fires at t=0 and
+    # drives the recall into an agent that is about to be torn down (context lost, not because recycle
+    # failed). Wait for the RESPAWN itself: a live record whose pid DIFFERS from the pre-recycle one. (Resume
+    # keeps the same session id but forks a NEW process, so the pid moves even though the sid does not.)
+    end = time.time() + 200
+    back = False
+    while time.time() < end:
+        cur = rs.freshest_live(surf) or {}
+        if cur.get("pid") and cur.get("pid") != old_pid and rs.present(surf):
+            back = True
+            break
+        time.sleep(3)
+    ev = {"label": label, "surface": surf[:8], "recycle_rc": rc, "old_pid": old_pid,
+          "new_pid": (rs.freshest_live(surf) or {}).get("pid"),
+          "alive": rs.alive(surf, tool), "present": rs.present(surf)}
+    if not back:
+        return Result(f"recycle[{tool}]", FAIL,
+                      "the agent did not respawn (no live process with a new pid) on its surface within 200s "
+                      "of recycle", ev,
+                      depends="`fleet recycle`: an in-place restart cannot bring the agent back")
+    time.sleep(6)                                        # let the resumed agent settle before we type at it
+    _drive(surf, "What was the token I asked you to remember before the restart? Reply with just the token.")
+    remembered, said = _wait_answer(surf, token, timeout=120)
+    ev["agent_recalled"] = said
+    if remembered:
+        return Result(f"recycle[{tool}]", PASS,
+                      "recycle restarted the agent in place (same surface), live + observable, and it still "
+                      "REMEMBERS — the resume_binding round-tripped", ev,
+                      depends="`fleet recycle` — the in-place restart every self-heal and go-live leans on")
+    return Result(f"recycle[{tool}]", FAIL,
+                  "the agent came back live+observable but LOST its context (recycle resumed nothing / the "
+                  "wrong session — the resume_binding did not round-trip)", ev,
+                  depends="`fleet recycle`: every in-place restart silently sheds the agent's work")
+
+
+def check_codex_hooks_install():
+    """Row 17 — `cmux hooks codex install` still yields hooks.json + a valid trusted_hash. 0.64.18 refactored
+    the hook catalog (AgentHookDefinitions -> AgentHookCatalog); this proves the refactor did not move the
+    install OUTPUT shape the fleet verifies before every codex launch.
+
+    A codex worker's Stop hook is how its conductor learns it finished; codex silently SKIPS an untrusted
+    hook (no prompt, no error), so 'installed' without 'trusted' is indistinguishable from not installed. The
+    fleet delegates to `cmux hooks codex install` then verifies BOTH halves (providers.codex_hooks_ok). We
+    prove the EFFECT: run the real install into a THROWAWAY CODEX_HOME and assert the file exists AND the
+    trusted_hash landed — not that the command exited 0. No live agent needed, so it runs every suite."""
+    from . import providers
+    home = tempfile.mkdtemp(prefix="conf-codex-home-")
+    try:
+        ok, detail = providers.codex_install_hooks(home)
+        exists = os.path.exists(os.path.join(home, "hooks.json"))
+        trusted = providers.codex_hooks_ok(home)         # BOTH halves: file present AND trusted_hash present
+        ev = {"install_ok": ok, "install_detail": detail, "hooks_json_exists": exists, "trusted": trusted}
+        if exists and trusted:
+            return Result("codex_hooks_install", PASS,
+                          "`cmux hooks codex install` wrote hooks.json AND trusted it (trusted_hash under "
+                          "[hooks.state]) — the catalog refactor kept the install output shape", ev,
+                          depends="every codex launch: an untrusted/missing hook fires no Stop, so the "
+                                  "conductor never learns a codex child finished")
+        if exists and not trusted:
+            return Result("codex_hooks_install", FAIL,
+                          "hooks.json was written but is NOT trusted (no trusted_hash) — codex silently skips "
+                          "it and no completion ever reaches the conductor", ev,
+                          depends="every codex child completion (silently dropped)")
+        return Result("codex_hooks_install", FAIL,
+                      f"`cmux hooks codex install` produced no hooks.json in the codex home ({detail})", ev,
+                      depends="every codex child: no Stop hook installed at all")
+    finally:
+        shutil.rmtree(home, ignore_errors=True)
 
 
 # =================================================================================================
@@ -898,8 +1161,11 @@ def run_suite(a, protected, home):
 
     try:
         checks.append(check_topology(sb, ws, parent))
-        checks.append(check_hook_store_schema())
         checks.append(check_feed_gate())
+        checks.append(check_codex_hooks_install())        # ledger row 17: standalone, no live agent needed
+        # check_hook_store_schema runs LATER (just before bus.result), once our own agents have written
+        # records — in an isolated test env the store starts EMPTY, so an upfront read only ever sees
+        # nothing. On prod it would pass anywhere; deferring it makes it validate the schema here too.
 
         tools = ["claude", "codex"] if a.tool == "both" else [a.tool]
         for tool in tools:
@@ -917,13 +1183,23 @@ def run_suite(a, protected, home):
             checks.append(check_stamping(agent))
             checks.append(check_hook_chain(agent, parent))
             bus.drain()
-            if tool == "claude":                          # the resume path is claude's today
+            if tool == "claude":                          # the resume + move paths are claude's today
+                # READ-ONLY checks first: they inspect the ORIGINAL agent's pane/state, so they must run
+                # before recycle (which restarts the agent and wipes the pane's STAMP nonce).
                 checks.append(check_capture_pane(sb, ws, agent["surface"], "STAMP"))
                 checks.append(check_read_screen(agent["surface"], "STAMP"))
                 checks.append(check_resume_binding(agent["surface"]))
                 checks.append(check_paint(sb, ws, agent["label"]))
-                checks.append(check_lifecycle(sb, agent, parent))
+                checks.append(check_resume_argv_parse(agent))         # ledger row 6 (the real breaking risk)
+                # recycle while the agent is HEALTHY: a dark agent can't pass recycle's quiet-gate
+                # (cli.cmd_move), so it runs BEFORE pane_move, which may darken the agent on an unhealed build.
+                checks.append(check_recycle(sb, agent, tool))         # ledger row 5 (claude)
+                checks.append(check_pane_move_healing(sb, agent, parent))  # ledger row 9 (HIGHEST — may darken)
+                checks.append(check_lifecycle(sb, agent, parent))     # archive->revive: the repair for a dark agent
+            else:
+                checks.append(check_recycle(sb, agent, tool))         # ledger row 5 (codex): last codex check
         bus.drain()
+        checks.append(check_hook_store_schema())          # NOW our agents have written records to inspect
         checks.append(bus.result())                      # read AFTER real turns have completed
     except NotDisposable as e:
         checks.append(Result("SAFETY", FAIL, f"the sandbox refused an operation: {e}", {},
