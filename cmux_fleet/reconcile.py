@@ -80,6 +80,13 @@ def session_snapshot_path(cmux_bin=None, snap_dir=None):
 
 # --- snapshot parse (predictive: what cmux would resume / recreate) --------------------------------
 _FLEET_SIG = re.compile(r"AGENT_ROLE=|AGENT_LABEL=|CMUX_FLEET_(?:STATE_DIR|TOML|ROOT|MARKETPLACE)")
+# The hook-store launchCommand records the AGENT's argv + its launcher metadata, NOT the shell wrapper's
+# env — so it carries NO `AGENT_LABEL=` (verified against real records: launchCommand keys are arguments/
+# launcher/source/executablePath/workingDirectory, no environment). The reliable fleet marker there is the
+# `--plugin-dir …/cmux-fleet` argument every fleet launch injects. Match that (plus the env-style sig, in
+# case a wrapper-style launchCommand is ever recorded). This distinction was caught by the test-env crash-
+# test: a synthetic launchCommand hid it; a real one does not carry the env sig.
+_HOOK_ORIGIN_SIG = re.compile(r"cmux-fleet|AGENT_ROLE=|AGENT_LABEL=|CMUX_FLEET_")
 _LABEL_RE = re.compile(r"AGENT_LABEL=([A-Za-z0-9._-]+)")
 _UUID_RE = r"[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}"
 _RESUME_RE = re.compile(r"--resume\s+(" + _UUID_RE + r")")
@@ -177,7 +184,7 @@ def _hook_fleet_origin(surface):
     store — so the fleet's single-store-reader invariant holds."""
     import json as _json
     from . import resolve as rs
-    return any(_FLEET_SIG.search(_json.dumps(r.get("launchCommand") or "")) for r in rs.records(surface))
+    return any(_HOOK_ORIGIN_SIG.search(_json.dumps(r.get("launchCommand") or "")) for r in rs.records(surface))
 
 
 def _classify(tree, snap, cmuxq=None):

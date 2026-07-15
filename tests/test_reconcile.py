@@ -223,3 +223,20 @@ def test_reconcile_debounces(monkeypatch):
     assert "skipped" not in first
     second = rc.reconcile_restore(close=False)                 # within DEBOUNCE_S, not forced
     assert second.get("skipped") == "debounced"
+
+
+def test_hook_fleet_origin_matches_the_REAL_launchcommand_shape(monkeypatch):
+    """Regression: a real fleet launchCommand carries NO AGENT_LABEL= (that's an env var, not argv) — its
+    fleet marker is the `--plugin-dir …/cmux-fleet` argument. A synthetic launchCommand hid this; the
+    test-env crash-test caught it. Route through resolve.records (the one store reader)."""
+    from cmux_fleet import resolve as rs
+    real = {"arguments": ["/Users/x/.local/bin/claude", "--setting-sources", "user,local",
+                          "--plugin-dir", "/Users/x/marketplace/plugins/cmux-fleet"],
+            "launcher": "claude", "source": "environment", "workingDirectory": "/x"}
+    monkeypatch.setattr(rs, "records", lambda s, st=None: [{"launchCommand": real}])
+    assert rc._hook_fleet_origin("anysurf") is True
+    # a NON-fleet claude (bare, no fleet plugin-dir) is NOT fleet-origin -> never swept
+    monkeypatch.setattr(rs, "records", lambda s, st=None: [{"launchCommand": {"arguments": ["/bin/claude", "--resume", "x"]}}])
+    assert rc._hook_fleet_origin("anysurf") is False
+    monkeypatch.setattr(rs, "records", lambda s, st=None: [])
+    assert rc._hook_fleet_origin("anysurf") is False
