@@ -54,6 +54,17 @@ RETRY_BACKOFF_S = (5, 10, 15)   # re-check at +5s, +15s, +30s after a skip, then
 _retrying = set()               # surfaces with an in-flight retry loop (dedup guard)
 _retry_lock = threading.Lock()
 
+# --- restore reconciliation on the post-relaunch surface.created burst (Ship 2) --------------------
+# When cmux relaunches it replays its restore snapshot, firing a BURST of surface.created frames. That
+# burst is the signal to reconcile the registry against what cmux resurrected (close deterministic husks,
+# flag resume-orphans). Detect >= CREATED_BURST_N created frames within CREATED_BURST_WINDOW, then run ONE
+# debounced reconcile in the background (the bus loop must keep processing). LIVE + reconcile-knob gated.
+CREATED_BURST_N = 3
+CREATED_BURST_WINDOW = 6.0
+_created_ts = []
+_reconcile_lock = threading.Lock()
+_reconcile_inflight = {"v": False}
+
 # --- fleet-doctor heartbeat sweep dedup + thresholds (conditions #1/#2/#3) ------------------------
 # Driven once per heartbeat tick (daemon._heartbeat_tick), the sweep walks every LIVE child and emits a
 # DEDUPED parent alert on each bad condition. Dedup is edge-triggered per (reason, label, session): fire
@@ -756,10 +767,50 @@ def fleet_doctor_sweep(now=None):
     return fired
 
 
+def _note_surface_created(ev):
+    """A burst of surface.created frames = cmux replaying its restore snapshot on relaunch. Fire ONE
+    debounced, background reconcile pass so the registry gets healed (husks closed, resume-orphans flagged)
+    without waiting for the next daemon-start. Non-blocking: the bus loop keeps processing other frames.
+    LIVE only (it CLOSES surfaces) and gated on the reconcile knob."""
+    from .config import RECONCILE_RESTORE
+    if not (LIVE and RECONCILE_RESTORE):
+        return
+    now = time.time()
+    _created_ts.append(now)
+    while _created_ts and now - _created_ts[0] > CREATED_BURST_WINDOW:
+        _created_ts.pop(0)
+    if len(_created_ts) < CREATED_BURST_N:
+        return
+    with _reconcile_lock:
+        if _reconcile_inflight["v"]:
+            return                                      # a reconcile is already chasing this burst
+        _reconcile_inflight["v"] = True
+    threading.Thread(target=_reconcile_burst, daemon=True).start()
+
+
+def _reconcile_burst():
+    """Settle briefly (more restored surfaces may still be arriving), then run one reconcile pass."""
+    try:
+        time.sleep(3.0)
+        from . import reconcile as rc
+        rep = rc.reconcile_restore(close=True, log=log, reason="surface-burst")
+        if rep.get("closed") or rep.get("resume_orphans"):
+            log(f"[reconcile] burst sweep: closed {len(rep.get('closed', []))} husk(s), "
+                f"{len(rep.get('resume_orphans', []))} resume-orphan(s) flagged")
+    except Exception as e:
+        log(f"[reconcile] burst error: {e}")
+    finally:
+        _created_ts.clear()
+        with _reconcile_lock:
+            _reconcile_inflight["v"] = False
+
+
 def handle(ev):
     if ev.get("category") == "surface":
         if ev.get("name") == "surface.closed":
             _archive_closed_surface(ev)
+        elif ev.get("name") == "surface.created":
+            _note_surface_created(ev)                   # relaunch-burst -> reconcile (Ship 2)
         return                                          # other surface.* frames are not ours to act on
     if ev.get("name") != "agent.hook.Stop":
         return
