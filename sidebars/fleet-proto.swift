@@ -133,8 +133,16 @@ func isCrowned(_ p, _ ordered, _ apos) -> Bool {
   if k != "" { return k == "conductor" }        // kind painted → authoritative (kills the pinned caveat)
   return ordered[ci].pinned                       // pre-adopt fallback
 }
-// the crowned anchor claiming workspace i (its nearest preceding anchor, if crowned); -1 => ungrouped
-func claimedBy(_ i, _ apos, _ crownedPos) -> Int {
+// a PAINTED fleet agent carries a progress.label (the daemon paints one for every live agent). Unpainted
+// non-fleet tabs (Berg's Dock/Files/Canvas/…, stray path-titled workspaces) have none — so they bucket
+// separately even when they trail a REAL conductor at the end of the order (no group-boundary field exists;
+// the durable fix is the upstream groupId projection). NB: an anchor's carrier tab also carries a label,
+// but anchors are excluded from children/bucket by isAnchor, so this stays exact for non-anchor rows.
+func isFleetAgent(_ w) -> Bool { return plLabel(w) != "" }
+// the crowned anchor claiming workspace i (its nearest preceding anchor, if crowned); -1 => ungrouped.
+// Only a painted fleet agent can be claimed — an unpainted tab trailing a conductor drops to the bucket.
+func claimedBy(_ i, _ ordered, _ apos, _ crownedPos) -> Int {
+  if !isFleetAgent(ordered[i]) { return -1 }
   let preceding = apos.filter { $0 < i }
   if preceding.count == 0 { return -1 }
   let nap = preceding[preceding.count - 1]
@@ -309,7 +317,7 @@ VStack(alignment: .leading, spacing: 8) {
   let ordered = workspaces                                  // native sidebar index order
   let apos = ordered.indices.filter { isAnchor(ordered[$0]) }
   let crownedPos = apos.filter { isCrowned($0, ordered, apos) }
-  let bucket = ordered.indices.filter { !isAnchor(ordered[$0]) && claimedBy($0, apos, crownedPos) < 0 }.map { ordered[$0] }
+  let bucket = ordered.indices.filter { !isAnchor(ordered[$0]) && claimedBy($0, ordered, apos, crownedPos) < 0 }.map { ordered[$0] }
   let carriers = ordered.filter { plLabel($0).hasPrefix("USAGE") }
 
   HStack {
@@ -330,7 +338,7 @@ VStack(alignment: .leading, spacing: 8) {
   ForEach(Array(crownedPos.enumerated()), id: \.offset) { gi, p in
     groupView(
       ordered[condIndexIn(p, ordered, apos)],
-      ordered.indices.filter { $0 > p && $0 < nextAnchorAfter(p, apos, ordered.count) && $0 != condIndexIn(p, ordered, apos) }.map { ordered[$0] }
+      ordered.indices.filter { $0 > p && $0 < nextAnchorAfter(p, apos, ordered.count) && $0 != condIndexIn(p, ordered, apos) && isFleetAgent(ordered[$0]) }.map { ordered[$0] }
     )
   }
 
