@@ -1462,6 +1462,8 @@ BLOB_TAG = "FLEET4"                                           # bump when the re
 BLOB_FIELDS = 12                                              # surface label state ctx parent kind tool model effort cwd col last
 USAGE_MARK = "⧗"                                              # separates the fleet-global usage panel from the
                                                              # blob (and each usage line); stripped from record text
+PROG_SEP = "⟐"                                               # per-agent progress.label machine suffix delimiter
+                                                             # ("<human>⟐<kind>⟐<last>"); single char, stripped from text
 
 
 def _blob_clean(s, n):
@@ -1663,7 +1665,16 @@ def _progress_label(r, pct, shared=False):
     who = f"{r['label']} · " if shared else ""
     lead = f"{state} · " if state and state != "-" else ""
     body = f"{meta} · {pct}% left" if meta else f"{pct}% left"
-    return f"{lead}{who}{body}"
+    human = f"{lead}{who}{body}"
+    # Machine suffix for a NATIVE custom sidebar: "<human>⟐<kind>⟐<last>".
+    #  • kind (conductor/child) — the durable crown discriminator, so the sidebar stops depending on Berg's
+    #    manual `pinned` state to tell a real conductor from a scaffold anchor.
+    #  • last — the agent's last ASSISTANT message (fleet transcript-derived `last_text`). cmux's native
+    #    `latestMessage` is the last PROMPT when iMessage mode is off (the default), so it can't carry the
+    #    reply; this is the one projected channel that can. ⟐ is stripped from the text so it never collides.
+    kind = r.get("kind") or "child"
+    last = (r.get("last_text") or "").replace(PROG_SEP, " ").replace("\n", " ").strip()[:100]
+    return f"{human}{PROG_SEP}{kind}{PROG_SEP}{last}"
 
 
 def _usage_carrier(rows):

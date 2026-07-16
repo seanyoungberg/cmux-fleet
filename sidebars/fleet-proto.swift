@@ -1,20 +1,22 @@
-// ⚓ fleet-proto v2 — the fleet conductor→worker hierarchy from NATIVE data. NO description blob.
+// ⚓ fleet-proto — the fleet conductor→worker hierarchy from NATIVE data (the live cutover sidebar).
 //
-// v2 improvements over v1:
-//   1. STALE-ANCHOR ROBUSTNESS + a deliberate "Workspaces" bucket. A "Conductor - X" anchor is crowned as a
-//      real group ONLY when its conductor member X is present in the anchor's run AND that member is pinned
-//      (the live discriminator that separates real fleet conductors from leftover scaffold anchors like
-//      "Conductor - loom-domain-expert", which is actually an AD *child*). Everything not claimed by a
-//      crowned group — orphans, Berg's Dock, ungrouped tabs — drops into an intentional "Workspaces" section
-//      (neutral, never a crowned pseudo-conductor). The durable discriminator is the fleet `kind` field; once
-//      it (or native groupId) is on a bindable channel, swap `pinned` for it — see the report.
-//   2. State coloring — rows tint by agent STATE parsed off `progress.label` (set-status pills aren't
-//      projected; state rides the label as a leading word: "working · model · effort · N% left").
-//   3. Subscriptions footer — read off ONE non-agent CARRIER tab whose label is "USAGE⧗line⧗line" (painted
-//      by the daemon onto a scaffold anchor), instead of stapled onto every conductor. Nothing real garbles.
+// Layout: crowned conductor groups (conductor row + indented children), then a deliberate neutral
+// "Workspaces" bucket for orphans / Berg's Dock / ungrouped tabs, then the fleet-global subscriptions footer.
 //
-// Reads ONLY native bindable fields (never `w.description`): title, index-order, pinned, progress.value/
-// .label, latestMessage, directory, unread, selected. Rows tap workspace.select.
+//   1. CROWN discriminator: a "Conductor - X" anchor is a real group only when its conductor member X is
+//      present in the anchor's run AND is a real conductor. Real-conductor test: the fleet KIND token on
+//      progress.label (authoritative) when painted; else Berg's manual `pinned` state (pre-adopt fallback).
+//      This is what keeps scaffold anchors (e.g. an AD *child* "Conductor - loom-domain-expert") out.
+//   2. State coloring — rows tint by agent STATE, the leading word of progress.label ("working · …").
+//   3. Last message — the agent's last ASSISTANT reply, NOT cmux's native latestMessage (which is the last
+//      PROMPT when iMessage mode is off, the default). Source order: progress.label ⟐last (post-adopt) →
+//      FLEET4 blob field 11 (transitional, live) → native latestMessage only if it differs from the prompt.
+//   4. Subscriptions footer — read off ONE non-agent CARRIER tab (label "USAGE⧗line⧗line"), not every conductor.
+//
+// progress.label is the one projected free-text channel, so the painter overloads it: "<human>⟐<kind>⟐<last>".
+// The sidebar shows only the <human> part in the ctx caption. Mostly-native: reads title, index-order, pinned,
+// progress.value/.label, latestMessage/latestPrompt, directory, unread, selected — plus blob field 11 for the
+// last-message ONLY, transitionally, until the ⟐last painter is adopted. Rows tap workspace.select.
 //
 // Interpreter rules: positive guard then EmptyView fallthrough; AnyView on branching views; `if let` not
 // `!= nil`; helpers never return arrays (bind arrays in the body / inline in ForEach); `.frame` clamp on
@@ -26,6 +28,45 @@ func isAnchor(_ w) -> Bool { return w.title.hasPrefix("Conductor - ") }
 func plLabel(_ w) -> String {
   if let p = w.progress { if let l = p.label { return l } }
   return ""
+}
+// The painter rides a machine suffix on progress.label: "<human>⟐<kind>⟐<last>". ⟐ (U+27D0) is a single
+// char so the split is reliable (multi-char splits are not). Absent pre-adopt → these return "" and callers
+// fall back: crown by pinned, and no message (cmux's native latestMessage is the last PROMPT, not the reply).
+func plHuman(_ w) -> String {
+  let l = plLabel(w)
+  let p = l.split(separator: "⟐")
+  if p.count >= 1 { return String(p[0]) }
+  return l
+}
+func kindOf(_ w) -> String {
+  let l = plLabel(w)
+  let p = l.split(separator: "⟐")
+  if p.count >= 2 { return String(p[1]) }
+  return ""
+}
+func lastOf(_ w) -> String {
+  let l = plLabel(w)
+  let p = l.split(separator: "⟐")
+  if p.count >= 3 { return String(p[2]) }
+  return ""
+}
+// TRANSITIONAL fallback for the last-message until the `⟐last` painter is adopted: the FLEET4 blob (still
+// painted as the fleet.swift fallback) carries the same transcript-derived assistant text in field 11.
+// Read ONLY that one field — everything else stays native. Drops away once progress.label carries `last`.
+func descOf(_ w) -> String { if let d = w.description { return d } ; return "" }
+func blobLast(_ w) -> String {
+  let d = descOf(w)
+  if !d.hasPrefix("FLEET4;") { return "" }
+  let recs = d.split(separator: ";")
+  if recs.count < 2 { return "" }
+  let rec = String(recs[1])
+  let segs = rec.split(separator: "⧗")                 // drop the fleet-global usage tail if this ws carries it
+  let base = segs.count >= 1 ? String(segs[0]) : rec
+  let f = base.split(separator: "~")
+  if f.count < 12 { return "" }
+  let last = String(f[11])
+  if last == "-" { return "" }
+  return last
 }
 // leading state word (single-string hasPrefix — no fragile multi-char split)
 func stateOf(_ w) -> String {
@@ -83,11 +124,14 @@ func condIndexIn(_ p, _ ordered, _ apos) -> Int {
   if hits.count > 0 { return hits[0] }
   return -1
 }
-// crown iff the conductor member is present AND pinned (the live real-vs-scaffold discriminator)
+// crown iff the conductor member is present AND is a real conductor. Discriminator: the fleet KIND token on
+// progress.label (authoritative) when present; else fall back to Berg's manual `pinned` state (pre-adopt).
 func isCrowned(_ p, _ ordered, _ apos) -> Bool {
   let ci = condIndexIn(p, ordered, apos)
   if ci < 0 { return false }
-  return ordered[ci].pinned
+  let k = kindOf(ordered[ci])
+  if k != "" { return k == "conductor" }        // kind painted → authoritative (kills the pinned caveat)
+  return ordered[ci].pinned                       // pre-adopt fallback
 }
 // the crowned anchor claiming workspace i (its nearest preceding anchor, if crowned); -1 => ungrouped
 func claimedBy(_ i, _ apos, _ crownedPos) -> Int {
@@ -125,21 +169,38 @@ func progBar(_ w) -> some View {
         RoundedRectangle(cornerRadius: 2).foregroundColor("#3DB9A0").frame(width: 60 * f, height: 5)
         Spacer()
       }.frame(width: 60, height: 5).background { RoundedRectangle(cornerRadius: 2).foregroundColor("#2A2E37") }
-      progLabelIn(p)
+      progCaption(w)
       Spacer()
     }.frame(height: 12))
   }
   return AnyView(EmptyView())
 }
-func progLabelIn(_ p) -> some View {
-  if let l = p.label {
-    return AnyView(Text(l).font(.system(size: 10, design: .monospaced)).foregroundColor("#8B8D98").lineLimit(1))
+// only the HUMAN part of progress.label (state·model·effort·ctx) — never the ⟐kind⟐last machine suffix.
+func progCaption(_ w) -> some View {
+  let h = plHuman(w)
+  if h != "" {
+    return AnyView(Text(h).font(.system(size: 10, design: .monospaced)).foregroundColor("#8B8D98").lineLimit(1))
   }
   return AnyView(EmptyView())
 }
+// native latestMessage is the last PROMPT (iMessage mode off), so it MUST NOT be shown as the agent's reply.
+// Show the fleet's transcript-derived last ASSISTANT message off progress.label (`lastOf`); only fall back
+// to native latestMessage when it demonstrably differs from the last prompt (iMessage-on case). Else nothing.
+func msgToShow(_ w) -> String {
+  let lm = lastOf(w)                 // 1. progress.label ⟐last (post-adopt, clean)
+  if lm != "" { return lm }
+  let bl = blobLast(w)               // 2. FLEET4 blob field 11 (live now, transitional)
+  if bl != "" { return bl }
+  if let m = w.latestMessage {       // 3. native, only if it differs from the prompt (iMessage-on edge)
+    if let pm = w.latestPrompt { if m != pm { return m } ; return "" }
+    return m
+  }
+  return ""
+}
 func msgLine(_ w) -> some View {
-  if let m = w.latestMessage {
-    return AnyView(Text(m).font(.system(size: 11)).foregroundColor(.tertiary).lineLimit(2).truncationMode(.tail))
+  let s = msgToShow(w)
+  if s != "" {
+    return AnyView(Text(s).font(.system(size: 11)).foregroundColor(.tertiary).lineLimit(2).truncationMode(.tail))
   }
   return AnyView(EmptyView())
 }
