@@ -89,13 +89,17 @@ def _bind():
 
 
 def test_launched_surface_survives_a_lying_hook_store(launched, monkeypatch):
-    """THE REGRESSION. The store says the session lives on FOREIGN; the agent's own env says LAUNCHED.
-    The env wins, the surface never moves, and the missing session id is filled in."""
-    monkeypatch.setattr(rs, "proc_ident", lambda pid: (LAUNCHED, LABEL))   # cmux told the process itself
+    """THE INVARIANT (I5). The store says the session lives on FOREIGN and nothing mentions LAUNCHED. The
+    surface NEVER moves to follow the lying store — whatever the store says, `_bind_launched_session`
+    returns the launched (ws, surf) unchanged. The missing session id is NOT recovered by env-adoption
+    any more: that fallback is RETIRED (cmux 0.64.18+ heals the misfile class natively via the
+    live-identity healing upsert), so the sid stays '' — a recoverable gap cmd_launch signposts, never a
+    row pointing at FOREIGN."""
+    monkeypatch.setattr(rs, "proc_ident", lambda pid: (LAUNCHED, LABEL))   # retired path; no longer consulted
     ws, surf, sid = _bind()
     assert surf == LAUNCHED, "the registry was bound to a surface fleet never launched onto"
     assert ws == WS, "the workspace was re-resolved to follow a surface we never launched onto"
-    assert sid == SID, "the session id was recoverable from the live process and should be filled in"
+    assert sid == "", "the retired env-adoption fallback should no longer recover a misfiled sid"
 
 
 def test_never_adopts_a_session_running_on_another_surface(launched, monkeypatch):

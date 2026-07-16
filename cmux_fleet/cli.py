@@ -805,9 +805,7 @@ def create_surface(spec, parent_surf, direction):
         # parent having a live hook-store record at all. It does not always: a bare shell surface has no
         # record ever, and a DARK agent's surface has none either (the app drops its writes). Measured on
         # this box 2026-07-12 — `move-refuse` sat plainly in `cmux tree`, and every `launch --place tab`
-        # off it died with "cannot resolve conductor workspace from --parent". It also breaks `move
-        # --archive-revive`, which anchors the fresh surface on an arbitrary surface in the TARGET
-        # workspace and has no reason to expect that one to be an agent. One tree read, both answers.
+        # off it died with "cannot resolve conductor workspace from --parent". One tree read, both answers.
         cws, agents_pane = surface_loc(parent_surf)
         if not cws:
             cws = ws_uuid_for_surface(parent_surf)     # store fallback, for when the tree can't be read
@@ -833,9 +831,8 @@ def create_surface(spec, parent_surf, direction):
             # A workspace-placed agent with NO group is legitimate — it is exactly what `move
             # --own-workspace` has always produced for a groupless conductor (plain
             # `move-tab-to-new-workspace`, no group anywhere). This branch used to ABORT, which made a
-            # groupless `--place workspace` unreachable from launch AND revive, and would have left
-            # `move --archive-revive --own-workspace` unable to serve a groupless conductor — the exact
-            # agents most likely to need it. Mint a standalone workspace; cmux mints it with its own
+            # groupless `--place workspace` unreachable from launch AND revive — the exact agents most
+            # likely to need it. Mint a standalone workspace; cmux mints it with its own
             # terminal surface, so the agent lands on that surface and no husk is left behind.
             out = cmuxq("new-workspace", "--name", spec["label"], "--cwd", spec["abs_cwd"], "--focus", "false")
             m = re.search(r"(workspace:\d+)", out)
@@ -1301,54 +1298,6 @@ def _deliver_launch(ws, surf, send_cmd):
         cmuxq("send", "--workspace", ws, "--surface", surf, send_cmd + "\n")
 
 
-def _adopt_misfiled_session(surf, label):
-    """The session of the agent we just seated on `surf`, when cmux filed it under a DIFFERENT surfaceId.
-    Returns '' when nothing proves a match. Prints the adoption note. Shared by every seating verb.
-
-    WITHOUT THIS, A MISFILE IS AN ABORT AFTER THE AGENT IS ALREADY RUNNING. That is not theory: `revive`
-    polled only its own surface, so when cmux misfiled the session it saw nothing, timed out, and exited —
-    leaving a LIVE agent on a surface nobody owned and its label stranded in the ARCHIVE. `fleet ls` then
-    rendered the archived row over a working agent and `vitals` dropped it entirely. cmux-custom spent an
-    evening in that state, doing real work, while the fleet insisted it was parked."""
-    sid = _session_on_launched_surface(surf, label)
-    if sid:
-        print(f"[fleet] note: cmux filed this session under a different surfaceId; adopted session "
-              f"{sid[:8]} for the SEATED surface {surf} (proven via the agent's own "
-              f"CMUX_SURFACE_ID/AGENT_LABEL env). The registry keeps the seated surface.")
-    return sid
-
-
-def _session_on_launched_surface(surf, label):
-    """The session id of the agent WE JUST LAUNCHED onto `surf`, recovered from the hook store when cmux
-    filed its record under a DIFFERENT surfaceId. Returns '' when nothing PROVES a match.
-
-    Identity is proven from the live process's own environment (rs.proc_ident -> CMUX_SURFACE_ID /
-    AGENT_LABEL), never from the record's `surfaceId` (the field that lies) and never from cwd (which is
-    not an identity at all -- every shell and agent sitting in the same worktree shares it). A record is
-    adopted only if its pid is ALIVE and that pid's own env says it is on the surface we launched, and
-    (when the env carries a label) that it is OUR label.
-
-    This function can only ever hand back a SESSION ID. It is structurally incapable of returning a
-    surface, which is the whole point: see _bind_launched_session for the invariant."""
-    from . import resolve as rs
-    from . import state as fs
-    for s in (_store().get("sessions") or {}).values():
-        if (s.get("agentLifecycle") or "") in ("-", "ended"):
-            continue
-        pid = s.get("pid")
-        if not pid or not fs.pid_alive(pid):
-            continue                                       # a dead pid cannot be the agent we just started
-        env_surf, env_label = rs.proc_ident(pid)
-        if not env_surf or env_surf.upper() != (surf or "").upper():
-            continue                                       # this process is NOT on the surface we launched
-        if label and env_label and env_label != label:
-            continue                                       # our surface, someone else's label -> not ours
-        sid = fs.bare_uuid(s.get("sessionId") or "")
-        if sid:
-            return sid
-    return ""
-
-
 def _bind_launched_session(ws, surf, send_cmd, tool, label, abs_cwd, caller, lazy, timeout):
     """The resume-aware bind step for `cmd_launch`. Delivers via exec (default; step 2) or the paste
     path (CMUX_FLEET_EXEC_LAUNCH=0 soak fallback), then, when the caller passthrough carries a claude `--resume <id>`, gates
@@ -1385,11 +1334,12 @@ def _bind_launched_session(ws, surf, send_cmd, tool, label, abs_cwd, caller, laz
     surface was an idle orphan and not a live session. `fleet vitals` read the agent `detached`, which
     was CORRECT: there was no agent on the surface the registry believed in.
 
-    Now: the surface never moves, and the sid is adopted only against PROOF from the live process's own
-    env (_session_on_launched_surface). If that proof is unavailable the sid stays '' -- and cmd_launch
-    already handles that safely: it aborts WITHOUT registering, leaves the surface up, and signposts
-    `fleet register <label> --surface <the launched surface>`. An empty sid is a recoverable gap; a
-    registry row pointing at someone else's terminal is not."""
+    Now: the surface never moves. The sid is filled in by polling the launched surface itself; if it
+    stays '' cmd_launch handles that safely -- it aborts WITHOUT registering, leaves the surface up, and
+    signposts `fleet register <label> --surface <the launched surface>`. An empty sid is a recoverable
+    gap; a registry row pointing at someone else's terminal is not. (The old misfile-ADOPTION fallback --
+    recovering the sid from the live process's env when cmux filed the session under a phantom surfaceId --
+    is retired: cmux 0.64.18+ heals that misfile class natively via the live-identity healing upsert.)"""
     if _exec_launch_enabled():
         sid = _exec_send_and_confirm(ws, surf, send_cmd, lazy, timeout)
     else:
@@ -1402,94 +1352,6 @@ def _bind_launched_session(ws, surf, send_cmd, tool, label, abs_cwd, caller, laz
                      f"booting or wedged at the menu); NOT registering. Re-run the launch once it "
                      f"settles. Inspect: cmux capture-pane --surface {surf}")
         sid = poll_session(surf)
-    if not sid and not lazy:
-        sid = _adopt_misfiled_session(surf, label)
-    return ws, surf, sid
-
-
-_OBSERVABLE_TIMEOUT_S = 8         # cmux files the session, then stamps; both are prompt when they happen at all
-
-
-def _observable_within(surf, cursor, timeout=None):
-    """POSITIVE proof that cmux can see an agent on `surf`, within a bounded window.
-
-    TWO INDEPENDENT READS, either of which is proof: cmux's hook STORE files a live agent here
-    (rs.present), or cmux is actively STAMPING this surface in its own event log (rs.stamps_since — the
-    `--panel=<surface>` status updates that drive vitals and the sidebar). A dark surface produces neither,
-    ever, so the window can be short: waiting longer never turns a dark surface bright, it only delays the
-    repair. Requiring proof rather than the absence of a complaint is the point — a launch that cannot show
-    its agent is visible has not succeeded, whatever the pane says."""
-    from . import resolve as rs
-    end = time.time() + (_OBSERVABLE_TIMEOUT_S if timeout is None else timeout)   # read at CALL time
-    while True:
-        if rs.present(surf) or rs.stamps_since(surf, cursor):
-            return True
-        if time.time() >= end:
-            return False
-        time.sleep(0.5)
-
-
-def _reseat_if_dark(ws, surf, sid, spec, parent, direction, cursor, redeliver, attempts=1):
-    """Hand back a surface cmux is ACTUALLY FILING. Returns (ws, surf, sid).
-
-    THE ONE dark-surface guard, for EVERY verb that seats an agent onto a fresh surface. `redeliver(ws,
-    surf) -> sid` is the only per-verb part: launch delivers a launch and binds; revive re-delivers and
-    resumes through the summary menu. Everything else — the proof, the re-seat, the bound retry, the
-    non-destructive give-up — is the same code, because two implementations of this would be precisely the
-    bug we spent last night killing.
-
-    THE DARK SURFACE. cmux sometimes files a freshly-seated agent's session under a surfaceId that is not
-    the one it put the agent on. The fleet survives the registry half of that (it adopts the session against
-    the live process's OWN env and keeps the seated surface — invariant I5). But cmux keeps stamping the
-    PHANTOM: the agent runs, serves read-screen, takes inbox messages and completes turns, while `vitals`,
-    `ls` and the sidebar — all keyed by surface — look straight through it. Permanently. The specimens
-    stamped 94, 66 and 0 status updates onto surfaces the fleet (and the agents' own env) had never heard
-    of, and 0 onto their own.
-
-    IT BIT `revive` IN PRODUCTION, which is the sharpest reason this is shared code now: revive is the
-    PRESCRIBED CURE for a dark surface, and it had no dark check of its own — so the cure reproduced the
-    disease, landing cmux-custom dark while it worked on a real job.
-
-    A dark agent reads exactly like a dead one to every store-derived check, and the reflex cure for death
-    is to relaunch — which puts a SECOND agent on the same worktree and the same branch as the first, which
-    is still alive and working. That is the trap this exists to keep anyone from ever walking into.
-
-    So repair it AT t=0, where the repair is free: the agent has just been seated, holds no new context, and
-    owns nothing worth saving. Close the surface, take the process down with it, and seat a fresh one. (Once
-    it is WORKING the remedy is `archive` + `revive` onto a new surface — never `recycle`, which re-execs
-    onto the same dark surface and fixes nothing.)
-
-    Bounded, and NON-DESTRUCTIVE when it gives up: if a re-seat is still dark we keep the agent, register
-    it, and say plainly that it is invisible and how to repair it. An alarm that cannot fix a thing does
-    not get to destroy it."""
-    from . import resolve as rs
-    for attempt in range(attempts + 1):
-        if _observable_within(surf, cursor):
-            return ws, surf, sid                         # PROVEN visible: nothing to repair
-        if not rs.alive(surf, spec["tool"]):
-            return ws, surf, sid                         # not dark — just nothing alive; the caller's problem
-        print(f"\n[fleet] DARK SURFACE: {spec['label']} is alive on {surf[:8]} but cmux is not filing it "
-              f"there (it filed the session elsewhere).")
-        print(f"[fleet]   Left alone, this agent works perfectly and is INVISIBLE to vitals/ls/the sidebar, "
-              f"forever.")
-        if attempt >= attempts:
-            print(f"[fleet]   The re-seat did not clear it, so the agent is being KEPT (it is alive and "
-                  f"healthy — killing it would be the worse error).")
-            print(f"[fleet]   It is registered and drivable, but it will not appear in vitals/ls. To repair: "
-                  f"`fleet archive {spec['label']}` then `fleet revive {spec['label']}` (NOT `recycle` — "
-                  f"that re-execs onto this same dark surface).")
-            return ws, surf, sid
-        print(f"[fleet]   Re-seating now, at t=0 — no context exists yet, so this costs nothing.")
-        _signal_agent_pids(surf, spec["tool"], lambda m: print(f"[fleet]   {m}"), "reseat")
-        cmuxq("close-surface", "--surface", surf, "--workspace", ws)
-        cursor = rs.stamp_cursor()                       # only stamps for the NEW surface may count
-        ws2, surf2 = create_surface(spec, parent, direction)
-        if not ws2 or not surf2:
-            print(f"[fleet]   could not create a replacement surface; keeping the dark one.")
-            return ws, surf, sid
-        ws, surf = ws2, surf2
-        print(f"[fleet]   re-seated onto surface {surf}")
-        sid = redeliver(ws, surf)                        # the ONE per-verb part: launch binds, revive resumes
     return ws, surf, sid
 
 
@@ -1752,15 +1614,11 @@ def cmd_launch(argv):
                  f"may still be booting (heavy loadout) or never started. The surface is NOT torn down. "
                  f"If it comes up, adopt it:\n[fleet]     fleet register {spec['label']} --surface {surf}\n"
                  f"[fleet]   (inspect first: cmux capture-pane --surface {surf})")
-    # A surface cmux is not FILING is a surface the fleet cannot see. Check before we register it, and
-    # repair it here — at t=0 the agent holds nothing, so a re-seat is free. Only when a session actually
-    # bound: a lazy tool has none yet, and there is nothing for cmux to have misfiled.
-    if sid:
-        ws, surf, sid = _reseat_if_dark(
-            ws, surf, sid, spec, a.parent, a.direction, stamp_cursor,
-            redeliver=lambda w, s: _bind_launched_session(w, s, send_cmd, spec["tool"], spec["label"],
-                                                          spec["abs_cwd"], caller, lazy,
-                                                          timeout=8 if lazy else 60)[2])
+    # The dark-surface / session-misfile class (cmux filing a freshly-seated agent's session under a
+    # surfaceId the fleet/agent env never saw) is HEALED NATIVELY since cmux 0.64.18: the live-identity
+    # healing upsert (agent.resolve_delivery_target) promotes the live pid/surface identity over the
+    # persisted record and re-stamps the surface. So the fleet's old reseat-if-dark guard is retired —
+    # the launched surface is authoritative (invariant I5) and we register it directly.
     register(surf, spec, a.parent, sid or "", ws)
     log_launch(spec, a.parent, surf, sid or "", send_cmd)
     # post-launch placement reconciliation: confirm the surface actually came up IN the worktree (a
@@ -2447,33 +2305,6 @@ def _live_agent_pids(surf, tool, ps_out=None):
     UNION itself is resolve's, defined once."""
     from . import resolve as rs
     return rs.agent_pids(surf, tool=tool or "claude", ps_out=ps_out, store_pids=_surface_pids(surf))
-
-
-def _relocation_liveness(surf, tool):
-    """May we move `surf` across workspaces without destroying an agent? Returns (verdict, evidence).
-
-    THE ASYMMETRY THAT SETS EVERY DEFAULT HERE: a wrong REFUSE costs the operator one extra flag
-    (`--archive-revive`, which relocates correctly anyway). A wrong ALLOW permanently darkens a healthy
-    agent — surface-scoped, survives a restart, unfixable by recycle. The two errors are not remotely equal,
-    so every uncertain branch resolves to "live" and refuses.
-
-    The LIVE/GONE/UNKNOWN judgment itself is `resolve.liveness` — including the one that matters most, that
-    an empty `ps` sweep is a FAILED sweep and therefore UNKNOWN (a box always has processes), never a
-    licence to destroy. This function adds exactly one thing on top, and it can only ever push toward
-    refusing:
-
-      the TUI backstop — a pane painting an agent while NO pid matched the seat rule. That means a tool
-      whose seat rule we do not have, so believe the screen over our own ignorance and treat it as LIVE.
-      It is a heuristic, and it is allowed here for the only reason a heuristic is ever allowed near a
-      destructive path: it cannot authorize the destruction, it can only prevent one."""
-    from . import resolve as rs
-    verdict, pids, evidence = rs.liveness(surf, tool=tool or "claude", store_pids=_surface_pids(surf))
-    if verdict == rs.GONE and _agent_surfaced(surf):
-        return rs.LIVE, (f"surface {surf[:8]} is painting a live agent TUI (no pid matched the seat-agent "
-                         f"rule for tool '{tool or 'claude'}' — treating it as LIVE, the safe way to be wrong)")
-    if verdict == rs.GONE:
-        return rs.GONE, f"no agent process and no agent TUI on surface {surf[:8]}"
-    return verdict, evidence
 
 
 def _identifies_as(cmdline, tool):
@@ -3579,13 +3410,10 @@ def cmd_revive(argv):
         # (5 plugins + memsearch onnx embedding load — the ~100s+ tail that made revive time out) can run
         # past a flat 60s. Same plugin-count heuristic the menu ceiling uses, with a higher bind ceiling.
         bound = poll_session(s, timeout=_resume_menu_timeout(_pc, base=60, per_plugin=8, ceiling=180))
-        # ...and when the poll comes up empty, ADOPT rather than abort. THE PRODUCTION BUG: revive polled
-        # only its own surface, so a misfiled session read as "never bound" — and revive exited AFTER the
-        # agent was already running, stranding a LIVE agent on an unowned surface with its label still in
-        # the ARCHIVE. `ls` then rendered the archived row over a working agent and `vitals` dropped it.
-        return bound or _adopt_misfiled_session(s, a.label)
+        # (0.64.18+ heals the session-misfile class natively via the live-identity healing upsert, so the
+        # old adopt-misfiled fallback is retired — the seated surface is authoritative.)
+        return bound
 
-    stamp_cursor = rs.stamp_cursor()             # BEFORE the surface exists: only OUR stamps may count
     ws, surf = create_surface(spec, a.parent, "down")
     if not ws or not surf:
         sys.exit(1)
@@ -3598,9 +3426,8 @@ def cmd_revive(argv):
                  f"agent is likely still booting. It is NOT torn down and '{a.label}' stays parked. Adopt it "
                  f"once it binds:\n[fleet]     fleet register {a.label} --surface {surf}\n"
                  f"[fleet]   (inspect: cmux capture-pane --surface {surf})")
-    # THE SAME PROOF `launch` DEMANDS. revive is the prescribed CURE for a dark surface — so a revive that
-    # cannot show its agent is observable has not succeeded, it has merely reproduced the disease.
-    ws, surf, sid = _reseat_if_dark(ws, surf, sid, spec, a.parent, "down", stamp_cursor, redeliver=_seat)
+    # (dark-surface heal is native since 0.64.18 — the old reseat-if-dark guard is retired; the seated
+    # surface is authoritative.)
     sid = _resume_binding(surf).get("checkpoint_id", "") or sid   # ground-truth session over a bridge poll id
     register(surf, spec, a.parent, sid, ws)
     fs.archive_del(a.label)
@@ -3963,152 +3790,28 @@ def cmd_group(argv):
     return 0
 
 
-def _move_target_flags(a):
-    """The target half of the operator's own command line, echoed back verbatim in the messages that
-    tell them what to type instead. Reconstructed (not the raw argv) so the suggestion is always the
-    canonical form."""
-    if a.own_workspace:
-        return "--own-workspace" + (f" --name {a.name}" if a.name else "")
-    return f"--to-workspace {a.to_workspace}"
-
-
-def _relocation_landing(label, child, target_uuid, own_ws):
-    """WHERE the relocated agent's FRESH surface will be born. Computed from the tree BEFORE anything is
-    archived, so a target we cannot resolve aborts with the agent still live and untouched.
-
-    Returns (place, parent_surface, group). `parent_surface` is what `revive --parent` consumes:
-    create_surface() derives the TARGET WORKSPACE from it for place=tab, which is how a revive lands
-    somewhere other than the caller's own workspace. This is the whole trick — the fresh surface is BORN
-    in the destination, never born-then-moved (a born-then-moved surface would be darkened by the very
-    move this verb refuses)."""
-    from . import state as fs
-    from . import resolve as rs
-    if own_ws:
-        # place=workspace mints a fresh workspace and lands the agent on the surface cmux mints with it.
-        # Group: the child's own, else the conductor's — the membership `move --own-workspace` always gave
-        # it (via `workspace-group add`), preserved here through the shelf row create_surface reads.
-        parent_entry = fs.live_get(child.get("parent") or "") or {}
-        return "workspace", os.environ.get("CMUX_SURFACE_ID", ""), (child.get("group") or
-                                                                    parent_entry.get("group") or "")
-    # place=tab into an EXISTING workspace: any surface already in it anchors the new tab. Prefer the
-    # caller's own surface when the caller lives there (the agent lands as a tab beside its conductor,
-    # which is what a conductor asking for --to-workspace <its own ws> means).
-    members = rs.workspace_surfaces(target_uuid)
-    if not members:
-        sys.exit(f"[fleet] move: workspace {target_uuid[:8]} holds no surfaces to anchor {label}'s new tab "
-                 f"against. Inspect: cmux tree --all")
-    me = (os.environ.get("CMUX_SURFACE_ID") or "").upper()
-    parent = me if me in members else members[0]
-    return "tab", parent, child.get("group", "")
-
-
-def _archive_revive(label, child, a, caller, plugins):
-    """THE HONEST RELOCATION: park the agent, then bring it back on a FRESH surface in the target
-    workspace. A fresh surface is the ONLY thing that restores the agent-status registration a
-    cross-workspace move destroys (verified live on berg-sandbox, 2026-07-10) — recycle re-execs on the
-    SAME surface and inherits the damage, so it is not an option and never was.
-
-    CONTEXT IS PRESERVED. revive's DEFAULT is resume-the-last-session, and `--fresh` is never passed
-    here. The resume is FULL SESSION, never the lossy compact summary: revive gates on
-    _resume_and_gate -> adapter.dismiss_resume_menu, which auto-picks 'full session as-is'. It does not
-    ask, and there is no branch on which it can pick the summary.
-
-    THE MIDWAY STATES, all recoverable, none silent:
-      * archive REFUSES (a live agent on the surface would not die / could not be identified) -> the
-        registry is untouched and the surface is still open. The agent is exactly where it was, LIVE.
-        Nothing moved.
-      * archive SUCCEEDS, the seat close leaves cmux residue -> the agent is PARKED on the shelf with its
-        session; we STOP rather than revive on top of a half-torn seat. `fleet revive <label>` finishes it.
-      * revive fails (a wedged resume menu, a session that will not bind) -> revive aborts BEFORE
-        archive_del by construction, so the label stays PARKED and the command is re-runnable. Its
-        session, and therefore its context, is on the shelf — nothing is lost.
-    The one state that CANNOT arise is the one that matters: we never close the old seat while the agent
-    is still alive on it (_stop_agent_for_close's never-orphan gate), and we never leave the agent live on
-    a darkened surface (we do not move a live surface at all)."""
-    from . import state as fs
-    surf = child.get("surface", "")
-    place, parent, group = _relocation_landing(label, child, a._target_uuid, a.own_workspace)
-    if not parent and place == "tab":
-        sys.exit(f"[fleet] move: no --parent surface to anchor {label}'s new tab against (no "
-                 f"$CMUX_SURFACE_ID and no surface in the target workspace).")
-    print(f"[fleet] move {label} --archive-revive: archiving, then reviving onto a FRESH surface "
-          f"(place={place}{', group ' + group if group else ''}); the session RESUMES in full.")
-
-    # An ALREADY-PARKED agent has nothing to archive — the flag names an END STATE, and for it that state
-    # is one revive away. Re-archiving would be a no-op at best and a refusal at worst.
-    if not fs.archive_get(label) and cmd_archive([label]) != 0:
-        if not fs.archive_get(label):                     # REFUSED -> nothing happened at all
-            print(f"[fleet] move: archive REFUSED, so NOTHING was moved — {label} is still LIVE on "
-                  f"surface {surf[:8]}, exactly as it was. Resolve the refusal above and re-run.")
-        else:                                             # parked, but the seat did not fully close
-            print(f"[fleet] move: {label} is PARKED (session preserved) but its old seat left cmux "
-                  f"residue — NOT reviving on top of a half-torn seat. Clear the residue above, then "
-                  f"finish by hand:\n[fleet]     fleet revive {label} --place {place} --parent {parent}")
-        return 1
-
-    # Retarget the shelf row so revive lands where the operator asked. The shelf IS revive's spec source,
-    # and it was written from the LIVE row (old place/group) — leaving it would re-land the agent in the
-    # workspace it just left.
-    fs.archive_put(label, {**(fs.archive_get(label) or {}), "place": place, "group": group})
-
-    rargv = [label, "--place", place] + (["--parent", parent] if parent else [])
-    for p in plugins:
-        rargv += ["--plugin", p]
-    if caller:
-        rargv += ["--"] + caller
-    try:
-        rc = cmd_revive(rargv)                            # NO --fresh: default = RESUME, full session
-    except SystemExit as ex:
-        if ex.code not in (0, None) and not isinstance(ex.code, int):
-            print(str(ex.code))                           # revive's own abort message
-        rc = 1
-    if rc != 0:
-        print(f"[fleet] move: the revive leg did not complete. {label} stays PARKED on the archive shelf "
-              f"with its session intact — nothing is lost. Re-run:\n"
-              f"[fleet]     fleet revive {label} --place {place}" + (f" --parent {parent}" if parent else ""))
-        return 1
-
-    now = fs.live_get(label) or {}
-    new_surf, new_ws = now.get("surface", ""), now.get("workspace", "")
-    if a.name and a.own_workspace and new_ws:
-        cmuxq("rename-workspace", "--workspace", new_ws, "--", a.name)
-    fs.log_event("moved", label=label, role=child.get("role"), session=now.get("session"),
-                 via="fleet-move-archive-revive", old_surface=surf, surface=new_surf, workspace=new_ws)
-    print(f"[fleet] DONE: relocated {label} to workspace {new_ws[:8]} on a FRESH surface "
-          f"{new_surf[:8]} (was {surf[:8]}); session resumed in full, agent-status registration intact.")
-    return 0
-
-
 def cmd_move(argv):
-    """Relocate a child into another workspace.
+    """Relocate a child into another workspace — NATIVELY (cmux 0.64.18+ heals the moved surface).
 
       fleet move <label> (--to-workspace <ws> | --own-workspace) [--name TITLE]
-                         [--archive-revive] [--plugin NAME] [-- <flags>]
 
-    A LIVE AGENT IS REFUSED. Moving a live surface across workspaces PERMANENTLY destroys that surface's
-    agent-status registration inside the cmux app — root-caused, reproduced on a disposable seat, and
-    live-verified 2026-07-10 (detachment-root-cause-2026-07-10.md). The break is surface-scoped and
-    survives a process restart, so nothing in-process can undo it: `fleet recycle` re-execs the pane on
-    the SAME surface and comes back dark (and a dark agent usually cannot even pass recycle's quiet-gate,
-    which reads the very lifecycle the break freezes). Only a FRESH surface restores it.
+    Moving a live surface across workspaces USED to permanently darken its agent-status registration
+    inside the cmux app, so this verb refused a live agent and offered `--archive-revive` (park + revive
+    onto a FRESH surface) as the only safe relocation. cmux 0.64.18 FIXED that natively: the live-identity
+    healing upsert (agent.resolve_delivery_target) promotes the live pid/surface identity over the
+    persisted record and re-stamps the moved surface, so a LIVE agent survives a relocation with its
+    registration intact (e2e-verified — conformance ROW 9 / fleet-0.64.18-verdicts.md, and the live
+    relocation test in this build).
 
-    This verb spent a day CALLING ITSELF 'the one safe verb' — true at the fleet layer (the registry
-    stayed coherent) and false at the cmux layer (it handed back an agent the app could no longer see).
-    It also shipped a WARNING printed next to the completed damage, which is not a guard. Hence: refuse.
+    So a move is now a SURFACE MOVE + a REGISTRY UPDATE — never an archive, a revive, a fresh surface, or
+    any teardown. The agent keeps its pid, session, context, surface UUID, and — critically — its PARENT
+    and GROUP. The old archive-revive path LOST those and split-brained a live rehome (cf-conductor,
+    2026-07-15: rehomed agents read parent=None/group=None); the clean repair was `cmux workspace-group
+    add`, which is exactly what this native path does. Re-grouping is surface-preserving, not a move.
 
-      --archive-revive   do the relocation CORRECTLY, in one command: archive the agent, revive it onto a
-                         FRESH surface in the target workspace, resuming the FULL session (never compact).
-
-    A plain move is still allowed on a surface with NO live agent (a husk): there is no registration left
-    to destroy. An ARCHIVED label has no surface at all — nothing to relocate — so a plain move is refused
-    and --archive-revive simply does the revive half, landing it in the target.
-
-    Bystanders are safe: the archive half goes through seat_close_plan, which downgrades the teardown to
-    `close-surface` and KEEPS the workspace whenever a sibling agent lives there."""
+    An ARCHIVED label has no surface, so there is nothing to relocate — bring it back into the target with
+    `fleet revive <label>` instead. Bystanders are safe: a surface move never touches sibling surfaces."""
     from . import state as fs
-    caller = []
-    if "--" in argv:
-        i = argv.index("--"); argv, caller = argv[:i], argv[i + 1:]
     ap = argparse.ArgumentParser(prog="fleet move", add_help=True)
     ap.add_argument("label", help="the child to relocate")
     ap.add_argument("--to-workspace", default="", metavar="WS",
@@ -4116,116 +3819,97 @@ def cmd_move(argv):
     ap.add_argument("--own-workspace", action="store_true",
                     help="relocate the child into a FRESH workspace (joins the conductor's group if one exists)")
     ap.add_argument("--name", default="", help="title for the new workspace (--own-workspace; default: label)")
-    ap.add_argument("--archive-revive", action="store_true",
-                    help="THE SAFE RELOCATION: archive the agent and revive it onto a FRESH surface in the "
-                         "target (full-session resume). Required for a LIVE agent — a plain move would "
-                         "permanently darken it.")
-    ap.add_argument("--plugin", action="append", default=[], metavar="NAME",
-                    help="union a plugin into the revived identity (--archive-revive; repeatable)")
     a = ap.parse_args(argv)
     if bool(a.to_workspace) == bool(a.own_workspace):
         sys.exit("[fleet] move: pass exactly one of --to-workspace <ws> | --own-workspace.")
-    plugins = _flatten_csv(a.plugin)
 
     child = fs.live_get(a.label)
     parked = fs.archive_get(a.label) if not child else None
     if not child and not parked:
         sys.exit(f"[fleet] move: '{a.label}' is neither a live registry member nor on the archive shelf.")
 
-    # ---- the ARCHIVED case: no surface exists, so there is nothing to relocate ----------------------
-    # Stated out loud, per Berg. An archived agent's PLACEMENT is not a property of anything currently in
-    # cmux — it is a decision made when the agent comes back. So a plain `move` has no referent and is
-    # refused; --archive-revive names an END STATE ("live on a fresh surface in the target"), which for a
-    # parked agent is reached by the revive half alone.
-    if parked and not a.archive_revive:
+    # An ARCHIVED label has no surface — there is nothing to relocate. Where it lands is decided when it
+    # comes back, so bring it back INTO the target with `fleet revive` instead of moving.
+    if parked:
         sys.exit(f"[fleet] move: '{a.label}' is ARCHIVED — it has no surface, so there is nothing to "
-                 f"move. Where it lands is decided when it comes back. Bring it back INTO the target:\n"
-                 f"[fleet]     fleet move {a.label} {_move_target_flags(a)} --archive-revive")
+                 f"move. Bring it back INTO the target instead:\n"
+                 f"[fleet]     fleet revive {a.label}"
+                 + ("   (--place workspace lands it on its own workspace)" if a.own_workspace else ""))
 
-    surf, cur_ws = "", ""
-    if child:
-        surf = child.get("surface", "")
-        if not surf:
-            sys.exit(f"[fleet] move: '{a.label}' has no surface recorded; cannot move.")
-        cur_ws = current_ws_for_surface(surf)
-        if not cur_ws:
-            sys.exit(f"[fleet] move: surface {surf[:8]} for '{a.label}' is not in cmux's tree (already "
-                     f"closed?). Use `fleet revive {a.label}` to relaunch, not move.")
+    surf = child.get("surface", "")
+    if not surf:
+        sys.exit(f"[fleet] move: '{a.label}' has no surface recorded; cannot move.")
+    cur_ws = current_ws_for_surface(surf)
+    if not cur_ws:
+        sys.exit(f"[fleet] move: surface {surf[:8]} for '{a.label}' is not in cmux's tree (already "
+                 f"closed?). Use `fleet revive {a.label}` to relaunch, not move.")
 
-    # resolve the target BEFORE anything is torn down or moved, so a bad target aborts with nothing touched.
-    a._target_uuid = ""
+    # RE-PARENT to the caller. Running `fleet move <child>` FROM a conductor is an ownership assertion:
+    # the child's registry parent + group follow the mover — this is how a rehome works, as a registry +
+    # cmux update, never the old archive-revive teardown (the path that split-brained cf-conductor's rehome
+    # to parent=None/group=None). A move with no resolvable caller conductor (a human shell / CI) preserves
+    # the child's existing parent + group.
+    caller_label = fs.label_for_surface(os.environ.get("CMUX_SURFACE_ID", "")) or ""
+    caller = fs.live_get(caller_label) if caller_label else None
+    new_parent = (caller_label if (caller and caller.get("kind") == "conductor" and caller_label != a.label)
+                  else child.get("parent"))
+    parent_entry = fs.live_get(new_parent or "") or {}
+
+    # resolve the target BEFORE the move, so a bad target aborts with nothing touched.
+    target_uuid = ""
     if a.to_workspace:
-        a._target_uuid = (a.to_workspace if _looks_like_uuid(a.to_workspace)
-                          else _ref_to_uuid("workspace", a.to_workspace))
-        if not a._target_uuid:
+        target_uuid = (a.to_workspace if _looks_like_uuid(a.to_workspace)
+                       else _ref_to_uuid("workspace", a.to_workspace))
+        if not target_uuid:
             sys.exit(f"[fleet] move: could not resolve --to-workspace '{a.to_workspace}' to a workspace "
                      f"(pass a UUID or a workspace:<n> ref). Inspect: cmux list-workspaces")
-        if cur_ws and a._target_uuid.upper() == cur_ws.upper():
+        if target_uuid.upper() == cur_ws.upper():
             print(f"[fleet] move: {a.label} is already in workspace {cur_ws[:8]}; nothing to do.")
             return 0
 
-    if parked:
-        print(f"[fleet] move {a.label}: already archived — skipping the archive half, reviving into the target.")
-        return _archive_revive(a.label, dict(parked, surface=""), a, caller, plugins)
-
-    # ---- THE GUARD. PID-authoritative, never `agentLifecycle` (the field a dark agent freezes) -------
-    # Refuses on UNKNOWN as well as LIVE: a sweep that FAILED cannot license a destructive act. The states
-    # are resolve's, not move's own — one vocabulary, one authority.
-    from . import resolve as rs
-    verdict, evidence = _relocation_liveness(surf, child.get("tool") or "claude")
-    if verdict in (rs.LIVE, rs.UNKNOWN) and not a.archive_revive:
-        alive = verdict == rs.LIVE
-        print(f"[fleet] move: REFUSED — {a.label} is "
-              f"{'LIVE' if alive else 'possibly LIVE'} ({evidence}).\n"
-              f"[fleet]   Moving a live surface across workspaces PERMANENTLY destroys its agent-status "
-              f"registration inside the cmux app. agentLifecycle freezes, `fleet ls`/`vitals` read it "
-              f"STALE forever, and cmux's sidebar drops it. The break is surface-scoped and survives a "
-              f"process restart, so `fleet recycle` CANNOT repair it — it re-execs on the SAME surface "
-              f"and comes back dark. Only a FRESH surface restores it.\n"
-              f"[fleet]   (Observability only: a darkened agent still works, still gets its inbox, still "
-              f"answers. It just goes invisible. Nothing needs waking.)\n"
-              f"[fleet]   Relocate it correctly — archive, then revive onto a fresh surface in the target, "
-              f"resuming the full session:\n"
-              f"[fleet]     fleet move {a.label} {_move_target_flags(a)} --archive-revive")
-        fs.log_event("move_refused", label=a.label, surface=surf, reason=verdict, evidence=evidence)
-        return 1
-    if a.archive_revive:
-        return _archive_revive(a.label, child, a, caller, plugins)
-
-    # ---- GONE: a husk surface. No live agent -> no registration to destroy -> the move is safe. --
-    print(f"[fleet] move: {evidence} — moving the husk surface (nothing live to darken).")
-
-    # 1. suppress the spurious archive (belt) BEFORE any surface op emits surface.closed.
+    # NATIVE RELOCATION — safe whether or not an agent is live on the surface. cmux 0.64.18+ heals the
+    # moved surface's agent-status registration, so there is no live-agent refusal, no archive, no revive,
+    # no fresh surface. The surface UUID is preserved, so the agent keeps its pid, session and context.
+    # 1. suppress the spurious archive: a cross-workspace move emits surface.closed (root cause #3), which
+    #    the router would otherwise read as an accidental external close and archive the still-live member.
     fs.expected_close_put(surf)
 
-    # 2. move the surface (UUID preserved).
+    # 2. move the surface (UUID preserved -> pid/session/context/registration all survive the move).
     if a.to_workspace:
-        cmuxq("move-surface", "--surface", surf, "--workspace", a._target_uuid, "--focus", "false")
-        new_group = child.get("group", "")               # group membership follows the target workspace
+        cmuxq("move-surface", "--surface", surf, "--workspace", target_uuid, "--focus", "false")
+        # a tab joins the target workspace's own visual group; the fleet group field follows the new parent.
+        new_group, new_place = parent_entry.get("group") or child.get("group", ""), "tab"
     else:
         cmuxq("move-tab-to-new-workspace", "--surface", surf, "--title", a.name or a.label,
               "--focus", "false")
-        new_group = ""
-        pe = fs.live_get(child.get("parent") or "") or {}
-        gname = pe.get("group") or ""
+        new_group, new_place = "", "workspace"
+        # re-group the FRESH workspace into the (new) parent conductor's group — `workspace-group add` is
+        # surface-preserving, NOT a surface move. This is the native regroup that repairs the split-brain
+        # the old archive-revive path caused (cf-conductor, 2026-07-15).
+        gname = parent_entry.get("group") or child.get("group") or ""
         gref = _group_ref(gname) if gname else ""
         new_ws_early = current_ws_for_surface(surf)
         if gref and new_ws_early:
             cmuxq("workspace-group", "add", "--group", gref, "--workspace", new_ws_early)  # surface-preserving
             new_group = gname
 
-    # 3. reconcile from TREE ground truth (root cause #3: never trust the frozen hook-store workspaceId).
+    # 3. reconcile the registry from TREE ground truth (root cause #3: never trust the frozen hook-store
+    #    workspaceId). A registry UPDATE — parent + group + workspace set TOGETHER (the split-brain fix),
+    #    every other field preserved (via {**child}) — never a teardown.
     new_ws = current_ws_for_surface(surf)
     if not new_ws:
         sys.exit(f"[fleet] move: after the move, surface {surf[:8]} could not be located in any workspace "
                  f"-- NOT touching the registry. Inspect: cmux tree --all. (The expected-close tombstone "
                  f"will lapse; if the surface is truly gone, `fleet register`/`revive` to recover.)")
-    fs.live_put(a.label, {**child, "workspace": new_ws, "place": "workspace", "group": new_group})
+    rehomed = new_parent != child.get("parent")
+    fs.live_put(a.label, {**child, "parent": new_parent, "workspace": new_ws, "place": new_place,
+                          "group": new_group})
     fs.log_event("moved", label=a.label, role=child.get("role"), session=child.get("session"),
-                 via="fleet-move-husk")
+                 via="fleet-move-native", parent=new_parent)
     print(f"[fleet] moved {a.label}: surface {surf[:8]} {cur_ws[:8]} -> {new_ws[:8]}"
+          + (f" (rehomed under {new_parent})" if rehomed else "")
           + (f" (group '{new_group}')" if new_group else "")
-          + f"; no agent was running on it.")
+          + "; relocated natively — pid/session/context/agent-status registration intact.")
     return 0
 
 
@@ -6194,9 +5878,8 @@ VERB_USAGE = {
               "                                                    bring a parked agent back (default RESUME last session; --fresh sheds; --session targets an arbitrary prior one)",
     "register": "  register <label> [--surface UUID] [--parent s] [--session id]\n"
                 "                                                    pull a LIVE-but-unregistered agent into the registry (recovery for a skipped auto-register)",
-    "move": "  move <label> (--to-workspace WS | --own-workspace) [--name TITLE] [--archive-revive] [-- <flags>]\n"
-            "                                                    relocate a child to another workspace. A LIVE agent is REFUSED (moving a live surface PERMANENTLY darkens it in cmux; recycle cannot fix it)\n"
-            "                                                    --archive-revive = the correct relocation: archive + revive onto a FRESH surface in the target, full-session resume",
+    "move": "  move <label> (--to-workspace WS | --own-workspace) [--name TITLE]\n"
+            "                                                    relocate a LIVE child natively — surface move + registry update, keeping pid/session/context/parent/group (cmux 0.64.18+ heals the moved surface; no archive/revive/fresh-surface). An ARCHIVED label has no surface: `fleet revive` it into the target instead",
     "group": "  group <init [--name N] | add <label> [--name N]>  make THIS conductor's workspace a named group (init) or retrofit a live child into it (add); membership ops keep agents live (the safe lane)",
     "recycle": "  recycle [label] [--fresh] [--session id] [--effort L] [--model M] [--force] [--plugin NAME] [--prime T|--no-prime] [-- <flags>]\n"
                "                                                    restart in place, same surface/identity (default self+RESUME; --fresh sheds; --plugin = index-aware plugin add, reaches linked + enabled)\n"

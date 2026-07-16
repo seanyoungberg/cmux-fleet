@@ -64,7 +64,6 @@ BASELINE = frozenset({
     ("cli.py", "poll_session", '.get("sessions")'),
     ("cli.py", "_surface_cwd", '.get("activeSessionsBySurface")'),
     ("cli.py", "_surface_cwd", '.get("sessions")'),
-    ("cli.py", "_session_on_launched_surface", '.get("sessions")'),
     ("cli.py", "cmd_ls", "read_hook_store()"),                   # sanctioned: one read, passed as st=
     ("cli.py", "_sessions_on_surface", '.get("sessions")'),
     ("cli.py", "_live_session_for", '.get("activeSessionsBySurface")'),
