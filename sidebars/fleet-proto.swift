@@ -104,10 +104,14 @@ func stateIcon(_ s) -> String {
   return ""
 }
 
+// last THREE path segments (repo/…/leaf), joined by "/". split on the single "/" char is reliable.
 func dirTail(_ w) -> String {
   let segs = w.directory.split(separator: "/")
-  if segs.count == 0 { return "" }
-  return String(segs[segs.count - 1])
+  let c = segs.count
+  if c == 0 { return "" }
+  if c == 1 { return String(segs[0]) }
+  if c == 2 { return "\(segs[c - 2])/\(segs[c - 1])" }
+  return "\(segs[c - 3])/\(segs[c - 2])/\(segs[c - 1])"
 }
 
 // ── group reconstruction (index-based; helpers return scalars, never arrays) ─────────────────────
@@ -159,37 +163,52 @@ func unreadDot(_ w) -> some View {
   }
   return AnyView(EmptyView())
 }
+// the ONE state indicator — up by the agent name, colored, with an icon (bigger). The old duplicate state
+// word by the ctx bar is gone; the bar row now carries only the gauge + % + model·effort.
 func statePill(_ w) -> some View {
   let s = stateOf(w)
   if s != "" {
-    return AnyView(HStack(spacing: 3) {
-      Image(systemName: stateIcon(s)).font(.system(size: 8)).foregroundColor(stateColor(s))
-      Text(s).font(.system(size: 9, design: .monospaced)).foregroundColor(stateColor(s))
+    return AnyView(HStack(spacing: 4) {
+      Image(systemName: stateIcon(s)).font(.system(size: 12)).foregroundColor(stateColor(s))
+      Text(s).font(.system(size: 11, design: .monospaced)).foregroundColor(stateColor(s))
     })
   }
   return AnyView(EmptyView())
 }
-func progBar(_ w) -> some View {
+// ctx as a FUEL GAUGE: green bar anchored LEFT, width ∝ ctx REMAINING (full at 100%, shrinks as it depletes),
+// threshold-colored (green >50 / amber 30–50 / red <30). progress.value is the CONSUMED fraction, so remaining
+// = 1 - value. The % sits next to the bar; model·effort are right-aligned (pushed by a Spacer).
+func ctxColor(_ remain) -> String {
+  if remain > 50 { return "#30A46C" }
+  if remain > 30 { return "#F5A623" }
+  return "#E5484D"
+}
+func progRow(_ w) -> some View {
   if let p = w.progress {
-    let f = p.value
+    let remain = (1.0 - p.value) * 100.0
+    let frac = remain / 100.0
+    let c = ctxColor(remain)
     return AnyView(HStack(spacing: 7) {
       HStack(spacing: 0) {
-        RoundedRectangle(cornerRadius: 2).foregroundColor("#3DB9A0").frame(width: 60 * f, height: 5)
+        RoundedRectangle(cornerRadius: 2).foregroundColor(c).frame(width: 66 * frac, height: 6)
         Spacer()
-      }.frame(width: 60, height: 5).background { RoundedRectangle(cornerRadius: 2).foregroundColor("#2A2E37") }
-      progCaption(w)
+      }.frame(width: 66, height: 6).background { RoundedRectangle(cornerRadius: 2).foregroundColor("#2A2E37") }
+      Text("\(Int(remain))%").font(.system(size: 10, design: .monospaced)).foregroundColor(c)
       Spacer()
-    }.frame(height: 12))
+      Text(modelEffort(w)).font(.system(size: 10, design: .monospaced)).foregroundColor("#7A7A85").lineLimit(1)
+    }.frame(height: 14))
   }
   return AnyView(EmptyView())
 }
-// only the HUMAN part of progress.label (state·model·effort·ctx) — never the ⟐kind⟐last machine suffix.
-func progCaption(_ w) -> some View {
+// model·effort, parsed off the HUMAN part "state · model · effort · N% left" (split on the single "·" char —
+// reliable, unlike a multi-char " · " split). Common live case (state present, per-agent workspace) → parts
+// [1]·[2]. A dedicated ⟐model⟐effort painter field would make this bulletproof (deferred; needs an adopt).
+func modelEffort(_ w) -> String {
   let h = plHuman(w)
-  if h != "" {
-    return AnyView(Text(h).font(.system(size: 10, design: .monospaced)).foregroundColor("#8B8D98").lineLimit(1))
-  }
-  return AnyView(EmptyView())
+  let parts = h.split(separator: "·")
+  if parts.count >= 4 { return "\(parts[1])·\(parts[2])" }
+  if parts.count == 3 { return "\(parts[1])" }
+  return ""
 }
 // native latestMessage is the last PROMPT (iMessage mode off), so it MUST NOT be shown as the agent's reply.
 // Show the fleet's transcript-derived last ASSISTANT message off progress.label (`lastOf`); only fall back
@@ -252,7 +271,7 @@ func agentRow(_ w, _ role) -> some View {
           Spacer()
           unreadDot(w)
         }
-        progBar(w)
+        progRow(w)
         dirLine(w)
         msgLine(w)
       }
