@@ -1647,14 +1647,41 @@ def _usage_lines():
 
 
 def _progress_label(r, pct, shared=False):
-    """The ctx bar's caption. Carries model·effort, which are NOT native cmux fields — they'd otherwise
-    have to lengthen the workspace subtitle. Reads as prose under the bar: 'fable-5 · xhigh · 63% left'.
-    The agent's name is prepended only on a SHARED workspace, where the title can't disambiguate it."""
+    """The ctx bar's caption. Carries model·effort (NOT native cmux fields) AND a leading STATE word.
+    Reads as prose under the bar: 'working · fable-5 · xhigh · 63% left'.
+
+    Why state rides HERE: `set-status` pills are NOT projected into the custom-sidebar snapshot (our
+    conformance test confirms), so a custom sidebar can't color rows by agent state from the pill. This
+    label is the one free-text channel that IS projected (binds as `w.progress.label`), so state rides it
+    as the leading token — a parser does `hasPrefix('<state> · ')`. STATE is FIRST (before the shared
+    who-prefix) so that prefix match is unambiguous. The agent's name is prepended only on a SHARED
+    workspace, where the title can't disambiguate it."""
     model = _short_model(r.get("model") or "")
     effort = r.get("effort") or ""
+    state = r.get("state") or ""
     meta = " · ".join(x for x in (model, effort) if x and x != "-")
     who = f"{r['label']} · " if shared else ""
-    return f"{who}{meta} · {pct}% left" if meta else f"{who}{pct}% left"
+    lead = f"{state} · " if state and state != "-" else ""
+    body = f"{meta} · {pct}% left" if meta else f"{pct}% left"
+    return f"{lead}{who}{body}"
+
+
+def _usage_carrier(rows):
+    """Pick a non-agent scaffold ANCHOR tab to carry the fleet-global subscriptions footer for the NATIVE
+    (blob-free) sidebar. cmux gives a custom sidebar no per-workspace global channel, and the native view
+    no longer staples usage onto conductor blobs — so the footer rides ONE carrier tab's `progress.label`
+    (a group ANCHOR, which is an agent-free marker workspace) and the sidebar reads it off just that tab.
+    Returns a workspace uuid or None (no groups / query failed)."""
+    try:
+        g = json.loads(_cmux("rpc", "workspace.group.list", "{}") or "{}")
+    except Exception:
+        return None
+    agent_ws = {r.get("ws") for r in rows if r.get("ws")}
+    for grp in g.get("groups", []):
+        anc = grp.get("anchor_workspace_id")
+        if anc and anc not in agent_ws:                        # an anchor with no live agent -> safe carrier
+            return anc
+    return None
 
 
 def _paint(rows, sidebar_blob=False):
@@ -1718,6 +1745,20 @@ def _paint(rows, sidebar_blob=False):
             continue
         _cmux("set-progress", prog, "--label", label, "--workspace", ws)
         painted += 1
+    # fleet-global SUBSCRIPTIONS footer for the NATIVE (blob-free) sidebar: paint the usage lines onto ONE
+    # non-agent CARRIER tab's progress.label ("USAGE⧗line⧗line…") instead of stapling onto every conductor.
+    # The native sidebar reads the footer off just that tab, so nothing REAL garbles. Independent of the blob
+    # path below (which still rides conductor descriptions for the legacy fleet.swift sidebar during transit).
+    ulines_native = _usage_lines()
+    carrier = _usage_carrier(rows)
+    if ulines_native and carrier:
+        ulabel = "USAGE" + USAGE_MARK + USAGE_MARK.join(ulines_native)
+        ukey = f"usage{_SEP}{carrier}"
+        ufp = f"0.00|{ulabel}"
+        cur[ukey] = ufp
+        if prev.get(ukey) != ufp:                              # on-change-only, like the pills/bars
+            _cmux("set-progress", "0.00", "--label", ulabel, "--workspace", carrier)
+            painted += 1
     # emit the fleet board for the custom sidebar (fleet.swift) — it can't read pills, only workspace
     # fields, so the board rides in workspace DESCRIPTIONS as a full CLI-derived record (`_fleet_blobs`):
     # one FLEET4 blob PER WORKSPACE, each record keyed by the agent's stable surface uuid, so whatever
@@ -1766,6 +1807,8 @@ def _paint(rows, sidebar_blob=False):
         parts = stale.split(_SEP)
         if parts[0] == "pill" and len(parts) == 3:
             _cmux("clear-status", parts[2], "--workspace", parts[1])
+        elif parts[0] == "usage" and len(parts) == 2:          # native footer carrier retired -> clear its bar
+            _cmux("clear-progress", "--workspace", parts[1])
         elif parts[0] in ("blob", "desc"):
             continue                                           # subtitles are handled above, not pills
         elif _SEP not in stale:                                # old format: bare ws -> the 'fleet' pill
