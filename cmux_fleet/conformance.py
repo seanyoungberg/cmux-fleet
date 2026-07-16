@@ -554,6 +554,26 @@ def _wait_answer(surf, token, timeout=90):
     return False, ""
 
 
+def _observable_within(surf, cursor, timeout=8):
+    """POSITIVE proof that cmux can see an agent on `surf`, within a bounded window — launch_bind's
+    dark-surface probe. TWO INDEPENDENT READS, either of which is proof: cmux's hook STORE files a live
+    agent here (rs.present), or cmux is actively STAMPING this surface in its own event log
+    (rs.stamps_since — the status updates that drive vitals and the sidebar). A dark surface produces
+    NEITHER, ever, so the window can be short; waiting longer never turns a dark surface bright.
+
+    Lives HERE, not in cli.py: the cutover (52eb49a) deleted the launch/revive seating guards that used to
+    share `cli._observable_within`, leaving this the only consumer — and a dangling `cli._observable_within`
+    call that would AttributeError the moment this check ran."""
+    from . import resolve as rs
+    end = time.time() + timeout
+    while True:
+        if rs.present(surf) or rs.stamps_since(surf, cursor):
+            return True
+        if time.time() >= end:
+            return False
+        time.sleep(0.5)
+
+
 def check_launch_bind(sb, parent_surf, trials, tool="claude"):
     """2. LAUNCH + BIND — the big one, and the reason a single green run proves nothing.
 
@@ -601,7 +621,7 @@ def check_launch_bind(sb, parent_surf, trials, tool="claude"):
         if tool != "claude":
             _drive(surf, f"Reply with exactly: BOUND-{i}")
             _wait_answer(surf, "BOUND", timeout=120)
-        observable = cli._observable_within(surf, cursor, timeout=15)
+        observable = _observable_within(surf, cursor, timeout=15)
         if not observable and rs.alive(surf, tool):
             dark += 1
         seated.append({"label": label, "surface": surf, "tool": tool, "dark": not observable})
