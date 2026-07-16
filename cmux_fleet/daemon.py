@@ -361,13 +361,20 @@ def _run_daemon(heartbeat_secs):
 
 
 def _sidebar_paint_tick():
-    """Repaint the custom fleet sidebar (fleet.swift) from the LIVE snapshot so state/ctx/model/last don't
-    go stale between manual `fleet paint` runs — the sidebar has no auto-refresh of its own, and native
-    fields (latestMessage) update themselves, so a snapshot-derived board drifts without this. On-change-
-    only via features.PAINT_STATE (an idle fleet is a snapshot + a diff, no writes). Runs ONLY when
-    [fleet].sidebar_paint is set; the caller isolates it so a bad paint can never kill the daemon/router."""
+    """Repaint the fleet sidebar from the LIVE snapshot so state/ctx/model/last don't go stale between
+    manual `fleet paint` runs — the sidebar has no auto-refresh of its own, and native fields (latestMessage)
+    update themselves, so a snapshot-derived board drifts without this. On-change-only via features.PAINT_STATE
+    (an idle fleet is a snapshot + a diff, no writes). Runs ONLY when [fleet].sidebar_paint is set; the caller
+    isolates it so a bad paint can never kill the daemon/router.
+
+    sidebar_blob=False completes the native de-jank: `_paint` still writes the per-agent pills + progress bars
+    (with the ⟐kind⟐last suffix the native fleet-proto sidebar reads) + the subscriptions carrier, and its
+    else-branch CLEARS the FLEET4 description blob every tick so it stops garbling the built-in sidebar.
+    NOTE: [fleet].sidebar_paint gates this WHOLE tick — turning it OFF stops pills/progress too (and never
+    clears the blob), so it is NOT the way to retire the blob; sidebar_blob here is. The blob is still
+    available on demand for the legacy fleet.swift fallback via FLEET_SIDEBAR_BLOB=1 (see features._paint)."""
     from . import features as ft
-    return ft._paint(ft.snapshot(), sidebar_blob=True)
+    return ft._paint(ft.snapshot(), sidebar_blob=False)
 
 
 def _heartbeat_tick():
