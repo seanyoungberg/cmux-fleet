@@ -175,9 +175,10 @@ func statePill(_ w) -> some View {
   }
   return AnyView(EmptyView())
 }
-// ctx as a FUEL GAUGE: green bar anchored LEFT, width ∝ ctx REMAINING (full at 100%, shrinks as it depletes),
-// threshold-colored (green >50 / amber 30–50 / red <30). progress.value is the CONSUMED fraction, so remaining
-// = 1 - value. The % sits next to the bar; model·effort are right-aligned (pushed by a Spacer).
+// ctx as a FUEL GAUGE: green bar anchored RIGHT, width ∝ ctx REMAINING (full at 100%, DRAINS IN FROM THE LEFT
+// as it depletes — the left goes dark first, green hugs the right), threshold-colored (green >50 / amber
+// 30–50 / red <30). progress.value is the CONSUMED fraction, so remaining = 1 - value. The % sits next to the
+// bar; model·effort are right-aligned (pushed by a Spacer).
 func ctxColor(_ remain) -> String {
   if remain > 50 { return "#30A46C" }
   if remain > 30 { return "#F5A623" }
@@ -190,8 +191,8 @@ func progRow(_ w) -> some View {
     let c = ctxColor(remain)
     return AnyView(HStack(spacing: 7) {
       HStack(spacing: 0) {
-        RoundedRectangle(cornerRadius: 2).foregroundColor(c).frame(width: 66 * frac, height: 6)
         Spacer()
+        RoundedRectangle(cornerRadius: 2).foregroundColor(c).frame(width: 66 * frac, height: 6)
       }.frame(width: 66, height: 6).background { RoundedRectangle(cornerRadius: 2).foregroundColor("#2A2E37") }
       Text("\(Int(remain))%").font(.system(size: 10, design: .monospaced)).foregroundColor(c)
       Spacer()
