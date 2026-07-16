@@ -649,20 +649,27 @@ def test_paint_progress_bar_is_the_worst_agent_on_the_workspace(monkeypatch):
     progs = [c for c in calls if c[0] == "set-progress"]
     assert len(progs) == 1                                    # ONE bar per workspace, not one per agent
     assert progs[0][1] == "0.88"                              # (100-12)/100 -> the WORST agent's usage
-    assert "b · 12% left" in progs[0]                         # labelled with who's tightest (shared ws)
+    label = progs[0][progs[0].index("--label") + 1]
+    assert label.startswith("working · ")                    # state rides the label as the leading word
+    assert "b · 12% left" in label                           # labelled with who's tightest (shared ws)
+    assert "⟐child⟐" in label                                # kind token appended (native crown discriminator)
 
 
 def test_paint_progress_label_carries_model_and_effort(monkeypatch):
     # model·effort are NOT native cmux fields -> they ride the bar's LABEL (the second free-text channel),
-    # so the built-in sidebar's ctx-bar caption shows them without lengthening the subtitle.
+    # so the built-in sidebar's ctx-bar caption shows them without lengthening the subtitle. The label now
+    # also carries a leading STATE word and a "⟐<kind>⟐<last>" machine suffix a native sidebar parses.
     ff = _ff()
     calls = _capture_cmux(ff, monkeypatch)
     rows = [dict(_row("solo", state="working", ctx_pct_remaining=63),
                  ws="workspace:9", model="claude-opus-4-8[1m]", effort="xhigh")]
     ff._paint(rows)
     prog = [c for c in calls if c[0] == "set-progress"][0]
-    assert "opus-4-8[1m] · xhigh · 63% left" in prog          # model·effort in the caption
-    assert "solo" not in prog[prog.index("--label") + 1]      # solo ws: no name prefix (title has it)
+    label = prog[prog.index("--label") + 1]
+    assert label.startswith("working · ")                    # state prefix
+    assert "opus-4-8[1m] · xhigh · 63% left" in label        # model·effort·ctx in the caption
+    assert "⟐child⟐" in label                                # kind token appended (crown discriminator)
+    assert "solo" not in label                               # solo ws: no name prefix (title has it)
 
 
 def test_paint_on_change_only_and_retires_vanished_pills(monkeypatch):
