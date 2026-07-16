@@ -572,8 +572,16 @@ def fleet_doctor_sweep(now=None):
             life = (rec.get("agentLifecycle") or "") if rec else ""
             ua = (rec.get("updatedAt") or 0) if rec else 0
             # A. stall — reuses #1's RECENT-window guard (a running record frozen for HOURS is a
-            # done-stuck ghost, not a live stall; the window excludes it).
-            if life == "running" and ua and STALL_S < (now - ua) < STALL_WINDOW:
+            # done-stuck ghost, not a live stall; the window excludes it). ALSO gate on turn-end: a
+            # 'running' record whose turn already CLOSED is cmux's lifecycle LAGGING, not a stall — the
+            # idle-timer lag, or (cmux.swift:24200) the `hasPendingBackgroundWork ? .running : .idle`
+            # branch that HOLDS 'running' while background shells drain and never resets (the 2026-07-15
+            # berg-sandbox done-idle "human typing" false alarm — root-caused in doctor-rootcause.md).
+            # features.turn_ended fails closed to False, so it only ever CLEARS a lagged 'running', never
+            # invents a stall; hadPendingBackgroundWorkAtStop is cmux's own positive flag for that case.
+            turn_done = (features.turn_ended((rec or {}).get("transcriptPath", ""))
+                         or bool((rec or {}).get("hadPendingBackgroundWorkAtStop")))
+            if life == "running" and ua and STALL_S < (now - ua) < STALL_WINDOW and not turn_done:
                 _emit_conductor("stall", label, entry, surface, {"stalled_s": int(now - ua)})
             else:
                 _rearm("stall", label, session)
@@ -684,7 +692,14 @@ def fleet_doctor_sweep(now=None):
             # #1 stall — bound 'running' record frozen in the RECENT window (STALL_S, STALL_WINDOW). A
             # missing/zero updatedAt never fires; a record stale for HOURS (a done-stuck ghost, not a live
             # stall) is above the window and skipped — see STALL_WINDOW. A real stall is caught fresh.
-            if life == "running" and ua and STALL_S < (now - ua) < STALL_WINDOW:
+            # Gate on turn-end too: a 'running' record whose turn already CLOSED is cmux's lifecycle
+            # LAGGING (idle-timer lag, or the cmux.swift:24200 hasPendingBackgroundWork branch that holds
+            # 'running' while background work drains and never resets) — NOT a stall. features.turn_ended
+            # fails closed (only ever clears a lagged 'running'); hadPendingBackgroundWorkAtStop is cmux's
+            # positive flag for the background-drain case. See doctor-rootcause.md.
+            turn_done = (features.turn_ended((rec or {}).get("transcriptPath", ""))
+                         or bool((rec or {}).get("hadPendingBackgroundWorkAtStop")))
+            if life == "running" and ua and STALL_S < (now - ua) < STALL_WINDOW and not turn_done:
                 _emit("stall", label, entry, surface, {"stalled_s": int(now - ua)})
             else:
                 _rearm("stall", label, session)                        # re-arm when it clears/ages out
