@@ -209,7 +209,6 @@ def test_handle_recovers_moved_child_via_registry_when_hookstore_session_absent(
                           "session": f"claude-{uuid}"})
 
     monkeypatch.setattr(router, "LIVE", True)
-    monkeypatch.setattr(router, "_reg", {"mtime": 0, "by_label": {}, "by_surface": {}})  # force a reload
     # THE DESYNC: hook store has NO sessions{} record for the child (its live record vanished on the
     # move) — only the frozen activeSessionsBySurface pointer, so _rec_by_session finds no surface.
     monkeypatch.setattr(router, "store",
@@ -249,7 +248,6 @@ def test_handle_skips_delivery_on_tool_mismatch(fs, monkeypatch):
                                      "session": "claude-stale-uuid-on-record"})
 
     monkeypatch.setattr(router, "LIVE", True)
-    monkeypatch.setattr(router, "_reg", {"mtime": 0, "by_label": {}, "by_surface": {}})  # force a reload
     # THE STALE RECORD: the hook store's sessions{} entry for this bare uuid resolves (via the PRIMARY
     # _rec_by_session/by_surface lookup) to CHILD, a claude-typed entry -- but the bus event that produced
     # this uuid is a CODEX Stop, so entry_tool != ev_tool -> reconcile_session() returns 'skip-tool'.
@@ -293,7 +291,6 @@ def test_handle_archives_registry_on_surface_closed(fs, monkeypatch):
                            "tool": "claude", "session": "claude-worker-uuid", "cwd": "/tmp/w"})
 
     monkeypatch.setattr(router, "LIVE", True)
-    monkeypatch.setattr(router, "_reg", {"mtime": 0, "by_label": {}, "by_surface": {}})  # force a reload
     # the surface is already gone when the frame arrives -> binding capture yields {} (no cmux shell-out)
     monkeypatch.setattr(cli, "_resume_binding", lambda surf: {})
     monkeypatch.setattr(router, "_surface_ws_now", lambda s: "")     # surface is GONE (a true close)
@@ -331,7 +328,6 @@ def test_handle_archives_muted_member_on_surface_closed(fs, monkeypatch):
     fs.live_put("muted-worker", {"surface": "MUTED", "kind": "child", "role": "w", "parent": "parent",
                                  "muted": True, "session": "claude-m"})
     monkeypatch.setattr(router, "LIVE", True)
-    monkeypatch.setattr(router, "_reg", {"mtime": 0, "by_label": {}, "by_surface": {}})
     monkeypatch.setattr(cli, "_resume_binding", lambda surf: {})
     monkeypatch.setattr(router, "_surface_ws_now", lambda s: "")     # surface is GONE (a true close)
     monkeypatch.setattr(router, "maybe_idle_wake", lambda parent_surface, label: None)
@@ -354,7 +350,6 @@ def test_handle_conductor_surface_closed_alerts_peers(fs, monkeypatch):
                          "session": "claude-peer"})
     monkeypatch.setattr(router, "fs", fs)   # test_features's reimport can leave router.fs stale; pin it so
     monkeypatch.setattr(router, "LIVE", True)  # the real wake path (fs.idlewake_on/wake_if_idle) is the one we patch
-    monkeypatch.setattr(router, "_reg", {"mtime": 0, "by_label": {}, "by_surface": {}})
     monkeypatch.setattr(cli, "_resume_binding", lambda surf: {})
     monkeypatch.setattr(router, "_surface_ws_now", lambda s: "")     # surface is GONE (a true close)
     monkeypatch.setattr(fs, "idlewake_on", lambda: True)
@@ -393,7 +388,6 @@ def test_handle_ignores_surface_closed_for_untracked_surface(fs, monkeypatch):
     surface.* frames (created/selected/focused) never reach the Stop path."""
     fs.live_put("worker", {"surface": "CHILD", "kind": "child", "role": "w", "session": "claude-w"})
     monkeypatch.setattr(router, "LIVE", True)
-    monkeypatch.setattr(router, "_reg", {"mtime": 0, "by_label": {}, "by_surface": {}})
 
     router.handle(_surface_closed_ev("SOME-RANDOM-TAB"))
     router.handle({"name": "surface.created", "category": "surface",
@@ -408,7 +402,6 @@ def test_handle_observe_mode_does_not_archive_on_surface_closed(fs, monkeypatch)
     a surface.closed only logs what a LIVE router would do."""
     fs.live_put("worker", {"surface": "CHILD", "kind": "child", "role": "w", "session": "claude-w"})
     monkeypatch.setattr(router, "LIVE", False)
-    monkeypatch.setattr(router, "_reg", {"mtime": 0, "by_label": {}, "by_surface": {}})
     monkeypatch.setattr(router, "_surface_ws_now", lambda s: "")     # surface is GONE (a true close)
 
     router.handle(_surface_closed_ev("CHILD"))
@@ -421,18 +414,19 @@ def test_handle_observe_mode_does_not_archive_on_surface_closed(fs, monkeypatch)
 # Root cause #3 / the 2026-07-07 incident: `cmux move-tab-to-new-workspace` emits surface.closed for the
 # moved surface even though it persists in its new workspace. The old handler read that as a close and
 # auto-archived three LIVE children. The fix positively confirms the surface against the live tree
-# (_surface_ws_now): a non-empty workspace == still alive == a MOVE, so skip the archive (and reconcile
-# the registry `workspace` so ls/graph stay honest even without `fleet move`).
+# (_surface_ws_now): a non-empty workspace == still alive == a MOVE, so skip the archive. Ship 5b RETIRED
+# the registry `workspace`-reconcile that used to run alongside the skip -- `workspace` is a DERIVED field
+# now (resolve.py reads the live tree), so there is nothing stored on the row to bring up to date.
 def test_handle_skips_archive_when_surface_moved(fs, monkeypatch):
     """A surface.closed for a surface that STILL EXISTS (moved to a new workspace) must NOT archive the
-    child, must NOT alert the parent, and must reconcile the registry `workspace` to the new one."""
+    child and must NOT alert the parent. The registry row is left UNTOUCHED -- Ship 5b retired the
+    workspace-reconcile (workspace is derived), so the handler must not rewrite the row on a move."""
     fs.live_put("parent", {"surface": "PARENT", "kind": "conductor", "role": "c",
                            "session": "claude-parent"})
     fs.live_put("worker", {"surface": "CHILD", "kind": "child", "role": "w", "parent": "parent",
                            "tool": "claude", "session": "claude-worker-uuid", "cwd": "/tmp/w",
                            "workspace": "WS-OLD"})
     monkeypatch.setattr(router, "LIVE", True)
-    monkeypatch.setattr(router, "_reg", {"mtime": 0, "by_label": {}, "by_surface": {}})
     monkeypatch.setattr(router, "_surface_ws_now", lambda s: "WS-NEW")   # surface PRESENT -> a MOVE
     waked = []
     monkeypatch.setattr(router, "maybe_idle_wake", lambda parent_surface, label: waked.append(parent_surface))
@@ -441,24 +435,23 @@ def test_handle_skips_archive_when_surface_moved(fs, monkeypatch):
 
     w = fs.live_get("worker")
     assert w is not None                                             # NOT archived -- still live
-    assert w["workspace"] == "WS-NEW"                                # registry workspace reconciled
+    assert w.get("workspace") == "WS-OLD"                           # row UNTOUCHED: no reconcile write (5b)
     assert fs.archive_get("worker") is None                         # nothing parked
     assert fs.inbox_pending("PARENT", kind="stale") == []           # parent NOT alerted (nothing wrong)
     assert waked == []                                              # ...and no wake
 
 
-def test_handle_move_reconcile_is_observe_safe(fs, monkeypatch):
-    """OBSERVE mode detects the move but writes NOTHING (same contract as every observe path): the
-    registry workspace is left as-is; a LIVE router is the only one that reconciles it."""
+def test_handle_move_skip_is_observe_safe(fs, monkeypatch):
+    """OBSERVE mode detects the move and writes NOTHING -- same as LIVE now that the reconcile is retired:
+    neither mode archives, alerts, or rewrites the row on a still-present (moved) surface."""
     fs.live_put("worker", {"surface": "CHILD", "kind": "child", "role": "w", "parent": "parent",
                            "session": "claude-w", "workspace": "WS-OLD"})
     monkeypatch.setattr(router, "LIVE", False)
-    monkeypatch.setattr(router, "_reg", {"mtime": 0, "by_label": {}, "by_surface": {}})
     monkeypatch.setattr(router, "_surface_ws_now", lambda s: "WS-NEW")
 
     router.handle(_surface_closed_ev("CHILD"))
 
-    assert fs.live_get("worker")["workspace"] == "WS-OLD"           # untouched in observe mode
+    assert fs.live_get("worker")["workspace"] == "WS-OLD"           # untouched (no reconcile in any mode)
     assert fs.archive_get("worker") is None                        # and never archived
 
 
@@ -498,7 +491,6 @@ def test_handle_skips_archive_and_alert_on_expected_cli_close(fs, monkeypatch):
     fs.live_put("worker", {"surface": "CHILD", "kind": "child", "role": "w", "parent": "parent",
                            "tool": "claude", "session": "claude-worker-uuid"})
     monkeypatch.setattr(router, "LIVE", True)
-    monkeypatch.setattr(router, "_reg", {"mtime": 0, "by_label": {}, "by_surface": {}})
     monkeypatch.setattr(cli, "_resume_binding", lambda surf: {})
     waked = []
     monkeypatch.setattr(router, "maybe_idle_wake", lambda parent_surface, label: waked.append(parent_surface))
@@ -520,7 +512,6 @@ def test_handle_still_archives_when_tombstone_expired(fs, monkeypatch):
     fs.live_put("worker", {"surface": "CHILD", "kind": "child", "role": "w", "parent": "parent",
                            "tool": "claude", "session": "claude-worker-uuid"})
     monkeypatch.setattr(router, "LIVE", True)
-    monkeypatch.setattr(router, "_reg", {"mtime": 0, "by_label": {}, "by_surface": {}})
     monkeypatch.setattr(cli, "_resume_binding", lambda surf: {})
     monkeypatch.setattr(router, "maybe_idle_wake", lambda parent_surface, label: None)
 
@@ -530,6 +521,70 @@ def test_handle_still_archives_when_tombstone_expired(fs, monkeypatch):
     assert fs.live_get("worker") is None                 # archived (expired tombstone doesn't shield)
     assert fs.archive_get("worker") is not None
     assert len(fs.inbox_pending("PARENT", kind="stale")) == 1   # genuine external-close path intact
+
+
+# --- WRITE-ORDER FLIP (Ship 5b): registry-before-close makes the expected-close tombstone REDUNDANT ----
+# The deliberate-close paths (fleet rm / archive) now live_del the row BEFORE closing the surface, and the
+# router reads the live store FRESH per event (no mtime cache). So by the time the surface.closed frame is
+# handled the live store has NO member bound to that surface -> the handler returns at the `if not entry`
+# gate, with no tombstone involved. This is the invariant the tombstone deletion (5b step 3) rides on:
+# prove the skip holds with the tombstone deliberately ABSENT.
+def test_handle_skips_deliberate_close_when_row_already_gone_no_tombstone(fs, monkeypatch):
+    """Registry-before-close: the CLI removed the live row before the surface closed, so a fresh-read
+    router finds no live member and skips -- no archive, no stale alert -- WITHOUT any expected-close
+    tombstone shielding the close."""
+    from cmux_fleet import cli
+    fs.live_put("parent", {"surface": "PARENT", "kind": "conductor", "role": "c", "session": "claude-parent"})
+    # No `worker` row: the CLI's live_del landed FIRST (the flip), so nothing is bound to CHILD when the
+    # frame arrives. And NO expected_close_put -- the belt is deliberately absent for this guard.
+    monkeypatch.setattr(router, "LIVE", True)
+    monkeypatch.setattr(cli, "_resume_binding", lambda surf: {})
+    waked = []
+    monkeypatch.setattr(router, "maybe_idle_wake", lambda parent_surface, label: waked.append(parent_surface))
+    assert not fs.expected_close_recent("CHILD")         # precondition: no tombstone shielding this close
+
+    router.handle(_surface_closed_ev("CHILD"))           # surface.closed for a surface with no live row
+
+    assert fs.archive_get("worker") is None              # nothing archived (no live member to evict)
+    assert fs.inbox_pending("PARENT", kind="stale") == []  # ...and NO spurious "revive?" alert
+    assert waked == []
+
+
+def test_rm_then_router_frame_no_spurious_alert_end_to_end(fs, monkeypatch):
+    """End-to-end write-order flip: run the REAL `fleet rm`, then feed the router the surface.closed frame
+    that close emits -- with the expected-close tombstone CLEARED, to isolate the ORDERING. Because rm
+    removed the live row BEFORE the close, the fresh-read router finds no live member and skips: the child
+    is not re-archived and the parent gets NO spurious stale alert. Composes cmd_rm + _archive_closed_surface
+    to prove the tombstone is redundant (the guard the 5b step-3 deletion rides on)."""
+    import os as _os
+    from cmux_fleet import cli
+    fs.live_put("parent", {"surface": "PARENT", "kind": "conductor", "role": "c", "session": "claude-parent"})
+    fs.live_put("kid", {"role": "worker", "kind": "child", "tool": "claude", "cwd": "/x", "place": "tab",
+                        "group": "", "surface": "KID-SURF", "session": "claude-kid", "parent": "parent",
+                        "plugins": [], "flags": [], "settings": "", "status": "live"})
+    monkeypatch.setattr(cli, "cmuxq", lambda *a: "")               # no real cmux; close is a no-op
+    monkeypatch.setattr(cli, "_resume_binding", lambda surf: {})
+    monkeypatch.setattr(fs, "lifecycle", lambda s: "idle")
+    monkeypatch.setattr(fs, "surface_has_live_pid", lambda s: True)
+    monkeypatch.setattr(router, "LIVE", True)
+    monkeypatch.setattr(router, "_surface_ws_now", lambda s: "")   # surface genuinely gone from the tree
+    waked = []
+    monkeypatch.setattr(router, "maybe_idle_wake", lambda parent_surface, label: waked.append(parent_surface))
+
+    cli.cmd_rm(["kid"])                                   # REAL teardown: live_del BEFORE the close
+    assert fs.live_get("kid") is None                    # removed from live
+    arch_after_rm = fs.archive_get("kid")
+    assert arch_after_rm is not None                     # ...but parked by rm (never vanished)
+
+    if _os.path.exists(fs.EXPECTED_CLOSE):               # isolate the ordering: pretend NO tombstone shields
+        _os.remove(fs.EXPECTED_CLOSE)                    # this close (the future step-3 world)
+    assert not fs.expected_close_recent("KID-SURF")
+
+    router.handle(_surface_closed_ev("KID-SURF"))        # the frame the close emitted
+
+    assert fs.inbox_pending("PARENT", kind="stale") == []   # NO spurious "revive?" alert to the parent
+    assert waked == []                                      # ...and no wake
+    assert fs.archive_get("kid") == arch_after_rm           # archive row untouched (no router re-archive)
 
 
 def test_member_by_session_matches_bare_uuid_tool_aware(monkeypatch):

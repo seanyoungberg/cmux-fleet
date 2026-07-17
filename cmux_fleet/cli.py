@@ -3070,6 +3070,13 @@ def cmd_rm(argv):
         fs.log_event("archived", label=label, role=e.get("role"), session=e.get("session"),
                      via="kill" if kill else "rm")
         archived = True
+        # WRITE-ORDER FLIP (Ship 5b, registry-before-close): drop the LIVE row BEFORE _close_seat closes the
+        # surface, so the router's fresh surface.closed read finds no live member and skips -- no duplicate
+        # archive, no spurious stale alert. archive_put ran first, so the agent is durably parked before its
+        # row leaves the live store. (The trailing `fs.live_del` below is then a harmless no-op on this
+        # path; it still does the removal on the detach/non-closing paths. The expected-close tombstone is a
+        # redundant belt now, deleted once this ordering has soaked -- 5b step 3.)
+        fs.live_del(label)
         # close the SEAT, not just the surface: a workspace-placed agent's workspace goes too, so `rm`
         # leaves no named husk workspace in the sidebar (Berg's ruling). Guards + verb choice live in
         # _close_seat/plan_seat_close; a tab/pane agent still only loses its own surface.
@@ -3258,10 +3265,16 @@ def cmd_archive(argv):
     # registry BEFORE the cmux mutation it describes (v2 §2): a seat close that half-fails must degrade
     # to "recorded, maybe-unresumable", never to "vanished".
     fs.archive_put(label, _build_archive_entry(e, b))
+    # WRITE-ORDER FLIP (Ship 5b, registry-before-close): drop the LIVE row BEFORE the surface closes, so the
+    # router's fresh-read surface.closed handler finds no live member for this surface and skips -- no
+    # duplicate archive, no spurious `kind='stale'` "revive?" alert. archive_put ran first, so the agent is
+    # durably parked before its row leaves the live store (degrades to "recorded", never "vanished"). The
+    # expected-close tombstone _close_seat still stamps is a redundant belt now -- deleted once this
+    # ordering has soaked on staging (5b step 3).
+    fs.live_del(label)
     seat_ok = True
     if surf:
         seat_ok, notes = _close_seat(label, e, "archive", planned=planned)
-    fs.live_del(label)
     fs.log_event("archived", label=label, role=e.get("role"), session=e.get("session"))
     print(f"[fleet] archived {label} (session {e.get('session')}); revive with: fleet revive {label}")
     if not seat_ok:                                     # the row is written and the agent is dead; the

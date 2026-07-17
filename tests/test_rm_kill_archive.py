@@ -217,6 +217,48 @@ def test_archive_writes_expected_close_tombstone(fs, monkeypatch):
     assert fs.expected_close_recent("SURF-WT4") is True          # ...and tombstoned first
 
 
+# --- WRITE-ORDER FLIP (Ship 5b, registry-before-close): the live row is dropped BEFORE the cmux surface
+# close, so the router (which reads the live store FRESH per event) finds no live member for the
+# surface.closed frame -> no duplicate archive, no spurious stale alert. This ordering is what makes the
+# expected-close tombstone redundant; these guards pin it so the tombstone can be deleted (5b step 3)
+# without reopening the 2026-07-07 mis-archive race. The archive_put already ran, so the row is durably
+# parked before it leaves the live store -- ordering never risks a "vanished" agent.
+def _record_del_and_close_order(fs, monkeypatch):
+    """Spy that appends ('live_del', ...) and ('cmux', 'close-surface', ...) to one list in call order."""
+    order = []
+    monkeypatch.setattr(fleet, "cmuxq", lambda *a: (order.append(("cmux",) + a) or ""))
+    monkeypatch.setattr(fleet, "_resume_binding", lambda surf: {})
+    monkeypatch.setattr(fs, "lifecycle", lambda s: "idle")
+    monkeypatch.setattr(fs, "surface_has_live_pid", lambda s: True)
+    real_live_del = fs.live_del
+    monkeypatch.setattr(fs, "live_del",
+                        lambda label: (order.append(("live_del", label)), real_live_del(label))[1])
+    return order
+
+
+def _assert_del_before_close(order, surf):
+    del_idx = next((i for i, c in enumerate(order) if c[0] == "live_del"), None)
+    close_idx = next((i for i, c in enumerate(order)
+                      if c[0] == "cmux" and len(c) > 1 and c[1] == "close-surface"), None)
+    assert del_idx is not None, f"no live_del recorded; got {order}"
+    assert close_idx is not None, f"no close-surface recorded; got {order}"
+    assert del_idx < close_idx, f"live_del must precede close-surface; got {order}"
+
+
+def test_rm_removes_live_row_before_closing_surface(fs, monkeypatch):
+    _seed(fs, "wo1", "SURF-ORDER1")
+    order = _record_del_and_close_order(fs, monkeypatch)
+    fleet.cmd_rm(["wo1"])
+    _assert_del_before_close(order, "SURF-ORDER1")
+
+
+def test_archive_removes_live_row_before_closing_surface(fs, monkeypatch):
+    _seed(fs, "wo2", "SURF-ORDER2")
+    order = _record_del_and_close_order(fs, monkeypatch)
+    fleet.cmd_archive(["wo2"])
+    _assert_del_before_close(order, "SURF-ORDER2")
+
+
 # --- kill-path adoption (the 2026-07-10 live-agent LEAK): rm/archive stop LIVE identity-checked pids
 # and NEVER close a surface over a survivor. Four live orphaned claudes were found on the box — two
 # from that day's `fleet rm --force` runs: rm SIGINT'd a stale first-record pid, closed the surface
