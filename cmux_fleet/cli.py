@@ -944,8 +944,11 @@ def _poll_surface_cwd(surf, want, timeout=10):
 def register(surf, spec, parent_surface, session, ws):
     from . import state as fs
     parent_label = fs.label_for_surface(parent_surface) or parent_surface   # store parent LABEL (durable)
+    # gen (Ship 5): a reseat fence bumped on every launch/revive/recycle, so any consumer can tell a cached
+    # derived view is from a PRIOR seat of this label. Monotonic across the label's lifetimes (live/archive).
+    _prior = fs.live_get(spec["label"]) or fs.archive_get(spec["label"])
     fs.live_put(spec["label"], {
-        "role": spec["role"], "kind": spec["kind"], "tool": spec["tool"],
+        "role": spec["role"], "kind": spec["kind"], "tool": spec["tool"], "gen": (fs.e_gen(_prior) + 1) if _prior else 1,
         "cwd": spec["abs_cwd"], "parent": parent_label, "place": spec["place"], "status": "live",
         "surface": surf, "workspace": ws,
         "session": f"claude-{session}" if spec["tool"] == "claude" else session,
@@ -2579,7 +2582,7 @@ def seat_close_plan(label, e):
             siblings.append({"surface": s, "kind": kind, "title": title, "label": by_surface.get(s, ""),
                              "pids": sorted(rs.occupants(s, ps_out=ps_out))})
     return {"surface": surf, "workspace": ws, "tree": tree, "ws_map": ws_map, "caller_ws": caller_ws,
-            "parent_ws": (parent_entry or {}).get("workspace", ""),
+            "parent_ws": rs.workspace(fs.e_surface(parent_entry), ws_map=ws_map) if parent_entry else "",
             "plan": plan_seat_close(label, surf, ws, caller_ws, place, siblings)}
 
 
@@ -2865,6 +2868,10 @@ def cmd_rm(argv):
                     if lbl != label and v.get("group") == gname:
                         members.setdefault(lbl, v)
             registry_all = {label: e, **members}
+            # Ship 5 NOTE: this registry-vs-cmux equality gate is slated for DELETE/rebuild-on-cmux-membership
+            # in a later sub-ship (DESIGN-v2 §8). Until then it reads the stored `workspace` (present on a v1
+            # row / pre-migrate). POST-`fleet migrate` the field is gone -> every row is 'unverifiable' -> the
+            # gate ABORTS the dissolve (safe: it refuses + signposts, never destroys). The rebuild lands in 5c.
             registry_ws = {lbl: v.get("workspace") for lbl, v in registry_all.items()}
             unverifiable = sorted(lbl for lbl, ws in registry_ws.items() if not ws)
             real_ws = _group_member_workspaces(gref)
@@ -4087,13 +4094,16 @@ def cmd_reap_surfaces(argv):
     ap.add_argument("--close", action="store_true", help="(review-gated) close husk candidates; refuses for now")
     a = ap.parse_args(argv)
     from . import state as fs
+    from . import resolve as rs
 
     live = fs.live_all()
     member_surf = {(e.get("surface") or "").upper(): lbl for lbl, e in live.items() if e.get("surface")}
     # fleet-managed workspaces = where live OR archived members live (an agent that exited leaves its
     # workspace member-less, so archived members matter for reach). A husk with a fleet AGENT_LABEL is
     # proven fleet-origin regardless of workspace, so it is always in scope (see below).
-    managed_ws = {(e.get("workspace") or "").upper() for e in live.values() if e.get("workspace")}
+    # DERIVED (Ship 5): a LIVE member's workspace comes from the tree via the resolver, never a stored field,
+    # so a live workspace is protected from reap even after the workspace field leaves the row.
+    managed_ws = {w.upper() for e in live.values() if (w := rs.workspace(fs.e_surface(e)))}
     managed_ws |= {(e.get("workspace") or "").upper() for e in fs.archive_all().values() if e.get("workspace")}
     tree = cmuxq("tree", "--all", "--id-format", "both")
 
@@ -5235,6 +5245,7 @@ def _recycle_exec_one(p):
     if lazy:
         e = fs.live_get(label) or {}
         e["surface"] = surf
+        e["gen"] = fs.e_gen(e) + 1                        # reseat fence (Ship 5): a recycle is a new seat
         if mode == "fresh":
             e["session"] = ""                            # a NEW session binds on 1st turn -> router backfills
             if p.get("cwd"):
@@ -5299,6 +5310,7 @@ def _recycle_exec_one(p):
             log(f"{'resumed' if mode == 'resume' else 'fresh'} session {sid} bound")
             e = fs.live_get(label) or {}
             e["surface"] = surf
+            e["gen"] = fs.e_gen(e) + 1                    # reseat fence (Ship 5)
             e["session"] = f"claude-{sid}" if e.get("tool", "claude") == "claude" else sid
             if mode == "fresh" and p.get("cwd"):
                 e["cwd"] = p["cwd"]                      # PERSIST the fresh cwd (a role move -> new session lives here)
@@ -5931,12 +5943,44 @@ INTERNAL_USAGE = {
 # rotting as verbs gain parsers (the 2026-07-11 bug: 16 verbs where `--help` was a positional label or,
 # worse, silently ignored — `fleet serve --help` STARTED THE HTTP SERVER and blocked).
 SELF_HELP_VERBS = frozenset({
-    "launch", "config", "plugins", "revive", "register", "recycle", "move", "group", "unstick",
+    "launch", "config", "plugins", "revive", "register", "recycle", "move", "group", "unstick", "migrate",
     "reap-surfaces", "sessions", "worktree", "profile", "daemon", "find", "codex-login", "codex-sync",
     # codex-setup is NOT here any more: it lost its ArgumentParser when it became a superseded-stub, so it
     # can no longer render its own --help. The guard now serves it from VERB_USAGE (which is the whole point
     # of the guard: a verb without a parser must never be RUN just to ask it for help).
 })
+
+
+def cmd_migrate(argv):
+    """fleet migrate [--dry-run] [--no-backup]   ONE-SHOT registry schema migration to v2 (Ship 5 thin-
+    registry). Rewrites every fleet.json + archive.json row into identity + spec + binding, DROPPING the
+    fields cmux now owns (workspace, status) so the registry can no longer lie about where an agent is, and
+    flips the schema marker to 2. Idempotent (safe to re-run). Backs up the v1 files first
+    (<file>.v1.bak-<ts>) unless --no-backup. This is the deliberate, reversible-from-backup switch: the
+    fleet reads BOTH shapes, so adopting the build changes NOTHING on disk until you run this."""
+    from . import state as fs
+    ap = argparse.ArgumentParser(prog="fleet migrate", add_help=True)
+    ap.add_argument("--dry-run", action="store_true", help="report what WOULD migrate; touch nothing")
+    ap.add_argument("--no-backup", action="store_true", help="skip the v1 backup (NOT recommended)")
+    a = ap.parse_args(argv)
+    fver, aver = fs.schema_ver("fleet"), fs.schema_ver("archive")
+    live_n, arch_n = len(fs.live_all()), len(fs.archive_all())
+    if fver >= fs.SCHEMA_CURRENT and aver >= fs.SCHEMA_CURRENT:
+        print(f"[fleet] migrate: already at schema v{fs.SCHEMA_CURRENT}. Nothing to do "
+              f"(fleet {live_n} rows, archive {arch_n} rows).")
+        return 0
+    if a.dry_run:
+        print(f"[fleet] migrate --dry-run: would migrate fleet.json ({live_n} rows) + archive.json "
+              f"({arch_n} rows) from v{fver}/v{aver} to v{fs.SCHEMA_CURRENT} — splits identity/spec/binding, "
+              f"drops workspace+status (derived), adds gen. Backup: {'skipped' if a.no_backup else 'yes'}.")
+        return 0
+    res = fs.migrate_state(backup=not a.no_backup)
+    print(f"[fleet] migrated fleet.json ({res['fleet']} rows) + archive.json ({res['archive']} rows) "
+          f"to schema v{fs.SCHEMA_CURRENT}.")
+    for b in res["backups"]:
+        print(f"[fleet]   v1 backup: {b}")
+    print("[fleet] the registry now stores identity + spec + binding; workspace/status derive live from cmux.")
+    return 0
 
 
 def usage_for(verb):
@@ -5954,7 +5998,7 @@ def verb_table():
     from . import conformance as cf
     return {"launch": cmd_launch, "config": cmd_config, "ls": cmd_ls, "plugins": cmd_plugins,
             "archive": cmd_archive, "revive": cmd_revive, "register": cmd_register, "recycle": cmd_recycle,
-            "move": cmd_move, "group": cmd_group,
+            "move": cmd_move, "group": cmd_group, "migrate": cmd_migrate,
             "unstick": cmd_unstick, "reap-surfaces": cmd_reap_surfaces, "sessions": cmd_sessions,
             "_recycle-exec": cmd_recycle_exec, "_recycle-bulk-exec": cmd_recycle_bulk_exec,
             "broadcast": cmd_broadcast,

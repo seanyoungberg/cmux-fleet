@@ -14,16 +14,19 @@
 #                      state, distinct from ack): the heartbeat reminds instead of re-nudging.
 #   doctor-dedup.json  durable fleet-doctor condition keys, so daemon restarts do not re-alert
 #                      steady-state conditions already seen in a prior process.
-#   fleet.json         the LIVE fleet, label-keyed: label -> {role,kind,tool,cwd,parent,place,
-#                      status:"live",surface,session}. Only running agents.
-#   archive.json       PARKED agents, label-keyed: {role,kind,tool,cwd,last_session,parent,archived_at}.
+#   fleet.json         the LIVE fleet, label-keyed. Ship 5 thin-registry: v1 was flat {role,kind,tool,cwd,
+#                      parent,place,status:"live",surface,session}; v2 (after `fleet migrate`) shrinks to
+#                      identity {role,kind,parent,tool,gen} + spec (intent) + binding {surface,session_hint}
+#                      and DERIVES workspace/status from cmux. Code reads BOTH shapes via the e_* accessors;
+#                      live_all()/live_get() return a flat working VIEW regardless of on-disk version.
+#   archive.json       PARKED agents, label-keyed: identity + spec + {last_session,binding_cmd,archived_at}.
 #   log.jsonl          append-only EVENT ledger: {ts,event,label,role,...}. Source-of-truth timeline.
 #   notify-mode        the wake dial, now a MUTE switch: passive (mute) | auto (default, wake-now).
 #   router.seq         bus cursor (cmux events --cursor-file). router.log — the router trace.
 #
 # Identity: kind(child|conductor) / role(type, ->AGENT_ROLE, owns the dir) / label(unique instance,
 # ->AGENT_LABEL, the registry key, durable across recycles) / surfaceId(current seat, a mutable field).
-import fcntl, glob, json, os, re, subprocess, sys, tempfile, time
+import contextlib, fcntl, glob, json, os, re, subprocess, sys, tempfile, time
 
 from .config import STATE, CMUX, HOOKSTORE  # path resolver
 
@@ -45,6 +48,8 @@ PRESENTED = os.path.join(STATE, "inbox-presented.json")  # {surface: {event_key:
 LEDGER_TTL_S = 14 * 86400   # acked/presented entries older than this are pruned on write (bounded files)
 PROVIDER_USAGE = os.path.join(STATE, "provider-usage.json")  # last usage poll snapshot (providers feature)
 CODEX_HEALTH = os.path.join(STATE, "codex-health.json")      # per-account token health (edge-trigger dedup)
+SCHEMA = os.path.join(STATE, "schema.json")   # {"fleet":2,"archive":2}; absent/1 => pre-migrate v1. Flipped by `fleet migrate`.
+SCHEMA_CURRENT = 2                            # Ship 5 thin-registry: identity + spec + binding; workspace/status derived.
 
 # Agent-helper command hints emitted into conductor context by the awareness/drain hooks. Phase 2
 # folded the four standalone plugin scripts into `fleet <verb>` subcommands, so these are now the app
@@ -372,9 +377,175 @@ def block_set(surface, kind, seq):
     return int(seq)
 
 
+# --- schema v2 (Ship 5 thin-registry): identity + spec + binding, workspace/status derived ----------
+# The row shrinks to what cmux has NO concept of. `to_v2` is the one shape; `to_v1` denormalizes back so a
+# not-yet-migrated state dir keeps writing v1 (reversible until Berg runs `fleet migrate`). Accessors read
+# BOTH shapes, so read sites convert incrementally with the suite staying green on the live v1 fixtures.
+_ID_KEYS = ("role", "kind", "parent", "tool", "gen")
+_SPEC_KEYS = ("cwd", "place", "group", "muted", "provider", "worktree", "plugins", "flags", "settings")
+_BINDING_KEYS = ("surface", "session_hint", "launchedAt")
+_ARCHIVE_KEEP = ("last_session", "binding_cmd", "binding_cwd", "archived_at")  # archive-row metadata: stays top-level
+_DERIVED_DROP = ("workspace", "status")          # cmux owns these now; deleted from the row (resolve.py derives)
+_KNOWN_TOP = set(_ID_KEYS) | set(_SPEC_KEYS) | set(_ARCHIVE_KEEP) | {
+    "surface", "session", "session_hint", "launchedAt", "spec", "binding", "v"} | set(_DERIVED_DROP)
+
+
+def is_v2(row):
+    return isinstance(row, dict) and isinstance(row.get("spec"), dict) and isinstance(row.get("binding"), dict)
+
+
+def to_v2(row):
+    """v1-flat OR v2-nested -> v2-nested. PURE + IDEMPOTENT. Drops the derived fields (workspace, status);
+    `session` -> binding.session_hint (kept for display + the router's reconcile target, never as the acting
+    id); `gen` defaults to 1. Unknown legacy top-level keys are preserved INTO spec so nothing is lost.
+
+    ABSORBS top-level overrides even when `row` is already v2: a caller doing `{**v2row, "place": x}`
+    (the common merge-write idiom) lands `place` in spec, `surface` in binding, etc. — so write sites keep
+    using the flat-merge idiom and this normalizes it on the way to disk."""
+    if not isinstance(row, dict):
+        return row
+    spec = dict(row.get("spec") or {})           # start from any existing nested blocks...
+    binding = dict(row.get("binding") or {})
+    # preserve every identity key that is PRESENT (even parent=None: a top-level conductor is meaningful,
+    # and the migrator must be faithful — never drop or invent parentage, §2.G).
+    r = {k: row[k] for k in ("role", "kind", "parent", "tool") if k in row}
+    r["gen"] = row.get("gen", 1)
+    for k in _ARCHIVE_KEEP:                       # archive metadata stays top-level (revive reads it there)
+        if k in row:
+            r[k] = row[k]
+    for k in _SPEC_KEYS:                          # ...then overlay any top-level spec keys (the merge idiom)
+        if k in row:
+            spec[k] = row[k]
+    for k, v in row.items():                      # forward-safe: keep any unknown legacy key in spec
+        if k not in _KNOWN_TOP:
+            spec[k] = v
+    if row.get("surface") is not None:
+        binding["surface"] = row["surface"]
+    if "session_hint" in row:
+        binding["session_hint"] = row["session_hint"]
+    elif "session" in row:
+        binding["session_hint"] = row.get("session")
+    if "launchedAt" in row:
+        binding["launchedAt"] = row["launchedAt"]
+    r["spec"], r["binding"] = spec, binding
+    return r
+
+
+def to_v1(row):
+    """v2-nested OR v1-flat -> v1-flat. The inverse used to persist under an UN-migrated (v1) state dir, so
+    adopting Ship 5 does not rewrite the on-disk shape until `fleet migrate` runs (reversible). Flattens
+    identity+spec+binding to top level; session_hint -> session; keeps `gen` (an unknown extra a v1 reader
+    ignores). Does NOT resurrect workspace/status (already derived + ignored by every reader since step 1)."""
+    if not isinstance(row, dict) or not is_v2(row):
+        return dict(row) if isinstance(row, dict) else row
+    flat = {k: row[k] for k in ("role", "kind", "parent", "tool") if k in row}
+    flat["gen"] = row.get("gen", 1)
+    for k in _ARCHIVE_KEEP:
+        if k in row:
+            flat[k] = row[k]
+    flat.update(row.get("spec") or {})
+    b = row.get("binding") or {}
+    if b.get("surface") is not None:
+        flat["surface"] = b["surface"]
+    if "session_hint" in b:
+        flat["session"] = b.get("session_hint")
+    if "launchedAt" in b:
+        flat["launchedAt"] = b["launchedAt"]
+    return flat
+
+
+# --- row-field accessors: read a registry row REGARDLESS of shape (v1 flat OR v2 nested) --------------
+def e_surface(e):
+    if not isinstance(e, dict):
+        return ""
+    return (e.get("binding") or {}).get("surface") if is_v2(e) else e.get("surface") or ""
+
+
+def e_session(e):
+    """The session HINT (display + router reconcile target; verbs that ACT resolve live)."""
+    if not isinstance(e, dict):
+        return ""
+    return ((e.get("binding") or {}).get("session_hint") if is_v2(e) else e.get("session")) or ""
+
+
+def e_spec(e, key, default=None):
+    """A spec (intent) field: cwd/place/group/muted/provider/worktree/plugins/flags/settings."""
+    if not isinstance(e, dict):
+        return default
+    if is_v2(e):
+        return (e.get("spec") or {}).get(key, default)
+    return e.get(key, default)
+
+
+def e_gen(e):
+    return int((e or {}).get("gen", 1) or 1) if isinstance(e, dict) else 1
+
+
+# --- schema version marker + `fleet migrate` (Berg-run; the build never runs it against live) ---------
+def schema_ver(which="fleet"):
+    """On-disk schema version ('fleet'|'archive'): 1 pre-migrate, 2 after `fleet migrate`. Absent file/key
+    => 1, so an un-migrated dir stays v1 and reversible."""
+    try:
+        return int(_read_json(SCHEMA, {}).get(which, 1) or 1)
+    except Exception:
+        return 1
+
+
+def _schema_set(which, ver):
+    m = _read_json(SCHEMA, {})
+    m[which] = ver
+    _atomic_write(SCHEMA, json.dumps(m, indent=2))
+
+
+def _persist_shape(entry, which):
+    """Coerce `entry` to the shape the on-disk store is at: v2 once migrated, else v1-flat (reversible)."""
+    return to_v2(entry) if schema_ver(which) >= 2 else to_v1(entry)
+
+
+@contextlib.contextmanager
+def _flock(path):
+    """Exclusive cross-process lock around a read-modify-write of `path` (mirrors inbox_next_seq). Closes
+    R1: two conductors reparenting concurrently used to lost-update the whole-file rewrite (writer A reads
+    {r1,r2}, B reads {r1,r2}, A writes {r1',r2}, B writes {r1,r2'} -> r1' lost -> the 07-16 graph flicker)."""
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    fd = os.open(path + ".lock", os.O_RDWR | os.O_CREAT, 0o644)
+    try:
+        fcntl.flock(fd, fcntl.LOCK_EX)
+        yield
+    finally:
+        fcntl.flock(fd, fcntl.LOCK_UN)
+        os.close(fd)
+
+
+def migrate_state(backup=True):
+    """The one-shot v1->v2 migrator (`fleet migrate`). Idempotent, flocked, backs up first. Rewrites every
+    fleet.json + archive.json row via to_v2 and flips the schema marker. Berg-run — the build NEVER calls
+    this against the live registry. Returns {fleet, archive, backups}."""
+    out = {"fleet": 0, "archive": 0, "backups": []}
+    for path, key in ((LIVE, "fleet"), (ARCHIVE, "archive")):
+        with _flock(path):
+            m = _read_json(path, {})
+            if not isinstance(m, dict):
+                continue
+            if backup and os.path.exists(path):
+                bak = f"{path}.v1.bak-{int(time.time())}"
+                _atomic_write(bak, json.dumps(m, indent=2))
+                out["backups"].append(bak)
+            migrated = {label: to_v2(row) for label, row in m.items()}
+            _atomic_write(path, json.dumps(migrated, indent=2))
+            _schema_set(key, SCHEMA_CURRENT)
+            out[key] = len(migrated)
+    return out
+
+
 # --- identity: the LIVE fleet (label-keyed) ------------------------------------------------
 def live_all():
-    return _read_json(LIVE, {})
+    """Every live row as a FLAT working view (identity+spec+binding flattened to top level), regardless of
+    the on-disk schema. This is a fresh derive per read — NOT persisted duplication, so it cannot drift —
+    and it is what lets existing `e.get("surface")`/`("cwd")`/`("place")` readers keep working across the v2
+    cutover unchanged. The DERIVED topology (workspace/status) is NOT in the view: those are gone from a v2
+    row and their readers go through resolve.py. `live_put` re-nests to the on-disk shape on the way back."""
+    return {k: to_v1(v) for k, v in _read_json(LIVE, {}).items()}
 
 
 def live_get(label):
@@ -382,32 +553,50 @@ def live_get(label):
 
 
 def live_put(label, entry):
-    m = live_all()
-    m[label] = entry
-    _atomic_write(LIVE, json.dumps(m, indent=2))
+    """Flocked whole-row write (R1). Persists in the on-disk schema version so an un-migrated dir stays v1
+    and reversible; a migrated dir stores v2."""
+    with _flock(LIVE):
+        m = _read_json(LIVE, {})
+        m[label] = _persist_shape(entry, "fleet")
+        _atomic_write(LIVE, json.dumps(m, indent=2))
 
 
 def live_del(label):
-    m = live_all()
-    e = m.pop(label, None)
-    _atomic_write(LIVE, json.dumps(m, indent=2))
-    return e
+    with _flock(LIVE):
+        m = _read_json(LIVE, {})
+        e = m.pop(label, None)
+        _atomic_write(LIVE, json.dumps(m, indent=2))
+        return e
+
+
+def live_update(label, mutate):
+    """Flocked read-modify-write of ONE row (the correct R1 primitive for a merge/conditional write):
+    mutate(entry_or_None) -> entry_or_None (None deletes). Two writers touching the SAME row serialize."""
+    with _flock(LIVE):
+        m = _read_json(LIVE, {})
+        new = mutate(m.get(label))
+        if new is None:
+            m.pop(label, None)
+        else:
+            m[label] = _persist_shape(new, "fleet")
+        _atomic_write(LIVE, json.dumps(m, indent=2))
+        return new
 
 
 def label_for_surface(surface):
     for label, v in live_all().items():
-        if v.get("surface") == surface:
+        if e_surface(v) == surface:
             return label
     return ""
 
 
 def surface_for_label(label):
-    return (live_get(label) or {}).get("surface", "")
+    return e_surface(live_get(label) or {})
 
 
 def entry_for_surface(surface):
     for v in live_all().values():
-        if v.get("surface") == surface:
+        if e_surface(v) == surface:
             return v
     return None
 
@@ -504,18 +693,28 @@ def reconcile_session(label, sid_bare, tool=None, event_tool=None):
     codex-store id never overwrites a claude agent's session (the berg-sandbox 019f144d trap). `tool`
     defaults to the entry's own tool (claude sessions store the `claude-` prefixed form).
     Returns the action: 'backfill' | 'reconcile' | 'skip-tool' | ''."""
-    e = live_get(label)
-    if not e or not sid_bare:
-        return ""
-    t = tool or e.get("tool", "claude")
-    if event_tool and event_tool != t:
-        return "skip-tool"                              # cross-tool id -> never write it (no contamination)
-    stored = bare_uuid(e.get("session") or "")
-    if stored == sid_bare:
-        return ""
-    e["session"] = f"claude-{sid_bare}" if t == "claude" else sid_bare
-    live_put(label, e)
-    return "backfill" if not stored else "reconcile"
+    action = [""]
+
+    def mut(e):
+        if not e or not sid_bare:
+            return e
+        t = tool or e.get("tool", "claude")
+        if event_tool and event_tool != t:
+            action[0] = "skip-tool"                     # cross-tool id -> never write it (no contamination)
+            return e
+        stored = bare_uuid(e_session(e) or "")
+        if stored == sid_bare:
+            return e
+        val = f"claude-{sid_bare}" if t == "claude" else sid_bare
+        if is_v2(e):
+            e.setdefault("binding", {})["session_hint"] = val
+        else:
+            e["session"] = val
+        action[0] = "backfill" if not stored else "reconcile"
+        return e
+
+    live_update(label, mut)                             # flocked read-modify-write (R1)
+    return action[0]
 
 
 # --- expected-close tombstones (CLI <-> router registry-hygiene handshake) ------------------------
@@ -557,7 +756,9 @@ def expected_close_recent(surface_id, now=None):
 
 # --- identity: the ARCHIVE shelf (parked, revivable) ---------------------------------------
 def archive_all():
-    return _read_json(ARCHIVE, {})
+    """Archive rows as a FLAT working view (same rationale as live_all): revive/ls read `last_session`,
+    `cwd`, `place`, `binding_cmd` etc. by top-level key across the v2 cutover unchanged."""
+    return {k: to_v1(v) for k, v in _read_json(ARCHIVE, {}).items()}
 
 
 def archive_get(label):
@@ -565,16 +766,18 @@ def archive_get(label):
 
 
 def archive_put(label, entry):
-    m = archive_all()
-    m[label] = entry
-    _atomic_write(ARCHIVE, json.dumps(m, indent=2))
+    with _flock(ARCHIVE):
+        m = _read_json(ARCHIVE, {})
+        m[label] = _persist_shape(entry, "archive")
+        _atomic_write(ARCHIVE, json.dumps(m, indent=2))
 
 
 def archive_del(label):
-    m = archive_all()
-    e = m.pop(label, None)
-    _atomic_write(ARCHIVE, json.dumps(m, indent=2))
-    return e
+    with _flock(ARCHIVE):
+        m = _read_json(ARCHIVE, {})
+        e = m.pop(label, None)
+        _atomic_write(ARCHIVE, json.dumps(m, indent=2))
+        return e
 
 
 # --- the event ledger ----------------------------------------------------------------------
