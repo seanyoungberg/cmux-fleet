@@ -3237,8 +3237,9 @@ def _notify_parent_lifecycle(parent, label, verb, invoker, refused):
     psurf = fs.surface_for_label(parent)
     if not psurf:
         return
+    past = verb + ("d" if verb.endswith("e") else "ed")      # archive->archived, remove->removed, reparent->reparented
     body = (f"[lifecycle] {invoker} "
-            + (f"TRIED to {verb}" if refused else f"{verb}d")
+            + (f"TRIED to {verb}" if refused else past)
             + f" your child '{label}'"
             + (" (REFUSED -- they'd need --force)." if refused else " (forced through --force)."))
     msg_id = secrets.token_hex(3)
@@ -4024,6 +4025,52 @@ def cmd_move(argv):
     return 0
 
 
+def cmd_reparent(argv):
+    """Surgically change a LIVE agent's registry `parent` and NOTHING else (fleet-ergonomics FIX 2). Unlike
+    `move` (which forces a workspace move + reparents under the caller) or `register` (which rebuilds the
+    whole spec), this touches only the one field, flocked via live_update so a concurrent writer on the
+    same row can't be clobbered. The new parent is another LABEL, or `none` for a TOP-LEVEL agent
+    (parent=None — the canonical rep `is_top_level` reads). The surface/session/context/group are untouched;
+    this is a pure registry-parentage edit, not a relocation. Cross-conductor ownership is guarded exactly
+    like archive/rm: reparenting a DIFFERENT conductor's child needs --force and notifies that parent; your
+    own child, your own node, and an anonymous CLI operator are unguarded."""
+    from . import state as fs
+    force = "--force" in argv
+    args = [a for a in argv if a != "--force"]
+    if len(args) != 2:
+        sys.exit("usage: fleet reparent <label> <parent-label|none> [--force]")
+    label, new_parent_arg = args[0], args[1]
+    e = fs.live_get(label)
+    if not e:
+        sys.exit(f"[fleet] reparent: no LIVE label '{label}' (reparent edits a live registry row)")
+    new_parent = None if new_parent_arg.strip().lower() == "none" else new_parent_arg
+    if new_parent == label:
+        sys.exit(f"[fleet] reparent: '{label}' can't be its own parent")
+    # don't mint a dangling parentage: a named new parent must be a known agent (live or archived). `none`
+    # (top-level) always passes. (A dangling parent is exactly what `fleet migrate` collapses to None.)
+    if new_parent is not None and not (fs.live_get(new_parent) or fs.archive_get(new_parent)):
+        sys.exit(f"[fleet] reparent: no known agent labeled '{new_parent}' (live or archived) to reparent "
+                 f"'{label}' under. Use 'none' for a top-level agent.")
+    _lifecycle_owner_guard(label, "reparent", force)         # another conductor's child needs --force + notify
+    old_parent = e.get("parent") or None
+
+    def _set(row):
+        if row is None:
+            return None                                      # vanished mid-update -> stays gone
+        row = dict(row)
+        row["parent"] = new_parent
+        return row
+
+    updated = fs.live_update(label, _set)
+    if updated is None:
+        sys.exit(f"[fleet] reparent: '{label}' vanished from the registry mid-update")
+    fs.log_event("reparented", label=label, role=e.get("role"),
+                 old_parent=old_parent or "", new_parent=new_parent or "")
+    print(f"[fleet] reparent {label}: parent {old_parent or '(top-level)'} -> "
+          + (new_parent if new_parent else "(top-level)"))
+    return 0
+
+
 def _looks_like_uuid(s):
     import re
     return bool(re.fullmatch(r"[0-9A-Fa-f]{8}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{12}",
@@ -4791,6 +4838,19 @@ def _recycle_plan(label, entry, caller, add_plugin, mode, session, force, prime_
     surf = entry.get("surface", "")
     old_sid = (entry.get("session") or "").replace("claude-", "")
     send_cmd, _checkpoint = _compose_recycle_cmd(label, entry, caller, add_plugin, mode, session, provider)
+    # FIX 3 (registry must not lie): a ROSTER recycle is TOML-authoritative — the launch is recomposed from
+    # the CURRENT toml (_compose_from_roster re-resolves), so the plugin set that ACTUALLY launches is the
+    # re-resolved one, which drifts from the recorded set whenever the toml changed since launch (berg-
+    # sandbox relaunched on 6 plugins while its row still said 4). Resolve it here so the exec writes THAT
+    # back onto the row. Off-roster agents reproduce from their captured binding -> the recorded set stands.
+    role, tool = entry.get("role"), entry.get("tool", "claude")
+    if _is_roster(role):
+        try:
+            resolved_plugins = resolve(load_config(), role, tool, None).get("plugins", [])
+        except SystemExit:
+            resolved_plugins = list(entry.get("plugins", []))
+    else:
+        resolved_plugins = list(entry.get("plugins", []))
     prime = None
     if not no_prime:
         if prime_override:
@@ -4806,9 +4866,10 @@ def _recycle_plan(label, entry, caller, add_plugin, mode, session, force, prime_
     return {"label": label, "surface": surf, "send_cmd": send_cmd, "mode": mode,
             "tool": entry.get("tool", "claude"), "force": force, "prime": prime, "old_session": old_sid,
             "cwd": _cwd_of_sendcmd(send_cmd),          # effective launch cwd, persisted after a FRESH bind
-            # deterministic plugin set (entry + add_plugin union) for the recycled event's `effective`
-            # field -- no token-scan needed for this part, unlike effort/model.
-            "plugins": _dedup(list(entry.get("plugins", [])) + list(add_plugin or [])),
+            # deterministic plugin set for the recycled event's `effective` field AND the row writeback
+            # (FIX 3): the RESOLVED set (toml-authoritative for a roster role) unioned with the --plugin
+            # adds -- what actually launched, so the registry stops recording a stale count.
+            "plugins": _dedup(list(resolved_plugins) + list(add_plugin or [])),
             # fix 1: the re-resolved account (registry `provider` re-bind + `fleet usage` attribution) and
             # the codex pre-launch refresh guard's target. "" when no [providers] (opt-in holds).
             "provider": (provider or {}).get("label", ""),
@@ -4924,6 +4985,17 @@ def cmd_recycle(argv):
     surf = entry.get("surface", "")
     if not surf:
         sys.exit(f"[fleet] recycle: label '{label}' has no surface on its registry entry")
+    # SELF-RECYCLE self-detection (fleet-ergonomics FIX 1): when the target surface IS the caller's own
+    # ($CMUX_SURFACE_ID), the quiet-gate can NEVER clear from inside this turn — the caller IS the running
+    # activity the gate waits on, so a non-forced self-recycle deadlocks to the 180s ABORT (berg-sandbox
+    # burned 4 attempts on exactly this). The caller explicitly asked to recycle itself and there is no
+    # human draft to protect, so auto-apply force with a clear notice. --force already does this; this just
+    # makes the common bare `fleet recycle --fresh` self-case work without the operator knowing the trick.
+    self_recycle = bool(surf) and surf == os.environ.get("CMUX_SURFACE_ID", "")
+    force = a.force or self_recycle
+    if self_recycle and not a.force:
+        print("[fleet] self-recycle: forcing respawn (your own turn keeps the surface 'running'; the "
+              "quiet-gate cannot clear from here)")
     if a.session and not a.force_session and not _known_session(entry, surf, a.session):
         sys.exit(f"[fleet] recycle: could not verify session '{a.session}' under {label}'s projects dir "
                  f"(bad id, or the dir couldn't be resolved/enumerated). `fleet sessions {label}` to list "
@@ -4944,7 +5016,7 @@ def cmd_recycle(argv):
     # account (never a silent ambient fall-back). Announced below; a moved default prints a loud warn.
     pr, provider_announce, provider_warn = _resolve_recycle_provider(
         entry.get("tool", "claude"), entry.get("role"), entry.get("provider", ""))
-    payload = _recycle_plan(label, entry, caller, _flatten_csv(a.plugin), mode, a.session, a.force,
+    payload = _recycle_plan(label, entry, caller, _flatten_csv(a.plugin), mode, a.session, force,
                             a.prime, a.no_prime, pr)
     provline, provwarn = _session_pref_provenance(entry.get("role"), entry.get("tool", "claude"),
                                                    payload["send_cmd"], a.effort, a.model)
@@ -4978,7 +5050,7 @@ def cmd_recycle(argv):
     subprocess.Popen([sys.executable, "-m", "cmux_fleet", "_recycle-exec", pf],
                      stdout=open(log, "a"), stderr=subprocess.STDOUT, stdin=subprocess.DEVNULL,
                      start_new_session=True)
-    gate = "idle" if a.force else "idle + empty draft"
+    gate = "idle" if force else "idle + empty draft"
     print(f"[fleet] recycle SCHEDULED (detached) for {label} on {surf}; mode={mode}.")
     print(f"[fleet]   waits for the surface to go quiet ({gate}), then respawns in place. log: {log}")
     return 0
@@ -5341,6 +5413,8 @@ def _recycle_exec_one(p):
                 e["cwd"] = p["cwd"]                      # PERSIST the fresh cwd so the next RESUME finds the new session
         if "provider" in p:
             e["provider"] = p["provider"]                # fix 1: record the account the agent NOW runs under
+        if "plugins" in p:
+            e["plugins"] = p["plugins"]                  # FIX 3: row records the resolved set that launched
         fs.live_put(label, e)
         fs.log_event("recycled", label=label, role=e.get("role"), surface=surf,
                      session=e.get("session") or "", mode=mode, effective=effective)
@@ -5405,6 +5479,8 @@ def _recycle_exec_one(p):
                 e["cwd"] = p["cwd"]                      # PERSIST the fresh cwd (a role move -> new session lives here)
             if "provider" in p:
                 e["provider"] = p["provider"]            # fix 1: record the account the agent NOW runs under
+            if "plugins" in p:
+                e["plugins"] = p["plugins"]              # FIX 3: row records the resolved set that launched
             fs.live_put(label, e)
             fs.log_event("recycled", label=label, role=e.get("role"), surface=surf, session=sid,
                          mode=mode, effective=effective)
@@ -5981,6 +6057,7 @@ VERB_USAGE = {
                 "                                                    pull a LIVE-but-unregistered agent into the registry (recovery for a skipped auto-register)",
     "move": "  move <label> (--to-workspace WS | --own-workspace) [--name TITLE]\n"
             "                                                    relocate a LIVE child natively — surface move + registry update, keeping pid/session/context/parent/group (cmux 0.64.18+ heals the moved surface; no archive/revive/fresh-surface). An ARCHIVED label has no surface: `fleet revive` it into the target instead",
+    "reparent": "  reparent <label> <parent-label|none> [--force]   surgically re-set a live agent's registry parent ONLY (none = top-level); everything else untouched. Another conductor's child needs --force (+ parent notified)",
     "group": "  group <init [--name N] | add <label> [--name N]>  make THIS conductor's workspace a named group (init) or retrofit a live child into it (add); membership ops keep agents live (the safe lane)",
     "recycle": "  recycle [label] [--fresh] [--session id] [--effort L] [--model M] [--force] [--plugin NAME] [--prime T|--no-prime] [-- <flags>]\n"
                "                                                    restart in place, same surface/identity (default self+RESUME; --fresh sheds; --plugin = index-aware plugin add, reaches linked + enabled)\n"
@@ -6088,7 +6165,7 @@ def verb_table():
     from . import conformance as cf
     return {"launch": cmd_launch, "config": cmd_config, "ls": cmd_ls, "plugins": cmd_plugins,
             "archive": cmd_archive, "revive": cmd_revive, "register": cmd_register, "recycle": cmd_recycle,
-            "move": cmd_move, "group": cmd_group, "migrate": cmd_migrate,
+            "move": cmd_move, "reparent": cmd_reparent, "group": cmd_group, "migrate": cmd_migrate,
             "unstick": cmd_unstick, "reap-surfaces": cmd_reap_surfaces, "sessions": cmd_sessions,
             "_recycle-exec": cmd_recycle_exec, "_recycle-bulk-exec": cmd_recycle_bulk_exec,
             "broadcast": cmd_broadcast,

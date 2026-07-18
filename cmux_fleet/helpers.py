@@ -81,10 +81,32 @@ def _submit(surf, text):
     return False
 
 
+def _resolve_surface_handle(handle):
+    """Resolve a surface HANDLE to a full surface UUID (fleet-ergonomics FIX 4). Accepts a full UUID
+    (passthrough) OR an UNAMBIGUOUS PREFIX of a live agent's surface — so the 8-char short surface that
+    `fleet ls` DISPLAYS is copy-pasteable straight into a surface-taking verb (there was no such path
+    before; you had to fish the full UUID out of fleet.json). A prefix matching exactly one live surface
+    resolves to its full UUID; a prefix matching MORE than one errors on the collision; a prefix matching
+    NONE passes through unchanged (it may be a full UUID cmux knows but the registry doesn't — e.g. a bare
+    surface — in which case cmux surfaces its own error). Case-insensitive."""
+    h = (handle or "").strip()
+    if not h:
+        return h
+    seen, matches = set(), []
+    for v in fs.live_all().values():
+        s = v.get("surface", "") or ""
+        if s and s.upper().startswith(h.upper()) and s not in seen:
+            seen.add(s); matches.append(s)
+    if len(matches) > 1:
+        sys.exit(f"[fleet] surface '{h}' is AMBIGUOUS — it prefixes {len(matches)} live surfaces "
+                 f"({', '.join(m[:12] for m in matches)}). Use more characters.")
+    return matches[0] if matches else h
+
+
 def cmd_drive_child(argv):
     if len(argv) < 2:
         sys.exit('usage: fleet drive-child <surface-uuid> <prompt...>')
-    surf, text = argv[0], " ".join(argv[1:])
+    surf, text = _resolve_surface_handle(argv[0]), " ".join(argv[1:])
     if _submit(surf, text):
         print(f"[drive] submitted to {surf[:8]}")
         return 0
