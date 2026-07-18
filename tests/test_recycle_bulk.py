@@ -83,11 +83,36 @@ def test_bulk_skips_dead_pid_running_ghost(fs, rs, monkeypatch):
 # --- the shared per-target plan ------------------------------------------------------------------
 def test_recycle_plan_fresh_primes_from_handover(fs, monkeypatch):
     monkeypatch.setattr(cli, "_compose_recycle_cmd", lambda *a, **k: ("claude ...", ""))
-    monkeypatch.setattr(cli, "_latest_handover", lambda cwd: "/x/handover/h.md")
+    monkeypatch.setattr(cli, "_latest_handover", lambda cwd, label=None: "/x/handover/h.md")
     entry = {"kind": "child", "surface": "A", "tool": "claude", "role": "w", "cwd": "/x", "session": "claude-s"}
     p = cli._recycle_plan("kidA", entry, [], [], "fresh", "", False, None, False)
     assert p["mode"] == "fresh" and p["surface"] == "A" and p["old_session"] == "s"
     assert p["prime"] and "FRESH" in p["prime"] and "h.md" in p["prime"]
+
+
+def test_latest_handover_prefers_the_label_prefixed_then_falls_back(tmp_path):
+    """Ship 5d label-keyed discovery: prefer handover/<label>-*.md (this agent's own), newest by mtime;
+    fall back to any handover/*.md while emitters transition. A co-located agent's handover in a shared
+    home must not be picked once the label prefix is in use."""
+    hd = tmp_path / "handover"
+    hd.mkdir()
+    # legacy (unprefixed) + a sibling's + two of MINE, mine written LAST so mtime alone wouldn't disambiguate
+    (hd / "2026-01-01-old.md").write_text("legacy")
+    (hd / "otheragent-2026-06-01.md").write_text("sibling")
+    (hd / "redesign-builder-2026-05-01-a.md").write_text("mine older")
+    (hd / "redesign-builder-2026-05-02-b.md").write_text("mine newer")
+    got = cli._latest_handover(str(tmp_path), "redesign-builder")
+    assert got.endswith("redesign-builder-2026-05-02-b.md"), "must pick MY newest, not the sibling/legacy"
+
+    # no label-prefixed file present -> legacy fallback to the newest of any prefix
+    hd2 = tmp_path / "h2"
+    (hd2 / "handover").mkdir(parents=True)
+    (hd2 / "handover" / "2026-01-01-only-legacy.md").write_text("x")
+    got2 = cli._latest_handover(str(hd2), "redesign-builder")
+    assert got2.endswith("2026-01-01-only-legacy.md"), "fallback to any handover while emitters transition"
+
+    # no label -> newest of any (unchanged legacy behavior)
+    assert cli._latest_handover(str(tmp_path)).endswith(".md")
 
 
 def test_recycle_plan_resume_has_no_prime(fs, monkeypatch):

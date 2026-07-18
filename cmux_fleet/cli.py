@@ -3424,7 +3424,7 @@ def cmd_revive(argv):
                  # command; plugins deterministic from the entry + --plugin union (already in spec).
                  effective={**_sendcmd_session_prefs(send_cmd), "plugins": spec["plugins"]})
     if a.fresh:                                                   # shed -> prime from the handover (like a fresh recycle)
-        ho = _latest_handover(spec["abs_cwd"])
+        ho = _latest_handover(spec["abs_cwd"], a.label)
         prime = (f"You were just REVIVED into a FRESH session (same identity: label '{a.label}', "
                  f"role '{spec.get('role')}'). Re-orient from your latest handover"
                  + (f" at {ho}" if ho else " under ./handover/") + ", then continue where it left off.")
@@ -4285,14 +4285,24 @@ def _quiet_gate(surf, timeout, force):
     return False
 
 
-def _latest_handover(abs_cwd):
-    """Newest handover/*.md under the agent's cwd (the cmux-handover convention), or '' if none."""
+def _latest_handover(abs_cwd, label=None):
+    """Newest handover under the agent's `handover/` dir, or '' if none. LABEL-KEYED discovery (Ship 5d):
+    when `label` is given, prefer this agent's OWN handovers — `handover/<label>-*.md`, newest by mtime —
+    and only fall back to the legacy `handover/*.md` (any prefix) when none carry the label. That keeps
+    the transition resolving while emitters move onto the label prefix, and stops a co-located agent's
+    handover (shared home) from being mistaken for this one's once the prefix is in use."""
     hd = os.path.join(abs_cwd, "handover")
     try:
         files = [os.path.join(hd, f) for f in os.listdir(hd) if f.endswith(".md")]
     except OSError:
         return ""
-    return max(files, key=os.path.getmtime) if files else ""
+    if not files:
+        return ""
+    if label:
+        owned = [f for f in files if os.path.basename(f).startswith(f"{label}-")]
+        if owned:
+            return max(owned, key=os.path.getmtime)
+    return max(files, key=os.path.getmtime)          # legacy fallback: newest handover of any prefix
 
 
 def _poll_session_back(surf, old_sid, mode, timeout=90):
@@ -4701,7 +4711,7 @@ def _recycle_plan(label, entry, caller, add_plugin, mode, session, force, prime_
         elif mode == "fresh":
             abs_cwd = entry.get("cwd", "")
             abs_cwd = abs_cwd if os.path.isabs(abs_cwd) else os.path.join(ROOT, abs_cwd)
-            ho = _latest_handover(abs_cwd)
+            ho = _latest_handover(abs_cwd, label)
             prime = (f"You were just recycled into a FRESH session (same identity: label '{label}', "
                      f"role '{entry.get('role')}', same surface). Re-orient from your latest handover"
                      + (f" at {ho}" if ho else " under ./handover/")
