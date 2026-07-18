@@ -8,7 +8,7 @@ description: Write a point-in-time session handover for the next instance of thi
 A handover is a **point-in-time brain dump of this session** for whoever picks up this agent next — a relaunch of you, or the conductor reading you cold. It is NOT a vault entity and NOT maintained; it is working memory in the agent's own space.
 
 ## Where it lives
-`<your cwd>/handover/<YYYY-MM-DD>.md`. Your cwd is your home (your identity seat). A second handover the same day → add a `-HHMM` suffix. Create `handover/` if it is not there; it is yours.
+`<your cwd>/handover/<label>-<YYYY-MM-DD>.md`, where `<label>` is `$AGENT_LABEL` (fall back to `$AGENT_ROLE`), emitted verbatim — the label prefix is what keeps co-homed instances of one role from colliding, and it matches the discovery glob boot reads (`handover/<label>-*.md`). A second handover the same day → add a `-HHMM` suffix. Create `handover/` if it is not there; it is yours.
 
 This is exactly the file `fleet recycle --fresh` auto-primes the next instance to read (the newest `handover/*.md` by mtime; a bare `fleet recycle` now RESUMES and does not prime). There is **no** separate top-level `HANDOVER.md` — that was the retired relauncher's convention; `handover/<date>.md` is the single source.
 
