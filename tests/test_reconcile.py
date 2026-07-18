@@ -46,7 +46,8 @@ def seams(monkeypatch, fs):
     the close path stay real. Only the store-backed predicates (surface_has_live_agent, _hook_fleet_origin)
     are patched, off two mutable sets the test fills."""
     state = {"live_surfaces": set(), "hook_origin": set()}
-    monkeypatch.setattr(fs, "surface_has_live_agent", lambda s: s.upper() in {x.upper() for x in state["live_surfaces"]})
+    from cmux_fleet import resolve as rs   # ASSESS re-home: surface_has_live_agent moved state->resolve (Ship 5)
+    monkeypatch.setattr(rs, "surface_has_live_agent", lambda s: s.upper() in {x.upper() for x in state["live_surfaces"]})
     monkeypatch.setattr(rc, "_hook_fleet_origin", lambda s: s.upper() in {x.upper() for x in state["hook_origin"]})
     state["fs"] = fs
     return state

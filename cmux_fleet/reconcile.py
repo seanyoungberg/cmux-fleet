@@ -192,6 +192,7 @@ def _classify(tree, snap, cmuxq=None):
     for tests; liveness/registry come from state (fs). Returns {tracked, resume_orphan, husk,
     human_shell, unknown}. A `husk` row is the DETERMINISTIC close candidate; nothing here mutates."""
     from . import cli
+    from . import resolve as rs          # ASSESS re-home: surface_has_live_agent moved state->resolve (Ship 5)
     live = fs.live_all()
     reg_surf = {(e.get("surface") or "").upper(): lbl for lbl, e in live.items() if e.get("surface")}
     arch_by_session = {}
@@ -218,7 +219,7 @@ def _classify(tree, snap, cmuxq=None):
             row["label"] = reg_surf[u]
             buckets["tracked"].append(row)
             continue
-        if fs.surface_has_live_agent(surf):
+        if rs.surface_has_live_agent(surf):
             # a LIVE agent the registry doesn't know — cmux resumed it, or it drifted off-registry.
             # NEVER close a live agent. Adoptable when its session matches an archived label.
             row["adopt_label"] = arch_by_session.get(fs.bare_uuid(rec.get("session") or ""), "")
