@@ -574,9 +574,17 @@ def fleet_doctor_sweep(now=None):
             # berg-sandbox done-idle "human typing" false alarm — root-caused in doctor-rootcause.md).
             # features.turn_ended fails closed to False, so it only ever CLEARS a lagged 'running', never
             # invents a stall; hadPendingBackgroundWorkAtStop is cmux's own positive flag for that case.
+            # attachment FIRST: its transcript-age gates the stall too (token-flow, not wall-clock).
+            att = rs.attachment(surface, st=st, ws_map=ws_map, now=now)
             turn_done = (features.turn_ended((rec or {}).get("transcriptPath", ""))
                          or bool((rec or {}).get("hadPendingBackgroundWorkAtStop")))
-            if life == "running" and ua and STALL_S < (now - ua) < STALL_WINDOW and not turn_done:
+            # ALSO gate stall on TRANSCRIPT-ADVANCE (doctor-reliability): a 'running' record frozen past
+            # STALL_S but whose TRANSCRIPT is still advancing (tokens flowing) is a live long turn, not a
+            # stall — record-age alone can't tell a slow live turn from a dead stream (2026-07-18 specimens).
+            tage = att["transcript_age_s"]
+            transcript_frozen = tage is None or tage > STALL_S
+            if (life == "running" and ua and STALL_S < (now - ua) < STALL_WINDOW
+                    and not turn_done and transcript_frozen):
                 _emit_conductor("stall", label, entry, surface, {"stalled_s": int(now - ua)})
             else:
                 _rearm("stall", label, session)
@@ -584,7 +592,6 @@ def fleet_doctor_sweep(now=None):
             # demonstrably works (transcript advancing), or an env/pointer mismatch proves the channel
             # dead. A conductor has no parent, so this fans out to peers + the desktop like DOWN. The
             # live case this exists for: berg-sandbox, record frozen 3.5h while actively writing turns.
-            att = rs.attachment(surface, st=st, ws_map=ws_map, now=now)
             if att["attached"] is False:
                 _emit_conductor("detached", label, entry, surface, {
                     "evidence": att["reasons"],
@@ -694,7 +701,13 @@ def fleet_doctor_sweep(now=None):
             # positive flag for the background-drain case. See doctor-rootcause.md.
             turn_done = (features.turn_ended((rec or {}).get("transcriptPath", ""))
                          or bool((rec or {}).get("hadPendingBackgroundWorkAtStop")))
-            if life == "running" and ua and STALL_S < (now - ua) < STALL_WINDOW and not turn_done:
+            # ALSO gate on TRANSCRIPT-ADVANCE (doctor-reliability): a 'running' record frozen past STALL_S
+            # whose TRANSCRIPT is still advancing (tokens flowing) is a live long turn, not a stall — record
+            # age alone can't tell a slow live turn from a dead stream. `att` is computed just above.
+            tage = att["transcript_age_s"]
+            transcript_frozen = tage is None or tage > STALL_S
+            if (life == "running" and ua and STALL_S < (now - ua) < STALL_WINDOW
+                    and not turn_done and transcript_frozen):
                 _emit("stall", label, entry, surface, {"stalled_s": int(now - ua)})
             else:
                 _rearm("stall", label, session)                        # re-arm when it clears/ages out
