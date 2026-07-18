@@ -517,11 +517,38 @@ def _flock(path):
         os.close(fd)
 
 
+def _normalize_parent(row, label, known_labels):
+    """Ship 5d migrate-normalize (Berg-ruled reconcile timing = AT migrate). Collapse a BROKEN parent to
+    the durable top-level rep `parent=None`: a parent that is empty, points at SELF, or names no known
+    agent (a dead surface-uuid like cf-conductor's, a pruned label) is not a real parent — normalizing it
+    to None makes `is_top_level` and routing agree instead of chasing a dangling label. A parent that
+    resolves to a known agent (live or archived) is carried forward FAITHFULLY — the migrator does not
+    guess intent, it only fixes provably-broken edges. Returns row unchanged when the parent is already
+    valid or already None; else a copy with parent=None."""
+    if not isinstance(row, dict):
+        return row
+    p = row.get("parent")
+    if p and p != label and p in known_labels:
+        return row                              # a real, resolvable parent -> keep faithfully
+    if "parent" in row and row.get("parent") is None:
+        return row                              # already the durable top-level rep
+    out = dict(row)
+    out["parent"] = None                        # empty / self / dangling -> durable top-level None
+    return out
+
+
 def migrate_state(backup=True):
     """The one-shot v1->v2 migrator (`fleet migrate`). Idempotent, flocked, backs up first. Rewrites every
-    fleet.json + archive.json row via to_v2 and flips the schema marker. Berg-run — the build NEVER calls
-    this against the live registry. Returns {fleet, archive, backups}."""
+    fleet.json + archive.json row via to_v2 (and the 5d parent-normalize) and flips the schema marker.
+    Berg-run — the build NEVER calls this against the live registry. Returns {fleet, archive, backups}."""
     out = {"fleet": 0, "archive": 0, "backups": []}
+    # The known-agent set for parent validation spans BOTH files: a live child may parent onto an archived
+    # conductor, and vice versa. Snapshot it up front (Berg-run one-shot, no concurrent writers).
+    known = set()
+    for path in (LIVE, ARCHIVE):
+        m = _read_json(path, {})
+        if isinstance(m, dict):
+            known |= set(m.keys())
     for path, key in ((LIVE, "fleet"), (ARCHIVE, "archive")):
         with _flock(path):
             m = _read_json(path, {})
@@ -531,7 +558,7 @@ def migrate_state(backup=True):
                 bak = f"{path}.v1.bak-{int(time.time())}"
                 _atomic_write(bak, json.dumps(m, indent=2))
                 out["backups"].append(bak)
-            migrated = {label: to_v2(row) for label, row in m.items()}
+            migrated = {label: to_v2(_normalize_parent(row, label, known)) for label, row in m.items()}
             _atomic_write(path, json.dumps(migrated, indent=2))
             _schema_set(key, SCHEMA_CURRENT)
             out[key] = len(migrated)
@@ -619,17 +646,34 @@ def parent_of(label):
 SCOPE_SETS = ("mine", "all", "conductors", "children")
 
 
+def is_my_direct_report(entry, parent_label):
+    """The 3-tier `mine` parent-match: ANY agent whose parent label == mine, REGARDLESS of kind. `entry`
+    is any dict carrying `parent` (a live registry entry, an archive row, or a vitals snapshot row). This
+    is what `--scope mine` keys on so a middle-tier conductor sees its OWN direct reports — including a
+    sub-conductor, which `is_my_child` (children-only) would miss. Backward-compatible: with no middle tier
+    present, parent==me already implies kind==child, so this equals is_my_child until a sub-conductor exists."""
+    return entry.get("parent") == parent_label
+
+
 def is_my_child(entry, parent_label):
-    """The `mine` parent-match: a CHILD whose parent label == mine. `entry` is any dict carrying
-    `kind`+`parent` (a live registry entry, an archive row, or a vitals snapshot row)."""
-    return entry.get("kind") == "child" and entry.get("parent") == parent_label
+    """The CHILDREN-ONLY parent-match: a direct report whose kind is `child` (not a sub-conductor). Kept
+    distinct from is_my_direct_report for the filters that are genuinely children-only — completion muting
+    (child→parent delivery). `entry` carries `kind`+`parent`."""
+    return is_my_direct_report(entry, parent_label) and entry.get("kind") == "child"
+
+
+def is_top_level(entry):
+    """A TOP-LEVEL agent reports to no one: its registry `parent` is None/absent — the durable canonical
+    rep (Ship 5d, Berg-ruled: no sentinel label). The derived 'is top-level' predicate; routing and
+    `peer-msg --to-parent` read the same `parent` field, so a top-level agent simply has nothing upstream."""
+    return not entry.get("parent")
 
 
 def scope_matches(scope, entry, label, caller_label, *, include_self):
     """Does `entry` (registry key `label`) fall in a SET-valued --scope, relative to caller_label?
       all         -> everyone
       conductors  -> kind == conductor          children -> kind == child
-      mine        -> caller's direct children (+ caller itself iff include_self)
+      mine        -> caller's direct reports of ANY kind (+ caller itself iff include_self)
     Reads pass include_self=True (show yourself in context); acts pass False (never fan out onto self).
     A non-set scope (a specific label) returns False here — set-scope verbs validate the value first."""
     kind = entry.get("kind")
@@ -640,7 +684,7 @@ def scope_matches(scope, entry, label, caller_label, *, include_self):
     if scope == "children":
         return kind == "child"
     if scope == "mine":
-        return is_my_child(entry, caller_label) or (include_self and label == caller_label)
+        return is_my_direct_report(entry, caller_label) or (include_self and label == caller_label)
     return False
 
 

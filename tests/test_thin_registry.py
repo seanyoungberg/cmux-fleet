@@ -104,12 +104,34 @@ def _raw_archive():
 
 
 def test_migrate_state_idempotent(fs):
-    fs.live_put("a", _v1_row())
+    fs.live_put("boss", _v1_row(kind="conductor", parent=None))   # a valid known parent for "a"
+    fs.live_put("a", _v1_row(parent="boss"))
     first = fs.migrate_state()
     disk1 = _raw_live()
     second = fs.migrate_state()                                 # re-run: already v2
     assert _raw_live() == disk1                                 # no further change
-    assert second["fleet"] == 1
+    assert second["fleet"] == 2
+
+
+def test_migrate_normalizes_broken_parents_to_top_level_none(fs):
+    """5d reconcile (Berg-ruled: normalize AT migrate). Collapse empty / self / dangling parents to the
+    durable top-level None — the cf-conductor dead-surface-uuid case, the berg-sandbox empty case, a
+    self-parent — while carrying a RESOLVABLE parent forward faithfully (the migrator fixes provably-broken
+    edges only, it does not guess intent)."""
+    fs.live_put("boss", _v1_row(surface="S-BOSS", kind="conductor", parent=None))    # top-level conductor
+    fs.live_put("kid", _v1_row(surface="S-KID", parent="boss"))                       # a REAL edge -> keep
+    fs.live_put("berg", _v1_row(surface="S-BERG", kind="conductor", parent=""))       # empty -> None
+    fs.live_put("selfp", _v1_row(surface="S-SELF", kind="conductor", parent="selfp")) # self -> None
+    fs.live_put("cf", _v1_row(surface="S-CF", kind="conductor",
+                              parent="29A7AC52-0E69-43FC-B3D4-B6F5319BF5ED"))          # dead surface-uuid -> None
+    fs.migrate_state()
+    assert fs.live_get("kid").get("parent") == "boss"        # resolvable parent preserved faithfully
+    assert fs.live_get("berg").get("parent") is None         # empty collapsed
+    assert fs.live_get("selfp").get("parent") is None        # self collapsed
+    assert fs.live_get("cf").get("parent") is None           # dangling surface-uuid collapsed
+    # the derived predicate agrees with the normalized rep
+    assert fs.is_top_level(fs.live_get("berg")) and fs.is_top_level(fs.live_get("cf"))
+    assert not fs.is_top_level(fs.live_get("kid"))
 
 
 # --- flocked writers (R1: the concurrent-reparent lost-update) -------------------------------------

@@ -171,3 +171,32 @@ def test_mute_scope_mine_toggles_only_my_children(fs, monkeypatch):
     assert fs.live_get("otherkid").get("muted") is not True   # sibling's child untouched
     fleet.cmd_mute(["--scope", "mine"], mute=False)
     assert "muted" not in fs.live_get("k1") and "muted" not in fs.live_get("k2")
+
+
+# ── 3-tier: a middle-tier conductor's `mine` sees a SUB-CONDUCTOR, but mute stays children-only ──────
+def _seed_three_tier(fs):
+    """advisor -> subcond (a sub-conductor) -> gk (grandchild); plus advisor's own leaf child k1."""
+    fs.live_put("advisor", {"surface": "SA", "kind": "conductor", "role": "adv"})
+    fs.live_put("k1", {"surface": "S1", "kind": "child", "role": "dev", "parent": "advisor", "session": "claude-x"})
+    fs.live_put("subcond", {"surface": "SS", "kind": "conductor", "role": "sub", "parent": "advisor"})
+    fs.live_put("gk", {"surface": "SG", "kind": "child", "role": "dev", "parent": "subcond", "session": "claude-g"})
+
+
+def test_is_my_direct_report_includes_a_sub_conductor_but_is_my_child_does_not(fs):
+    _seed_three_tier(fs)
+    sub = fs.live_get("subcond")
+    assert fs.is_my_direct_report(sub, "advisor") is True        # a direct report of ANY kind
+    assert fs.is_my_child(sub, "advisor") is False               # ...but not a CHILD (it's a conductor)
+    assert fs.is_my_child(fs.live_get("k1"), "advisor") is True  # a leaf child is both
+
+
+def test_scope_mine_includes_sub_conductor_yet_mute_still_children_only(fs, monkeypatch):
+    _seed_three_tier(fs)
+    # `mine` (advisor) now spans the middle tier: the sub-conductor is a direct report...
+    assert {l for l, _ in fs.scope_members("mine", "advisor", include_self=False)} == {"k1", "subcond"}
+    assert "gk" not in {l for l, _ in fs.scope_members("mine", "advisor", include_self=False)}  # grandchild is subcond's, not advisor's
+    # ...but mute is child→parent delivery, so a `mute --scope mine` never mutes the sub-conductor.
+    monkeypatch.setenv("CMUX_SURFACE_ID", "SA")
+    fleet.cmd_mute(["--scope", "mine"], mute=True)
+    assert fs.live_get("k1").get("muted") is True
+    assert fs.live_get("subcond").get("muted") is not True       # children-only filter preserved
