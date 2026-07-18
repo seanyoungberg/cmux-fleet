@@ -907,11 +907,14 @@ def _poll_surface_cwd(surf, want, timeout=10):
     return last
 
 
-def register(surf, spec, parent_surface, session, ws):
+def register(surf, spec, parent_surface, session, ws, parent_label=None):
     from . import state as fs
     # store parent LABEL (durable); a top-level launch (no parent surface) stores None -- the canonical
     # top-level rep that is_top_level reads (Ship 5d, Berg-ruled: no sentinel), NOT an empty string.
-    parent_label = fs.label_for_surface(parent_surface) or parent_surface or None
+    # `parent_label` explicit override (item 9): revive passes the ARCHIVED parent so the reporting
+    # relationship is PRESERVED across the rm->revive round trip (not re-derived from whoever revived it).
+    if parent_label is None:
+        parent_label = fs.label_for_surface(parent_surface) or parent_surface or None
     # gen (Ship 5): a reseat fence bumped on every launch/revive/recycle, so any consumer can tell a cached
     # derived view is from a PRIOR seat of this label. Monotonic across the label's lifetimes (live/archive).
     _prior = fs.live_get(spec["label"]) or fs.archive_get(spec["label"])
@@ -2816,6 +2819,7 @@ def cmd_rm(argv):
     e = e_live or fs.archive_get(label)
     if not e:
         sys.exit(f"fleet rm: no such label '{label}'")
+    _lifecycle_owner_guard(label, "remove", force)           # item 9: another conductor's child needs --force
     # running-surface guard (ships WITH the default flip -- it's the flip's own footgun): the default
     # now CLOSES the surface, so a mid-turn agent would be killed half-way. A SYNCHRONOUS check +
     # refuse, deliberately NOT recycle's async quiet-gate: an async wait here would race the exact
@@ -3224,6 +3228,46 @@ def _build_archive_entry(e, b):
     return arch
 
 
+def _notify_parent_lifecycle(parent, label, verb, invoker, refused):
+    """Best-effort inbox note to a child's parent that ANOTHER conductor touched their child (item 9).
+    Needs the parent LIVE to receive the row (inbox is surface-addressed); a parked/offline parent simply
+    misses it. Rendered as a `peer` row so it shows in the parent's `fleet inbox` like any peer message."""
+    from . import state as fs
+    import secrets
+    psurf = fs.surface_for_label(parent)
+    if not psurf:
+        return
+    body = (f"[lifecycle] {invoker} "
+            + (f"TRIED to {verb}" if refused else f"{verb}d")
+            + f" your child '{label}'"
+            + (" (REFUSED -- they'd need --force)." if refused else " (forced through --force)."))
+    msg_id = secrets.token_hex(3)
+    fs.inbox_put("peer", psurf, {
+        "ptype": "peer-msg", "to_label": parent,
+        "from_surface": os.environ.get("CMUX_SURFACE_ID", ""), "from_label": invoker,
+        "msg_id": msg_id, "reply_to": None, "reply_expected": False, "body": body,
+    }, event_key=f"lifecycle:{verb}:{label}:{'refused' if refused else 'done'}:{invoker}")
+
+
+def _lifecycle_owner_guard(label, verb, force):
+    """Item 9 cross-conductor guard for archive/rm. A DIFFERENT identified conductor (invoker != the
+    target's registry parent) acting on another conductor's child is REFUSED without --force, and the
+    parent is notified EITHER WAY (refused attempt or forced-through). No-op when the target is top-level
+    (no parent), when the invoker IS the parent, when the invoker IS the target itself (self-removal / a
+    call from the target's own surface), or when there's no identified invoker surface at all -- an
+    operator driving the CLI directly (no $CMUX_SURFACE_ID, e.g. Berg) keeps full unguarded control.
+    `verb` is 'archive' | 'remove' (used in the messages)."""
+    from . import state as fs
+    parent = fs.parent_of(label)
+    invoker = fs.label_for_surface(os.environ.get("CMUX_SURFACE_ID", "")) or ""
+    if not parent or not invoker or invoker == parent or invoker == label:
+        return
+    _notify_parent_lifecycle(parent, label, verb, invoker, refused=not force)
+    if not force:
+        sys.exit(f"[fleet] {verb} REFUSED: '{label}' is {parent}'s child, not yours. Pass --force to "
+                 f"{verb} another conductor's child ({parent} has been notified of the attempt).")
+
+
 def cmd_archive(argv):
     """Park a live agent: stop its process(es) (SIGINT x2 to every live identity-checked pid = clean
     TUI exit), close its cmux seat, move it to the archive shelf with enough to `claude --resume` it
@@ -3235,12 +3279,15 @@ def cmd_archive(argv):
     sidebar (Berg's ruling, 2026-07-10). A tab/pane agent only loses its surface — its parent's
     workspace survives."""
     from . import state as fs
-    if not argv:
-        sys.exit("usage: fleet archive <label>")
-    label = argv[0]
+    force = "--force" in argv
+    args = [a for a in argv if a != "--force"]
+    if not args:
+        sys.exit("usage: fleet archive <label> [--force]")
+    label = args[0]
     e = fs.live_get(label)
     if not e:
         sys.exit(f"fleet archive: no LIVE label '{label}'")
+    _lifecycle_owner_guard(label, "archive", force)          # item 9: another conductor's child needs --force
     surf = e.get("surface", "")
     # capture cmux's GROUND-TRUTH launch binding BEFORE we tear the surface down — this is the same
     # source recycle replays, so revive can recompose the EXACT last command (caller passthrough +
@@ -3341,6 +3388,16 @@ def cmd_revive(argv):
     if not spec["cwd"]:
         print(f"[fleet] warn: revive {a.label} resolved no cwd (sparse shelf, not a roster role, no "
               f"binding) -> abs_cwd falls back to ROOT root; claude --resume may not find the session")
+    # inherit the placement parent's workspace group like `launch --place workspace` (item 9): a
+    # place=workspace agent revived with no group of its own joins its parent's group (a conductor anchors
+    # its OWN named group). The visual group follows the placement parent (a.parent), same as launch.
+    if spec["place"] == "workspace" and not spec["group"]:
+        if spec["kind"] == "conductor":
+            spec["group"] = spec["label"]
+        elif a.parent:
+            pe = fs.entry_for_surface(a.parent)
+            if pe and pe.get("group"):
+                spec["group"] = pe["group"]
 
     # ACCOUNT re-resolution (fix 1): a revive FOLLOWS CONFIG for the account too, identically to recycle —
     # the archived binding dropped the account env, so re-resolve + inject it here (and record it on the
@@ -3444,7 +3501,10 @@ def cmd_revive(argv):
     # (dark-surface heal is native since 0.64.18 — the old reseat-if-dark guard is retired; the seated
     # surface is authoritative.)
     sid = _resume_binding(surf).get("checkpoint_id", "") or sid   # ground-truth session over a bridge poll id
-    register(surf, spec, a.parent, sid, ws)
+    # PRESERVE the reporting relationship across the round trip (item 9): the revived agent keeps its
+    # ARCHIVED parent, not whoever revived it. a.parent still drives PLACEMENT (surface + group), but the
+    # registry parent comes from the shelf -- a top-level agent (archived parent None) stays top-level.
+    register(surf, spec, a.parent, sid, ws, parent_label=e.get("parent") or None)
     fs.archive_del(a.label)
     fs.log_event("revived", label=a.label, role=spec["role"], surface=surf, session=sid, fresh=a.fresh,
                  # ledger parity with log_launch/recycled: ground-truth effort/model off the composed
