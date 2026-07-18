@@ -15,6 +15,19 @@ sys.path.insert(0, REPO)
 from cmux_fleet import cli as fleet  # noqa: E402  (not popped by other test files)
 
 
+def _tree_from_registry(monkeypatch):
+    """Ship 5c: the --with-group gate derives each seated member's workspace from the live TREE
+    (rs.surface_ws_map), not a stored field. These unit tests express the intended tree position in each
+    row's `workspace`, so stub the tree map to report exactly that (surface -> workspace) for every seated
+    live row — an archived/surfaceless row contributes nothing (it is not in any cmux workspace). Imported
+    inside so a sys.modules reset elsewhere can't leave a stale `rs` twin."""
+    from cmux_fleet import resolve as rs, state as fs
+    monkeypatch.setattr(rs, "surface_ws_map",
+                        lambda ttl=2.0: {(v.get("surface") or "").upper(): v.get("workspace")
+                                         for v in fs.live_all().values()
+                                         if v.get("surface") and v.get("workspace")})
+
+
 def test_group_ref_resolves_name_passthrough_and_missing(monkeypatch):
     monkeypatch.setattr(fleet, "cmuxq",
                         lambda *a: '{"groups":[{"name":"alpha","ref":"workspace_group:2"}]}')
@@ -150,7 +163,7 @@ def test_rm_with_group_dissolves_by_ref(monkeypatch):
     # registry and cmux AGREE on membership (workspace ids match member_workspace_refs) -> dissolve proceeds.
     from cmux_fleet import state as fs
     fs.live_put("cond", {"role": "r", "kind": "conductor", "tool": "claude", "group": "gg",
-                         "surface": "", "workspace": "WS-COND", "status": "live"})
+                         "surface": "SC", "workspace": "WS-COND", "status": "live"})
     calls = []
 
     def fake_cmuxq(*a):
@@ -162,6 +175,7 @@ def test_rm_with_group_dissolves_by_ref(monkeypatch):
     monkeypatch.setattr(fleet, "cmuxq", fake_cmuxq)
     monkeypatch.setattr(fleet, "_group_ref", lambda g: "workspace_group:4")
     monkeypatch.setattr(fleet, "_ref_to_uuid", lambda kind, ref: "WS-COND")
+    _tree_from_registry(monkeypatch)
     fleet.cmd_rm(["cond", "--with-group"])
     assert ("workspace-group", "delete", "workspace_group:4") in calls   # delete by REF
     assert fs.live_get("cond") is None
@@ -189,6 +203,7 @@ def test_rm_with_group_sweeps_all_members(monkeypatch):
     monkeypatch.setattr(fleet, "_group_ref", lambda g: "workspace_group:1")
     monkeypatch.setattr(fleet, "_ref_to_uuid",
                         lambda kind, ref: {"workspace:c": "WS-C", "workspace:w": "WS-W"}[ref])
+    _tree_from_registry(monkeypatch)
     fleet.cmd_rm(["cond", "--with-group"])
     assert fs.live_get("cond") is None         # the selected conductor is gone
     assert fs.live_get("child") is None         # ...and so is its group sibling (the swept orphan)
@@ -215,6 +230,7 @@ def test_rm_with_group_refuses_on_membership_mismatch(monkeypatch):
     monkeypatch.setattr(fleet, "cmuxq", fake_cmuxq)
     monkeypatch.setattr(fleet, "_group_ref", lambda g: "workspace_group:3")
     monkeypatch.setattr(fleet, "_ref_to_uuid", lambda kind, ref: "WS-" + ref.split(":")[1])
+    _tree_from_registry(monkeypatch)
     with pytest.raises(SystemExit):
         fleet.cmd_rm(["staging-conductor", "--with-group"])
     assert not [c for c in calls if c[:2] == ("workspace-group", "delete")]   # refused BEFORE dissolving
@@ -232,9 +248,9 @@ def test_rm_with_group_dissolves_modelb_group_including_scaffold_anchor(monkeypa
     # -- the scaffold has no registry row).
     from cmux_fleet import state as fs
     fs.live_put("X", {"role": "c", "kind": "conductor", "tool": "claude", "group": "Conductor - X",
-                      "surface": "", "workspace": "WS-X", "status": "live"})
+                      "surface": "SXX", "workspace": "WS-X", "status": "live"})
     fs.live_put("kid", {"role": "w", "kind": "child", "tool": "claude", "group": "Conductor - X",
-                        "parent": "X", "surface": "", "workspace": "WS-KID", "status": "live"})
+                        "parent": "X", "surface": "SKID", "workspace": "WS-KID", "status": "live"})
     calls = []
 
     def fake_cmuxq(*a):
@@ -250,6 +266,7 @@ def test_rm_with_group_dissolves_modelb_group_including_scaffold_anchor(monkeypa
     monkeypatch.setattr(fleet, "cmuxq", fake_cmuxq)
     monkeypatch.setattr(fleet, "_group_ref", lambda g: "workspace_group:7")
     monkeypatch.setattr(fleet, "_ref_to_uuid", lambda kind, ref: uuid.get(ref, ""))
+    _tree_from_registry(monkeypatch)
     fleet.cmd_rm(["X", "--with-group"])
     assert ("workspace-group", "delete", "workspace_group:7") in calls   # dissolved (closes scaffold too)
     assert fs.live_get("X") is None                                      # named target cleared
@@ -279,6 +296,7 @@ def test_rm_with_group_refuses_on_modelb_agent_mismatch_despite_anchor(monkeypat
     monkeypatch.setattr(fleet, "cmuxq", fake_cmuxq)
     monkeypatch.setattr(fleet, "_group_ref", lambda g: "workspace_group:9")
     monkeypatch.setattr(fleet, "_ref_to_uuid", lambda kind, ref: uuid.get(ref, ""))
+    _tree_from_registry(monkeypatch)
     with pytest.raises(SystemExit):
         fleet.cmd_rm(["X", "--with-group"])
     assert not [c for c in calls if c[:2] == ("workspace-group", "delete")]  # refused BEFORE dissolving
@@ -341,6 +359,7 @@ def _dissolve_stubs(monkeypatch, live_surfaces, member_refs, gref="workspace_gro
     monkeypatch.setattr(fleet, "_ref_to_uuid", lambda kind, ref: member_refs[ref])
     monkeypatch.setattr(fleet, "_resume_binding", lambda s: {})
     monkeypatch.setattr(fs, "surface_has_live_agent", lambda s: s in live_surfaces)
+    _tree_from_registry(monkeypatch)
     return calls
 
 
@@ -432,6 +451,7 @@ def _stub_group_cmux(monkeypatch, calls):
     monkeypatch.setattr(fleet, "_resume_binding", lambda surf: {})
     monkeypatch.setattr(fleet.time, "sleep", lambda *_: None)
     monkeypatch.setattr(fleet, "_STOP_WAIT_S", 0.05)
+    _tree_from_registry(monkeypatch)
 
 
 def test_with_group_all_dead_members_dissolves(fs, monkeypatch):

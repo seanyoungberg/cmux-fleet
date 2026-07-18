@@ -2833,11 +2833,15 @@ def cmd_rm(argv):
                     if lbl != label and v.get("group") == gname:
                         members.setdefault(lbl, v)
             registry_all = {label: e, **members}
-            # Ship 5 NOTE: this registry-vs-cmux equality gate is slated for DELETE/rebuild-on-cmux-membership
-            # in a later sub-ship (DESIGN-v2 §8). Until then it reads the stored `workspace` (present on a v1
-            # row / pre-migrate). POST-`fleet migrate` the field is gone -> every row is 'unverifiable' -> the
-            # gate ABORTS the dissolve (safe: it refuses + signposts, never destroys). The rebuild lands in 5c.
-            registry_ws = {lbl: v.get("workspace") for lbl, v in registry_all.items()}
+            # Ship 5c: rebuilt on cmux TRUTH (DESIGN-v2 §8). There is no stored `workspace` to trust anymore,
+            # so each SEATED member's workspace is derived from the live TREE (rs.surface_ws_map). An
+            # archived/parked row has NO surface -> it is not in any cmux workspace, so it does not participate
+            # in the membership cross-check (it is swept by LABEL below, not by workspace). A seated member the
+            # tree cannot locate is 'unverifiable' -> a mismatch (fail-closed). The set of seated members'
+            # ACTUAL workspaces must equal cmux's real group membership (minus the Model-B anchor, below).
+            ws_map = rs.surface_ws_map()
+            registry_ws = {lbl: (ws_map.get((v.get("surface") or "").upper()) or "")
+                           for lbl, v in registry_all.items() if v.get("surface")}
             unverifiable = sorted(lbl for lbl, ws in registry_ws.items() if not ws)
             real_ws = _group_member_workspaces(gref)
             # Model B (empty-anchor, ratified 2026-07-10): a group's anchor is an AGENTLESS scaffold
