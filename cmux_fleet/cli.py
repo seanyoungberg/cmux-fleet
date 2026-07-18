@@ -3471,17 +3471,17 @@ def _live_session_for(surf):
       2. else the freshest sessions[] record for the surface whose agentLifecycle is not in
          ('','-','ended') AND whose surface still resolves live in the tree (surface_loc()[0] present)."""
     from . import state as fs
+    from . import resolve as rs
     d = _store()
-    active = d.get("activeSessionsBySurface") or {}
-    ae = active.get(surf) or active.get((surf or "").upper()) or {}
+    ae = rs.active_entry(surf, st=d)                  # cmux's 'bound right now' pointer entry
     if ae.get("sessionId"):
-        for s in (d.get("sessions") or {}).values():
-            if (s.get("sessionId") or "") == ae["sessionId"]:
-                # pid-aware live gate: cmux's active pointer can resolve to a FROZEN dead-pid record
-                # (the SessionEnd-less brick, 2026-07-06). A dead pid == not live -> return None so
-                # `register` refuses a dead surface instead of binding onto a ghost; a live pid returns
-                # the record as before.
-                return s if fs.pid_alive(s.get("pid")) else None
+        s = rs.record_by_session(ae["sessionId"], st=d)
+        if s:
+            # pid-aware live gate: cmux's active pointer can resolve to a FROZEN dead-pid record
+            # (the SessionEnd-less brick, 2026-07-06). A dead pid == not live -> return None so
+            # `register` refuses a dead surface instead of binding onto a ghost; a live pid returns
+            # the record as before.
+            return s if fs.pid_alive(s.get("pid")) else None
         return ae            # bare active pointer, no full record to pid-check: keep cmux's word (rare
                              # degenerate state, NOT the freeze class -- the freeze RETAINS the full
                              # record, caught above; over-restricting here would break a just-bound seat)

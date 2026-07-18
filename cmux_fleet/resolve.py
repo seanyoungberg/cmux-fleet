@@ -137,6 +137,42 @@ def active_ptr(surface, st=None):
     return sid or ""
 
 
+def active_entry(surface, st=None):
+    """The FULL activeSessionsBySurface entry dict cmux files for `surface` ({} if none) — the pointer
+    entry, not just its sessionId (see active_ptr). Same cmux cache that CAN lie; used as the bare-pointer
+    fallback where cmux names a session for a surface but no full sessions[] record backs the pointer."""
+    st = fs.read_hook_store() if st is None else st
+    e = (st.get("activeSessionsBySurface") or {}).get(surface) \
+        or (st.get("activeSessionsBySurface") or {}).get((surface or "").upper()) or {}
+    return e if isinstance(e, dict) else {}
+
+
+def record_by_session(sid, st=None):
+    """The hook-store sessions[] record whose sessionId == `sid` ({} if none). A BY-SESSION lookup (the
+    surface readers key on surfaceId; this keys on the session id cmux stamps into a bus event): the router
+    resolves a Stop's bus session id to its surface this way, and the register live-gate resolves cmux's
+    active pointer to its full record. Bare-uuid normalization is the caller's job."""
+    st = fs.read_hook_store() if st is None else st
+    for s in (st.get("sessions") or {}).values():
+        if s.get("sessionId") == sid:
+            return s
+    return {}
+
+
+def session_transcript(frag, st=None):
+    """The transcriptPath cmux RECORDED (from the hook, never guessed) for the first session whose id
+    CONTAINS `frag` ('' if none / empty frag). A by-fragment lookup: child-digest resolves a partial
+    session id to the authoritative transcript for any tool. Any-liveness (a completed child's transcript
+    is exactly what the digest wants), so no pid rule here — this is a path lookup, not a seat selection."""
+    if not frag:
+        return ""
+    st = fs.read_hook_store() if st is None else st
+    for s in (st.get("sessions") or {}).values():
+        if frag in (s.get("sessionId") or "") and s.get("transcriptPath"):
+            return s["transcriptPath"]
+    return ""
+
+
 # --- the named predicates (delegates to the canonical state.py bodies; see module docstring) -------
 def lifecycle(surface):
     """Advisory lifecycle string for display (freshest record of any liveness). Never act on it."""

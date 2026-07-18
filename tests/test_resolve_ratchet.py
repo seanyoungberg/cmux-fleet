@@ -50,12 +50,13 @@ RAW_READ = "read_hook_store"
 RAW_KEYS = frozenset({"sessions", "activeSessionsBySurface"})
 EXEMPT = frozenset({"resolve.py", "state.py"})
 
-# The debt, as measured 2026-07-12: (module, enclosing function, what it touches). 24 sites, none of them
-# new. They are NOT all bugs — most are the sanctioned "read the store ONCE, pass it down as `st=`"
-# sharing pattern (cmd_ls, snapshot, fleet_doctor_sweep). The genuine hand-rolled selections still in here
-# — features._freshest_session, cli._live_session_for, router._rec_by_session, helpers.cmd_child_digest —
-# are the migration's remaining work, and they are listed so they cannot be forgotten. Nothing may join
-# this list.
+# The debt, as measured 2026-07-12 and tightened since: (module, enclosing function, what it touches).
+# None of them new. Most are the sanctioned "read the store ONCE, pass it down as `st=`" sharing pattern
+# (cmd_ls, snapshot, fleet_doctor_sweep). Of the genuine hand-rolled selections the migration set out to
+# retire (cli._live_session_for, router._rec_by_session, helpers.cmd_child_digest, features._freshest_session),
+# all are now routed through resolve (5b-2 / 5c) EXCEPT features._freshest_session, which is blocked by the
+# features<->resolve import cycle (resolve lazy-imports features for the ws-map; features can't import
+# resolve at module load). It stays here until that cycle is broken. Nothing may join this list.
 BASELINE = frozenset({
     # cli.py — the largest cluster: the ported cmux-placement helpers and the ls/poll paths.
     ("cli.py", "_store", "read_hook_store()"),
@@ -65,8 +66,6 @@ BASELINE = frozenset({
     ("cli.py", "_surface_cwd", '.get("sessions")'),
     ("cli.py", "cmd_ls", "read_hook_store()"),                   # sanctioned: one read, passed as st=
     ("cli.py", "_sessions_on_surface", '.get("sessions")'),
-    ("cli.py", "_live_session_for", '.get("activeSessionsBySurface")'),
-    ("cli.py", "_live_session_for", '.get("sessions")'),
     ("cli.py", "_discover_surface_for", '.get("sessions")'),
     ("cli.py", "_tool_for_surface", '.get("activeSessionsBySurface")'),
     ("cli.py", "_tool_for_surface", '.get("sessions")'),
@@ -74,12 +73,8 @@ BASELINE = frozenset({
     ("features.py", "_freshest_session", '.get("sessions")'),    # a selection that predates resolve
     ("features.py", "snapshot", "read_hook_store()"),            # sanctioned: one read, passed as st=
     ("features.py", "cmd_find", "read_hook_store()"),            # sanctioned: one read, passed as st=
-    # helpers.py
-    ("helpers.py", "cmd_child_digest", "read_hook_store()"),
-    ("helpers.py", "cmd_child_digest", '.get("sessions")'),
     # router.py
     ("router.py", "store", "read_hook_store()"),
-    ("router.py", "_rec_by_session", '.get("sessions")'),
     ("router.py", "transcript_of", '.get("activeSessionsBySurface")'),
     ("router.py", "transcript_of", '.get("sessions")'),
     ("router.py", "fleet_doctor_sweep", "read_hook_store()"),    # sanctioned: one read, shared per sweep

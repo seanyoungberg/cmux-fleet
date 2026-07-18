@@ -152,17 +152,10 @@ def store():
     return fs.read_hook_store()                              # union of all per-agent stores (tool-agnostic)
 
 
-def _rec_by_session(st, uuid):
-    for s in (st.get("sessions") or {}).values():
-        if s.get("sessionId") == uuid:
-            return s
-    return {}
-
-
 def _member_by_session(sid_bare, ev_tool=""):
     """Registry-truth fallback for a Stop whose hook-store `sessions{}` record has vanished or desynced
     (root cause #3: a running child whose surface was MOVED across workspaces loses its live session
-    record, leaving only a frozen `activeSessionsBySurface` pointer — so `_rec_by_session` finds no
+    record, leaving only a frozen `activeSessionsBySurface` pointer — so `rs.record_by_session` finds no
     surface). Recover the member straight from the fleet registry by matching the bus session id to a
     LIVE member's registered `session`. TOOL-AWARE when the bus tool is known (never bind a codex id onto
     a claude agent); FAIL-OPEN to a uuid-only match when the bus id is bare. Returns the entry with its
@@ -181,13 +174,13 @@ def _member_by_session(sid_bare, ev_tool=""):
 def surface_of(st, sid_raw):
     # the bus event's session_id is tool-prefixed (claude-<uuid> / codex-<uuid>); the store keys on
     # the bare uuid. bare_uuid strips ANY tool prefix so codex Stops map to a surface like claude's do.
-    return _rec_by_session(st, fs.bare_uuid(sid_raw)).get("surfaceId", "")
+    return rs.record_by_session(fs.bare_uuid(sid_raw), st).get("surfaceId", "")
 
 
 def transcript_of(st, surface):
     cur = ((st.get("activeSessionsBySurface") or {}).get(surface) or {}).get("sessionId", "")
     if cur:
-        r = _rec_by_session(st, cur)
+        r = rs.record_by_session(cur, st)
         if r:
             return r.get("transcriptPath", "")
     for s in (st.get("sessions") or {}).values():
@@ -776,12 +769,12 @@ def handle(ev):
     st = store()
     raw_sid = p.get("session_id") or ""
     sid_bare = fs.bare_uuid(raw_sid)
-    surface = _rec_by_session(st, sid_bare).get("surfaceId", "")
+    surface = rs.record_by_session(sid_bare, st).get("surfaceId", "")
     entry = registry()["by_surface"].get(surface) if surface else None
     if not entry:
         # ROOT CAUSE #3 (moved/desynced child): the hook store's `sessions{}` record for this Stop is
         # missing — a running child whose surface was MOVED across workspaces loses its live session
-        # record, leaving only a frozen `activeSessionsBySurface` pointer, so `_rec_by_session` resolves
+        # record, leaving only a frozen `activeSessionsBySurface` pointer, so `rs.record_by_session` resolves
         # NO surface. Do NOT drop the Stop (silent completion loss = the parent stalls, never woken).
         # Recover the member from fleet-REGISTRY truth by matching the bus session id, then fall through
         # to the normal queue+notify+wake path. The gist may be thin/empty because the cmux session

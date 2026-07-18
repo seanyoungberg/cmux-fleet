@@ -169,11 +169,8 @@ def cmd_child_digest(argv):
 
     # Prefer cmux's AUTHORITATIVE transcriptPath from its hook stores (recorded from the hook, never
     # guessed) over globbing. The union store carries the right path for ANY tool; the globs are fallback.
-    path = None
-    for s in (fs.read_hook_store().get("sessions") or {}).values():
-        if frag and frag in (s.get("sessionId") or "") and s.get("transcriptPath"):
-            path = s["transcriptPath"]
-            break
+    from . import resolve as rs
+    path = rs.session_transcript(frag) or None
     if not path:
         for pat in (f"~/.claude/projects/*/*{frag}*.jsonl",          # claude
                     f"~/.codex/sessions/*/*/*/*{frag}*.jsonl"):       # codex

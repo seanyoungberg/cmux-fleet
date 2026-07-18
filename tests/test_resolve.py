@@ -168,6 +168,35 @@ def test_side_by_side_synthetic_matrix(monkeypatch):
     assert rs.seat("S-BRICK", st=st, ws_map={})["present"] is False
 
 
+# --- 1c. the by-session / by-fragment primitives (5b-2 finish: routed off the cli/router/helpers raw reads) ---
+def test_by_session_primitives_match_the_old_inline_reads():
+    """record_by_session / active_entry / session_transcript are exact ports of the hand-rolled reads that
+    lived in router._rec_by_session, cli._live_session_for, and helpers.cmd_child_digest. Pin the semantics
+    the ports must preserve: exact by-session record match, the FULL active-pointer entry (not just its sid,
+    case-insensitive), and first-transcript by session-id fragment gated on a recorded transcriptPath."""
+    st = {
+        "activeSessionsBySurface": {"S-UP": {"sessionId": "claude-abc", "extra": "keep-me"}},
+        "sessions": {
+            "r1": {"sessionId": "claude-abc", "surfaceId": "S-UP", "pid": 111, "transcriptPath": "/t/abc.jsonl"},
+            "r2": {"sessionId": "codex-def", "surfaceId": "S-DN", "pid": 222, "transcriptPath": "/t/def.jsonl"},
+            "r3": {"sessionId": "claude-ghi", "surfaceId": "S-DN", "pid": 333},   # no transcriptPath
+        },
+    }
+    # record_by_session: exact sessionId match; {} when absent
+    assert rs.record_by_session("codex-def", st=st)["surfaceId"] == "S-DN"
+    assert rs.record_by_session("nope", st=st) == {}
+    # active_entry: the FULL pointer entry (not just the sid), case-insensitive surface, {} when absent
+    assert rs.active_entry("S-UP", st=st) == {"sessionId": "claude-abc", "extra": "keep-me"}
+    assert rs.active_entry("s-up", st=st).get("extra") == "keep-me"     # case-insensitive
+    assert rs.active_entry("S-NONE", st=st) == {}
+    # session_transcript: first record whose sessionId CONTAINS the fragment AND has a transcriptPath
+    assert rs.session_transcript("abc", st=st) == "/t/abc.jsonl"
+    assert rs.session_transcript("def", st=st) == "/t/def.jsonl"
+    assert rs.session_transcript("ghi", st=st) == ""                   # id matches but no transcriptPath -> skip
+    assert rs.session_transcript("", st=st) == ""                     # empty fragment matches nothing
+    assert rs.session_transcript("zzz", st=st) == ""
+
+
 # --- 2. the attachment axis (invariant I4) --------------------------------------------------------------
 def _turn_transcript(path, now, age_s):
     """Write a REAL-SHAPED transcript whose last TURN is `age_s` old, plus fresh bookkeeping lines.
