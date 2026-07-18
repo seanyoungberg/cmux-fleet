@@ -398,7 +398,7 @@ def _codex_clean_config_flags(home=CODEX_DEFAULT_HOME):
     return flags
 
 
-def adapter_compile(tool, spec, caller_tokens, codex_home=None, conductor=""):
+def adapter_compile(tool, spec, caller_tokens, codex_home=None):
     """Compile {plugins, flags, env, settings} + caller passthrough -> (bin, arg_tokens, env_map)
     for the given tool. Adding a tool = adding a branch here + a [tool.<t>] block.
 
@@ -408,17 +408,16 @@ def adapter_compile(tool, spec, caller_tokens, codex_home=None, conductor=""):
     seat home is what broke the agent launch (see _codex_clean_config_flags). None = codex's own default
     home, which is exactly right for a user who has configured no providers at all.
 
-    `conductor` is the LABEL of the agent this one reports to. A child was told its own name and its role
-    but never who launched it — and `fleet peer-msg` addresses by label, so a worker that cannot name its
-    conductor cannot report to it. The fleet knows the parent at launch; this hands it to the child instead
-    of making it go digging."""
+    IDENTITY (Ship 5d): the launcher injects ONLY AGENT_ROLE + AGENT_LABEL, the irreducible launch
+    identity. Everything else DERIVES from source at use-time (the Ship 5 thesis, applied to identity):
+    kind from AGENT_ROLE + the roster (loom:prime resolves it), and the parent conductor from the registry
+    `parent` field (routing already reads it; `fleet peer-msg --to-parent` addresses it). No AGENT_CONDUCTOR
+    env — a captured binding's env goes stale across a recycle; the registry never does."""
     # spec['flags'] is already a token list (tool-floor<-role); layer the caller passthrough on top.
     merged = _layer_tokens([spec["flags"], list(caller_tokens or [])])
     env = {**_profile_env(), **dict(spec["env"])}            # build/profile pins first; a role's env wins
     env["AGENT_ROLE"] = spec["role"]                          # behavioral type (exposed to the agent)
     env["AGENT_LABEL"] = spec["label"]                        # unique instance -> routing/recycle
-    if conductor:
-        env["AGENT_CONDUCTOR"] = conductor                   # who to report to (peer-msg addresses by label)
 
     if tool == "claude":
         args = []
@@ -1475,9 +1474,7 @@ def cmd_launch(argv):
             sys.exit(f"[fleet] --provider: {e}")
         codex_home = (pr.get("env") or {}).get("CODEX_HOME")   # the home this codex launch will really use
 
-    from . import state as _fs
-    bin_name, args, env = adapter_compile(spec["tool"], spec, caller, codex_home=codex_home,
-                                          conductor=_fs.label_for_surface(a.parent) if a.parent else "")
+    bin_name, args, env = adapter_compile(spec["tool"], spec, caller, codex_home=codex_home)
 
     if pr:
         env.update(pr["env"])
@@ -4364,16 +4361,6 @@ def _binding_argv(command):
     return argv
 
 
-def _conductor_of(label):
-    """The LABEL of the agent this one reports to, from the registry (live, else archived). The registry is
-    the authority on parentage, so a recycle/revive re-derives $AGENT_CONDUCTOR instead of trusting a
-    captured binding's env — which is exactly how a restarted child would otherwise lose track of its
-    conductor. '' when unknown (an orphan, or a row that predates this)."""
-    from . import state as fs
-    e = fs.live_get(label) or fs.archive_get(label) or {}
-    return e.get("parent") or ""
-
-
 def _prepend_resume(args, tool, sid):
     """Prefix a resume directive per tool: claude takes a `--resume <id>` FLAG, codex a `resume <id>`
     SUBCOMMAND. No sid (or an unknown tool) -> no-op = a fresh launch."""
@@ -4413,8 +4400,9 @@ def _replay_binding_argv(argv, tool, role, label, cwd, caller_tokens, add_plugin
     base = _prepend_resume(base, tool, resume_session)           # claude --resume flag | codex resume subcmd
     # profile-pin a recycled/revived child too (bindings capture null env -> re-inject the build env)
     env = {**_profile_env(), "AGENT_ROLE": role, "AGENT_LABEL": label}
-    if _conductor_of(label):
-        env["AGENT_CONDUCTOR"] = _conductor_of(label)            # survives a recycle: parentage is in the registry
+    # No AGENT_CONDUCTOR (Ship 5d): parentage is derived from the registry at use-time, not carried in env —
+    # a captured binding's env goes stale across a recycle, the registry `parent` never does. Routing +
+    # `fleet peer-msg --to-parent` read it live.
     # ACCOUNT re-resolution (fix 1): a captured binding drops the account env (its own docstring: env is NOT
     # recoverable), so re-inject the re-resolved account env/args here — this is exactly why an ad-hoc
     # recycle used to revert to the ambient credential. render carries raw_env (spawn-time secret channel).
@@ -4503,7 +4491,7 @@ def _compose_from_registry(label, entry, caller_tokens, add_plugins, resume_sess
             "flags": _layer_tokens([list(entry.get("flags", [])), list(caller_tokens or [])]),
             "env": {}, "settings": entry.get("settings", "")}
     codex_home = (provider.get("env") or {}).get("CODEX_HOME") if provider else None
-    bin_name, args, env = adapter_compile(tool, spec, [], codex_home=codex_home, conductor=_conductor_of(label))
+    bin_name, args, env = adapter_compile(tool, spec, [], codex_home=codex_home)
     args = _prepend_resume(args, tool, resume_session)           # claude --resume flag | codex resume subcmd
     env, args, raw_env = _apply_provider(env, args, provider)
     return render_send_cmd(bin_name, args, env, abs_cwd, raw_env)
@@ -4535,8 +4523,7 @@ def _compose_from_roster(role, tool, label, caller_tokens, add_plugins, resume_s
     # thread the re-resolved codex home into adapter_compile so a codex seat's cruft-stripping flags are
     # enumerated from THAT home (same reason cmd_launch passes codex_home; a mismatch breaks codex start).
     codex_home = (provider.get("env") or {}).get("CODEX_HOME") if provider else None
-    bin_name, args, env = adapter_compile(tool, spec, caller_tokens, codex_home=codex_home,
-                                          conductor=_conductor_of(label))
+    bin_name, args, env = adapter_compile(tool, spec, caller_tokens, codex_home=codex_home)
     args = _prepend_resume(args, tool, resume_session)
     env, args, raw_env = _apply_provider(env, args, provider)    # fix 1: inject the re-resolved account env
     return render_send_cmd(bin_name, args, env, abs_cwd, raw_env)
@@ -5925,8 +5912,8 @@ VERB_USAGE = {
     "profile": "  profile <name> [--base DIR] [--root DIR] [--init]  emit env that pins ALL entrypoints at THIS build (eval it for multi-build isolation)",
     "daemon": "  daemon <start|stop|status|restart> [--foreground] [--heartbeat [SECS]]  run the router as a detached daemon (survives shell exit + recycle); start --foreground for launchd",
     "drive-child": "  drive-child <surface-uuid> <prompt...>            submit a prompt to a child's TUI (beats the paste-settle enter-race)",
-    "peer-msg": "  peer-msg <to-label> \"<body>\" [--no-reply] [--reply-to <id>] [--expect-reply] [--no-wake]\n"
-                "                                                    input-safe A2A: message a live PEER conductor (into its context, never its input box)",
+    "peer-msg": "  peer-msg <to-label>|--to-parent \"<body>\" [--no-reply] [--reply-to <id>] [--expect-reply] [--no-wake]\n"
+                "                                                    input-safe A2A: message a live PEER by label (or --to-parent: your registry-resolved conductor), into its context never its input box",
     "child-digest": "  child-digest <session-frag> [N]                   print a child's last N transcript turns (the reliable content source)",
     "inbox": "  inbox [--scope mine|<label>|all|conductors|children] [--json]  pending inbox on demand (default mine = yours; <label> peeks one; all = triage) — the catch-up read after a recycle",
     "inbox-ack": "  inbox-ack <seq> [--peer|--stale|--doctor] [--surface UUID]  mark shown completions/alerts/peer msgs handled so they stop re-surfacing",

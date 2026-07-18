@@ -601,6 +601,16 @@ def entry_for_surface(surface):
     return None
 
 
+def parent_of(label):
+    """The LABEL of the agent `label` reports to, from the registry (live, else archived); '' when the row
+    has no parent (a top-level agent) or the label is unknown. The registry is the authority on parentage,
+    so parent addressing DERIVES it at use-time rather than trusting a captured env (which goes stale across
+    a recycle) — the shared resolver behind recycle/revive re-derivation and `fleet peer-msg --to-parent`
+    (Ship 5d retired the AGENT_CONDUCTOR env var in favor of this)."""
+    e = live_get(label) or archive_get(label) or {}
+    return e.get("parent") or ""
+
+
 # --- unified --scope model (ratified 2026-07-07) -------------------------------------------------
 # ONE scoping vocabulary on every scope-aware verb. `mine|all|conductors|children` are the SET values
 # (a bare <label> is a single-target scope the verb resolves itself); the only thing that varies per

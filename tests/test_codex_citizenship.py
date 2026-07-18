@@ -112,8 +112,8 @@ def test_status_is_a_PURE_READ(tmp_path):
 
 # --- the content contract: what a worker must actually be told ------------------------------------
 @pytest.mark.parametrize("must_say, why", [
-    ("fleet peer-msg", "a codex worker that never reports is invisible to its conductor — the headline"),
-    ("$AGENT_CONDUCTOR", "peer-msg addresses by LABEL; a worker that cannot name its conductor cannot report"),
+    ("fleet peer-msg", "how a blocked worker reaches its conductor and reads the reply"),
+    ("--to-parent", "5d: no AGENT_CONDUCTOR env — a worker reaches its conductor via registry-derived parent addressing, without naming it"),
     ("fleet inbox", "how to read what is addressed to you"),
     ("git add -A", "named so it can be forbidden: a worker is not alone in the tree"),
     ("git -C", "never `cd <dir> && git`"),
@@ -121,6 +121,13 @@ def test_status_is_a_PURE_READ(tmp_path):
 ])
 def test_the_doc_says_the_thing(must_say, why):
     assert must_say in pv.codex_citizenship_text(), why
+
+
+def test_the_doc_does_NOT_carry_the_retired_AGENT_CONDUCTOR_env(tmp_path):
+    """Ship 5d retired the AGENT_CONDUCTOR env var: parentage derives from the registry, and a worker
+    reaches its conductor via `peer-msg --to-parent`, not a captured env label. The doc must not resurrect
+    the env var — a codex worker told to `peer-msg "$AGENT_CONDUCTOR"` would address the empty string."""
+    assert "$AGENT_CONDUCTOR" not in pv.codex_citizenship_text()
 
 
 def test_the_doc_warns_that_backticks_are_EATEN_SILENTLY(tmp_path):
