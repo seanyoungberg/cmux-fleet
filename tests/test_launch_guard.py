@@ -24,7 +24,10 @@ def _launch(tmp_path, *extra):
 
 @pytest.fixture(autouse=True)
 def _hermetic(monkeypatch):
-    monkeypatch.setattr(fleet, "load_config", lambda: {})       # keep the host's real toml out
+    # keep the host's real toml out, but carry a [role.adhoc] block so `--adhoc` resolves (5d: --adhoc
+    # is an alias for the rostered adhoc role; --cwd below still overrides the home).
+    monkeypatch.setattr(fleet, "load_config",
+                        lambda: {"role": {"adhoc": {"cwd": "agents/ad-hoc", "claude": {}}}})
 
 
 def test_launch_refuses_live_label(fs, rs, monkeypatch, tmp_path):

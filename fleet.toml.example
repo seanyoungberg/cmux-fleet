@@ -16,8 +16,9 @@
 # plugin_index = ""                 # path to the plugins.toml INDEX (see plugins.toml.example); "" ->
 #                                   #   <this-file's-dir>/plugins.toml. Absent file = empty index, no error.
 #                                   #   The index powers the `plugins = [...]` roster key.  env: CMUX_FLEET_PLUGIN_INDEX
-# floor_claudemd = ""               # CLAUDE.md symlinked into freshly-created ad-hoc cwds; "" = none.  env: CMUX_FLEET_FLOOR
-# adhoc_subdir = "agents/ad-hoc"    # where `--adhoc <name>` agents get a cwd (relative to root).  env: CMUX_FLEET_ADHOC_SUBDIR
+# floor_claudemd = ""               # CLAUDE.md symlinked into the shared ad-hoc home; "" = none.  env: CMUX_FLEET_FLOOR
+#                                   # (`--adhoc <name>` is now an alias for the [role.adhoc] block below —
+#                                   #  one shared flat home, <name> becomes the LABEL. No adhoc_subdir key.)
 # sidebar_paint = false             # daemon auto-repaints the custom fleet.swift sidebar (~every 4s, on-change)
 #                                   #   so state/ctx/model/last stay live. OFF by default: it writes a FLEET
 #                                   #   record into each agent workspace's DESCRIPTION (a subtitle in the
@@ -86,6 +87,14 @@ flags   = "--effort high"
 # Efforts: 5.6-sol/terra also accept `max` and `ultra` above `xhigh` (5.5 topped out at xhigh).
 
 # --- example roles ----------------------------------------------------------------------------
+# THE scratch role. `fleet launch --adhoc <name>` is an alias for `launch adhoc --label <name>`: every
+# ad-hoc agent shares this ONE flat home (differentiated by label, not a per-name dir), and inherits the
+# tool floor (no role plugins). Permanence = promotion to its own [role.<name>] block. `--cwd` overrides
+# the home for a work-targeted run. Omit this block and `--adhoc` errors (the scratch role is opt-in).
+[role.adhoc]
+cwd = "agents/ad-hoc"
+[role.adhoc.claude]
+
 [role.worker]
 kind = "child"
 place = "tab"

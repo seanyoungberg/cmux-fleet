@@ -3,7 +3,7 @@
 # umbrella for the rest of the scripts (state/drive/digest/ack).
 #
 #   fleet launch <role> [launcher flags] [-- <verbatim tool flags>]
-#   fleet launch --adhoc <name> --tool claude [-- --model opus]   # off-roster dynamic agent
+#   fleet launch --adhoc <name> --tool claude [-- --model opus]   # alias: the `adhoc` role, label=<name>
 #
 # DESIGN (see docs/architecture.md "Dispatch"): the launcher is a dumb command BUILDER over three
 # NATIVE config channels, it invents no setting names of its own:
@@ -27,7 +27,7 @@
 # [defaults] (orchestration) -> [role] scalars -> tool config [tool.<t>] -> [role.<t>] -> caller `--`.
 import argparse, json, os, re, shlex, subprocess, sys, tempfile, time
 
-from .config import ROOT, STATE, CMUX, FLOOR, FLEET_TOML, ADHOC_SUBDIR, PLUGIN_INDEX, HOOKSTORE, HOOKSTORE_EXPLICIT, load_plugin_index  # path resolver
+from .config import ROOT, STATE, CMUX, FLOOR, FLEET_TOML, PLUGIN_INDEX, HOOKSTORE, HOOKSTORE_EXPLICIT, load_plugin_index  # path resolver
 
 # The checkout/build root: the dir that holds bin/, .claude-plugin/, fleet.toml.example next to the
 # cmux_fleet package. In a repo/editable install this is the repo root (unchanged from the flat layout,
@@ -147,19 +147,21 @@ def resolve(cfg, role, tool_override, adhoc_name):
     tools = cfg.get("tool", {}) or {}
     roles = cfg.get("role", {}) or {}
 
-    if adhoc_name:                                            # off-roster dynamic agent
-        rblock = {}
-        orch_scalars = {"cwd": os.path.join(ADHOC_SUBDIR, adhoc_name)}
-        label = adhoc_name
-    else:
-        if role not in roles:
-            sys.exit(f"fleet: role '{role}' not in {FLEET_TOML}")
-        rblock = roles[role]
-        orch_scalars = {k: v for k, v in rblock.items() if not isinstance(v, dict)}
-        label = role
+    # `--adhoc NAME` is an ALIAS for the rostered `adhoc` role with label=NAME (Ship 5d): one shared flat
+    # home ([role.adhoc].cwd), the name is the LABEL not a per-name directory. So an ad-hoc agent resolves
+    # off the real roster block exactly like any role — same machinery — and only its label differs.
+    if adhoc_name:
+        if "adhoc" not in roles:
+            sys.exit(f"fleet: --adhoc needs a [role.adhoc] block in {FLEET_TOML} (the scratch role's shared home)")
+        role = "adhoc"
+    if role not in roles:
+        sys.exit(f"fleet: role '{role}' not in {FLEET_TOML}")
+    rblock = roles[role]
+    orch_scalars = {k: v for k, v in rblock.items() if not isinstance(v, dict)}
+    label = adhoc_name or role
 
     tool = tool_override or orch_scalars.get("tool") or defaults.get("tool") or "claude"
-    if not adhoc_name and tool not in rblock and not (tools.get(tool)):
+    if tool not in rblock and not (tools.get(tool)):
         # role exists but neither it nor a [tool.<t>] floor defines this tool
         sys.exit(f"fleet: role '{role}' has no config for tool '{tool}' (no [role.{role}.{tool}] or [tool.{tool}])")
 
@@ -186,7 +188,7 @@ def resolve(cfg, role, tool_override, adhoc_name):
     setting_sources = rtool.get("setting_sources") or tdef.get("setting_sources") or ""
 
     return {
-        "tool": tool, "role": label, "label": label,   # role = behavioral type; label defaults to it
+        "tool": tool, "role": role, "label": label,   # role = behavioral type; label defaults to it (adhoc: role='adhoc', label=NAME)
         "kind": orch.get("kind", "child"),
         "place": orch.get("place", "tab"),
         "group": orch.get("group", ""),
@@ -907,7 +909,9 @@ def _poll_surface_cwd(surf, want, timeout=10):
 
 def register(surf, spec, parent_surface, session, ws):
     from . import state as fs
-    parent_label = fs.label_for_surface(parent_surface) or parent_surface   # store parent LABEL (durable)
+    # store parent LABEL (durable); a top-level launch (no parent surface) stores None -- the canonical
+    # top-level rep that is_top_level reads (Ship 5d, Berg-ruled: no sentinel), NOT an empty string.
+    parent_label = fs.label_for_surface(parent_surface) or parent_surface or None
     # gen (Ship 5): a reseat fence bumped on every launch/revive/recycle, so any consumer can tell a cached
     # derived view is from a PRIOR seat of this label. Monotonic across the label's lifetimes (live/archive).
     _prior = fs.live_get(spec["label"]) or fs.archive_get(spec["label"])
@@ -1331,14 +1335,15 @@ def cmd_launch(argv):
 
     ap = argparse.ArgumentParser(prog="fleet launch", add_help=True)
     ap.add_argument("role", nargs="?", help="roster role name (omit with --adhoc)")
-    ap.add_argument("--adhoc", metavar="NAME", help="off-roster dynamic agent; cwd=workers/<NAME>")
+    ap.add_argument("--adhoc", metavar="NAME", help="alias for the rostered `adhoc` role with label=NAME "
+                                    "(one shared flat home, no per-name dir)")
     ap.add_argument("--tool", help="override the resolved tool (claude|codex|...)")
     ap.add_argument("--parent", default=os.environ.get("CMUX_SURFACE_ID", ""),
-                    help="conductor surfaceId (default $CMUX_SURFACE_ID)")
+                    help="conductor surfaceId (default $CMUX_SURFACE_ID); 'none' = a top-level agent (no parent)")
     ap.add_argument("--label", help="override the display label / registry label")
     ap.add_argument("--place", help="override placement (tab|pane|workspace)")
     ap.add_argument("--group", help="workspace group for --place workspace (name or workspace_group:<ref>); "
-                                    "needed for an --adhoc agent, which has no toml group")
+                                    "'none' = a standalone workspace (opt out of the own/parent-group default)")
     ap.add_argument("--direction", default="down", help="split direction for --place pane")
     ap.add_argument("--cwd", help="override the launch cwd (absolute)")
     ap.add_argument("--plugin", action="append", default=[], metavar="NAME",
@@ -1367,6 +1372,15 @@ def cmd_launch(argv):
     a = ap.parse_args(argv)
     if not a.role and not a.adhoc:
         ap.error("need a <role> or --adhoc <name>")
+    # none-vs-unset on the two placement axes (Ship 5d R-5d-1 / item 7-creation): the launch arg spec must
+    # express an EXPLICIT "none" distinct from "unset/default".
+    #   --parent none  -> a TOP-LEVEL agent (registry parent=None). Distinct from unset (=$CMUX_SURFACE_ID).
+    #   --group  none  -> a STANDALONE workspace (no group). Distinct from unset (=own/parent group, below)
+    #                     and from --group NAME (join/bootstrap that group).
+    top_level = (a.parent or "").strip().lower() == "none"
+    if top_level:
+        a.parent = ""
+    group_none = (a.group or "").strip().lower() == "none"
     # first-class session-preference overrides funnel into the caller-token layer (highest precedence),
     # so `fleet launch role --effort max` works without a `-- --effort max` passthrough.
     if a.effort:
@@ -1378,7 +1392,7 @@ def cmd_launch(argv):
     spec = resolve(cfg, a.role, a.tool, a.adhoc)
     if a.place:
         spec["place"] = a.place
-    if a.group:
+    if a.group and not group_none:                           # `--group none` is the standalone sentinel, not a name
         spec["group"] = a.group
     if a.label:
         spec["label"] = a.label
@@ -1390,7 +1404,8 @@ def cmd_launch(argv):
         spec["plugins"] = _dedup(spec["plugins"] + _flatten_csv(a.plugin))
     # one conductor = one group: a place=workspace conductor with no explicit group anchors its OWN group
     # (named for its label); a place=workspace child with no explicit group joins its parent's group.
-    if spec["place"] == "workspace" and not spec["group"]:
+    # `--group none` (group_none) opts OUT of this default entirely -> a deliberately standalone workspace.
+    if spec["place"] == "workspace" and not spec["group"] and not group_none:
         if spec["kind"] == "conductor":
             spec["group"] = spec["label"]
         elif a.parent:
@@ -1398,6 +1413,10 @@ def cmd_launch(argv):
             pe = fs.entry_for_surface(a.parent)
             if pe and pe.get("group"):
                 spec["group"] = pe["group"]
+    # a top-level agent has no parent surface to place a tab/pane in -> it must own a workspace.
+    if top_level and spec["place"] != "workspace":
+        sys.exit(f"[fleet] ABORT: --parent none needs --place workspace (a top-level agent has no parent "
+                 f"surface to hold a {spec['place']})")
     spec["abs_cwd"] = a.cwd or (spec["cwd"] if os.path.isabs(spec["cwd"]) else os.path.join(ROOT, spec["cwd"]))
 
     # --- worktree (config-gated, default-off) ---------------------------------------------------
@@ -1511,8 +1530,8 @@ def cmd_launch(argv):
     if a.dry_run:
         print("[fleet] dry-run (omit --dry-run to spawn)")
         return 0
-    if not a.parent:
-        sys.exit("[fleet] ABORT: no --parent and no $CMUX_SURFACE_ID")
+    if not a.parent and not top_level:                       # `--parent none` (top_level) is the deliberate opt-out
+        sys.exit("[fleet] ABORT: no --parent and no $CMUX_SURFACE_ID (pass --parent none for a top-level agent)")
 
     # live-label guard (registry/surface 1:1 invariant, same family as the rm flip): register() is a
     # bare live_put overwrite, so launching into a label whose row still points at a live surface would
@@ -1545,7 +1564,7 @@ def cmd_launch(argv):
                      f"or re-run with --force if you KNOW the old surface is already dead.")
 
     os.makedirs(spec["abs_cwd"], exist_ok=True)
-    if a.adhoc:                                          # ad-hoc cwds are created fresh at launch ->
+    if a.adhoc:                                          # the shared adhoc home has no role plugins/CLAUDE.md ->
         _link_floor_claudemd(spec["abs_cwd"])            # symlink the floor CLAUDE.md so they inherit it
     if spec["tool"] == "codex":                          # design the update modal out (Berg: always
         note = _codex_update_preflight()                 # allow the update); the pane scan below is the
@@ -1752,7 +1771,15 @@ def cmd_config(argv):
         ap.error("need a <role>, --adhoc <name>, or --cwd <dir>")
 
     cfg = load_config()
-    spec = resolve(cfg, a.role or "default-worker", a.tool, a.adhoc or (None if a.role else "_inspect"))
+    # default-worker folded into `adhoc` (5d): --adhoc NAME inspects the scratch role (requires [role.adhoc],
+    # like launch). A bare `--cwd` probe, though, is roster-INDEPENDENT — just "what does the tool stack in
+    # this dir" — so it must NOT need a roster (nor even a [tool.<t>] floor; a fresh/empty toml is fine).
+    # When no [role.adhoc] exists, synthesize one carrying the target tool's (empty) sub-block, so resolve's
+    # tool-check is satisfied and we get a floor-only probe spec.
+    if not a.role and not a.adhoc and "adhoc" not in (cfg.get("role") or {}):
+        tool = a.tool or (cfg.get("defaults", {}) or {}).get("tool") or "claude"
+        cfg = {**cfg, "role": {**(cfg.get("role") or {}), "adhoc": {tool: {}}}}
+    spec = resolve(cfg, a.role or "adhoc", a.tool, a.adhoc or (None if a.role else "_inspect"))
     cwd = os.path.abspath(os.path.expanduser(a.cwd)) if a.cwd \
         else (spec["cwd"] if os.path.isabs(spec["cwd"]) else os.path.join(ROOT, spec["cwd"]))
     bin_name, args, env = adapter_compile(spec["tool"], spec, [])
