@@ -3843,61 +3843,94 @@ def cmd_move(argv):
     parent_entry = fs.live_get(new_parent or "") or {}
 
     # resolve the target BEFORE the move, so a bad target aborts with nothing touched.
-    target_uuid = ""
+    target_uuid, same_ws = "", False
     if a.to_workspace:
         target_uuid = (a.to_workspace if _looks_like_uuid(a.to_workspace)
                        else _ref_to_uuid("workspace", a.to_workspace))
         if not target_uuid:
             sys.exit(f"[fleet] move: could not resolve --to-workspace '{a.to_workspace}' to a workspace "
                      f"(pass a UUID or a workspace:<n> ref). Inspect: cmux list-workspaces")
-        if target_uuid.upper() == cur_ws.upper():
-            print(f"[fleet] move: {a.label} is already in workspace {cur_ws[:8]}; nothing to do.")
-            return 0
+        same_ws = target_uuid.upper() == cur_ws.upper()
 
-    # NATIVE RELOCATION — safe whether or not an agent is live on the surface. cmux 0.64.18+ heals the
-    # moved surface's agent-status registration, so there is no live-agent refusal, no archive, no revive,
-    # no fresh surface. The surface UUID is preserved, so the agent keeps its pid, session and context.
-    # 1. suppress the spurious archive: a cross-workspace move emits surface.closed (root cause #3), which
-    #    the router would otherwise read as an accidental external close and archive the still-live member.
-    fs.expected_close_put(surf)
+    # A move is RELOCATE (the surface) + REPARENT (the org chart), DECOUPLED. `--own-workspace` and a
+    # cross-ws `--to-workspace` both relocate; a same-ws `--to-workspace` is a PURE REPARENT — the surface
+    # stays put, but parent + group still follow the mover. Decoupling is what makes `fleet move <child>
+    # --to-workspace <its-own-ws>` from a NEW conductor a valid ownership assertion instead of the old no-op
+    # short-circuit (post-thin-registry there is no stored workspace left to "reconcile").
+    relocate = a.own_workspace or (a.to_workspace and not same_ws)
 
-    # 2. move the surface (UUID preserved -> pid/session/context/registration all survive the move).
-    if a.to_workspace:
-        cmuxq("move-surface", "--surface", surf, "--workspace", target_uuid, "--focus", "false")
-        # a tab joins the target workspace's own visual group; the fleet group field follows the new parent.
-        new_group, new_place = parent_entry.get("group") or child.get("group", ""), "tab"
+    if relocate:
+        # NATIVE RELOCATION — safe whether or not an agent is live on the surface. cmux 0.64.18+ heals the
+        # moved surface's agent-status registration, so no live-agent refusal, no archive, no revive, no
+        # fresh surface. The surface UUID is preserved, so the agent keeps its pid, session and context.
+        # Suppress the spurious archive: a cross-workspace move emits surface.closed (root cause #3), which
+        # the router would otherwise read as an accidental external close and archive the still-live member.
+        fs.expected_close_put(surf)
+        if a.to_workspace:
+            cmuxq("move-surface", "--surface", surf, "--workspace", target_uuid, "--focus", "false")
+        else:
+            cmuxq("move-tab-to-new-workspace", "--surface", surf, "--title", a.name or a.label,
+                  "--focus", "false")
+
+        # CONFIRM the surface's actual landing from TREE ground truth (never trust the frozen hook-store
+        # workspaceId). FRESH read (ttl=0): the default 2s memo would confirm against a STALE pre-move tree
+        # (the load-bearing correctness point).
+        new_ws = rs.workspace(surf, ws_map=rs.surface_ws_map(ttl=0))
+        if not new_ws:
+            sys.exit(f"[fleet] move: after the move, surface {surf[:8]} could not be located in any "
+                     f"workspace -- NOT touching the registry. Inspect: cmux tree --all. (The expected-close "
+                     f"tombstone will lapse; if the surface is truly gone, `fleet register`/`revive`.)")
+
+        # POST-MOVE VERIFY — `cmuxq` DISCARDS the return code, so a failed move-surface /
+        # move-tab-to-new-workspace reads as success. Assert the surface actually landed where we asked
+        # BEFORE rewriting the registry to claim it did: a false "rehomed" is how a move silently split-brains.
+        if a.to_workspace and new_ws.upper() != target_uuid.upper():
+            sys.exit(f"[fleet] move: move-surface did NOT take — {a.label} is in {new_ws[:8]}, not the "
+                     f"target {target_uuid[:8]}. NOT touching the registry (no false 'rehomed'). "
+                     f"Inspect: cmux tree --all.")
+        if a.own_workspace and new_ws.upper() == cur_ws.upper():
+            sys.exit(f"[fleet] move: --own-workspace did NOT relocate {a.label} — it is still in "
+                     f"{cur_ws[:8]} (move-tab-to-new-workspace reused the same workspace, not a fresh one). "
+                     f"NOT touching the registry. Inspect: cmux tree --all.")
     else:
-        cmuxq("move-tab-to-new-workspace", "--surface", surf, "--title", a.name or a.label,
-              "--focus", "false")
-        new_group, new_place = "", "workspace"
-        # re-group the FRESH workspace into the (new) parent conductor's group — `workspace-group add` is
-        # surface-preserving, NOT a surface move. This is the native regroup that repairs the split-brain
-        # the old archive-revive path caused (cf-conductor, 2026-07-15).
-        gname = parent_entry.get("group") or child.get("group") or ""
-        gref = _group_ref(gname) if gname else ""
-        new_ws_early = rs.workspace(surf, ws_map=rs.surface_ws_map(ttl=0))   # FRESH read: a move just happened
-        if gref and new_ws_early:
-            cmuxq("workspace-group", "add", "--group", gref, "--workspace", new_ws_early)  # surface-preserving
+        new_ws = cur_ws                                       # same-ws PURE REPARENT: the surface never moved
+
+    # group + place follow the (possibly new) parent. The relocation kind decides placement, and a group the
+    # parent owns is (re)joined surface-preserving via `workspace-group add` — the native regroup that repairs
+    # the split-brain the old archive-revive path caused (cf-conductor, 2026-07-15).
+    gname = parent_entry.get("group") or child.get("group") or ""
+    gref = _group_ref(gname) if gname else ""
+    if a.own_workspace:
+        new_place, new_group = "workspace", ""
+        if gref and new_ws:                                  # the FRESH workspace is in no group yet -> join it
+            cmuxq("workspace-group", "add", "--group", gref, "--workspace", new_ws)   # surface-preserving
+            new_group = gname
+    elif relocate:                                           # cross-ws --to-workspace: joined the target as a tab
+        # the target workspace carries its own visual group; the fleet group field follows the new parent.
+        new_place, new_group = "tab", gname
+    else:                                                    # same-ws PURE REPARENT: keep the placement, follow the group
+        new_place, new_group = child.get("place", "tab"), child.get("group", "")
+        if gref and new_ws and gname != child.get("group"):  # pull the current ws into the new parent's group
+            cmuxq("workspace-group", "add", "--group", gref, "--workspace", new_ws)   # surface-preserving
             new_group = gname
 
-    # 3. reconcile the registry from TREE ground truth (root cause #3: never trust the frozen hook-store
-    #    workspaceId). A registry UPDATE — parent + group + workspace set TOGETHER (the split-brain fix),
-    #    every other field preserved (via {**child}) — never a teardown. FRESH read (ttl=0): the default 2s
-    #    memo would confirm the move against a STALE pre-move tree (the load-bearing correctness point).
-    new_ws = rs.workspace(surf, ws_map=rs.surface_ws_map(ttl=0))
-    if not new_ws:
-        sys.exit(f"[fleet] move: after the move, surface {surf[:8]} could not be located in any workspace "
-                 f"-- NOT touching the registry. Inspect: cmux tree --all. (The expected-close tombstone "
-                 f"will lapse; if the surface is truly gone, `fleet register`/`revive` to recover.)")
+    # a registry UPDATE — parent + group + workspace set TOGETHER (the split-brain fix), every other field
+    # preserved (via {**child}) — never a teardown.
     rehomed = new_parent != child.get("parent")
     fs.live_put(a.label, {**child, "parent": new_parent, "workspace": new_ws, "place": new_place,
                           "group": new_group})
     fs.log_event("moved", label=a.label, role=child.get("role"), session=child.get("session"),
                  via="fleet-move-native", parent=new_parent)
-    print(f"[fleet] moved {a.label}: surface {surf[:8]} {cur_ws[:8]} -> {new_ws[:8]}"
-          + (f" (rehomed under {new_parent})" if rehomed else "")
-          + (f" (group '{new_group}')" if new_group else "")
-          + "; relocated natively — pid/session/context/agent-status registration intact.")
+    if relocate:
+        print(f"[fleet] moved {a.label}: surface {surf[:8]} {cur_ws[:8]} -> {new_ws[:8]}"
+              + (f" (rehomed under {new_parent})" if rehomed else "")
+              + (f" (group '{new_group}')" if new_group else "")
+              + "; relocated natively — pid/session/context/agent-status registration intact.")
+    else:
+        print(f"[fleet] move {a.label}: stayed in workspace {cur_ws[:8]} (pure reparent)"
+              + (f"; rehomed under {new_parent}" if rehomed else "; parent unchanged")
+              + (f", group '{new_group}'" if new_group else "")
+              + ".")
     return 0
 
 

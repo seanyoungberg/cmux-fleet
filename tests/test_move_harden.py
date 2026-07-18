@@ -239,6 +239,30 @@ def test_move_REHOMES_under_the_caller_conductor(fs, rs, movable, monkeypatch):
     assert ga and "workspace_group:9" in ga[0] and "NEW-WS" in ga[0]   # cf's group, surface-preserving
 
 
+# --- the post-move VERIFY: cmuxq swallows failures, so confirm the landing before touching the registry ---
+
+def test_move_to_workspace_aborts_when_the_move_did_not_take(fs, rs, movable, monkeypatch):
+    """Bug #1: `cmuxq` DISCARDS the return code, so a FAILED move-surface reads as success. The post-move
+    verify reads the surface's ACTUAL workspace and, finding it is NOT the target, aborts WITHOUT rewriting
+    the registry — no false 'rehomed' (which is how a move silently split-brains)."""
+    monkeypatch.setattr(rs, "workspace", _seq("WS-OLD", "SOMEWHERE-ELSE"))   # move-surface silently no-ops
+    with pytest.raises(SystemExit) as ex:
+        fleet.cmd_move(["kid", "--to-workspace", TARGET_WS])
+    assert "did NOT take" in str(ex.value)
+    assert fs.live_get("kid")["workspace"] == "WS-OLD"       # registry untouched (no false rehome)
+
+
+def test_move_own_workspace_aborts_when_the_workspace_is_not_fresh(fs, rs, movable, monkeypatch):
+    """Bug #3: `--own-workspace` must land the surface in a genuinely NEW workspace. If
+    move-tab-to-new-workspace reuses the same one (fake-fresh), the post-move verify sees the surface never
+    left cur_ws and aborts WITHOUT rewriting the registry."""
+    monkeypatch.setattr(rs, "workspace", _seq("WS-OLD", "WS-OLD"))   # the 'fresh' ws IS the old one
+    with pytest.raises(SystemExit) as ex:
+        fleet.cmd_move(["kid", "--own-workspace"])
+    assert "did NOT relocate" in str(ex.value)
+    assert fs.live_get("kid")["workspace"] == "WS-OLD"       # registry untouched
+
+
 # --- the ARCHIVED agent: no surface, so revive it into the target (never move) -----------------------
 
 def test_move_of_an_ARCHIVED_label_refuses_and_signposts_revive(fs, monkeypatch):
@@ -273,15 +297,47 @@ def test_move_requires_exactly_one_target(fs, monkeypatch):
         fleet.cmd_move(["kid", "--own-workspace", "--to-workspace", "WS"])  # both
 
 
-def test_move_noop_when_already_in_target(fs, rs, monkeypatch):
-    fs.live_put("kid", {"role": "w", "kind": "child", "surface": "KID-S",
-                        "workspace": "11111111-1111-1111-1111-111111111111", "status": "live"})
+def test_move_same_ws_from_conductor_reparents_and_regroups(fs, rs, monkeypatch):
+    """Bug #2 (the no-op short-circuit is GONE): `fleet move <child> --to-workspace <its-own-ws>` from a
+    conductor is a valid PURE REPARENT. Post-thin-registry there's no stored workspace to 'reconcile', so a
+    same-ws move still follows the mover — parent + group update, surface-preserving (NO move-surface, NO
+    archive-suppression tombstone), the current ws pulled into the new parent's group."""
+    CUR_WS = "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa"
+    fs.live_put("cond", {"role": "c", "kind": "conductor", "surface": "COND-S", "group": "G", "status": "live"})
+    fs.live_put("kid", {"role": "w", "kind": "child", "parent": "other", "surface": "KID-S",
+                        "place": "tab", "status": "live"})
     calls = []
     monkeypatch.setattr(fleet, "cmuxq", lambda *a: (calls.append(a) or ""))
-    monkeypatch.setattr(rs, "workspace", lambda *a, **k: "11111111-1111-1111-1111-111111111111")
-    assert fleet.cmd_move(["kid", "--to-workspace", "11111111-1111-1111-1111-111111111111"]) == 0
-    assert not [c for c in calls if c[0] == "move-surface"]              # nothing moved
-    assert not fs.expected_close_recent("KID-S")                        # and no tombstone stamped
+    monkeypatch.setenv("CMUX_SURFACE_ID", "COND-S")           # the caller running move IS conductor cond
+    monkeypatch.setattr(rs, "workspace", lambda *a, **k: CUR_WS)
+    monkeypatch.setattr(fleet, "_group_ref", lambda g: "workspace_group:5" if g == "G" else "")
+
+    assert fleet.cmd_move(["kid", "--to-workspace", CUR_WS]) == 0
+    assert not [c for c in calls if c[0] in ("move-surface", "move-tab-to-new-workspace")]   # NOTHING relocated
+    assert not fs.expected_close_recent("KID-S")             # no surface close -> no tombstone
+    ga = [c for c in calls if c[:2] == ("workspace-group", "add")]
+    assert ga and "workspace_group:5" in ga[0] and CUR_WS in ga[0]   # cur ws pulled into cond's group
+    kid = fs.live_get("kid")
+    assert kid["parent"] == "cond" and kid["group"] == "G"  # REPARENTED (was 'other') + regrouped
+    assert kid["place"] == "tab"                            # placement unchanged (the surface stayed put)
+
+
+def test_move_same_ws_no_caller_is_a_benign_reparent(fs, rs, monkeypatch):
+    """A same-ws move with no resolvable caller conductor (a human shell / CI) preserves parent + group and
+    changes nothing on the surface: no move-surface, no tombstone (the reparent is a no-op, not a short-circuit)."""
+    CUR_WS = "11111111-1111-1111-1111-111111111111"
+    fs.live_put("kid", {"role": "w", "kind": "child", "parent": "cond", "surface": "KID-S",
+                        "place": "tab", "group": "G", "status": "live"})
+    calls = []
+    monkeypatch.setattr(fleet, "cmuxq", lambda *a: (calls.append(a) or ""))
+    monkeypatch.delenv("CMUX_SURFACE_ID", raising=False)      # no caller conductor
+    monkeypatch.setattr(rs, "workspace", lambda *a, **k: CUR_WS)
+    monkeypatch.setattr(fleet, "_group_ref", lambda g: "")
+    assert fleet.cmd_move(["kid", "--to-workspace", CUR_WS]) == 0
+    assert not [c for c in calls if c[0] == "move-surface"]   # nothing relocated
+    assert not fs.expected_close_recent("KID-S")             # and no tombstone stamped
+    kid = fs.live_get("kid")
+    assert kid["parent"] == "cond" and kid["group"] == "G"   # unchanged (no mover to follow)
 
 
 # --- E. the liveness authority itself ------------------------------------------------------------------
