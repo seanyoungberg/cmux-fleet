@@ -476,34 +476,6 @@ def surface_loc(surf):
     return None, None
 
 
-def ws_uuid_for_surface(surf):
-    """The workspace UUID of the agent LIVING on `surf`: the freshest hook-store record with an ALIVE
-    pid wins, falling back to the freshest record of any liveness, then ''.
-
-    The old form returned the FIRST surface-matching record in dict order — no aliveness, no recency —
-    the same stale-ghost pick that `_pid_for_surface` made before it was deleted (2026-07-10). cmux
-    never drops a surface's old records, and a reboot/resume re-homes the surface into a NEW workspace,
-    so the lingering dead records keep pointing at the OLD (now-closed) workspace. Diagnosed live by
-    berg-sandbox: its surface carried four records — three dead ones naming a dead workspace, and the
-    one LIVE record naming the real one. Feeding the dead pick to `fleet launch --place tab|pane` made
-    every such launch abort with 'Workspace not found'. The correct workspace was in the store the whole
-    time; we were reading the wrong row. A dead pid cannot be the agent, so it cannot name its workspace.
-
-    Still a store read: if a live agent is MOVED between workspaces without a record update, the record
-    can lag. Callers that need certainty resolve against the live tree (`surface_ws_from_tree`)."""
-    from . import state as fs
-    live_ws, live_ts, any_ws, any_ts = "", -1.0, "", -1.0
-    for s in (_store().get("sessions") or {}).values():
-        if (s.get("surfaceId") or "").upper() != (surf or "").upper():
-            continue
-        ts = s.get("updatedAt") or 0
-        if ts >= any_ts:
-            any_ws, any_ts = s.get("workspaceId", ""), ts
-        if fs.pid_alive(s.get("pid")) and ts >= live_ts:
-            live_ws, live_ts = s.get("workspaceId", ""), ts
-    return live_ws or any_ws
-
-
 def surface_ws_from_tree(tree_text, surf):
     """Parse `cmux tree` TEXT -> the workspace UUID that CONTAINS `surf`, or '' if `surf` is not in the
     tree (genuinely closed). PURE (no shell-out) so register's workspace derivation and the router's
@@ -521,14 +493,6 @@ def surface_ws_from_tree(tree_text, surf):
         if ms and ms.group(1).upper() == surf.upper():
             return ws
     return ""
-
-
-def current_ws_for_surface(surf):
-    """The workspace UUID that CURRENTLY contains `surf`, from cmux's live TREE (the visual ground
-    truth), falling back to the hook store only when the tree can't be read. Prefer the TREE because the
-    hook store's workspaceId FREEZES when a surface is MOVED across workspaces (root cause #3) -- so
-    register/`move` record where the surface lives NOW, not where it was first bound. '' if unlocatable."""
-    return surface_ws_from_tree(cmuxq("tree", "--all", "--id-format", "both"), surf) or ws_uuid_for_surface(surf)
 
 
 def _all_workspace_uuids(tree_text):
@@ -797,6 +761,7 @@ def create_surface(spec, parent_surf, direction):
     """Create the target surface per spec['place']; return (ws_uuid, surf_uuid). Aborts (None) on any
     unresolved UUID -- never send blind."""
     import re
+    from . import resolve as rs
     place = spec["place"]
     if place in ("tab", "pane"):
         # WHERE THE PARENT SURFACE LIVES = a question about the TREE, which is the visual ground truth,
@@ -808,7 +773,7 @@ def create_surface(spec, parent_surf, direction):
         # off it died with "cannot resolve conductor workspace from --parent". One tree read, both answers.
         cws, agents_pane = surface_loc(parent_surf)
         if not cws:
-            cws = ws_uuid_for_surface(parent_surf)     # store fallback, for when the tree can't be read
+            cws = rs._ws_from_store(parent_surf)       # store fallback, for when the tree can't be read
         if not cws:
             print("[fleet] ABORT: cannot resolve conductor workspace from --parent"); return None, None
         if place == "tab":
@@ -3672,8 +3637,8 @@ def cmd_register(argv):
     # cross-workspace MOVE the hook-store workspaceId FREEZES at the OLD workspace (root cause #3), so
     # trusting `rec` here re-registered moved children straight back into their old shared workspace
     # (observed 2026-07-07: children re-registered to the shared ws, not their new 43/44/45).
-    # current_ws_for_surface reads the tree first; rec.workspaceId is only the last-ditch fallback.
-    ws = current_ws_for_surface(surf) or rec.get("workspaceId") or ""
+    # rs.workspace reads the live tree first; rec.workspaceId is only the last-ditch fallback.
+    ws = rs.workspace(surf) or rec.get("workspaceId") or ""
     surf_cwd = rec.get("cwd") or _surface_cwd(surf) or ""
 
     # rebuild the spec: roster role (toml-authoritative, berg's proven recipe) > archive/live entry >
@@ -3743,6 +3708,7 @@ def cmd_group(argv):
           `workspace-group add` -- the child stays live (no move). Records the group on the child's row.
     """
     from . import state as fs
+    from . import resolve as rs
     ap = argparse.ArgumentParser(prog="fleet group", add_help=True)
     ap.add_argument("sub", choices=["init", "add"], help="init (anchor my workspace as a group) | add <label>")
     ap.add_argument("label", nargs="?", help="child label (for `add`)")
@@ -3757,7 +3723,7 @@ def cmd_group(argv):
 
     if a.sub == "init":
         name = a.name or self_entry.get("group") or self_label
-        my_ws = current_ws_for_surface(self_surf) or self_entry.get("workspace") or ""
+        my_ws = rs.workspace(self_surf) or self_entry.get("workspace") or ""
         if not my_ws:
             sys.exit(f"[fleet] group init: cannot resolve {self_label}'s current workspace from cmux.")
         gref = _group_ref(name)
@@ -3799,7 +3765,7 @@ def cmd_group(argv):
     if not gref:
         sys.exit(f"[fleet] group add: no cmux group named '{name}' (run `fleet group init`). "
                  f"Inspect: cmux workspace-group list --json")
-    child_ws = current_ws_for_surface(child.get("surface", "")) or child.get("workspace") or ""
+    child_ws = rs.workspace(child.get("surface", "")) or child.get("workspace") or ""
     if not child_ws:
         sys.exit(f"[fleet] group add: cannot resolve {a.label}'s current workspace from cmux.")
     cmuxq("workspace-group", "add", "--group", gref, "--workspace", child_ws)   # SAFE: no surface move
@@ -3832,6 +3798,7 @@ def cmd_move(argv):
     An ARCHIVED label has no surface, so there is nothing to relocate — bring it back into the target with
     `fleet revive <label>` instead. Bystanders are safe: a surface move never touches sibling surfaces."""
     from . import state as fs
+    from . import resolve as rs
     ap = argparse.ArgumentParser(prog="fleet move", add_help=True)
     ap.add_argument("label", help="the child to relocate")
     ap.add_argument("--to-workspace", default="", metavar="WS",
@@ -3859,7 +3826,7 @@ def cmd_move(argv):
     surf = child.get("surface", "")
     if not surf:
         sys.exit(f"[fleet] move: '{a.label}' has no surface recorded; cannot move.")
-    cur_ws = current_ws_for_surface(surf)
+    cur_ws = rs.workspace(surf)                                # pre-move: the 2s memo is fine (nothing has moved yet)
     if not cur_ws:
         sys.exit(f"[fleet] move: surface {surf[:8]} for '{a.label}' is not in cmux's tree (already "
                  f"closed?). Use `fleet revive {a.label}` to relaunch, not move.")
@@ -3908,15 +3875,16 @@ def cmd_move(argv):
         # the old archive-revive path caused (cf-conductor, 2026-07-15).
         gname = parent_entry.get("group") or child.get("group") or ""
         gref = _group_ref(gname) if gname else ""
-        new_ws_early = current_ws_for_surface(surf)
+        new_ws_early = rs.workspace(surf, ws_map=rs.surface_ws_map(ttl=0))   # FRESH read: a move just happened
         if gref and new_ws_early:
             cmuxq("workspace-group", "add", "--group", gref, "--workspace", new_ws_early)  # surface-preserving
             new_group = gname
 
     # 3. reconcile the registry from TREE ground truth (root cause #3: never trust the frozen hook-store
     #    workspaceId). A registry UPDATE — parent + group + workspace set TOGETHER (the split-brain fix),
-    #    every other field preserved (via {**child}) — never a teardown.
-    new_ws = current_ws_for_surface(surf)
+    #    every other field preserved (via {**child}) — never a teardown. FRESH read (ttl=0): the default 2s
+    #    memo would confirm the move against a STALE pre-move tree (the load-bearing correctness point).
+    new_ws = rs.workspace(surf, ws_map=rs.surface_ws_map(ttl=0))
     if not new_ws:
         sys.exit(f"[fleet] move: after the move, surface {surf[:8]} could not be located in any workspace "
                  f"-- NOT touching the registry. Inspect: cmux tree --all. (The expected-close tombstone "

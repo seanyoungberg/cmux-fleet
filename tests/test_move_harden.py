@@ -33,7 +33,8 @@ def rs():
 
 
 def _seq(*vals):
-    """A stand-in for current_ws_for_surface: returns vals[0], vals[1], ... on successive calls."""
+    """A stand-in for rs.workspace: returns vals[0], vals[1], ... on successive calls (ignores args, so it
+    covers both the pre-move `rs.workspace(surf)` and the post-move `rs.workspace(surf, ws_map=...)`)."""
     it = iter(vals)
     return lambda *a, **k: next(it)
 
@@ -54,7 +55,7 @@ def _modelb_group_cmux(calls, gref="workspace_group:7", name="AD - Berg Sandbox"
     return fake
 
 
-def test_group_init_bootstraps_modelb_and_records(fs, monkeypatch):
+def test_group_init_bootstraps_modelb_and_records(fs, rs, monkeypatch):
     # group ABSENT -> create --from MY ws; Model B: KEEP the scaffold cmux mints as the empty anchor and
     # TITLE it 'Conductor - <label>'. My workspace stays an ordinary MEMBER -- NO set-anchor onto it, NO
     # close. Then record the group on the conductor's row.
@@ -62,7 +63,7 @@ def test_group_init_bootstraps_modelb_and_records(fs, monkeypatch):
                          "workspace": "WS-COND", "status": "live"})
     calls = []
     monkeypatch.setattr(fleet, "cmuxq", _modelb_group_cmux(calls, member_ref="workspace:2"))
-    monkeypatch.setattr(fleet, "current_ws_for_surface", lambda surf: "WS-COND")
+    monkeypatch.setattr(rs, "workspace", lambda *a, **k: "WS-COND")
     monkeypatch.setattr(fleet, "_group_ref", _seq("", "workspace_group:7"))   # absent, then present
     monkeypatch.setattr(fleet, "_ref_to_uuid",
                         lambda kind, ref, tree=None: {"workspace:88": "WS-SCAFFOLD",
@@ -83,13 +84,13 @@ def test_group_init_bootstraps_modelb_and_records(fs, monkeypatch):
     assert fs.live_get("cond")["place"] == "workspace"
 
 
-def test_group_init_defaults_the_group_name_to_the_label(fs, monkeypatch):
+def test_group_init_defaults_the_group_name_to_the_label(fs, rs, monkeypatch):
     # no --name -> the group (and the 'Conductor - <label>' anchor title) default to the conductor's label.
     fs.live_put("cond", {"role": "c", "kind": "conductor", "tool": "claude", "surface": "COND-S",
                          "workspace": "WS-COND", "status": "live"})
     calls = []
     monkeypatch.setattr(fleet, "cmuxq", _modelb_group_cmux(calls, name="cond"))
-    monkeypatch.setattr(fleet, "current_ws_for_surface", lambda surf: "WS-COND")
+    monkeypatch.setattr(rs, "workspace", lambda *a, **k: "WS-COND")
     monkeypatch.setattr(fleet, "_group_ref", _seq("", "workspace_group:7"))
     monkeypatch.setattr(fleet, "_ref_to_uuid",
                         lambda kind, ref, tree=None: {"workspace:88": "WS-SCAFFOLD",
@@ -102,13 +103,13 @@ def test_group_init_defaults_the_group_name_to_the_label(fs, monkeypatch):
     assert fs.live_get("cond")["group"] == "cond"
 
 
-def test_group_init_existing_group_just_records(fs, monkeypatch):
+def test_group_init_existing_group_just_records(fs, rs, monkeypatch):
     # group ALREADY exists -> record it on the conductor, no create/set-anchor/close.
     fs.live_put("cond", {"role": "c", "kind": "conductor", "tool": "claude", "surface": "COND-S",
                          "workspace": "WS-COND", "status": "live"})
     calls = []
     monkeypatch.setattr(fleet, "cmuxq", lambda *a: (calls.append(a) or ""))
-    monkeypatch.setattr(fleet, "current_ws_for_surface", lambda surf: "WS-COND")
+    monkeypatch.setattr(rs, "workspace", lambda *a, **k: "WS-COND")
     monkeypatch.setattr(fleet, "_group_ref", lambda g: "workspace_group:3")   # already exists
 
     assert fleet.cmd_group(["init", "--name", "grp", "--surface", "COND-S"]) == 0
@@ -116,7 +117,7 @@ def test_group_init_existing_group_just_records(fs, monkeypatch):
     assert fs.live_get("cond")["group"] == "grp"
 
 
-def test_group_add_retrofits_child_without_moving_surface(fs, monkeypatch):
+def test_group_add_retrofits_child_without_moving_surface(fs, rs, monkeypatch):
     # `group add`: the SAFE lane -- workspace-group add (no surface move), child stays live, group recorded.
     fs.live_put("cond", {"role": "c", "kind": "conductor", "tool": "claude", "surface": "COND-S",
                          "workspace": "WS-COND", "group": "grp", "status": "live"})
@@ -125,7 +126,7 @@ def test_group_add_retrofits_child_without_moving_surface(fs, monkeypatch):
     calls = []
     monkeypatch.setattr(fleet, "cmuxq", lambda *a: (calls.append(a) or ""))
     monkeypatch.setattr(fleet, "_group_ref", lambda g: "workspace_group:4")
-    monkeypatch.setattr(fleet, "current_ws_for_surface", lambda surf: "WS-KID")
+    monkeypatch.setattr(rs, "workspace", lambda *a, **k: "WS-KID")
 
     assert fleet.cmd_group(["add", "kid", "--surface", "COND-S"]) == 0
     add = [c for c in calls if c[:2] == ("workspace-group", "add")][0]
@@ -166,7 +167,10 @@ def movable(fs, rs, monkeypatch):
     calls = []
     monkeypatch.setattr(fleet, "cmuxq", lambda *a: (calls.append(a) or ""))
     monkeypatch.setattr(fleet, "_store", lambda: {"sessions": {}})
-    monkeypatch.setattr(fleet, "current_ws_for_surface", lambda s: "WS-OLD")
+    monkeypatch.setattr(rs, "workspace", lambda *a, **k: "WS-OLD")
+    # the ttl=0 post-move confirm reads call rs.surface_ws_map(ttl=0) (features._cmux, NOT fleet.cmuxq) —
+    # stub it to {} so no test shells out to a live cmux tree; rs.workspace is patched anyway so the map is ignored.
+    monkeypatch.setattr(rs, "surface_ws_map", lambda ttl=2.0: {})
     monkeypatch.setattr(rs, "workspace_surfaces", lambda ws, ws_map=None: ["SIB-S"])
     return calls
 
@@ -177,10 +181,10 @@ def _moves(calls, verb):
 
 # --- the native relocation: a LIVE agent moves (no refusal, no archive-revive) ----------------------
 
-def test_move_to_workspace_relocates_a_LIVE_agent_natively(fs, movable, monkeypatch):
+def test_move_to_workspace_relocates_a_LIVE_agent_natively(fs, rs, movable, monkeypatch):
     """A live agent is NO LONGER refused — the surface is moved natively and the registry updated. cmux
     0.64.18+ heals the moved surface, so no archive, no revive, no fresh surface, no registry churn."""
-    monkeypatch.setattr(fleet, "current_ws_for_surface", _seq("WS-OLD", TARGET_WS))
+    monkeypatch.setattr(rs, "workspace", _seq("WS-OLD", TARGET_WS))
     assert fleet.cmd_move(["kid", "--to-workspace", TARGET_WS]) == 0
     mv = _moves(movable, "move-surface")
     assert mv and "KID-S" in mv[0] and TARGET_WS in mv[0]        # the surface itself moved (UUID preserved)
@@ -193,13 +197,13 @@ def test_move_to_workspace_relocates_a_LIVE_agent_natively(fs, movable, monkeypa
     assert fs.expected_close_recent("KID-S")                    # router archive-suppression belt
 
 
-def test_move_own_workspace_regroups_into_the_conductors_group_surface_preserving(fs, movable, monkeypatch):
+def test_move_own_workspace_regroups_into_the_conductors_group_surface_preserving(fs, rs, movable, monkeypatch):
     """`--own-workspace`: the surface moves to a FRESH workspace, which is then regrouped into the
     conductor's group via `workspace-group add` (surface-preserving — NOT a surface move). This is the
     exact native regroup that repairs the split-brain the old archive-revive path caused."""
     fs.live_put("cond", {**fs.live_get("cond"), "group": "G"})
     monkeypatch.setattr(fleet, "_group_ref", lambda g: "workspace_group:7" if g == "G" else "")
-    monkeypatch.setattr(fleet, "current_ws_for_surface", _seq("WS-OLD", "NEW-WS", "NEW-WS"))
+    monkeypatch.setattr(rs, "workspace", _seq("WS-OLD", "NEW-WS", "NEW-WS"))
     assert fleet.cmd_move(["kid", "--own-workspace"]) == 0
     assert _moves(movable, "move-tab-to-new-workspace")
     ga = [c for c in movable if c[:2] == ("workspace-group", "add")]
@@ -209,16 +213,16 @@ def test_move_own_workspace_regroups_into_the_conductors_group_surface_preservin
     assert kid["place"] == "workspace"
 
 
-def test_move_does_NOT_archive_or_revive_a_live_agent(fs, movable, monkeypatch):
+def test_move_does_NOT_archive_or_revive_a_live_agent(fs, rs, movable, monkeypatch):
     """The whole point of the cutover: a live relocation never parks the agent or spins a fresh surface."""
     monkeypatch.setattr(fleet, "cmd_archive", lambda argv: pytest.fail("move must NOT archive a live agent"))
     monkeypatch.setattr(fleet, "cmd_revive", lambda argv: pytest.fail("move must NOT revive a live agent"))
-    monkeypatch.setattr(fleet, "current_ws_for_surface", _seq("WS-OLD", TARGET_WS))
+    monkeypatch.setattr(rs, "workspace", _seq("WS-OLD", TARGET_WS))
     assert fleet.cmd_move(["kid", "--to-workspace", TARGET_WS]) == 0
     assert fs.archive_get("kid") is None and fs.live_get("kid") is not None   # never parked
 
 
-def test_move_REHOMES_under_the_caller_conductor(fs, movable, monkeypatch):
+def test_move_REHOMES_under_the_caller_conductor(fs, rs, movable, monkeypatch):
     """Running `fleet move <child>` FROM a conductor re-parents the child to that conductor — the rehome
     the cf-conductor incident needed. The registry parent + group follow the mover, set TOGETHER (no
     archive, no revive, no split-brain to parent=None/group=None)."""
@@ -226,7 +230,7 @@ def test_move_REHOMES_under_the_caller_conductor(fs, movable, monkeypatch):
                        "group": "CFG", "status": "live"})
     monkeypatch.setenv("CMUX_SURFACE_ID", "CF-S")               # the caller running move IS conductor cf
     monkeypatch.setattr(fleet, "_group_ref", lambda g: "workspace_group:9" if g == "CFG" else "")
-    monkeypatch.setattr(fleet, "current_ws_for_surface", _seq("WS-OLD", "NEW-WS", "NEW-WS"))
+    monkeypatch.setattr(rs, "workspace", _seq("WS-OLD", "NEW-WS", "NEW-WS"))
     assert fleet.cmd_move(["kid", "--own-workspace"]) == 0
     kid = fs.live_get("kid")
     assert kid["parent"] == "cf"                                # RE-PARENTED to the mover (was 'cond')
@@ -251,11 +255,11 @@ def test_move_of_an_ARCHIVED_label_refuses_and_signposts_revive(fs, monkeypatch)
 
 # --- D. argument handling (unchanged contracts) -------------------------------------------------------
 
-def test_move_refuses_when_surface_not_in_tree(fs, monkeypatch):
+def test_move_refuses_when_surface_not_in_tree(fs, rs, monkeypatch):
     fs.live_put("kid", {"role": "w", "kind": "child", "surface": "KID-S", "workspace": "WS-OLD",
                         "status": "live"})
     monkeypatch.setattr(fleet, "cmuxq", lambda *a: "")
-    monkeypatch.setattr(fleet, "current_ws_for_surface", lambda s: "")   # surface GONE from the tree
+    monkeypatch.setattr(rs, "workspace", lambda *a, **k: "")   # surface GONE from the tree
     with pytest.raises(SystemExit):
         fleet.cmd_move(["kid", "--own-workspace"])                       # -> revive, not move
 
@@ -269,13 +273,12 @@ def test_move_requires_exactly_one_target(fs, monkeypatch):
         fleet.cmd_move(["kid", "--own-workspace", "--to-workspace", "WS"])  # both
 
 
-def test_move_noop_when_already_in_target(fs, monkeypatch):
+def test_move_noop_when_already_in_target(fs, rs, monkeypatch):
     fs.live_put("kid", {"role": "w", "kind": "child", "surface": "KID-S",
                         "workspace": "11111111-1111-1111-1111-111111111111", "status": "live"})
     calls = []
     monkeypatch.setattr(fleet, "cmuxq", lambda *a: (calls.append(a) or ""))
-    monkeypatch.setattr(fleet, "current_ws_for_surface",
-                        lambda s: "11111111-1111-1111-1111-111111111111")
+    monkeypatch.setattr(rs, "workspace", lambda *a, **k: "11111111-1111-1111-1111-111111111111")
     assert fleet.cmd_move(["kid", "--to-workspace", "11111111-1111-1111-1111-111111111111"]) == 0
     assert not [c for c in calls if c[0] == "move-surface"]              # nothing moved
     assert not fs.expected_close_recent("KID-S")                        # and no tombstone stamped

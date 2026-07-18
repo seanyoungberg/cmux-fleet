@@ -59,7 +59,6 @@ EXEMPT = frozenset({"resolve.py", "state.py"})
 BASELINE = frozenset({
     # cli.py — the largest cluster: the ported cmux-placement helpers and the ls/poll paths.
     ("cli.py", "_store", "read_hook_store()"),
-    ("cli.py", "ws_uuid_for_surface", '.get("sessions")'),
     ("cli.py", "poll_session", '.get("activeSessionsBySurface")'),
     ("cli.py", "poll_session", '.get("sessions")'),
     ("cli.py", "_surface_cwd", '.get("activeSessionsBySurface")'),
