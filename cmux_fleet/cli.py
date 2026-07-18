@@ -2348,12 +2348,13 @@ def _graceful_close(surf, tool, log, timeout=6):
     signalled pid dies, and ALWAYS falls through to the respawn. This is an HONESTY step, NOT the
     confirming signal: _confirmed_gone -- not this -- authorizes the relaunch."""
     from . import state as fs
+    from . import resolve as rs
     pids = _signal_agent_pids(surf, tool, log, "graceful close")
     if not pids:
         return                                        # nothing live to close -> pid-aware verify confirms
     end = time.time() + timeout
     while time.time() < end:
-        if fs.lifecycle(surf) in ("", "-", "ended") or not any(fs.pid_alive(p) for p in pids):
+        if rs.lifecycle(surf) in ("", "-", "ended") or not any(fs.pid_alive(p) for p in pids):
             log("graceful close: old session reached a clean terminal lifecycle (SessionEnd fired)")
             return
         time.sleep(0.5)
@@ -3136,11 +3137,12 @@ def cmd_worktree(argv):
         if not info:
             sys.exit(f"fleet worktree clean: no registered worktree for '{a.label}' (see `fleet worktree ls`)")
         from . import state as fs
+        from . import resolve as rs
         live = fs.live_get(a.label)
         # refuse only if a GENUINELY-live agent holds the surface (non-terminal lifecycle AND a live pid).
         # A dead-pid frozen 'running' ghost (the SessionEnd-less brick, 2026-07-06) must NOT block worktree
         # teardown -- there is no live work to protect. surface_has_live_agent is the shared authority.
-        if info["where"] == "live" and live and fs.surface_has_live_agent(live.get("surface", "")):
+        if info["where"] == "live" and live and rs.surface_has_live_agent(live.get("surface", "")):
             sys.exit(f"fleet worktree clean: '{a.label}' is still LIVE. Either `fleet archive {a.label}` "
                      f"then `fleet worktree clean {a.label}`, or `fleet rm {a.label} --kill` (which itself "
                      f"tears the worktree down).")
@@ -4132,7 +4134,7 @@ def cmd_reap_surfaces(argv):
         if u in member_surf:
             buckets["tracked"].append({"surface": surf, "label": member_surf[u], "title": title})
             continue
-        if fs.surface_has_live_agent(surf):               # codex-aware: union hook store + live pid is the authority
+        if rs.surface_has_live_agent(surf):               # codex-aware: union hook store + live pid is the authority
             buckets["live-agent"].append({"surface": surf, "note": "live agent (pid)", "title": title})
             continue
         pane = cmuxq("capture-pane", "--surface", surf) or ""

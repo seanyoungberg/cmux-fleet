@@ -55,26 +55,26 @@ def test_include_muted_keeps_them(fs):
     assert skipped == []
 
 
-def test_bulk_skips_stale_non_live(fs, monkeypatch):
+def test_bulk_skips_stale_non_live(fs, rs, monkeypatch):
     # a child whose surface is gone (lifecycle ended) but still recorded a session = STALE -> bulk must
     # skip it (else respawn-pane targets a gone UUID / the quiet-gate burns on a dead surface).
     fs.live_put("kidA", {"kind": "child", "surface": "A", "parent": "me", "tool": "claude", "session": "claude-x"})
     fs.live_put("kidB", {"kind": "child", "surface": "B", "parent": "me", "tool": "claude", "session": "claude-y"})
-    monkeypatch.setattr(fs, "lifecycle", lambda surf: "ended" if surf == "A" else "idle")
-    monkeypatch.setattr(fs, "surface_has_live_pid", lambda surf: surf == "B")   # B is the genuinely-live one
+    monkeypatch.setattr(rs, "lifecycle", lambda surf: "ended" if surf == "A" else "idle")
+    monkeypatch.setattr(rs, "surface_has_live_pid", lambda surf: surf == "B")   # B is the genuinely-live one
     sel, skipped = cli._bulk_targets("children", "SELF", "me", include_muted=False)
     assert [l for l, _ in sel] == ["kidB"]                  # only the live one
     assert ("kidA", "stale/non-live") in skipped
 
 
-def test_bulk_skips_dead_pid_running_ghost(fs, monkeypatch):
+def test_bulk_skips_dead_pid_running_ghost(fs, rs, monkeypatch):
     # round-2 gap (2026-07-06): a child FROZEN 'running' on a DEAD pid (SessionEnd-less brick) must read
     # STALE here too -- CONSISTENT with cmd_ls -- so a bulk sweep skips it (reported) rather than burning
     # the quiet-gate on a dead seat. The operator then recovers it with an explicit (pid-aware) recycle.
     fs.live_put("kidA", {"kind": "child", "surface": "A", "parent": "me", "tool": "claude", "session": "claude-x"})
     fs.live_put("kidB", {"kind": "child", "surface": "B", "parent": "me", "tool": "claude", "session": "claude-y"})
-    monkeypatch.setattr(fs, "lifecycle", lambda surf: "running")               # BOTH read 'running'...
-    monkeypatch.setattr(fs, "surface_has_live_pid", lambda surf: surf == "B")  # ...but A's process is DEAD
+    monkeypatch.setattr(rs, "lifecycle", lambda surf: "running")               # BOTH read 'running'...
+    monkeypatch.setattr(rs, "surface_has_live_pid", lambda surf: surf == "B")  # ...but A's process is DEAD
     sel, skipped = cli._bulk_targets("children", "SELF", "me", include_muted=False)
     assert [l for l, _ in sel] == ["kidB"]                  # only the genuinely-live one
     assert ("kidA", "stale/non-live") in skipped            # the dead-pid 'running' ghost skipped as stale
@@ -100,12 +100,12 @@ def test_recycle_plan_resume_has_no_prime(fs, monkeypatch):
 # --- Fix 2: bulk recycle live-print shows each agent's RESOLVED model/effort (provenance). A bulk
 #     recycle is exactly where a silent model/effort drift would slip by unseen, so the per-agent line
 #     must surface what each agent is coming back on — not just mode=. ---------------------------------
-def test_bulk_dryrun_prints_resolved_effort_model_per_agent(fs, monkeypatch, capsys):
+def test_bulk_dryrun_prints_resolved_effort_model_per_agent(fs, rs, monkeypatch, capsys):
     fs.live_put("me",   {"kind": "conductor", "surface": "SELF", "tool": "claude"})
     fs.live_put("kidA", {"kind": "child", "surface": "A", "parent": "me", "tool": "claude", "role": "w"})
     fs.live_put("kidB", {"kind": "child", "surface": "B", "parent": "me", "tool": "claude", "role": "w"})
     monkeypatch.setenv("CMUX_SURFACE_ID", "SELF")
-    monkeypatch.setattr(fs, "lifecycle", lambda surf: "idle")            # both live (not stale)
+    monkeypatch.setattr(rs, "lifecycle", lambda surf: "idle")            # both live (not stale)
     monkeypatch.setattr(cli, "_is_roster", lambda role: False)           # hermetic: no config read
     # compose emits the effort/model tokens the provenance reads back off the command.
     monkeypatch.setattr(cli, "_compose_recycle_cmd",

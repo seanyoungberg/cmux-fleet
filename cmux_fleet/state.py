@@ -896,20 +896,8 @@ def last_agent_text(path, cap=160):
         return ""
 
 
-def lifecycle(surface):
-    """agentLifecycle for a surface from cmux's hook stores (idle|running|needsInput|unknown|''),
-    tool-agnostic via read_hook_store. Picks the freshest entry for the surface (an agent can leave
-    more than one session record on a surface; the newest updatedAt is the live one)."""
-    best, best_ts = "", -1.0
-    try:
-        for s in (read_hook_store().get("sessions") or {}).values():
-            if s.get("surfaceId") == surface:
-                ts = s.get("updatedAt") or 0
-                if ts >= best_ts:
-                    best, best_ts = s.get("agentLifecycle", ""), ts
-    except Exception:
-        pass
-    return best
+# NOTE: lifecycle() moved to resolve.py (finish-5b-2 step 3 — resolve owns the liveness bodies now;
+# this module keeps the store I/O they read: read_hook_store / pid_alive / bare_uuid / entry_for_surface).
 
 
 # --- pid liveness + dead-record reaping (the SessionEnd-freeze backstop, 2026-07-06) --------
@@ -936,28 +924,9 @@ def pid_alive(pid):
     return True
 
 
-def surface_has_live_pid(surface):
-    """True iff any hook-store record for `surface` carries a live pid — the pid-authoritative answer
-    to 'is a real agent process still attached to this surface?' (used by recycle's respawn-verify to
-    refuse relaunching over a claude that survived the respawn, and to positively confirm death)."""
-    surf = (surface or "").upper()
-    for s in (read_hook_store().get("sessions") or {}).values():
-        if (s.get("surfaceId") or "").upper() == surf and pid_alive(s.get("pid")):
-            return True
-    return False
-
-
-def surface_has_live_agent(surface):
-    """True iff a GENUINELY-live agent occupies `surface`: cmux's lifecycle is non-terminal AND a real
-    process is still attached (a live pid). This is the SHARED 'is this seat actually live?' authority —
-    the negation ('gone/stale') is the single answer that `fleet ls` STALE-detection, bulk-recycle's
-    stale-skip, `launch`'s overwrite-guard, `worktree clean`'s refuse-if-live, and recycle's re-bind
-    poll must ALL agree on, so a SessionEnd-less brick (frozen 'running'/'idle'/'unknown' on a dead/None
-    pid — root-caused 2026-07-06) reads as gone EVERYWHERE, never as a false 'live' at whichever site
-    still trusts the lifecycle string alone. Stricter than surface_has_live_pid (pid only): this ALSO
-    requires the lifecycle to be non-terminal, so a surface mid-drop (terminal string, pid briefly
-    lingering) reads as gone too — the two conditions together are 'a live agent is actually here'."""
-    return lifecycle(surface) not in ("", "-", "ended") and surface_has_live_pid(surface)
+# NOTE: surface_has_live_pid() + surface_has_live_agent() moved to resolve.py (finish-5b-2 step 3).
+# They compose pid_alive() (kept here) with read_hook_store()/lifecycle() reads; resolve owns the
+# liveness rule now, this module owns the store I/O they call back into via fs.*.
 
 
 def reap_dead_surface_records(surface, dry_run=False):
@@ -1015,68 +984,13 @@ def reap_dead_surface_records(surface, dry_run=False):
     return {"reaped": reaped, "live_kept": live_kept, "files": files}
 
 
-# --- wake-gate liveness: staleness + bound-session cross-check (design 2.2a) ----------------
-# lifecycle() above returns the freshest record's RAW agentLifecycle (for display: `fleet ls`, vitals,
-# the cli.py liveness checks). The WAKE GATE needs a stricter question — "is this surface in a GENUINE,
-# live, mid-turn 'running' state I must not interrupt?" — because a STALE/orphaned 'running' record
-# (a cmux reboot-replay, a move-surface binding desync, a pre-fix summarizer stomp) must NOT read as
-# busy: if it does, guard #1 trips on every event and the surface is silenced forever (the cmux-advisor
-# stall, root-caused 2026-07-01). We keep lifecycle()'s contract intact (cli.py/features.py depend on
-# it) and answer the wake question with a dedicated, hardened predicate.
+# --- wake-gate staleness window (the predicates that use it live in resolve.py) -------------
+# LIFECYCLE_STALE_S bounds "is this a live turn?": a 'running' record that has not ticked within it is
+# treated as NOT mid-turn (a real turn re-stamps continuously; a frozen one is an orphan). The wake-gate
+# predicates that apply it — resolve.surface_busy + its resolver resolve.resolve_bound_record — moved to
+# resolve.py (finish-5b-2 step 3, root incident: the 2026-07-01 cmux-advisor stall from an orphaned
+# 'running' record). The constant stays here as shared state config; resolve reads it via fs.LIFECYCLE_STALE_S.
 LIFECYCLE_STALE_S = 90   # a 'running' record that has not ticked within this window is not a live turn
-
-
-def resolve_bound_record(surface, st=None, bound=None):
-    """The hook-store session record for `surface`'s FLEET-BOUND session (registry truth, kept honest by
-    the reconciliation lane), falling back to the freshest record on the surface when the binding can't
-    be matched; {} when nothing claims the surface. This is the shared record-resolution behind BOTH the
-    wake gate (surface_busy — 'is this a fresh live turn?') and its inverse in the fleet-doctor sweep
-    ('is this bound 'running' record frozen = a dead stall?' / 'is it at needsInput?'). Resolving against
-    the fleet BINDING rather than max-updatedAt is what defeats the days-old orphan records (e.g. surf
-    1A5E3168's ~3-day 'running' ghost, and the many stale 'needsInput' orphans) — an orphan belongs to a
-    session no live member is bound to, so it is simply never the resolved record for a live member.
-    `st`/`bound` may be passed to skip re-reading the hook store / registry per call — the sweep walks
-    every member off ONE store read and already holds each entry's bound session."""
-    st = read_hook_store() if st is None else st
-    recs = [s for s in (st.get("sessions") or {}).values() if s.get("surfaceId") == surface]
-    if not recs:
-        return {}                               # nothing claims this surface
-    if bound is None:
-        bound = bare_uuid((entry_for_surface(surface) or {}).get("session", ""))
-    rec = None
-    if bound:
-        rec = next((s for s in recs if bare_uuid(s.get("sessionId", "")) == bound), None)
-    if rec is None:                             # no fleet-bound record -> fall back to the freshest
-        rec = max(recs, key=lambda s: s.get("updatedAt") or 0)
-    return rec
-
-
-def surface_busy(surface, now=None):
-    """True ONLY when `surface` is genuinely mid-turn (a fresh, live 'running' record) — the single case
-    the wake gate must never interrupt. Hardened two ways against the stale read that stalled
-    cmux-advisor:
-      - liveness cross-check: prefer the record for the fleet's OWN bound session (registry truth, kept
-        honest by the reconciliation lane) over 'max updatedAt across all records on the surface'. The
-        pointer that lied in the incident was cmux's activeSessionsBySurface, not the fleet binding, so
-        resolving against the binding defeats the orphaned-'running' record directly.
-      - staleness guard: a 'running' record that has not ticked within LIFECYCLE_STALE_S is treated as
-        NOT a live turn (a real turn re-stamps continuously; a frozen one is an orphan).
-    Leans to NOT-busy on any ambiguity/read error: wake_if_idle then confirms an actual clean idle
-    prompt on screen before injecting, so a false 'not busy' can never corrupt a real turn, while a
-    false 'busy' — the failure we are killing — can never silence an idle surface."""
-    now = time.time() if now is None else now
-    try:
-        rec = resolve_bound_record(surface)
-        if not rec or rec.get("agentLifecycle") != "running":
-            return False
-        if not pid_alive(rec.get("pid")):
-            return False                        # a DEAD pid cannot be mid-turn: a frozen 'running' brick
-                                                # (SessionEnd-less death, root-caused 2026-07-06), not a
-                                                # live turn. Same not-busy lean as the staleness guard
-                                                # below -- the pid is the shared liveness authority.
-        return (now - (rec.get("updatedAt") or 0)) <= LIFECYCLE_STALE_S
-    except Exception:
-        return False                            # fail-open to not-busy; the screen read is the arbiter
 
 
 # --- draft-through: tier 3 of the wake ladder (design 2.3 / 3c, E1) -------------------------
@@ -1151,7 +1065,8 @@ def wake_if_idle(surface, msg):
     outrank a visibly-idle prompt (that is the whole stall fix), and — the converse — we never inject
     when NO clean prompt is visible (mid-render, a running tool, needsInput), which keeps a wake off a
     busy pane even when surface_busy leaned not-busy on a bad read."""
-    if surface_busy(surface):
+    from . import resolve as rs   # lazy: resolve imports state at module load; call-time breaks the cycle
+    if rs.surface_busy(surface):
         return False                                   # tier 1 — never interrupt a live turn
     screen = _cmux("read-screen", "--surface", surface, "--lines", "40")
     prompts = [ln for ln in screen.splitlines() if "❯" in ln]   # ❯ = the compose-prompt marker

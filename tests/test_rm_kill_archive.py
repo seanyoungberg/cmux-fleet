@@ -5,7 +5,7 @@
 # zombie incident), --detach is the explicit opt-in for the old soft drop-row-only behavior, a
 # mid-turn ('running') surface refuses without --force, and --kill remains the alias that also tears
 # down a worktree. Pure units against the throwaway $CMUX_STATE_DIR; cmux reads (cmuxq /
-# _resume_binding / fs.lifecycle) are stubbed.
+# _resume_binding / rs.lifecycle) are stubbed.
 import json
 
 import pytest
@@ -21,8 +21,9 @@ def _stub_cmux(monkeypatch, fs, lifecycle="idle", binding=None, calls=None, has_
     monkeypatch.setattr(fleet, "cmuxq",
                         (lambda *a: (calls.append(a) or "")) if calls is not None else (lambda *a: ""))
     monkeypatch.setattr(fleet, "_resume_binding", lambda surf: binding or {})
-    monkeypatch.setattr(fs, "lifecycle", lambda s: lifecycle)
-    monkeypatch.setattr(fs, "surface_has_live_pid", lambda s: has_pid)
+    from cmux_fleet import resolve as rs   # fresh: liveness predicates live here (finish-5b-2 step 3)
+    monkeypatch.setattr(rs, "lifecycle", lambda s: lifecycle)
+    monkeypatch.setattr(rs, "surface_has_live_pid", lambda s: has_pid)
 
 
 def _seed(fs, label, surf, session="claude-OLD", **extra):
@@ -228,8 +229,9 @@ def _record_del_and_close_order(fs, monkeypatch):
     order = []
     monkeypatch.setattr(fleet, "cmuxq", lambda *a: (order.append(("cmux",) + a) or ""))
     monkeypatch.setattr(fleet, "_resume_binding", lambda surf: {})
-    monkeypatch.setattr(fs, "lifecycle", lambda s: "idle")
-    monkeypatch.setattr(fs, "surface_has_live_pid", lambda s: True)
+    from cmux_fleet import resolve as rs   # fresh: liveness predicates live here (finish-5b-2 step 3)
+    monkeypatch.setattr(rs, "lifecycle", lambda s: "idle")
+    monkeypatch.setattr(rs, "surface_has_live_pid", lambda s: True)
     real_live_del = fs.live_del
     monkeypatch.setattr(fs, "live_del",
                         lambda label: (order.append(("live_del", label)), real_live_del(label))[1])

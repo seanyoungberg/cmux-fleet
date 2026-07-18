@@ -70,6 +70,7 @@ def test_lock_is_reusable_after_release():
 # When an idle-wake is skipped (parent mid-turn at event time), a bounded background loop re-fires the
 # WAKE ONLY over ~30s so latency is seconds, not the 2m heartbeat — never re-delivering content.
 from cmux_fleet import state as fs  # noqa: E402
+from cmux_fleet import resolve as rs  # noqa: E402  (liveness predicates live here since finish-5b-2 step 3)
 
 
 def test_maybe_idle_wake_schedules_retry_on_skip_on_running(monkeypatch):
@@ -77,7 +78,7 @@ def test_maybe_idle_wake_schedules_retry_on_skip_on_running(monkeypatch):
     monkeypatch.setattr(fs, "idlewake_on", lambda: True)
     monkeypatch.setattr(fs, "inbox_pending", lambda surf, kind=None: [{"seq": 1}])
     monkeypatch.setattr(fs, "wake_if_idle", lambda surf, msg: False)     # skipped
-    monkeypatch.setattr(fs, "surface_busy", lambda s: True)             # ...because genuinely mid-turn
+    monkeypatch.setattr(rs, "surface_busy", lambda s: True)             # ...because genuinely mid-turn
     scheduled = []
     monkeypatch.setattr(router, "_schedule_idle_wake_retry", lambda surf, label: scheduled.append(surf))
     router.maybe_idle_wake("S", "cond")
@@ -91,7 +92,7 @@ def test_maybe_idle_wake_no_retry_on_draft_or_noprompt_skip(monkeypatch):
     monkeypatch.setattr(fs, "idlewake_on", lambda: True)
     monkeypatch.setattr(fs, "inbox_pending", lambda surf, kind=None: [{"seq": 1}])
     monkeypatch.setattr(fs, "wake_if_idle", lambda surf, msg: False)     # skipped
-    monkeypatch.setattr(fs, "surface_busy", lambda s: False)           # ...NOT mid-turn (draft/no prompt)
+    monkeypatch.setattr(rs, "surface_busy", lambda s: False)           # ...NOT mid-turn (draft/no prompt)
     scheduled = []
     monkeypatch.setattr(router, "_schedule_idle_wake_retry", lambda surf, label: scheduled.append(surf))
     router.maybe_idle_wake("S", "cond")
@@ -114,7 +115,7 @@ def test_idle_wake_retry_loop_wakes_then_stops(monkeypatch):
     monkeypatch.setattr(router.time, "sleep", lambda s: None)           # no real waiting
     monkeypatch.setattr(fs, "idlewake_on", lambda: True)
     monkeypatch.setattr(fs, "inbox_pending", lambda surf, kind=None: [{"seq": 1}])
-    monkeypatch.setattr(fs, "surface_busy", lambda s: True)             # still mid-turn between tries
+    monkeypatch.setattr(rs, "surface_busy", lambda s: True)             # still mid-turn between tries
     n = {"wake": 0}
     def wake(surf, msg):
         n["wake"] += 1
@@ -146,7 +147,7 @@ def test_idle_wake_retry_loop_never_redelivers_content(monkeypatch):
     monkeypatch.setattr(fs, "idlewake_on", lambda: True)
     monkeypatch.setattr(fs, "inbox_pending", lambda surf, kind=None: [{"seq": 1}])
     monkeypatch.setattr(fs, "wake_if_idle", lambda surf, msg: False)    # never wakes -> exhausts backoff
-    monkeypatch.setattr(fs, "surface_busy", lambda s: True)            # still mid-turn (don't early-stop)
+    monkeypatch.setattr(rs, "surface_busy", lambda s: True)            # still mid-turn (don't early-stop)
     put = []
     monkeypatch.setattr(fs, "inbox_put", lambda *a, **k: put.append(a))
     router._retrying.add("S")
@@ -564,8 +565,8 @@ def test_rm_then_router_frame_no_spurious_alert_end_to_end(fs, monkeypatch):
                         "plugins": [], "flags": [], "settings": "", "status": "live"})
     monkeypatch.setattr(cli, "cmuxq", lambda *a: "")               # no real cmux; close is a no-op
     monkeypatch.setattr(cli, "_resume_binding", lambda surf: {})
-    monkeypatch.setattr(fs, "lifecycle", lambda s: "idle")
-    monkeypatch.setattr(fs, "surface_has_live_pid", lambda s: True)
+    monkeypatch.setattr(rs, "lifecycle", lambda s: "idle")
+    monkeypatch.setattr(rs, "surface_has_live_pid", lambda s: True)
     monkeypatch.setattr(router, "LIVE", True)
     monkeypatch.setattr(router, "_surface_ws_now", lambda s: "")   # surface genuinely gone from the tree
     waked = []

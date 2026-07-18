@@ -112,15 +112,15 @@ def test_side_by_side_live_corpus_predicates(live_corpus):
     for surf in surfaces:
         # delegated fields must equal the canonical predicates verbatim
         s = rs.seat(surf, st=st, ws_map={})           # empty ws_map -> exercises the store fallback
-        assert s["present"] == fs.surface_has_live_agent(surf), surf
+        assert s["present"] == rs.surface_has_live_agent(surf), surf
         assert s["lifecycle"] == (ff._freshest_session(st, surf).get("agentLifecycle", "")), surf
         assert s["pids"] == ref_surface_pids(surf), surf
         assert rs.live_sid(surf, st=st) == ref_live_bound_sid(surf), surf
         assert s["session"] == fs.bare_uuid(ref_live_bound_sid(surf)), surf
         assert rs._ws_from_store(surf, st=st) == ref_ws_uuid_for_surface(surf), surf
         assert rs.freshest(surf, st=st) == ff._freshest_session(st, surf), surf
-        assert rs.bound_record(surf, st=st) == fs.resolve_bound_record(surf, st=st), surf
-        assert rs.busy(surf) == fs.surface_busy(surf), surf
+        assert rs.bound_record(surf, st=st) == rs.resolve_bound_record(surf, st=st), surf
+        assert rs.busy(surf) == rs.surface_busy(surf), surf
 
 
 def test_side_by_side_live_corpus_tree_workspace(live_corpus, monkeypatch):
@@ -157,7 +157,7 @@ def test_side_by_side_synthetic_matrix(monkeypatch):
     monkeypatch.setattr(fs, "read_hook_store", lambda: st)
     for surf in surfaces:
         s = rs.seat(surf, st=st, ws_map={})
-        assert s["present"] == fs.surface_has_live_agent(surf), surf
+        assert s["present"] == rs.surface_has_live_agent(surf), surf
         assert s["pids"] == ref_surface_pids(surf), surf
         assert rs.live_sid(surf, st=st) == ref_live_bound_sid(surf), surf
         assert rs._ws_from_store(surf, st=st) == ref_ws_uuid_for_surface(surf), surf

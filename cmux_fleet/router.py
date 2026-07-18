@@ -210,7 +210,7 @@ def maybe_idle_wake(parent_surface, label):
     if fs.wake_if_idle(parent_surface, "(auto-wake) handle your pending fleet inbox items"):
         fs.presented_mark(parent_surface, pending, "wake")   # cooldown: the heartbeat won't re-nudge these
         log(f"[IDLE-WAKE] {label}: empty prompt -> submitted wake trigger")
-    elif fs.surface_busy(parent_surface):               # skip-on-RUNNING -> parent goes idle soon -> retry
+    elif rs.surface_busy(parent_surface):               # skip-on-RUNNING -> parent goes idle soon -> retry
         log(f"[idle-wake] skip {label}: mid-turn -> scheduling bounded retry")
         _schedule_idle_wake_retry(parent_surface, label)
     else:                                               # draft / no clean prompt -> heartbeat is the backstop
@@ -243,7 +243,7 @@ def _idle_wake_retry_loop(surface, label):
                 fs.presented_mark(surface, pending, "wake")
                 log(f"[idle-wake-retry] {label}: woke after ~{delay}s backoff")
                 return
-            if not fs.surface_busy(surface):            # turn ended but still not wakeable (draft/no prompt)
+            if not rs.surface_busy(surface):            # turn ended but still not wakeable (draft/no prompt)
                 log(f"[idle-wake-retry] {label}: parent idle but not wakeable (draft/no clean prompt) "
                     f"-> heartbeat backstop")
                 return

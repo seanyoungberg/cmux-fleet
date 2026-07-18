@@ -345,6 +345,7 @@ def test_rm_without_group_leaves_group_intact(monkeypatch):
 # agent (the liveness authority) so the fixture doesn't depend on the machine's real cmux hook store.
 def _dissolve_stubs(monkeypatch, live_surfaces, member_refs, gref="workspace_group:7"):
     from cmux_fleet import state as fs
+    from cmux_fleet import resolve as rs   # liveness predicates live here (finish-5b-2 step 3)
     calls = []
 
     def fake_cmuxq(*a):
@@ -358,7 +359,7 @@ def _dissolve_stubs(monkeypatch, live_surfaces, member_refs, gref="workspace_gro
     monkeypatch.setattr(fleet, "_group_ref", lambda g: gref)
     monkeypatch.setattr(fleet, "_ref_to_uuid", lambda kind, ref: member_refs[ref])
     monkeypatch.setattr(fleet, "_resume_binding", lambda s: {})
-    monkeypatch.setattr(fs, "surface_has_live_agent", lambda s: s in live_surfaces)
+    monkeypatch.setattr(rs, "surface_has_live_agent", lambda s: s in live_surfaces)
     _tree_from_registry(monkeypatch)
     return calls
 

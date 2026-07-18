@@ -20,17 +20,16 @@
 #
 # WHAT IS *NOT* FLAGGED, deliberately: calling the hardened predicates (surface_busy, lifecycle,
 # surface_has_live_agent, surface_has_live_pid, resolve_bound_record). Those ARE the safe interface —
-# they already apply the liveness rule. resolve.py DELEGATES to them in state.py on purpose (see its
-# header: the suite's dominant patch seams are `state.read_hook_store` and those `state.*` names, and the
-# delegation is what keeps every existing test seam live while call sites migrate onto resolve's
-# interface). A "cleanup" that inlines those bodies into resolve.py and deletes the state.py names would
-# silently detach a large part of the suite from the code it thinks it is patching. Do not do it; the
-# last test in this file pins it.
+# they already apply the liveness rule. As of finish-5b-2 step 3 they are DEFINED in resolve.py (the
+# state.py delegation seam is gone); the suite's dominant patch seams moved onto the resolve module with
+# them. read_hook_store — the store's raw byte I/O — stays in state.py, and resolve reaches it via `fs.`;
+# that is the invariant (resolve owns the liveness RULE, state owns the store bytes). The last test in
+# this file pins BOTH halves: the five bodies live in resolve now, read_hook_store still lives in state.
 #
 # THE TWO EXEMPT MODULES:
-#   resolve.py — THE resolver. This is where raw reads are supposed to live.
-#   state.py   — the canonical home of the predicate bodies resolve delegates to (step 1 of the v2
-#                migration; step 3 physically in-lines them here and deletes the state.py names).
+#   resolve.py — THE resolver. This is where raw reads (and now the liveness bodies) are supposed to live.
+#   state.py   — the store's raw I/O home: read_hook_store / pid_alive / bare_uuid / entry_for_surface,
+#                the primitives the resolve bodies call back into via `fs.*`.
 #
 # HOW THE RATCHET WORKS: the baseline below is the raw-store debt as it stands. The discovered set must
 # EQUAL it — so the test fails in BOTH directions:
@@ -178,17 +177,30 @@ def test_resolve_is_the_only_module_that_may_read_the_store():
 
 
 @pytest.mark.parametrize("name", ["surface_has_live_agent", "surface_has_live_pid", "lifecycle",
-                                  "surface_busy", "resolve_bound_record", "read_hook_store"])
-def test_the_delegation_to_state_stays_load_bearing(name):
-    """resolve.py DELEGATES the canonical predicate bodies to state.py, on purpose, and that delegation is
-    what keeps the suite's dominant patch seams (`state.read_hook_store` and these `state.*` names) live
-    while call sites migrate onto resolve's interface.
+                                  "surface_busy", "resolve_bound_record"])
+def test_the_liveness_bodies_live_in_resolve_now(name):
+    """The INVERSE of the old delegation pin, flipped when finish-5b-2 step 3 physically in-lined the
+    five liveness bodies into resolve.py and deleted the state.py names.
 
-    Pinned here because it looks exactly like something to 'simplify'. Inline these bodies into resolve.py
-    and delete the state.py names, and a large part of the suite goes on patching a seam nothing calls any
-    more — green, and testing nothing. Step 3 (schema v2) moves them deliberately, together with the
-    tests. Until then: both names exist, and resolve reaches state through them."""
+    This is the seam-integrity guard the migration turned on: the suite's dominant patch seams
+    (`<name>` on the resolve module) must patch a name resolve ACTUALLY DEFINES, or they go green while
+    testing a dead seam — the exact failure the old pin warned about, now watched from the other side.
+    So: each body is defined in resolve.py, and NOT in state.py (a lingering state.py copy would let a
+    mis-retargeted seam patch the wrong module and still pass). read_hook_store is the deliberate
+    exception — see the next test; it stays in state.py and resolve reaches it through `fs`."""
     state_src = open(os.path.join(PKG, "state.py"), encoding="utf-8").read()
     resolve_src = open(os.path.join(PKG, "resolve.py"), encoding="utf-8").read()
-    assert f"def {name}(" in state_src, f"state.py no longer defines {name} — the test seams patch it"
+    assert f"def {name}(" in resolve_src, f"resolve.py must DEFINE {name} — the test seams patch it there now"
+    assert f"def {name}(" not in state_src, (
+        f"state.py still defines {name} — the step-3 inline deletes it, else a mis-retargeted seam "
+        f"patches the dead state copy and passes while testing nothing")
+
+
+def test_read_hook_store_stays_the_state_owned_store_read():
+    """read_hook_store — the store's raw byte I/O — stays canonical in state.py; resolve reaches it via
+    `fs`. This is the OTHER half of the split: resolve owns the liveness rule, state owns the store bytes.
+    Its patch seam (`state.read_hook_store`) is the suite's single most-used one and must stay on state."""
+    state_src = open(os.path.join(PKG, "state.py"), encoding="utf-8").read()
+    resolve_src = open(os.path.join(PKG, "resolve.py"), encoding="utf-8").read()
+    assert "def read_hook_store(" in state_src, "state.py must keep read_hook_store — the store I/O home"
     assert "from . import state as fs" in resolve_src, "resolve.py must reach state.py through `fs`"

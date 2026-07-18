@@ -193,7 +193,7 @@ def test_recycle_aborts_loudly_on_malformed_toml(fs, monkeypatch, tmp_path):
 
 
 # --- the detached exec re-binds the registry's `provider` field to the resolved account -----------
-def test_recycle_exec_rebinds_resolved_provider_field(fs, monkeypatch):
+def test_recycle_exec_rebinds_resolved_provider_field(fs, rs, monkeypatch):
     # after a recycle moves the account, the registry must record the account the agent NOW runs under (so
     # `fleet usage` attributes it correctly and the next recycle doesn't re-warn). Drive a clean fresh bind.
     fleet_state.live_put("w", {"role": "w", "tool": "claude", "surface": "S", "cwd": "/x",
@@ -201,7 +201,7 @@ def test_recycle_exec_rebinds_resolved_provider_field(fs, monkeypatch):
     monkeypatch.setattr(fleet.time, "sleep", lambda *_: None)
     monkeypatch.setattr(fleet, "cmuxq", lambda *a, **k: "OK" if a and a[0] == "respawn-pane" else "")
     monkeypatch.setattr(fleet, "_quiet_gate", lambda *a, **k: True)
-    monkeypatch.setattr(fleet_state, "lifecycle", lambda surf: "ended")
+    monkeypatch.setattr(rs, "lifecycle", lambda surf: "ended")
     monkeypatch.setattr(fleet, "_agent_surfaced", lambda surf: False)
     monkeypatch.setattr(fleet, "_resume_menu_visible", lambda surf: False)
     monkeypatch.setattr(fleet, "_poll_session_back", lambda *a, **k: "NEWSID")
@@ -212,14 +212,14 @@ def test_recycle_exec_rebinds_resolved_provider_field(fs, monkeypatch):
     assert fleet_state.live_get("w")["provider"] == "claude:berglabs"   # re-bound to the resolved account
 
 
-def test_recycle_exec_leaves_provider_empty_when_none_configured(fs, monkeypatch):
+def test_recycle_exec_leaves_provider_empty_when_none_configured(fs, rs, monkeypatch):
     # opt-in: a no-providers recycle carries provider="" -> the re-bind records "" (unchanged), never errors.
     fleet_state.live_put("w", {"role": "w", "tool": "claude", "surface": "S", "cwd": "/x",
                                "session": "claude-OLD", "kind": "child", "provider": ""})
     monkeypatch.setattr(fleet.time, "sleep", lambda *_: None)
     monkeypatch.setattr(fleet, "cmuxq", lambda *a, **k: "OK" if a and a[0] == "respawn-pane" else "")
     monkeypatch.setattr(fleet, "_quiet_gate", lambda *a, **k: True)
-    monkeypatch.setattr(fleet_state, "lifecycle", lambda surf: "ended")
+    monkeypatch.setattr(rs, "lifecycle", lambda surf: "ended")
     monkeypatch.setattr(fleet, "_agent_surfaced", lambda surf: False)
     monkeypatch.setattr(fleet, "_resume_menu_visible", lambda surf: False)
     monkeypatch.setattr(fleet, "_poll_session_back", lambda *a, **k: "NEWSID")
