@@ -892,7 +892,7 @@ def poll_session(surf, timeout=60):
     The fallback must stay: this is the "has anything bound yet?" probe, and a just-bound session may not
     have written its pid yet — requiring a live pid outright would hang every launch. Prefer-alive gives
     us the ghost fix with no liveness precondition. Callers needing certainty that the bind is a LIVE
-    agent use `_live_bound_sid` (recycle's confirm), not this."""
+    agent use `rs.live_sid` (recycle's confirm), not this."""
     from . import state as fs
     end = time.time() + timeout
     while time.time() < end:
@@ -2286,7 +2286,7 @@ def _surface_pids(surface):
     snapshot for the recycle verify AND the kill-path target set: any of these still alive AFTER the
     respawn means the old agent survived the kill, so we must NOT relaunch over it (the 'never type
     into a live TUI' invariant). ALL records are scanned and DEAD pids are excluded — the kill-path
-    twin of _live_bound_sid's rule (a dead pid cannot be the agent). Contrast _pid_for_surface, which
+    twin of rs.live_sid's rule (a dead pid cannot be the agent). Contrast _pid_for_surface, which
     returns the FIRST record's pid in dict order with no aliveness check: on a surface with several
     lingering records that is usually a dead ghost (the 2026-07-10 wedge: SIGINTs hit corpses 76035
     and 70208 while the real agent, 76142 on the 4th record, survived orphaned).
@@ -4291,25 +4291,10 @@ def _latest_handover(abs_cwd):
     return max(files, key=os.path.getmtime) if files else ""
 
 
-def _live_bound_sid(surf):
-    """The sessionId of the freshest hook-store record on `surf` whose pid is ALIVE, or ''. THE live-pid
-    truth for 'which session is actually running on this seat right now'. poll_session's sessions[]
-    fallback returns the FIRST record that matches the surface — dict insertion order, i.e. usually the
-    OLD lingering entry cmux never drops post-respawn — so a confirm built on it can stare at a dead
-    ghost forever while the real fresh agent sits unconfirmed (the 2026-07-09 berg-sandbox recycle
-    misdetect: four recycles in a row 'no fresh session bound' with a live claude on the seat). A dead
-    pid cannot host a TUI, so filtering to live pids and taking the freshest is the record that IS the
-    running agent.
-    Canonical body: resolve.live_sid (step 1 of the v2 migration); this name stays as the recycle
-    confirm's call-site seam until step 3."""
-    from . import resolve as rs
-    return rs.live_sid(surf)
-
-
 def _poll_session_back(surf, old_sid, mode, timeout=90):
     """Confirm the recycled agent re-bound a session to `surf`. respawn-pane fully REMOVES the old
     session entry from cmux's hook store (session-end), then the relaunch re-creates it:
-      FRESH  -> confirm on the LIVE-PID truth (_live_bound_sid): the freshest record on the surface
+      FRESH  -> confirm on the LIVE-PID truth (rs.live_sid): the freshest record on the surface
                 with an ALIVE pid is the running agent, whatever sid cmux assigned it. This replaced
                 the old sid-exclusion-vs-{old_sid, pre_sid} confirm, which rode poll_session's
                 arbitrary-first-record fallback and could stare at the dead lingering ghost forever
@@ -4331,7 +4316,7 @@ def _poll_session_back(surf, old_sid, mode, timeout=90):
     end = time.time() + timeout
     while time.time() < end:
         if mode == "fresh":
-            sid = _live_bound_sid(surf)
+            sid = rs.live_sid(surf)
             if sid and sid != old_sid:
                 return sid
         else:
@@ -5241,7 +5226,7 @@ def _recycle_exec_one(p):
             return 1
         log("confirmed after direct-kill fallback")
     # (The old pre_sid snapshot + fresh-mode sid-exclusion lived here. Retired: the fresh confirm is now
-    # LIVE-PID-resolved (_live_bound_sid via _poll_session_back), so cmux's undropped stale sessions[]
+    # LIVE-PID-resolved (rs.live_sid via _poll_session_back), so cmux's undropped stale sessions[]
     # entry — a DEAD pid by this point, the respawn was just verified — can never false-confirm, and no
     # exclusion set is needed.)
     if _exec_launch_enabled():

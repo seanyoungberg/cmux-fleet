@@ -121,7 +121,7 @@ def freshest(surface, st=None):
 
 def freshest_live(surface, st=None):
     """The newest record on `surface` with an ALIVE pid ({} if none) — the record that IS the agent
-    (the liveness rule). This is _live_bound_sid's selection, exposed as the record."""
+    (the liveness rule). This is `live_sid`'s selection, exposed as the record."""
     recs = live_records(surface, st)
     return max(recs, key=lambda s: s.get("updatedAt") or 0) if recs else {}
 
@@ -361,7 +361,10 @@ def pids(surface, st=None):
 
 def live_sid(surface, st=None):
     """The sessionId of the freshest ALIVE record ('' if none) — 'which session is actually running
-    on this seat right now' (canonical body here; cli._live_bound_sid delegates)."""
+    on this seat right now'. THE live-pid truth for the recycle confirm (`_poll_session_back`): a dead
+    pid cannot host a TUI, so the freshest live-pid record is the running agent, whatever sid cmux
+    assigned it (the 2026-07-09 berg-sandbox recycle-misdetect fix — the old sid-exclusion confirm rode
+    poll_session's arbitrary-first-record fallback and could stare at a dead ghost forever)."""
     return freshest_live(surface, st).get("sessionId", "")
 
 
