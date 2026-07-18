@@ -1406,6 +1406,85 @@ def cmd_graph(argv):
     return 0
 
 
+def _groups_view():
+    """[{name, owner, readable, members, ghosts, unfiled, filed}] for every group the fleet NAMES, with
+    membership read from cmux TRUTH (resolve.group_members), not the registry's stored `group` field.
+
+    Why this exists (§2.G): `workspace-group list` reports members as raw `workspace:N` refs, so reading
+    'who is in this group' meant mapping refs to agents by hand — which cost a wrong "that's Berg's group"
+    call (2026-07-15). This resolves each group's member workspaces to the fleet LABELS living on them.
+
+    The registry names a group (a conductor's group defaults to its own label) but cmux OWNS the
+    membership, and the two can diverge — that divergence is the incident class, so it's surfaced, not
+    hidden: `ghosts` = labels the registry files under this group that cmux does NOT place in it;
+    `unfiled` = labels cmux places here that the registry does not file. `readable` is False when cmux
+    reports no membership for the named group (dissolved, or cmux unreadable) — fail-closed, never shown
+    as 'zero members'."""
+    from . import resolve as rs
+    live = fs.live_all()
+    ws_map = rs.surface_ws_map()
+    ws_labels = {}                                        # workspace uuid (upper) -> [labels living there]
+    for label, e in live.items():
+        surf = e.get("surface") or ""
+        ws = (rs.workspace(surf, ws_map=ws_map) if surf else "") or ""
+        if ws:
+            ws_labels.setdefault(ws.upper(), []).append(label)
+    out = []
+    for gname in sorted({(e.get("group") or "") for e in live.values() if e.get("group")}):
+        # owner: the like-named conductor (the DEFAULT convention — a conductor's group defaults to its
+        # own label, architecture.md), else the conductor actually living in the group (the real fleet
+        # names groups "Conductor - <label>", so the name-match never fires there).
+        name_owner = gname if (gname in live and live[gname].get("kind") == "conductor") else ""
+        filed = sorted(l for l, e in live.items() if (e.get("group") or "") == gname)
+        member_ws = rs.group_members(gname)              # cmux truth: {workspace uuids} or None
+        if member_ws is None:
+            out.append({"name": gname, "owner": name_owner, "readable": False,
+                        "members": [], "ghosts": [], "unfiled": [], "filed": filed})
+            continue
+        member_ws_u = {(w or "").upper() for w in member_ws}
+        members = sorted({l for w in member_ws_u for l in ws_labels.get(w, [])})
+        owner = name_owner or next((l for l in members if live.get(l, {}).get("kind") == "conductor"), "")
+        out.append({"name": gname, "owner": owner, "readable": True, "members": members,
+                    "ghosts": [l for l in filed if l not in members],       # registry says yes, cmux no
+                    "unfiled": [l for l in members if l not in filed],       # cmux says yes, registry no
+                    "filed": filed})
+    return out
+
+
+def _groups_text(groups, live):
+    if not groups:
+        return "(no fleet groups — no live agent carries a group)"
+    out = []
+    for g in groups:
+        head = g["name"] + (f"  (conductor {g['owner']})" if g["owner"] else "")
+        if not g["readable"]:
+            out.append(f"{head}  — cmux reports no membership (dissolved, or cmux unreadable); "
+                       f"registry files: {', '.join(g['filed']) or '(none)'}")
+            continue
+        out.append(head)
+        if not g["members"] and not g["ghosts"]:
+            out.append("    (no members)")
+        for l in g["members"]:
+            tag = " ⟵ conductor" if live.get(l, {}).get("kind") == "conductor" else ""
+            flag = "   (unfiled: cmux places it here, registry does not record it)" if l in g["unfiled"] else ""
+            out.append(f"    {l}{tag}{flag}")
+        for l in g["ghosts"]:
+            out.append(f"    {l}   (GHOST: registry files it here, cmux does not place it)")
+    return "\n".join(out)
+
+
+def cmd_groups(argv):
+    """fleet groups [--json]   the fleet's groups rendered BY LABEL — for each group the fleet names, the
+    member AGENTS living in its workspaces per cmux's REAL membership (not the registry's stored `group`
+    field). Surfaces registry-vs-cmux divergence (ghost / unfiled), the §2.G read-side gap. Read-only."""
+    groups = _groups_view()
+    if "--json" in argv:
+        print(json.dumps(groups, indent=2))
+        return 0
+    print(_groups_text(groups, fs.live_all()))
+    return 0
+
+
 # ─── serve: THIN read-only localhost view (no daemon, no buttons, no analytics) ────────────────
 def cmd_serve(argv):
     """fleet serve [--port N]   a THIN foreground localhost server: GET / -> the live graph HTML,
