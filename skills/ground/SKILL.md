@@ -8,6 +8,12 @@ description: Orient a cmux-fleet agent at session start. Run FIRST in any cmux f
 ## Where you are
 A cmux-native agent in a cmux-fleet. cmux owns sessions, lifecycle, transcripts, and the event bus; the `cmux-fleet` plugin adds the orchestration layer on top: the `fleet` CLI (on PATH), the roster at `$CMUX_FLEET_TOML`, and state under `$CMUX_STATE_DIR`. See `scripts/config.py` for how those paths resolve.
 
+## Fleet citizen basics (every agent, worker or conductor)
+Three things every fleet member does:
+- **Your inbox** — messages TO you (replies, instructions, alerts; for a conductor, also child completions) land in an inbox, not your prompt. `fleet inbox` lists what's pending, oldest first; `fleet inbox-ack <seq>` clears one once handled. `inbox-ack` is **high-water** — it clears everything up to that seq, so ack in ascending order and only once you've handled everything at or below it.
+- **Message another agent** — `fleet peer-msg <label> "<body>"` reaches another agent's inbox (never its input box), carrying your identity markers; the recipient acks with `fleet inbox-ack <seq> --peer`. This is how you reach your parent conductor or a peer.
+- **Your completion is delivered for you** — when you finish a turn, the fleet router (a daemon) delivers your final message to your parent's inbox automatically. You don't hand-report a completion; finishing the turn is the report.
+
 ## Recall before re-deriving
 Before researching context, check what is already filed: past handovers (`./handover/`), the project's own docs, and any memory tool you have configured (for example `memsearch:memory-recall`, if installed). Do not re-derive what is already written down.
 
