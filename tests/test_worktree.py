@@ -185,19 +185,19 @@ def test_launch_no_worktree_override(repo, tmp_path):
 
 
 # --- `fleet worktree clean` precondition (needs the registry row; refuses while live) -------------
-def test_worktree_clean_refuses_while_live(monkeypatch):
+def test_worktree_clean_refuses_while_live(rs, monkeypatch):
     from cmux_fleet import cli as fleet
     from cmux_fleet import state as fs
     fs.live_put("wc-live", {"role": "r", "kind": "child", "tool": "claude", "surface": "S1",
                             "status": "live",
                             "worktree": {"repo": "/r", "path": "/r/.worktrees/wc-live", "branch": "fleet/wc-live"}})
-    monkeypatch.setattr(fs, "lifecycle", lambda s: "running")
-    monkeypatch.setattr(fs, "surface_has_live_pid", lambda s: True)   # genuinely live (non-terminal AND live pid)
+    monkeypatch.setattr(rs, "lifecycle", lambda s: "running")
+    monkeypatch.setattr(rs, "surface_has_live_pid", lambda s: True)   # genuinely live (non-terminal AND live pid)
     with pytest.raises(SystemExit):                      # live -> refuse (archive or rm --kill instead)
         fleet.cmd_worktree(["clean", "wc-live"])
 
 
-def test_worktree_clean_proceeds_over_dead_pid_ghost(monkeypatch):
+def test_worktree_clean_proceeds_over_dead_pid_ghost(rs, monkeypatch):
     # round-2 gap (2026-07-06): a FROZEN 'running' record on a DEAD pid (SessionEnd-less brick) must NOT
     # block worktree teardown -- there's no live work to protect. surface_has_live_agent reads it gone, so
     # clean proceeds (previously the dead ghost tripped the live-guard and stranded the worktree).
@@ -206,8 +206,8 @@ def test_worktree_clean_proceeds_over_dead_pid_ghost(monkeypatch):
     fs.live_put("wc-ghost", {"role": "r", "kind": "child", "tool": "claude", "surface": "S1",
                              "status": "live",
                              "worktree": {"repo": "/r", "path": "/r/.worktrees/wc-ghost", "branch": "fleet/wc-ghost"}})
-    monkeypatch.setattr(fs, "lifecycle", lambda s: "running")         # frozen non-terminal string...
-    monkeypatch.setattr(fs, "surface_has_live_pid", lambda s: False)  # ...but the process is DEAD
+    monkeypatch.setattr(rs, "lifecycle", lambda s: "running")         # frozen non-terminal string...
+    monkeypatch.setattr(rs, "surface_has_live_pid", lambda s: False)  # ...but the process is DEAD
     monkeypatch.setattr(wt, "teardown",
                         lambda repo, path, label, wip_commit_flag=False, force=False: (True, "removed"))
     rc = fleet.cmd_worktree(["clean", "wc-ghost"])       # past the guard -> real teardown (stubbed)

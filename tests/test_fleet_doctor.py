@@ -488,11 +488,11 @@ def test_expected_close_surface_is_skipped_by_doctor_sweep(fs, monkeypatch, wake
     assert wake == []
 
 
-def test_non_live_session_bound_surface_is_skipped_by_doctor_sweep(fs, monkeypatch, wake):
+def test_non_live_session_bound_surface_is_skipped_by_doctor_sweep(fs, rs, monkeypatch, wake):
     """A session-bound registry row whose surface no longer has a live agent is stale by the same
     predicate used by ls/bulk-recycle, so the doctor sweep should not produce health alerts for it."""
     _seed_parent_child()
-    monkeypatch.setattr(fs, "surface_has_live_agent", lambda surf: False)
+    monkeypatch.setattr(rs, "surface_has_live_agent", lambda surf: False)
     monkeypatch.setattr(fs, "read_hook_store", lambda: _store("needsInput", NOW - 100))
 
     assert router.fleet_doctor_sweep(now=NOW) == 0
@@ -605,7 +605,7 @@ def test_never_bound_skips_claude(fs, monkeypatch, wake):
     assert fs.inbox_pending("PARENT", kind="doctor") == []
 
 
-def test_never_bound_dedups_then_rearms_on_bind(fs, monkeypatch, wake):
+def test_never_bound_dedups_then_rearms_on_bind(fs, rs, monkeypatch, wake):
     """Fires once, silent on the next tick (no storm); when the child finally BINDS a session the pending
     key leaves live_keys and the dedup prunes, so a future never-bound would re-fire fresh."""
     store = _seed_never_bound(AGED_LAUNCH)
@@ -617,7 +617,7 @@ def test_never_bound_dedups_then_rearms_on_bind(fs, monkeypatch, wake):
     # child binds on its first turn: session backfills -> the ("never-bound","child","") key prunes.
     fs.live_put("child", {"surface": "CHILD", "kind": "child", "role": "w", "parent": "parent",
                           "tool": "codex", "session": "codex-boundnow", "launchedAt": AGED_LAUNCH})
-    monkeypatch.setattr(fs, "surface_has_live_agent", lambda surf: True)
+    monkeypatch.setattr(rs, "surface_has_live_agent", lambda surf: True)
     monkeypatch.setattr(fs, "read_hook_store",
                         lambda: _store("idle", FRESH_UA, sid="boundnow"))
     router.fleet_doctor_sweep(now=NOW + 240)
@@ -714,7 +714,7 @@ def test_down_conductor_still_gets_the_down_alarm(fs):
     assert "DOWN" in title and "revive" in body
 
 
-def test_berg_sandbox_repro_live_conductor_stall_never_says_down_or_revive(fs, monkeypatch, wake):
+def test_berg_sandbox_repro_live_conductor_stall_never_says_down_or_revive(fs, rs, monkeypatch, wake):
     """END-TO-END through the real sweep on the live-observed shape: a conductor whose bound 'running'
     record froze past STALL_S while its pid is ALIVE (Berg typing). The sweep still ALERTS — a stalled
     conductor is worth a look — but every channel must route to INSPECT, not to a killer."""
@@ -725,7 +725,7 @@ def test_berg_sandbox_repro_live_conductor_stall_never_says_down_or_revive(fs, m
     monkeypatch.setattr(fs, "read_hook_store",
                         lambda: _store("running", STALE_UA, surface=SANDBOX_SURF, sid="sandbox"))
     assert router.fleet_doctor_sweep(now=NOW) == 1
-    assert fs.surface_has_live_agent(SANDBOX_SURF) is True        # precondition: the pid really IS alive
+    assert rs.surface_has_live_agent(SANDBOX_SURF) is True        # precondition: the pid really IS alive
 
     row = fs.inbox_pending("PEER", kind="doctor")[0]
     assert row["reason"] == "stall" and row["live"] is True        # the row records the pid verdict

@@ -128,9 +128,10 @@ def test_open_gate_uuids_only_unreplied_gates(monkeypatch):
 
 def test_infer_state_open_gate_forces_needs_input(monkeypatch):
     ff = _ff()
+    from cmux_fleet import resolve as rs   # _infer_state reads rs.lifecycle (moved here, finish-5b-2 step 3)
     import time as _t
     u = "2502f0f3-fd17-4370-9709-7f0417d188eb"
-    monkeypatch.setattr(ff.fs, "lifecycle", lambda surf: "idle")
+    monkeypatch.setattr(rs, "lifecycle", lambda surf: "idle")
     monkeypatch.setattr(ff.fs, "last_agent_text", lambda p, cap=400: "wrapped up cleanly")
     entry = {"surface": "S1", "session": True}
     sess = {"sessionId": u, "transcriptPath": "", "updatedAt": _t.time()}   # fresh activity

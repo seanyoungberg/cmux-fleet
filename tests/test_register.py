@@ -1,6 +1,6 @@
 # tests/test_register.py — `fleet register`: the manual escape hatch that pulls a LIVE-but-UNREGISTERED
 # agent into the registry (recovery for a skipped auto-register / an agent launched outside fleet).
-# Pure units: the cmux reads (_store / poll_session / ws_uuid_for_surface) are monkeypatched; the
+# Pure units: the cmux reads (_store / poll_session / rs.workspace) are monkeypatched; the
 # registry/archive side runs against the throwaway $CMUX_STATE_DIR. No toml in the test env, so
 # _is_roster is False and no roster resolve runs.
 import os
@@ -12,6 +12,14 @@ import pytest
 from cmux_fleet import cli as fleet  # noqa: E402
 
 
+@pytest.fixture
+def rs():
+    """The in-process `resolve` module — imported INSIDE the fixture so a test_features sys.modules reset
+    (this file sorts after it) can't leave us holding a stale twin. Same rationale as test_move_harden's."""
+    from cmux_fleet import resolve
+    return resolve
+
+
 def _patch_cmux(monkeypatch, session="SESS", ws="WS-1", store=None, tool="claude", surf_cwd="",
                 roster=False, live=True):
     # derive tool/session/workspace/cwd from the "live surface" — all cmux reads are stubbed so the
@@ -19,12 +27,12 @@ def _patch_cmux(monkeypatch, session="SESS", ws="WS-1", store=None, tool="claude
     # env otherwise falls back to the host's real ~/.config/cmux-fleet/fleet.toml, breaking hermeticity).
     # `_live_session_for` is THE register live gate (codex P1): a truthy record means the surface is
     # CURRENTLY live; None means dead/stale -> register must refuse. Stub it so tests don't poll the host.
+    from cmux_fleet import resolve as rs
     rec = {"sessionId": session, "workspaceId": ws, "cwd": surf_cwd} if live else None
     monkeypatch.setattr(fleet, "_live_session_for", lambda surf: rec)
-    monkeypatch.setattr(fleet, "ws_uuid_for_surface", lambda surf: ws)
-    # register derives the workspace from cmux TREE ground-truth (current_ws_for_surface), not the frozen
-    # bind record -- stub it so unit tests never shell out to `cmux tree`. Default: agrees with `ws`.
-    monkeypatch.setattr(fleet, "current_ws_for_surface", lambda surf: ws)
+    # register derives the workspace from cmux TREE ground-truth (rs.workspace), not the frozen bind
+    # record -- stub it so unit tests never shell out to `cmux tree`. Default: agrees with `ws`.
+    monkeypatch.setattr(rs, "workspace", lambda *a, **k: ws)
     monkeypatch.setattr(fleet, "_tool_for_surface", lambda surf: tool)
     monkeypatch.setattr(fleet, "_surface_cwd", lambda surf: surf_cwd)
     monkeypatch.setattr(fleet, "_is_roster", lambda role: roster)
@@ -46,24 +54,24 @@ def test_register_promotes_archived_with_explicit_surface(fs, monkeypatch):
     assert fs.archive_get("homelab") is None            # archive->live promotion: shelf entry removed
 
 
-def test_register_uses_tree_workspace_not_frozen_bind_record(fs, monkeypatch):
+def test_register_uses_tree_workspace_not_frozen_bind_record(fs, rs, monkeypatch):
     # root cause #3 (2026-07-07): after a cross-workspace MOVE the bind record's workspaceId FREEZES at
     # the OLD workspace, so register must record where the surface lives NOW (cmux tree ground-truth),
     # not the frozen value -- else a moved child re-registers back into its old shared workspace.
     fs.archive_put("moved", {"role": "moved", "tool": "claude", "kind": "child", "cwd": "/x/m",
                              "place": "workspace", "group": "g"})
     _patch_cmux(monkeypatch, session="S", ws="WS-OLD")   # frozen bind record + hook store both say OLD
-    monkeypatch.setattr(fleet, "current_ws_for_surface", lambda surf: "WS-NEW")   # the tree = ground truth
+    monkeypatch.setattr(rs, "workspace", lambda *a, **k: "WS-NEW")   # the tree = ground truth
     assert fleet.cmd_register(["moved", "--surface", "SURF-M", "--parent", "P"]) == 0
     assert fs.live_get("moved")["workspace"] == "WS-NEW"   # tree wins over the frozen workspaceId
 
 
-def test_register_falls_back_to_bind_record_when_tree_unreadable(fs, monkeypatch):
-    # if the tree can't be read (current_ws_for_surface -> ''), fall back to the bind record's
-    # workspaceId rather than registering an empty workspace.
+def test_register_falls_back_to_bind_record_when_tree_unreadable(fs, rs, monkeypatch):
+    # if the tree can't be read (rs.workspace -> ''), fall back to the bind record's workspaceId rather
+    # than registering an empty workspace.
     fs.archive_put("w", {"role": "w", "tool": "claude", "kind": "child", "cwd": "/x/w", "place": "tab"})
     _patch_cmux(monkeypatch, session="S", ws="WS-REC")
-    monkeypatch.setattr(fleet, "current_ws_for_surface", lambda surf: "")   # tree unreadable
+    monkeypatch.setattr(rs, "workspace", lambda *a, **k: "")   # tree unreadable
     assert fleet.cmd_register(["w", "--surface", "SURF-W", "--parent", "P"]) == 0
     assert fs.live_get("w")["workspace"] == "WS-REC"   # fell back to rec.workspaceId
 
@@ -151,7 +159,7 @@ def test_register_ambiguous_cwd_asks_for_surface(fs, monkeypatch):
     assert fs.live_get("amb") is None
 
 
-def test_register_typeerror_repro_dict_launchcommand(fs, monkeypatch):
+def test_register_typeerror_repro_dict_launchcommand(fs, rs, monkeypatch):
     # THE crash repro: a fully UNREGISTERED agent (no archive/live entry) whose cmux launchCommand is a
     # dict. The old code did re.search(pattern, dict) while deriving the role from the binding ->
     # 'expected string or bytes-like object, got dict'. _launchcmd coerces it now -> no crash, role
@@ -163,7 +171,7 @@ def test_register_typeerror_repro_dict_launchcommand(fs, monkeypatch):
                                 "launchCommand": {"argv": ["claude"], "env": {"AGENT_ROLE": "kg"}}}}}
     monkeypatch.setattr(fleet, "_store", lambda: store)
     monkeypatch.setattr(fleet, "_tool_for_surface", lambda surf: "claude")
-    monkeypatch.setattr(fleet, "ws_uuid_for_surface", lambda surf: "WS-KG")
+    monkeypatch.setattr(rs, "workspace", lambda *a, **k: "WS-KG")
     monkeypatch.setattr(fleet, "_surface_cwd", lambda surf: "/x")
     monkeypatch.setattr(fleet, "_is_roster", lambda role: False)
     # must NOT raise TypeError; deriving role from the dict binding coerces it and falls back to the label
@@ -218,12 +226,14 @@ def test_register_roster_role_is_toml_authoritative(fs, monkeypatch):
     assert fs.archive_get("hl") is None                 # promoted from archive
 
 
-def test_ws_uuid_for_surface_prefers_the_live_record_over_stale_ghosts(fs, monkeypatch):
-    # THE 2026-07-10 berg-sandbox incident, replayed. cmux never drops a surface's old records, and a
-    # reboot/resume re-homes the surface into a NEW workspace — so the lingering DEAD records keep naming
-    # the OLD, now-closed workspace. The old first-in-dict-order pick handed `fleet launch --place tab`
-    # that dead workspace and every launch aborted 'Workspace not found'. Dict order puts the ghosts first
-    # here on purpose: a dead pid cannot be the agent, so it cannot name the agent's workspace.
+def test_ws_from_store_prefers_the_live_record_over_stale_ghosts(fs, rs):
+    # THE 2026-07-10 berg-sandbox incident, replayed against rs._ws_from_store (the resolver that absorbed
+    # cli.ws_uuid_for_surface in 5c). cmux never drops a surface's old records, and a reboot/resume re-homes
+    # the surface into a NEW workspace — so the lingering DEAD records keep naming the OLD, now-closed
+    # workspace. The old first-in-dict-order pick handed `fleet launch --place tab` that dead workspace and
+    # every launch aborted 'Workspace not found'. Dict order puts the ghosts first here on purpose: a dead
+    # pid cannot be the agent, so it cannot name the agent's workspace. (The store snapshot is threaded via
+    # st= so the unit never reads the host hook store.)
     DEAD_WS, LIVE_WS = "WS-DEAD", "WS-LIVE"
     store = {"sessions": {
         "ghost1": {"surfaceId": "S", "sessionId": "g1", "updatedAt": 30, "pid": 999999, "workspaceId": DEAD_WS},
@@ -231,15 +241,14 @@ def test_ws_uuid_for_surface_prefers_the_live_record_over_stale_ghosts(fs, monke
         "live":   {"surfaceId": "S", "sessionId": "l1", "updatedAt": 10, "pid": os.getpid(), "workspaceId": LIVE_WS},
         "other":  {"surfaceId": "X", "sessionId": "o1", "updatedAt": 99, "pid": os.getpid(), "workspaceId": "WS-OTHER"},
     }}
-    monkeypatch.setattr(fleet, "_store", lambda: store)
     # the live record wins even though BOTH ghosts are newer by updatedAt and come first in dict order
-    assert fleet.ws_uuid_for_surface("S") == LIVE_WS
-    assert fleet.ws_uuid_for_surface("s") == LIVE_WS          # surface match is case-insensitive
+    assert rs._ws_from_store("S", st=store) == LIVE_WS
+    assert rs._ws_from_store("s", st=store) == LIVE_WS       # surface match is case-insensitive
     # no live record on the surface -> fall back to the freshest record of any liveness (best effort)
     del store["sessions"]["live"]
-    assert fleet.ws_uuid_for_surface("S") == DEAD_WS
+    assert rs._ws_from_store("S", st=store) == DEAD_WS
     # surface absent entirely -> ''
-    assert fleet.ws_uuid_for_surface("NOPE") == ""
+    assert rs._ws_from_store("NOPE", st=store) == ""
 
 
 def test_poll_session_prefers_live_record_but_still_binds_a_pidless_fresh_one(fs, monkeypatch):

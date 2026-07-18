@@ -103,7 +103,8 @@ HOOKSTORE   = _resolve_path("CMUX_HOOKSTORE_DIR",     "hookstore_dir",  os.path.
 # left byte-identical and cmux's hooks keep writing to their own default. One knob -> read-side and write-side
 # cannot drift onto different dirs. (cmux's default write dir IS ~/.cmuxterm — confirmed against the binary.)
 HOOKSTORE_EXPLICIT = bool((os.environ.get("CMUX_HOOKSTORE_DIR") or "").strip() or str(_fleet.get("hookstore_dir") or "").strip())
-ADHOC_SUBDIR = _resolve("CMUX_FLEET_ADHOC_SUBDIR",   "adhoc_subdir",   "_meta/agents/ad-hoc")          # relative to ROOT (intentionally not anchored)
+# (`adhoc_subdir` retired 5d: `--adhoc NAME` now aliases the rostered `adhoc` role — one shared flat home
+# declared in [role.adhoc].cwd, differentiated by LABEL, no per-name subdir. See resolve() in cli.py.)
 # `fleet vitals` context-remaining % denominator. 0 -> fleet_features guesses from the model string
 # (a fleet usually runs one window, so one knob is right; the model string can't tell 200k from 1M).
 CONTEXT_WINDOW = int(_resolve("CMUX_FLEET_CONTEXT_WINDOW", "context_window", "0") or "0")

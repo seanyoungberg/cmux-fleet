@@ -16,7 +16,7 @@ from conftest import REPO
 _DUMP = textwrap.dedent("""
     import json
     from cmux_fleet import config
-    keys = ["ROOT","STATE","CMUX","FLOOR","HOOKSTORE","HOOKSTORE_EXPLICIT","ADHOC_SUBDIR","FLEET_TOML","TOML_DIR","SIDEBAR_PAINT"]
+    keys = ["ROOT","STATE","CMUX","FLOOR","HOOKSTORE","HOOKSTORE_EXPLICIT","FLEET_TOML","TOML_DIR","SIDEBAR_PAINT"]
     print(json.dumps({k: getattr(config, k) for k in keys}))
 """)
 
@@ -95,18 +95,8 @@ def test_hookstore_explicit_true_via_toml(tmp_path):
     assert c["HOOKSTORE_EXPLICIT"] is True
 
 
-def test_adhoc_subdir_default_under_meta():
-    # FIX 3: the SHIPPED default lives under _meta/ (alongside the other agent homes), not at the vault
-    # root — an unconfigured `fleet launch --adhoc` must not create a fresh agents/ tree at <root>/.
-    c, _ = _resolve()
-    assert c["ADHOC_SUBDIR"] == "_meta/agents/ad-hoc"
-
-
-def test_adhoc_subdir_env_and_toml_override(tmp_path):
-    c, _ = _resolve(env={"CMUX_FLEET_ADHOC_SUBDIR": "custom/adhoc"})
-    assert c["ADHOC_SUBDIR"] == "custom/adhoc"
-    c, _ = _resolve(toml_text='[fleet]\nadhoc_subdir = "from/toml"\n', toml_dir=str(tmp_path))
-    assert c["ADHOC_SUBDIR"] == "from/toml"
+# (`adhoc_subdir` retired 5d: `--adhoc NAME` aliases the rostered `adhoc` role — one shared flat home
+#  from [role.adhoc].cwd, no config constant. The adhoc-as-role resolution is asserted in test_launch.py.)
 
 
 # --- the dirname anchor (relative toml path -> toml's dir) --------------------------------------

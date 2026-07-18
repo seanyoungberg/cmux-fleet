@@ -34,9 +34,26 @@ def test_ls_empty(cli_env):
     assert "LIVE FLEET (0)" in p.stdout
 
 
-def test_launch_dry_run_composes(cli_env):
-    p = run_fleet(cli_env, "launch", "--adhoc", "smoke", "--parent", "FAKEPARENT", "--dry-run")
+def test_launch_dry_run_composes(cli_env, tmp_path):
+    # `--adhoc NAME` is an alias for the rostered `adhoc` role (5d): NAME becomes the label, cwd = the
+    # role's ONE shared home (no per-name subdir). Needs a [role.adhoc] block in the toml.
+    toml = tmp_path / "fleet.toml"
+    toml.write_text('[role.adhoc]\ncwd = "agents/ad-hoc"\n[role.adhoc.claude]\n')
+    env = {**cli_env, "CMUX_FLEET_TOML": str(toml)}
+    p = run_fleet(env, "launch", "--adhoc", "smoke", "--parent", "FAKEPARENT", "--dry-run")
     assert "dry-run" in p.stdout.lower()
+    assert "role/label=smoke" in p.stdout          # label = the ad-hoc name
+    assert "agents/ad-hoc" in p.stdout             # cwd = the shared adhoc home, NOT agents/ad-hoc/smoke
+    assert "ad-hoc/smoke" not in p.stdout          # ...specifically NO per-name subdir
+
+
+def test_launch_adhoc_needs_role_block(cli_env, tmp_path):
+    # opt-in: with no [role.adhoc] block, --adhoc errors (the off-roster per-name path is retired).
+    toml = tmp_path / "fleet.toml"
+    toml.write_text('[role.worker]\ncwd = "agents/w"\n[role.worker.claude]\n')
+    env = {**cli_env, "CMUX_FLEET_TOML": str(toml)}
+    p = run_fleet(env, "launch", "--adhoc", "smoke", "--parent", "FAKE", "--dry-run", expect=None)
+    assert p.returncode != 0 and "role.adhoc" in (p.stdout + p.stderr)
 
 
 def test_launch_plugin_unions_on_a_role(cli_env, tmp_path):
@@ -60,8 +77,13 @@ def test_launch_plugin_unions_on_a_role(cli_env, tmp_path):
 
 
 def test_config_renders(cli_env, tmp_path):
-    # `fleet config --cwd <dir>` reads the settings stack; no cmux, no roster needed.
-    p = run_fleet(cli_env, "config", "--cwd", str(tmp_path))
+    # `fleet config --cwd <dir>` reads the settings stack; no cmux, no roster needed. Pin a toml with
+    # NEITHER [role.adhoc] NOR a [tool.claude] floor to prove the pure-cwd probe stays roster-independent
+    # (5d: --adhoc is a rostered alias, but a bare --cwd inspect must not require it).
+    toml = tmp_path / "fleet.toml"
+    toml.write_text('[role.worker]\ncwd = "agents/w"\n[role.worker.claude]\n')
+    env = {**cli_env, "CMUX_FLEET_TOML": str(toml)}
+    p = run_fleet(env, "config", "--cwd", str(tmp_path))
     assert "fleet config" in p.stdout and "FLEET ADDS" in p.stdout
 
 

@@ -836,7 +836,7 @@ def check_pane_move_healing(sb, agent, parent_surf):
                       {"surface": surf[:8]}, depends="the DELETE gate")
     rc_mv, out_mv = _cmux("move-surface", "--surface", surf, "--workspace", target_ws, "--focus", "false")
     try:
-        moved_ws = cli.current_ws_for_surface(surf)       # tree ground truth: where the surface landed
+        moved_ws = rs.workspace(surf, ws_map=rs.surface_ws_map(ttl=0))   # FRESH tree: where the surface landed post-move
     except Exception:
         moved_ws = ""
     token = "MOVED-" + str(os.getpid())[-4:]              # a REAL turn: what a healthy build re-stamps on

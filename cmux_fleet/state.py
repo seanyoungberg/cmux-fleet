@@ -517,11 +517,38 @@ def _flock(path):
         os.close(fd)
 
 
+def _normalize_parent(row, label, known_labels):
+    """Ship 5d migrate-normalize (Berg-ruled reconcile timing = AT migrate). Collapse a BROKEN parent to
+    the durable top-level rep `parent=None`: a parent that is empty, points at SELF, or names no known
+    agent (a dead surface-uuid like cf-conductor's, a pruned label) is not a real parent — normalizing it
+    to None makes `is_top_level` and routing agree instead of chasing a dangling label. A parent that
+    resolves to a known agent (live or archived) is carried forward FAITHFULLY — the migrator does not
+    guess intent, it only fixes provably-broken edges. Returns row unchanged when the parent is already
+    valid or already None; else a copy with parent=None."""
+    if not isinstance(row, dict):
+        return row
+    p = row.get("parent")
+    if p and p != label and p in known_labels:
+        return row                              # a real, resolvable parent -> keep faithfully
+    if "parent" in row and row.get("parent") is None:
+        return row                              # already the durable top-level rep
+    out = dict(row)
+    out["parent"] = None                        # empty / self / dangling -> durable top-level None
+    return out
+
+
 def migrate_state(backup=True):
     """The one-shot v1->v2 migrator (`fleet migrate`). Idempotent, flocked, backs up first. Rewrites every
-    fleet.json + archive.json row via to_v2 and flips the schema marker. Berg-run — the build NEVER calls
-    this against the live registry. Returns {fleet, archive, backups}."""
+    fleet.json + archive.json row via to_v2 (and the 5d parent-normalize) and flips the schema marker.
+    Berg-run — the build NEVER calls this against the live registry. Returns {fleet, archive, backups}."""
     out = {"fleet": 0, "archive": 0, "backups": []}
+    # The known-agent set for parent validation spans BOTH files: a live child may parent onto an archived
+    # conductor, and vice versa. Snapshot it up front (Berg-run one-shot, no concurrent writers).
+    known = set()
+    for path in (LIVE, ARCHIVE):
+        m = _read_json(path, {})
+        if isinstance(m, dict):
+            known |= set(m.keys())
     for path, key in ((LIVE, "fleet"), (ARCHIVE, "archive")):
         with _flock(path):
             m = _read_json(path, {})
@@ -531,7 +558,7 @@ def migrate_state(backup=True):
                 bak = f"{path}.v1.bak-{int(time.time())}"
                 _atomic_write(bak, json.dumps(m, indent=2))
                 out["backups"].append(bak)
-            migrated = {label: to_v2(row) for label, row in m.items()}
+            migrated = {label: to_v2(_normalize_parent(row, label, known)) for label, row in m.items()}
             _atomic_write(path, json.dumps(migrated, indent=2))
             _schema_set(key, SCHEMA_CURRENT)
             out[key] = len(migrated)
@@ -601,6 +628,16 @@ def entry_for_surface(surface):
     return None
 
 
+def parent_of(label):
+    """The LABEL of the agent `label` reports to, from the registry (live, else archived); '' when the row
+    has no parent (a top-level agent) or the label is unknown. The registry is the authority on parentage,
+    so parent addressing DERIVES it at use-time rather than trusting a captured env (which goes stale across
+    a recycle) — the shared resolver behind recycle/revive re-derivation and `fleet peer-msg --to-parent`
+    (Ship 5d retired the AGENT_CONDUCTOR env var in favor of this)."""
+    e = live_get(label) or archive_get(label) or {}
+    return e.get("parent") or ""
+
+
 # --- unified --scope model (ratified 2026-07-07) -------------------------------------------------
 # ONE scoping vocabulary on every scope-aware verb. `mine|all|conductors|children` are the SET values
 # (a bare <label> is a single-target scope the verb resolves itself); the only thing that varies per
@@ -609,17 +646,34 @@ def entry_for_surface(surface):
 SCOPE_SETS = ("mine", "all", "conductors", "children")
 
 
+def is_my_direct_report(entry, parent_label):
+    """The 3-tier `mine` parent-match: ANY agent whose parent label == mine, REGARDLESS of kind. `entry`
+    is any dict carrying `parent` (a live registry entry, an archive row, or a vitals snapshot row). This
+    is what `--scope mine` keys on so a middle-tier conductor sees its OWN direct reports — including a
+    sub-conductor, which `is_my_child` (children-only) would miss. Backward-compatible: with no middle tier
+    present, parent==me already implies kind==child, so this equals is_my_child until a sub-conductor exists."""
+    return entry.get("parent") == parent_label
+
+
 def is_my_child(entry, parent_label):
-    """The `mine` parent-match: a CHILD whose parent label == mine. `entry` is any dict carrying
-    `kind`+`parent` (a live registry entry, an archive row, or a vitals snapshot row)."""
-    return entry.get("kind") == "child" and entry.get("parent") == parent_label
+    """The CHILDREN-ONLY parent-match: a direct report whose kind is `child` (not a sub-conductor). Kept
+    distinct from is_my_direct_report for the filters that are genuinely children-only — completion muting
+    (child→parent delivery). `entry` carries `kind`+`parent`."""
+    return is_my_direct_report(entry, parent_label) and entry.get("kind") == "child"
+
+
+def is_top_level(entry):
+    """A TOP-LEVEL agent reports to no one: its registry `parent` is None/absent — the durable canonical
+    rep (Ship 5d, Berg-ruled: no sentinel label). The derived 'is top-level' predicate; routing and
+    `peer-msg --to-parent` read the same `parent` field, so a top-level agent simply has nothing upstream."""
+    return not entry.get("parent")
 
 
 def scope_matches(scope, entry, label, caller_label, *, include_self):
     """Does `entry` (registry key `label`) fall in a SET-valued --scope, relative to caller_label?
       all         -> everyone
       conductors  -> kind == conductor          children -> kind == child
-      mine        -> caller's direct children (+ caller itself iff include_self)
+      mine        -> caller's direct reports of ANY kind (+ caller itself iff include_self)
     Reads pass include_self=True (show yourself in context); acts pass False (never fan out onto self).
     A non-set scope (a specific label) returns False here — set-scope verbs validate the value first."""
     kind = entry.get("kind")
@@ -630,7 +684,7 @@ def scope_matches(scope, entry, label, caller_label, *, include_self):
     if scope == "children":
         return kind == "child"
     if scope == "mine":
-        return is_my_child(entry, caller_label) or (include_self and label == caller_label)
+        return is_my_direct_report(entry, caller_label) or (include_self and label == caller_label)
     return False
 
 
@@ -896,20 +950,8 @@ def last_agent_text(path, cap=160):
         return ""
 
 
-def lifecycle(surface):
-    """agentLifecycle for a surface from cmux's hook stores (idle|running|needsInput|unknown|''),
-    tool-agnostic via read_hook_store. Picks the freshest entry for the surface (an agent can leave
-    more than one session record on a surface; the newest updatedAt is the live one)."""
-    best, best_ts = "", -1.0
-    try:
-        for s in (read_hook_store().get("sessions") or {}).values():
-            if s.get("surfaceId") == surface:
-                ts = s.get("updatedAt") or 0
-                if ts >= best_ts:
-                    best, best_ts = s.get("agentLifecycle", ""), ts
-    except Exception:
-        pass
-    return best
+# NOTE: lifecycle() moved to resolve.py (finish-5b-2 step 3 — resolve owns the liveness bodies now;
+# this module keeps the store I/O they read: read_hook_store / pid_alive / bare_uuid / entry_for_surface).
 
 
 # --- pid liveness + dead-record reaping (the SessionEnd-freeze backstop, 2026-07-06) --------
@@ -936,28 +978,9 @@ def pid_alive(pid):
     return True
 
 
-def surface_has_live_pid(surface):
-    """True iff any hook-store record for `surface` carries a live pid — the pid-authoritative answer
-    to 'is a real agent process still attached to this surface?' (used by recycle's respawn-verify to
-    refuse relaunching over a claude that survived the respawn, and to positively confirm death)."""
-    surf = (surface or "").upper()
-    for s in (read_hook_store().get("sessions") or {}).values():
-        if (s.get("surfaceId") or "").upper() == surf and pid_alive(s.get("pid")):
-            return True
-    return False
-
-
-def surface_has_live_agent(surface):
-    """True iff a GENUINELY-live agent occupies `surface`: cmux's lifecycle is non-terminal AND a real
-    process is still attached (a live pid). This is the SHARED 'is this seat actually live?' authority —
-    the negation ('gone/stale') is the single answer that `fleet ls` STALE-detection, bulk-recycle's
-    stale-skip, `launch`'s overwrite-guard, `worktree clean`'s refuse-if-live, and recycle's re-bind
-    poll must ALL agree on, so a SessionEnd-less brick (frozen 'running'/'idle'/'unknown' on a dead/None
-    pid — root-caused 2026-07-06) reads as gone EVERYWHERE, never as a false 'live' at whichever site
-    still trusts the lifecycle string alone. Stricter than surface_has_live_pid (pid only): this ALSO
-    requires the lifecycle to be non-terminal, so a surface mid-drop (terminal string, pid briefly
-    lingering) reads as gone too — the two conditions together are 'a live agent is actually here'."""
-    return lifecycle(surface) not in ("", "-", "ended") and surface_has_live_pid(surface)
+# NOTE: surface_has_live_pid() + surface_has_live_agent() moved to resolve.py (finish-5b-2 step 3).
+# They compose pid_alive() (kept here) with read_hook_store()/lifecycle() reads; resolve owns the
+# liveness rule now, this module owns the store I/O they call back into via fs.*.
 
 
 def reap_dead_surface_records(surface, dry_run=False):
@@ -1015,68 +1038,13 @@ def reap_dead_surface_records(surface, dry_run=False):
     return {"reaped": reaped, "live_kept": live_kept, "files": files}
 
 
-# --- wake-gate liveness: staleness + bound-session cross-check (design 2.2a) ----------------
-# lifecycle() above returns the freshest record's RAW agentLifecycle (for display: `fleet ls`, vitals,
-# the cli.py liveness checks). The WAKE GATE needs a stricter question — "is this surface in a GENUINE,
-# live, mid-turn 'running' state I must not interrupt?" — because a STALE/orphaned 'running' record
-# (a cmux reboot-replay, a move-surface binding desync, a pre-fix summarizer stomp) must NOT read as
-# busy: if it does, guard #1 trips on every event and the surface is silenced forever (the cmux-advisor
-# stall, root-caused 2026-07-01). We keep lifecycle()'s contract intact (cli.py/features.py depend on
-# it) and answer the wake question with a dedicated, hardened predicate.
+# --- wake-gate staleness window (the predicates that use it live in resolve.py) -------------
+# LIFECYCLE_STALE_S bounds "is this a live turn?": a 'running' record that has not ticked within it is
+# treated as NOT mid-turn (a real turn re-stamps continuously; a frozen one is an orphan). The wake-gate
+# predicates that apply it — resolve.surface_busy + its resolver resolve.resolve_bound_record — moved to
+# resolve.py (finish-5b-2 step 3, root incident: the 2026-07-01 cmux-advisor stall from an orphaned
+# 'running' record). The constant stays here as shared state config; resolve reads it via fs.LIFECYCLE_STALE_S.
 LIFECYCLE_STALE_S = 90   # a 'running' record that has not ticked within this window is not a live turn
-
-
-def resolve_bound_record(surface, st=None, bound=None):
-    """The hook-store session record for `surface`'s FLEET-BOUND session (registry truth, kept honest by
-    the reconciliation lane), falling back to the freshest record on the surface when the binding can't
-    be matched; {} when nothing claims the surface. This is the shared record-resolution behind BOTH the
-    wake gate (surface_busy — 'is this a fresh live turn?') and its inverse in the fleet-doctor sweep
-    ('is this bound 'running' record frozen = a dead stall?' / 'is it at needsInput?'). Resolving against
-    the fleet BINDING rather than max-updatedAt is what defeats the days-old orphan records (e.g. surf
-    1A5E3168's ~3-day 'running' ghost, and the many stale 'needsInput' orphans) — an orphan belongs to a
-    session no live member is bound to, so it is simply never the resolved record for a live member.
-    `st`/`bound` may be passed to skip re-reading the hook store / registry per call — the sweep walks
-    every member off ONE store read and already holds each entry's bound session."""
-    st = read_hook_store() if st is None else st
-    recs = [s for s in (st.get("sessions") or {}).values() if s.get("surfaceId") == surface]
-    if not recs:
-        return {}                               # nothing claims this surface
-    if bound is None:
-        bound = bare_uuid((entry_for_surface(surface) or {}).get("session", ""))
-    rec = None
-    if bound:
-        rec = next((s for s in recs if bare_uuid(s.get("sessionId", "")) == bound), None)
-    if rec is None:                             # no fleet-bound record -> fall back to the freshest
-        rec = max(recs, key=lambda s: s.get("updatedAt") or 0)
-    return rec
-
-
-def surface_busy(surface, now=None):
-    """True ONLY when `surface` is genuinely mid-turn (a fresh, live 'running' record) — the single case
-    the wake gate must never interrupt. Hardened two ways against the stale read that stalled
-    cmux-advisor:
-      - liveness cross-check: prefer the record for the fleet's OWN bound session (registry truth, kept
-        honest by the reconciliation lane) over 'max updatedAt across all records on the surface'. The
-        pointer that lied in the incident was cmux's activeSessionsBySurface, not the fleet binding, so
-        resolving against the binding defeats the orphaned-'running' record directly.
-      - staleness guard: a 'running' record that has not ticked within LIFECYCLE_STALE_S is treated as
-        NOT a live turn (a real turn re-stamps continuously; a frozen one is an orphan).
-    Leans to NOT-busy on any ambiguity/read error: wake_if_idle then confirms an actual clean idle
-    prompt on screen before injecting, so a false 'not busy' can never corrupt a real turn, while a
-    false 'busy' — the failure we are killing — can never silence an idle surface."""
-    now = time.time() if now is None else now
-    try:
-        rec = resolve_bound_record(surface)
-        if not rec or rec.get("agentLifecycle") != "running":
-            return False
-        if not pid_alive(rec.get("pid")):
-            return False                        # a DEAD pid cannot be mid-turn: a frozen 'running' brick
-                                                # (SessionEnd-less death, root-caused 2026-07-06), not a
-                                                # live turn. Same not-busy lean as the staleness guard
-                                                # below -- the pid is the shared liveness authority.
-        return (now - (rec.get("updatedAt") or 0)) <= LIFECYCLE_STALE_S
-    except Exception:
-        return False                            # fail-open to not-busy; the screen read is the arbiter
 
 
 # --- draft-through: tier 3 of the wake ladder (design 2.3 / 3c, E1) -------------------------
@@ -1151,7 +1119,8 @@ def wake_if_idle(surface, msg):
     outrank a visibly-idle prompt (that is the whole stall fix), and — the converse — we never inject
     when NO clean prompt is visible (mid-render, a running tool, needsInput), which keeps a wake off a
     busy pane even when surface_busy leaned not-busy on a bad read."""
-    if surface_busy(surface):
+    from . import resolve as rs   # lazy: resolve imports state at module load; call-time breaks the cycle
+    if rs.surface_busy(surface):
         return False                                   # tier 1 — never interrupt a live turn
     screen = _cmux("read-screen", "--surface", surface, "--lines", "40")
     prompts = [ln for ln in screen.splitlines() if "❯" in ln]   # ❯ = the compose-prompt marker

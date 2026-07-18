@@ -3,7 +3,7 @@
 # umbrella for the rest of the scripts (state/drive/digest/ack).
 #
 #   fleet launch <role> [launcher flags] [-- <verbatim tool flags>]
-#   fleet launch --adhoc <name> --tool claude [-- --model opus]   # off-roster dynamic agent
+#   fleet launch --adhoc <name> --tool claude [-- --model opus]   # alias: the `adhoc` role, label=<name>
 #
 # DESIGN (see docs/architecture.md "Dispatch"): the launcher is a dumb command BUILDER over three
 # NATIVE config channels, it invents no setting names of its own:
@@ -27,7 +27,7 @@
 # [defaults] (orchestration) -> [role] scalars -> tool config [tool.<t>] -> [role.<t>] -> caller `--`.
 import argparse, json, os, re, shlex, subprocess, sys, tempfile, time
 
-from .config import ROOT, STATE, CMUX, FLOOR, FLEET_TOML, ADHOC_SUBDIR, PLUGIN_INDEX, HOOKSTORE, HOOKSTORE_EXPLICIT, load_plugin_index  # path resolver
+from .config import ROOT, STATE, CMUX, FLOOR, FLEET_TOML, PLUGIN_INDEX, HOOKSTORE, HOOKSTORE_EXPLICIT, load_plugin_index  # path resolver
 
 # The checkout/build root: the dir that holds bin/, .claude-plugin/, fleet.toml.example next to the
 # cmux_fleet package. In a repo/editable install this is the repo root (unchanged from the flat layout,
@@ -147,19 +147,21 @@ def resolve(cfg, role, tool_override, adhoc_name):
     tools = cfg.get("tool", {}) or {}
     roles = cfg.get("role", {}) or {}
 
-    if adhoc_name:                                            # off-roster dynamic agent
-        rblock = {}
-        orch_scalars = {"cwd": os.path.join(ADHOC_SUBDIR, adhoc_name)}
-        label = adhoc_name
-    else:
-        if role not in roles:
-            sys.exit(f"fleet: role '{role}' not in {FLEET_TOML}")
-        rblock = roles[role]
-        orch_scalars = {k: v for k, v in rblock.items() if not isinstance(v, dict)}
-        label = role
+    # `--adhoc NAME` is an ALIAS for the rostered `adhoc` role with label=NAME (Ship 5d): one shared flat
+    # home ([role.adhoc].cwd), the name is the LABEL not a per-name directory. So an ad-hoc agent resolves
+    # off the real roster block exactly like any role — same machinery — and only its label differs.
+    if adhoc_name:
+        if "adhoc" not in roles:
+            sys.exit(f"fleet: --adhoc needs a [role.adhoc] block in {FLEET_TOML} (the scratch role's shared home)")
+        role = "adhoc"
+    if role not in roles:
+        sys.exit(f"fleet: role '{role}' not in {FLEET_TOML}")
+    rblock = roles[role]
+    orch_scalars = {k: v for k, v in rblock.items() if not isinstance(v, dict)}
+    label = adhoc_name or role
 
     tool = tool_override or orch_scalars.get("tool") or defaults.get("tool") or "claude"
-    if not adhoc_name and tool not in rblock and not (tools.get(tool)):
+    if tool not in rblock and not (tools.get(tool)):
         # role exists but neither it nor a [tool.<t>] floor defines this tool
         sys.exit(f"fleet: role '{role}' has no config for tool '{tool}' (no [role.{role}.{tool}] or [tool.{tool}])")
 
@@ -186,7 +188,7 @@ def resolve(cfg, role, tool_override, adhoc_name):
     setting_sources = rtool.get("setting_sources") or tdef.get("setting_sources") or ""
 
     return {
-        "tool": tool, "role": label, "label": label,   # role = behavioral type; label defaults to it
+        "tool": tool, "role": role, "label": label,   # role = behavioral type; label defaults to it (adhoc: role='adhoc', label=NAME)
         "kind": orch.get("kind", "child"),
         "place": orch.get("place", "tab"),
         "group": orch.get("group", ""),
@@ -398,7 +400,7 @@ def _codex_clean_config_flags(home=CODEX_DEFAULT_HOME):
     return flags
 
 
-def adapter_compile(tool, spec, caller_tokens, codex_home=None, conductor=""):
+def adapter_compile(tool, spec, caller_tokens, codex_home=None):
     """Compile {plugins, flags, env, settings} + caller passthrough -> (bin, arg_tokens, env_map)
     for the given tool. Adding a tool = adding a branch here + a [tool.<t>] block.
 
@@ -408,17 +410,16 @@ def adapter_compile(tool, spec, caller_tokens, codex_home=None, conductor=""):
     seat home is what broke the agent launch (see _codex_clean_config_flags). None = codex's own default
     home, which is exactly right for a user who has configured no providers at all.
 
-    `conductor` is the LABEL of the agent this one reports to. A child was told its own name and its role
-    but never who launched it — and `fleet peer-msg` addresses by label, so a worker that cannot name its
-    conductor cannot report to it. The fleet knows the parent at launch; this hands it to the child instead
-    of making it go digging."""
+    IDENTITY (Ship 5d): the launcher injects ONLY AGENT_ROLE + AGENT_LABEL, the irreducible launch
+    identity. Everything else DERIVES from source at use-time (the Ship 5 thesis, applied to identity):
+    kind from AGENT_ROLE + the roster (loom:prime resolves it), and the parent conductor from the registry
+    `parent` field (routing already reads it; `fleet peer-msg --to-parent` addresses it). No AGENT_CONDUCTOR
+    env — a captured binding's env goes stale across a recycle; the registry never does."""
     # spec['flags'] is already a token list (tool-floor<-role); layer the caller passthrough on top.
     merged = _layer_tokens([spec["flags"], list(caller_tokens or [])])
     env = {**_profile_env(), **dict(spec["env"])}            # build/profile pins first; a role's env wins
     env["AGENT_ROLE"] = spec["role"]                          # behavioral type (exposed to the agent)
     env["AGENT_LABEL"] = spec["label"]                        # unique instance -> routing/recycle
-    if conductor:
-        env["AGENT_CONDUCTOR"] = conductor                   # who to report to (peer-msg addresses by label)
 
     if tool == "claude":
         args = []
@@ -476,34 +477,6 @@ def surface_loc(surf):
     return None, None
 
 
-def ws_uuid_for_surface(surf):
-    """The workspace UUID of the agent LIVING on `surf`: the freshest hook-store record with an ALIVE
-    pid wins, falling back to the freshest record of any liveness, then ''.
-
-    The old form returned the FIRST surface-matching record in dict order — no aliveness, no recency —
-    the same stale-ghost pick that `_pid_for_surface` made before it was deleted (2026-07-10). cmux
-    never drops a surface's old records, and a reboot/resume re-homes the surface into a NEW workspace,
-    so the lingering dead records keep pointing at the OLD (now-closed) workspace. Diagnosed live by
-    berg-sandbox: its surface carried four records — three dead ones naming a dead workspace, and the
-    one LIVE record naming the real one. Feeding the dead pick to `fleet launch --place tab|pane` made
-    every such launch abort with 'Workspace not found'. The correct workspace was in the store the whole
-    time; we were reading the wrong row. A dead pid cannot be the agent, so it cannot name its workspace.
-
-    Still a store read: if a live agent is MOVED between workspaces without a record update, the record
-    can lag. Callers that need certainty resolve against the live tree (`surface_ws_from_tree`)."""
-    from . import state as fs
-    live_ws, live_ts, any_ws, any_ts = "", -1.0, "", -1.0
-    for s in (_store().get("sessions") or {}).values():
-        if (s.get("surfaceId") or "").upper() != (surf or "").upper():
-            continue
-        ts = s.get("updatedAt") or 0
-        if ts >= any_ts:
-            any_ws, any_ts = s.get("workspaceId", ""), ts
-        if fs.pid_alive(s.get("pid")) and ts >= live_ts:
-            live_ws, live_ts = s.get("workspaceId", ""), ts
-    return live_ws or any_ws
-
-
 def surface_ws_from_tree(tree_text, surf):
     """Parse `cmux tree` TEXT -> the workspace UUID that CONTAINS `surf`, or '' if `surf` is not in the
     tree (genuinely closed). PURE (no shell-out) so register's workspace derivation and the router's
@@ -521,14 +494,6 @@ def surface_ws_from_tree(tree_text, surf):
         if ms and ms.group(1).upper() == surf.upper():
             return ws
     return ""
-
-
-def current_ws_for_surface(surf):
-    """The workspace UUID that CURRENTLY contains `surf`, from cmux's live TREE (the visual ground
-    truth), falling back to the hook store only when the tree can't be read. Prefer the TREE because the
-    hook store's workspaceId FREEZES when a surface is MOVED across workspaces (root cause #3) -- so
-    register/`move` record where the surface lives NOW, not where it was first bound. '' if unlocatable."""
-    return surface_ws_from_tree(cmuxq("tree", "--all", "--id-format", "both"), surf) or ws_uuid_for_surface(surf)
 
 
 def _all_workspace_uuids(tree_text):
@@ -797,6 +762,7 @@ def create_surface(spec, parent_surf, direction):
     """Create the target surface per spec['place']; return (ws_uuid, surf_uuid). Aborts (None) on any
     unresolved UUID -- never send blind."""
     import re
+    from . import resolve as rs
     place = spec["place"]
     if place in ("tab", "pane"):
         # WHERE THE PARENT SURFACE LIVES = a question about the TREE, which is the visual ground truth,
@@ -808,7 +774,7 @@ def create_surface(spec, parent_surf, direction):
         # off it died with "cannot resolve conductor workspace from --parent". One tree read, both answers.
         cws, agents_pane = surface_loc(parent_surf)
         if not cws:
-            cws = ws_uuid_for_surface(parent_surf)     # store fallback, for when the tree can't be read
+            cws = rs._ws_from_store(parent_surf)       # store fallback, for when the tree can't be read
         if not cws:
             print("[fleet] ABORT: cannot resolve conductor workspace from --parent"); return None, None
         if place == "tab":
@@ -892,7 +858,7 @@ def poll_session(surf, timeout=60):
     The fallback must stay: this is the "has anything bound yet?" probe, and a just-bound session may not
     have written its pid yet — requiring a live pid outright would hang every launch. Prefer-alive gives
     us the ghost fix with no liveness precondition. Callers needing certainty that the bind is a LIVE
-    agent use `_live_bound_sid` (recycle's confirm), not this."""
+    agent use `rs.live_sid` (recycle's confirm), not this."""
     from . import state as fs
     end = time.time() + timeout
     while time.time() < end:
@@ -941,9 +907,14 @@ def _poll_surface_cwd(surf, want, timeout=10):
     return last
 
 
-def register(surf, spec, parent_surface, session, ws):
+def register(surf, spec, parent_surface, session, ws, parent_label=None):
     from . import state as fs
-    parent_label = fs.label_for_surface(parent_surface) or parent_surface   # store parent LABEL (durable)
+    # store parent LABEL (durable); a top-level launch (no parent surface) stores None -- the canonical
+    # top-level rep that is_top_level reads (Ship 5d, Berg-ruled: no sentinel), NOT an empty string.
+    # `parent_label` explicit override (item 9): revive passes the ARCHIVED parent so the reporting
+    # relationship is PRESERVED across the rm->revive round trip (not re-derived from whoever revived it).
+    if parent_label is None:
+        parent_label = fs.label_for_surface(parent_surface) or parent_surface or None
     # gen (Ship 5): a reseat fence bumped on every launch/revive/recycle, so any consumer can tell a cached
     # derived view is from a PRIOR seat of this label. Monotonic across the label's lifetimes (live/archive).
     _prior = fs.live_get(spec["label"]) or fs.archive_get(spec["label"])
@@ -1367,14 +1338,15 @@ def cmd_launch(argv):
 
     ap = argparse.ArgumentParser(prog="fleet launch", add_help=True)
     ap.add_argument("role", nargs="?", help="roster role name (omit with --adhoc)")
-    ap.add_argument("--adhoc", metavar="NAME", help="off-roster dynamic agent; cwd=workers/<NAME>")
+    ap.add_argument("--adhoc", metavar="NAME", help="alias for the rostered `adhoc` role with label=NAME "
+                                    "(one shared flat home, no per-name dir)")
     ap.add_argument("--tool", help="override the resolved tool (claude|codex|...)")
     ap.add_argument("--parent", default=os.environ.get("CMUX_SURFACE_ID", ""),
-                    help="conductor surfaceId (default $CMUX_SURFACE_ID)")
+                    help="conductor surfaceId (default $CMUX_SURFACE_ID); 'none' = a top-level agent (no parent)")
     ap.add_argument("--label", help="override the display label / registry label")
     ap.add_argument("--place", help="override placement (tab|pane|workspace)")
     ap.add_argument("--group", help="workspace group for --place workspace (name or workspace_group:<ref>); "
-                                    "needed for an --adhoc agent, which has no toml group")
+                                    "'none' = a standalone workspace (opt out of the own/parent-group default)")
     ap.add_argument("--direction", default="down", help="split direction for --place pane")
     ap.add_argument("--cwd", help="override the launch cwd (absolute)")
     ap.add_argument("--plugin", action="append", default=[], metavar="NAME",
@@ -1403,6 +1375,15 @@ def cmd_launch(argv):
     a = ap.parse_args(argv)
     if not a.role and not a.adhoc:
         ap.error("need a <role> or --adhoc <name>")
+    # none-vs-unset on the two placement axes (Ship 5d R-5d-1 / item 7-creation): the launch arg spec must
+    # express an EXPLICIT "none" distinct from "unset/default".
+    #   --parent none  -> a TOP-LEVEL agent (registry parent=None). Distinct from unset (=$CMUX_SURFACE_ID).
+    #   --group  none  -> a STANDALONE workspace (no group). Distinct from unset (=own/parent group, below)
+    #                     and from --group NAME (join/bootstrap that group).
+    top_level = (a.parent or "").strip().lower() == "none"
+    if top_level:
+        a.parent = ""
+    group_none = (a.group or "").strip().lower() == "none"
     # first-class session-preference overrides funnel into the caller-token layer (highest precedence),
     # so `fleet launch role --effort max` works without a `-- --effort max` passthrough.
     if a.effort:
@@ -1414,7 +1395,7 @@ def cmd_launch(argv):
     spec = resolve(cfg, a.role, a.tool, a.adhoc)
     if a.place:
         spec["place"] = a.place
-    if a.group:
+    if a.group and not group_none:                           # `--group none` is the standalone sentinel, not a name
         spec["group"] = a.group
     if a.label:
         spec["label"] = a.label
@@ -1426,7 +1407,8 @@ def cmd_launch(argv):
         spec["plugins"] = _dedup(spec["plugins"] + _flatten_csv(a.plugin))
     # one conductor = one group: a place=workspace conductor with no explicit group anchors its OWN group
     # (named for its label); a place=workspace child with no explicit group joins its parent's group.
-    if spec["place"] == "workspace" and not spec["group"]:
+    # `--group none` (group_none) opts OUT of this default entirely -> a deliberately standalone workspace.
+    if spec["place"] == "workspace" and not spec["group"] and not group_none:
         if spec["kind"] == "conductor":
             spec["group"] = spec["label"]
         elif a.parent:
@@ -1434,6 +1416,10 @@ def cmd_launch(argv):
             pe = fs.entry_for_surface(a.parent)
             if pe and pe.get("group"):
                 spec["group"] = pe["group"]
+    # a top-level agent has no parent surface to place a tab/pane in -> it must own a workspace.
+    if top_level and spec["place"] != "workspace":
+        sys.exit(f"[fleet] ABORT: --parent none needs --place workspace (a top-level agent has no parent "
+                 f"surface to hold a {spec['place']})")
     spec["abs_cwd"] = a.cwd or (spec["cwd"] if os.path.isabs(spec["cwd"]) else os.path.join(ROOT, spec["cwd"]))
 
     # --- worktree (config-gated, default-off) ---------------------------------------------------
@@ -1510,9 +1496,7 @@ def cmd_launch(argv):
             sys.exit(f"[fleet] --provider: {e}")
         codex_home = (pr.get("env") or {}).get("CODEX_HOME")   # the home this codex launch will really use
 
-    from . import state as _fs
-    bin_name, args, env = adapter_compile(spec["tool"], spec, caller, codex_home=codex_home,
-                                          conductor=_fs.label_for_surface(a.parent) if a.parent else "")
+    bin_name, args, env = adapter_compile(spec["tool"], spec, caller, codex_home=codex_home)
 
     if pr:
         env.update(pr["env"])
@@ -1549,8 +1533,8 @@ def cmd_launch(argv):
     if a.dry_run:
         print("[fleet] dry-run (omit --dry-run to spawn)")
         return 0
-    if not a.parent:
-        sys.exit("[fleet] ABORT: no --parent and no $CMUX_SURFACE_ID")
+    if not a.parent and not top_level:                       # `--parent none` (top_level) is the deliberate opt-out
+        sys.exit("[fleet] ABORT: no --parent and no $CMUX_SURFACE_ID (pass --parent none for a top-level agent)")
 
     # live-label guard (registry/surface 1:1 invariant, same family as the rm flip): register() is a
     # bare live_put overwrite, so launching into a label whose row still points at a live surface would
@@ -1583,7 +1567,7 @@ def cmd_launch(argv):
                      f"or re-run with --force if you KNOW the old surface is already dead.")
 
     os.makedirs(spec["abs_cwd"], exist_ok=True)
-    if a.adhoc:                                          # ad-hoc cwds are created fresh at launch ->
+    if a.adhoc:                                          # the shared adhoc home has no role plugins/CLAUDE.md ->
         _link_floor_claudemd(spec["abs_cwd"])            # symlink the floor CLAUDE.md so they inherit it
     if spec["tool"] == "codex":                          # design the update modal out (Berg: always
         note = _codex_update_preflight()                 # allow the update); the pane scan below is the
@@ -1790,7 +1774,15 @@ def cmd_config(argv):
         ap.error("need a <role>, --adhoc <name>, or --cwd <dir>")
 
     cfg = load_config()
-    spec = resolve(cfg, a.role or "default-worker", a.tool, a.adhoc or (None if a.role else "_inspect"))
+    # default-worker folded into `adhoc` (5d): --adhoc NAME inspects the scratch role (requires [role.adhoc],
+    # like launch). A bare `--cwd` probe, though, is roster-INDEPENDENT — just "what does the tool stack in
+    # this dir" — so it must NOT need a roster (nor even a [tool.<t>] floor; a fresh/empty toml is fine).
+    # When no [role.adhoc] exists, synthesize one carrying the target tool's (empty) sub-block, so resolve's
+    # tool-check is satisfied and we get a floor-only probe spec.
+    if not a.role and not a.adhoc and "adhoc" not in (cfg.get("role") or {}):
+        tool = a.tool or (cfg.get("defaults", {}) or {}).get("tool") or "claude"
+        cfg = {**cfg, "role": {**(cfg.get("role") or {}), "adhoc": {tool: {}}}}
+    spec = resolve(cfg, a.role or "adhoc", a.tool, a.adhoc or (None if a.role else "_inspect"))
     cwd = os.path.abspath(os.path.expanduser(a.cwd)) if a.cwd \
         else (spec["cwd"] if os.path.isabs(spec["cwd"]) else os.path.join(ROOT, spec["cwd"]))
     bin_name, args, env = adapter_compile(spec["tool"], spec, [])
@@ -2286,7 +2278,7 @@ def _surface_pids(surface):
     snapshot for the recycle verify AND the kill-path target set: any of these still alive AFTER the
     respawn means the old agent survived the kill, so we must NOT relaunch over it (the 'never type
     into a live TUI' invariant). ALL records are scanned and DEAD pids are excluded — the kill-path
-    twin of _live_bound_sid's rule (a dead pid cannot be the agent). Contrast _pid_for_surface, which
+    twin of rs.live_sid's rule (a dead pid cannot be the agent). Contrast _pid_for_surface, which
     returns the FIRST record's pid in dict order with no aliveness check: on a surface with several
     lingering records that is usually a dead ghost (the 2026-07-10 wedge: SIGINTs hit corpses 76035
     and 70208 while the real agent, 76142 on the 4th record, survived orphaned).
@@ -2383,12 +2375,13 @@ def _graceful_close(surf, tool, log, timeout=6):
     signalled pid dies, and ALWAYS falls through to the respawn. This is an HONESTY step, NOT the
     confirming signal: _confirmed_gone -- not this -- authorizes the relaunch."""
     from . import state as fs
+    from . import resolve as rs
     pids = _signal_agent_pids(surf, tool, log, "graceful close")
     if not pids:
         return                                        # nothing live to close -> pid-aware verify confirms
     end = time.time() + timeout
     while time.time() < end:
-        if fs.lifecycle(surf) in ("", "-", "ended") or not any(fs.pid_alive(p) for p in pids):
+        if rs.lifecycle(surf) in ("", "-", "ended") or not any(fs.pid_alive(p) for p in pids):
             log("graceful close: old session reached a clean terminal lifecycle (SessionEnd fired)")
             return
         time.sleep(0.5)
@@ -2826,6 +2819,7 @@ def cmd_rm(argv):
     e = e_live or fs.archive_get(label)
     if not e:
         sys.exit(f"fleet rm: no such label '{label}'")
+    _lifecycle_owner_guard(label, "remove", force)           # item 9: another conductor's child needs --force
     # running-surface guard (ships WITH the default flip -- it's the flip's own footgun): the default
     # now CLOSES the surface, so a mid-turn agent would be killed half-way. A SYNCHRONOUS check +
     # refuse, deliberately NOT recycle's async quiet-gate: an async wait here would race the exact
@@ -2868,11 +2862,15 @@ def cmd_rm(argv):
                     if lbl != label and v.get("group") == gname:
                         members.setdefault(lbl, v)
             registry_all = {label: e, **members}
-            # Ship 5 NOTE: this registry-vs-cmux equality gate is slated for DELETE/rebuild-on-cmux-membership
-            # in a later sub-ship (DESIGN-v2 §8). Until then it reads the stored `workspace` (present on a v1
-            # row / pre-migrate). POST-`fleet migrate` the field is gone -> every row is 'unverifiable' -> the
-            # gate ABORTS the dissolve (safe: it refuses + signposts, never destroys). The rebuild lands in 5c.
-            registry_ws = {lbl: v.get("workspace") for lbl, v in registry_all.items()}
+            # Ship 5c: rebuilt on cmux TRUTH (DESIGN-v2 §8). There is no stored `workspace` to trust anymore,
+            # so each SEATED member's workspace is derived from the live TREE (rs.surface_ws_map). An
+            # archived/parked row has NO surface -> it is not in any cmux workspace, so it does not participate
+            # in the membership cross-check (it is swept by LABEL below, not by workspace). A seated member the
+            # tree cannot locate is 'unverifiable' -> a mismatch (fail-closed). The set of seated members'
+            # ACTUAL workspaces must equal cmux's real group membership (minus the Model-B anchor, below).
+            ws_map = rs.surface_ws_map()
+            registry_ws = {lbl: (ws_map.get((v.get("surface") or "").upper()) or "")
+                           for lbl, v in registry_all.items() if v.get("surface")}
             unverifiable = sorted(lbl for lbl, ws in registry_ws.items() if not ws)
             real_ws = _group_member_workspaces(gref)
             # Model B (empty-anchor, ratified 2026-07-10): a group's anchor is an AGENTLESS scaffold
@@ -3070,6 +3068,13 @@ def cmd_rm(argv):
         fs.log_event("archived", label=label, role=e.get("role"), session=e.get("session"),
                      via="kill" if kill else "rm")
         archived = True
+        # WRITE-ORDER FLIP (Ship 5b, registry-before-close): drop the LIVE row BEFORE _close_seat closes the
+        # surface, so the router's fresh surface.closed read finds no live member and skips -- no duplicate
+        # archive, no spurious stale alert. archive_put ran first, so the agent is durably parked before its
+        # row leaves the live store. (The trailing `fs.live_del` below is then a harmless no-op on this
+        # path; it still does the removal on the detach/non-closing paths. The expected-close tombstone is a
+        # redundant belt now, deleted once this ordering has soaked -- 5b step 3.)
+        fs.live_del(label)
         # close the SEAT, not just the surface: a workspace-placed agent's workspace goes too, so `rm`
         # leaves no named husk workspace in the sidebar (Berg's ruling). Guards + verb choice live in
         # _close_seat/plan_seat_close; a tab/pane agent still only loses its own surface.
@@ -3160,11 +3165,12 @@ def cmd_worktree(argv):
         if not info:
             sys.exit(f"fleet worktree clean: no registered worktree for '{a.label}' (see `fleet worktree ls`)")
         from . import state as fs
+        from . import resolve as rs
         live = fs.live_get(a.label)
         # refuse only if a GENUINELY-live agent holds the surface (non-terminal lifecycle AND a live pid).
         # A dead-pid frozen 'running' ghost (the SessionEnd-less brick, 2026-07-06) must NOT block worktree
         # teardown -- there is no live work to protect. surface_has_live_agent is the shared authority.
-        if info["where"] == "live" and live and fs.surface_has_live_agent(live.get("surface", "")):
+        if info["where"] == "live" and live and rs.surface_has_live_agent(live.get("surface", "")):
             sys.exit(f"fleet worktree clean: '{a.label}' is still LIVE. Either `fleet archive {a.label}` "
                      f"then `fleet worktree clean {a.label}`, or `fleet rm {a.label} --kill` (which itself "
                      f"tears the worktree down).")
@@ -3222,6 +3228,46 @@ def _build_archive_entry(e, b):
     return arch
 
 
+def _notify_parent_lifecycle(parent, label, verb, invoker, refused):
+    """Best-effort inbox note to a child's parent that ANOTHER conductor touched their child (item 9).
+    Needs the parent LIVE to receive the row (inbox is surface-addressed); a parked/offline parent simply
+    misses it. Rendered as a `peer` row so it shows in the parent's `fleet inbox` like any peer message."""
+    from . import state as fs
+    import secrets
+    psurf = fs.surface_for_label(parent)
+    if not psurf:
+        return
+    body = (f"[lifecycle] {invoker} "
+            + (f"TRIED to {verb}" if refused else f"{verb}d")
+            + f" your child '{label}'"
+            + (" (REFUSED -- they'd need --force)." if refused else " (forced through --force)."))
+    msg_id = secrets.token_hex(3)
+    fs.inbox_put("peer", psurf, {
+        "ptype": "peer-msg", "to_label": parent,
+        "from_surface": os.environ.get("CMUX_SURFACE_ID", ""), "from_label": invoker,
+        "msg_id": msg_id, "reply_to": None, "reply_expected": False, "body": body,
+    }, event_key=f"lifecycle:{verb}:{label}:{'refused' if refused else 'done'}:{invoker}")
+
+
+def _lifecycle_owner_guard(label, verb, force):
+    """Item 9 cross-conductor guard for archive/rm. A DIFFERENT identified conductor (invoker != the
+    target's registry parent) acting on another conductor's child is REFUSED without --force, and the
+    parent is notified EITHER WAY (refused attempt or forced-through). No-op when the target is top-level
+    (no parent), when the invoker IS the parent, when the invoker IS the target itself (self-removal / a
+    call from the target's own surface), or when there's no identified invoker surface at all -- an
+    operator driving the CLI directly (no $CMUX_SURFACE_ID, e.g. Berg) keeps full unguarded control.
+    `verb` is 'archive' | 'remove' (used in the messages)."""
+    from . import state as fs
+    parent = fs.parent_of(label)
+    invoker = fs.label_for_surface(os.environ.get("CMUX_SURFACE_ID", "")) or ""
+    if not parent or not invoker or invoker == parent or invoker == label:
+        return
+    _notify_parent_lifecycle(parent, label, verb, invoker, refused=not force)
+    if not force:
+        sys.exit(f"[fleet] {verb} REFUSED: '{label}' is {parent}'s child, not yours. Pass --force to "
+                 f"{verb} another conductor's child ({parent} has been notified of the attempt).")
+
+
 def cmd_archive(argv):
     """Park a live agent: stop its process(es) (SIGINT x2 to every live identity-checked pid = clean
     TUI exit), close its cmux seat, move it to the archive shelf with enough to `claude --resume` it
@@ -3233,12 +3279,15 @@ def cmd_archive(argv):
     sidebar (Berg's ruling, 2026-07-10). A tab/pane agent only loses its surface — its parent's
     workspace survives."""
     from . import state as fs
-    if not argv:
-        sys.exit("usage: fleet archive <label>")
-    label = argv[0]
+    force = "--force" in argv
+    args = [a for a in argv if a != "--force"]
+    if not args:
+        sys.exit("usage: fleet archive <label> [--force]")
+    label = args[0]
     e = fs.live_get(label)
     if not e:
         sys.exit(f"fleet archive: no LIVE label '{label}'")
+    _lifecycle_owner_guard(label, "archive", force)          # item 9: another conductor's child needs --force
     surf = e.get("surface", "")
     # capture cmux's GROUND-TRUTH launch binding BEFORE we tear the surface down — this is the same
     # source recycle replays, so revive can recompose the EXACT last command (caller passthrough +
@@ -3258,10 +3307,16 @@ def cmd_archive(argv):
     # registry BEFORE the cmux mutation it describes (v2 §2): a seat close that half-fails must degrade
     # to "recorded, maybe-unresumable", never to "vanished".
     fs.archive_put(label, _build_archive_entry(e, b))
+    # WRITE-ORDER FLIP (Ship 5b, registry-before-close): drop the LIVE row BEFORE the surface closes, so the
+    # router's fresh-read surface.closed handler finds no live member for this surface and skips -- no
+    # duplicate archive, no spurious `kind='stale'` "revive?" alert. archive_put ran first, so the agent is
+    # durably parked before its row leaves the live store (degrades to "recorded", never "vanished"). The
+    # expected-close tombstone _close_seat still stamps is a redundant belt now -- deleted once this
+    # ordering has soaked on staging (5b step 3).
+    fs.live_del(label)
     seat_ok = True
     if surf:
         seat_ok, notes = _close_seat(label, e, "archive", planned=planned)
-    fs.live_del(label)
     fs.log_event("archived", label=label, role=e.get("role"), session=e.get("session"))
     print(f"[fleet] archived {label} (session {e.get('session')}); revive with: fleet revive {label}")
     if not seat_ok:                                     # the row is written and the agent is dead; the
@@ -3333,6 +3388,16 @@ def cmd_revive(argv):
     if not spec["cwd"]:
         print(f"[fleet] warn: revive {a.label} resolved no cwd (sparse shelf, not a roster role, no "
               f"binding) -> abs_cwd falls back to ROOT root; claude --resume may not find the session")
+    # inherit the placement parent's workspace group like `launch --place workspace` (item 9): a
+    # place=workspace agent revived with no group of its own joins its parent's group (a conductor anchors
+    # its OWN named group). The visual group follows the placement parent (a.parent), same as launch.
+    if spec["place"] == "workspace" and not spec["group"]:
+        if spec["kind"] == "conductor":
+            spec["group"] = spec["label"]
+        elif a.parent:
+            pe = fs.entry_for_surface(a.parent)
+            if pe and pe.get("group"):
+                spec["group"] = pe["group"]
 
     # ACCOUNT re-resolution (fix 1): a revive FOLLOWS CONFIG for the account too, identically to recycle —
     # the archived binding dropped the account env, so re-resolve + inject it here (and record it on the
@@ -3436,14 +3501,17 @@ def cmd_revive(argv):
     # (dark-surface heal is native since 0.64.18 — the old reseat-if-dark guard is retired; the seated
     # surface is authoritative.)
     sid = _resume_binding(surf).get("checkpoint_id", "") or sid   # ground-truth session over a bridge poll id
-    register(surf, spec, a.parent, sid, ws)
+    # PRESERVE the reporting relationship across the round trip (item 9): the revived agent keeps its
+    # ARCHIVED parent, not whoever revived it. a.parent still drives PLACEMENT (surface + group), but the
+    # registry parent comes from the shelf -- a top-level agent (archived parent None) stays top-level.
+    register(surf, spec, a.parent, sid, ws, parent_label=e.get("parent") or None)
     fs.archive_del(a.label)
     fs.log_event("revived", label=a.label, role=spec["role"], surface=surf, session=sid, fresh=a.fresh,
                  # ledger parity with log_launch/recycled: ground-truth effort/model off the composed
                  # command; plugins deterministic from the entry + --plugin union (already in spec).
                  effective={**_sendcmd_session_prefs(send_cmd), "plugins": spec["plugins"]})
     if a.fresh:                                                   # shed -> prime from the handover (like a fresh recycle)
-        ho = _latest_handover(spec["abs_cwd"])
+        ho = _latest_handover(spec["abs_cwd"], a.label)
         prime = (f"You were just REVIVED into a FRESH session (same identity: label '{a.label}', "
                  f"role '{spec.get('role')}'). Re-orient from your latest handover"
                  + (f" at {ho}" if ho else " under ./handover/") + ", then continue where it left off.")
@@ -3489,17 +3557,17 @@ def _live_session_for(surf):
       2. else the freshest sessions[] record for the surface whose agentLifecycle is not in
          ('','-','ended') AND whose surface still resolves live in the tree (surface_loc()[0] present)."""
     from . import state as fs
+    from . import resolve as rs
     d = _store()
-    active = d.get("activeSessionsBySurface") or {}
-    ae = active.get(surf) or active.get((surf or "").upper()) or {}
+    ae = rs.active_entry(surf, st=d)                  # cmux's 'bound right now' pointer entry
     if ae.get("sessionId"):
-        for s in (d.get("sessions") or {}).values():
-            if (s.get("sessionId") or "") == ae["sessionId"]:
-                # pid-aware live gate: cmux's active pointer can resolve to a FROZEN dead-pid record
-                # (the SessionEnd-less brick, 2026-07-06). A dead pid == not live -> return None so
-                # `register` refuses a dead surface instead of binding onto a ghost; a live pid returns
-                # the record as before.
-                return s if fs.pid_alive(s.get("pid")) else None
+        s = rs.record_by_session(ae["sessionId"], st=d)
+        if s:
+            # pid-aware live gate: cmux's active pointer can resolve to a FROZEN dead-pid record
+            # (the SessionEnd-less brick, 2026-07-06). A dead pid == not live -> return None so
+            # `register` refuses a dead surface instead of binding onto a ghost; a live pid returns
+            # the record as before.
+            return s if fs.pid_alive(s.get("pid")) else None
         return ae            # bare active pointer, no full record to pid-check: keep cmux's word (rare
                              # degenerate state, NOT the freeze class -- the freeze RETAINS the full
                              # record, caught above; over-restricting here would break a just-bound seat)
@@ -3659,8 +3727,8 @@ def cmd_register(argv):
     # cross-workspace MOVE the hook-store workspaceId FREEZES at the OLD workspace (root cause #3), so
     # trusting `rec` here re-registered moved children straight back into their old shared workspace
     # (observed 2026-07-07: children re-registered to the shared ws, not their new 43/44/45).
-    # current_ws_for_surface reads the tree first; rec.workspaceId is only the last-ditch fallback.
-    ws = current_ws_for_surface(surf) or rec.get("workspaceId") or ""
+    # rs.workspace reads the live tree first; rec.workspaceId is only the last-ditch fallback.
+    ws = rs.workspace(surf) or rec.get("workspaceId") or ""
     surf_cwd = rec.get("cwd") or _surface_cwd(surf) or ""
 
     # rebuild the spec: roster role (toml-authoritative, berg's proven recipe) > archive/live entry >
@@ -3730,6 +3798,7 @@ def cmd_group(argv):
           `workspace-group add` -- the child stays live (no move). Records the group on the child's row.
     """
     from . import state as fs
+    from . import resolve as rs
     ap = argparse.ArgumentParser(prog="fleet group", add_help=True)
     ap.add_argument("sub", choices=["init", "add"], help="init (anchor my workspace as a group) | add <label>")
     ap.add_argument("label", nargs="?", help="child label (for `add`)")
@@ -3744,7 +3813,7 @@ def cmd_group(argv):
 
     if a.sub == "init":
         name = a.name or self_entry.get("group") or self_label
-        my_ws = current_ws_for_surface(self_surf) or self_entry.get("workspace") or ""
+        my_ws = rs.workspace(self_surf) or self_entry.get("workspace") or ""
         if not my_ws:
             sys.exit(f"[fleet] group init: cannot resolve {self_label}'s current workspace from cmux.")
         gref = _group_ref(name)
@@ -3786,7 +3855,7 @@ def cmd_group(argv):
     if not gref:
         sys.exit(f"[fleet] group add: no cmux group named '{name}' (run `fleet group init`). "
                  f"Inspect: cmux workspace-group list --json")
-    child_ws = current_ws_for_surface(child.get("surface", "")) or child.get("workspace") or ""
+    child_ws = rs.workspace(child.get("surface", "")) or child.get("workspace") or ""
     if not child_ws:
         sys.exit(f"[fleet] group add: cannot resolve {a.label}'s current workspace from cmux.")
     cmuxq("workspace-group", "add", "--group", gref, "--workspace", child_ws)   # SAFE: no surface move
@@ -3819,6 +3888,7 @@ def cmd_move(argv):
     An ARCHIVED label has no surface, so there is nothing to relocate — bring it back into the target with
     `fleet revive <label>` instead. Bystanders are safe: a surface move never touches sibling surfaces."""
     from . import state as fs
+    from . import resolve as rs
     ap = argparse.ArgumentParser(prog="fleet move", add_help=True)
     ap.add_argument("label", help="the child to relocate")
     ap.add_argument("--to-workspace", default="", metavar="WS",
@@ -3846,7 +3916,7 @@ def cmd_move(argv):
     surf = child.get("surface", "")
     if not surf:
         sys.exit(f"[fleet] move: '{a.label}' has no surface recorded; cannot move.")
-    cur_ws = current_ws_for_surface(surf)
+    cur_ws = rs.workspace(surf)                                # pre-move: the 2s memo is fine (nothing has moved yet)
     if not cur_ws:
         sys.exit(f"[fleet] move: surface {surf[:8]} for '{a.label}' is not in cmux's tree (already "
                  f"closed?). Use `fleet revive {a.label}` to relaunch, not move.")
@@ -3863,60 +3933,94 @@ def cmd_move(argv):
     parent_entry = fs.live_get(new_parent or "") or {}
 
     # resolve the target BEFORE the move, so a bad target aborts with nothing touched.
-    target_uuid = ""
+    target_uuid, same_ws = "", False
     if a.to_workspace:
         target_uuid = (a.to_workspace if _looks_like_uuid(a.to_workspace)
                        else _ref_to_uuid("workspace", a.to_workspace))
         if not target_uuid:
             sys.exit(f"[fleet] move: could not resolve --to-workspace '{a.to_workspace}' to a workspace "
                      f"(pass a UUID or a workspace:<n> ref). Inspect: cmux list-workspaces")
-        if target_uuid.upper() == cur_ws.upper():
-            print(f"[fleet] move: {a.label} is already in workspace {cur_ws[:8]}; nothing to do.")
-            return 0
+        same_ws = target_uuid.upper() == cur_ws.upper()
 
-    # NATIVE RELOCATION — safe whether or not an agent is live on the surface. cmux 0.64.18+ heals the
-    # moved surface's agent-status registration, so there is no live-agent refusal, no archive, no revive,
-    # no fresh surface. The surface UUID is preserved, so the agent keeps its pid, session and context.
-    # 1. suppress the spurious archive: a cross-workspace move emits surface.closed (root cause #3), which
-    #    the router would otherwise read as an accidental external close and archive the still-live member.
-    fs.expected_close_put(surf)
+    # A move is RELOCATE (the surface) + REPARENT (the org chart), DECOUPLED. `--own-workspace` and a
+    # cross-ws `--to-workspace` both relocate; a same-ws `--to-workspace` is a PURE REPARENT — the surface
+    # stays put, but parent + group still follow the mover. Decoupling is what makes `fleet move <child>
+    # --to-workspace <its-own-ws>` from a NEW conductor a valid ownership assertion instead of the old no-op
+    # short-circuit (post-thin-registry there is no stored workspace left to "reconcile").
+    relocate = a.own_workspace or (a.to_workspace and not same_ws)
 
-    # 2. move the surface (UUID preserved -> pid/session/context/registration all survive the move).
-    if a.to_workspace:
-        cmuxq("move-surface", "--surface", surf, "--workspace", target_uuid, "--focus", "false")
-        # a tab joins the target workspace's own visual group; the fleet group field follows the new parent.
-        new_group, new_place = parent_entry.get("group") or child.get("group", ""), "tab"
+    if relocate:
+        # NATIVE RELOCATION — safe whether or not an agent is live on the surface. cmux 0.64.18+ heals the
+        # moved surface's agent-status registration, so no live-agent refusal, no archive, no revive, no
+        # fresh surface. The surface UUID is preserved, so the agent keeps its pid, session and context.
+        # Suppress the spurious archive: a cross-workspace move emits surface.closed (root cause #3), which
+        # the router would otherwise read as an accidental external close and archive the still-live member.
+        fs.expected_close_put(surf)
+        if a.to_workspace:
+            cmuxq("move-surface", "--surface", surf, "--workspace", target_uuid, "--focus", "false")
+        else:
+            cmuxq("move-tab-to-new-workspace", "--surface", surf, "--title", a.name or a.label,
+                  "--focus", "false")
+
+        # CONFIRM the surface's actual landing from TREE ground truth (never trust the frozen hook-store
+        # workspaceId). FRESH read (ttl=0): the default 2s memo would confirm against a STALE pre-move tree
+        # (the load-bearing correctness point).
+        new_ws = rs.workspace(surf, ws_map=rs.surface_ws_map(ttl=0))
+        if not new_ws:
+            sys.exit(f"[fleet] move: after the move, surface {surf[:8]} could not be located in any "
+                     f"workspace -- NOT touching the registry. Inspect: cmux tree --all. (The expected-close "
+                     f"tombstone will lapse; if the surface is truly gone, `fleet register`/`revive`.)")
+
+        # POST-MOVE VERIFY — `cmuxq` DISCARDS the return code, so a failed move-surface /
+        # move-tab-to-new-workspace reads as success. Assert the surface actually landed where we asked
+        # BEFORE rewriting the registry to claim it did: a false "rehomed" is how a move silently split-brains.
+        if a.to_workspace and new_ws.upper() != target_uuid.upper():
+            sys.exit(f"[fleet] move: move-surface did NOT take — {a.label} is in {new_ws[:8]}, not the "
+                     f"target {target_uuid[:8]}. NOT touching the registry (no false 'rehomed'). "
+                     f"Inspect: cmux tree --all.")
+        if a.own_workspace and new_ws.upper() == cur_ws.upper():
+            sys.exit(f"[fleet] move: --own-workspace did NOT relocate {a.label} — it is still in "
+                     f"{cur_ws[:8]} (move-tab-to-new-workspace reused the same workspace, not a fresh one). "
+                     f"NOT touching the registry. Inspect: cmux tree --all.")
     else:
-        cmuxq("move-tab-to-new-workspace", "--surface", surf, "--title", a.name or a.label,
-              "--focus", "false")
-        new_group, new_place = "", "workspace"
-        # re-group the FRESH workspace into the (new) parent conductor's group — `workspace-group add` is
-        # surface-preserving, NOT a surface move. This is the native regroup that repairs the split-brain
-        # the old archive-revive path caused (cf-conductor, 2026-07-15).
-        gname = parent_entry.get("group") or child.get("group") or ""
-        gref = _group_ref(gname) if gname else ""
-        new_ws_early = current_ws_for_surface(surf)
-        if gref and new_ws_early:
-            cmuxq("workspace-group", "add", "--group", gref, "--workspace", new_ws_early)  # surface-preserving
+        new_ws = cur_ws                                       # same-ws PURE REPARENT: the surface never moved
+
+    # group + place follow the (possibly new) parent. The relocation kind decides placement, and a group the
+    # parent owns is (re)joined surface-preserving via `workspace-group add` — the native regroup that repairs
+    # the split-brain the old archive-revive path caused (cf-conductor, 2026-07-15).
+    gname = parent_entry.get("group") or child.get("group") or ""
+    gref = _group_ref(gname) if gname else ""
+    if a.own_workspace:
+        new_place, new_group = "workspace", ""
+        if gref and new_ws:                                  # the FRESH workspace is in no group yet -> join it
+            cmuxq("workspace-group", "add", "--group", gref, "--workspace", new_ws)   # surface-preserving
+            new_group = gname
+    elif relocate:                                           # cross-ws --to-workspace: joined the target as a tab
+        # the target workspace carries its own visual group; the fleet group field follows the new parent.
+        new_place, new_group = "tab", gname
+    else:                                                    # same-ws PURE REPARENT: keep the placement, follow the group
+        new_place, new_group = child.get("place", "tab"), child.get("group", "")
+        if gref and new_ws and gname != child.get("group"):  # pull the current ws into the new parent's group
+            cmuxq("workspace-group", "add", "--group", gref, "--workspace", new_ws)   # surface-preserving
             new_group = gname
 
-    # 3. reconcile the registry from TREE ground truth (root cause #3: never trust the frozen hook-store
-    #    workspaceId). A registry UPDATE — parent + group + workspace set TOGETHER (the split-brain fix),
-    #    every other field preserved (via {**child}) — never a teardown.
-    new_ws = current_ws_for_surface(surf)
-    if not new_ws:
-        sys.exit(f"[fleet] move: after the move, surface {surf[:8]} could not be located in any workspace "
-                 f"-- NOT touching the registry. Inspect: cmux tree --all. (The expected-close tombstone "
-                 f"will lapse; if the surface is truly gone, `fleet register`/`revive` to recover.)")
+    # a registry UPDATE — parent + group + workspace set TOGETHER (the split-brain fix), every other field
+    # preserved (via {**child}) — never a teardown.
     rehomed = new_parent != child.get("parent")
     fs.live_put(a.label, {**child, "parent": new_parent, "workspace": new_ws, "place": new_place,
                           "group": new_group})
     fs.log_event("moved", label=a.label, role=child.get("role"), session=child.get("session"),
                  via="fleet-move-native", parent=new_parent)
-    print(f"[fleet] moved {a.label}: surface {surf[:8]} {cur_ws[:8]} -> {new_ws[:8]}"
-          + (f" (rehomed under {new_parent})" if rehomed else "")
-          + (f" (group '{new_group}')" if new_group else "")
-          + "; relocated natively — pid/session/context/agent-status registration intact.")
+    if relocate:
+        print(f"[fleet] moved {a.label}: surface {surf[:8]} {cur_ws[:8]} -> {new_ws[:8]}"
+              + (f" (rehomed under {new_parent})" if rehomed else "")
+              + (f" (group '{new_group}')" if new_group else "")
+              + "; relocated natively — pid/session/context/agent-status registration intact.")
+    else:
+        print(f"[fleet] move {a.label}: stayed in workspace {cur_ws[:8]} (pure reparent)"
+              + (f"; rehomed under {new_parent}" if rehomed else "; parent unchanged")
+              + (f", group '{new_group}'" if new_group else "")
+              + ".")
     return 0
 
 
@@ -4114,7 +4218,7 @@ def cmd_reap_surfaces(argv):
         if u in member_surf:
             buckets["tracked"].append({"surface": surf, "label": member_surf[u], "title": title})
             continue
-        if fs.surface_has_live_agent(surf):               # codex-aware: union hook store + live pid is the authority
+        if rs.surface_has_live_agent(surf):               # codex-aware: union hook store + live pid is the authority
             buckets["live-agent"].append({"surface": surf, "note": "live agent (pid)", "title": title})
             continue
         pane = cmuxq("capture-pane", "--surface", surf) or ""
@@ -4268,35 +4372,30 @@ def _quiet_gate(surf, timeout, force):
     return False
 
 
-def _latest_handover(abs_cwd):
-    """Newest handover/*.md under the agent's cwd (the cmux-handover convention), or '' if none."""
+def _latest_handover(abs_cwd, label=None):
+    """Newest handover under the agent's `handover/` dir, or '' if none. LABEL-KEYED discovery (Ship 5d):
+    when `label` is given, prefer this agent's OWN handovers — `handover/<label>-*.md`, newest by mtime —
+    and only fall back to the legacy `handover/*.md` (any prefix) when none carry the label. That keeps
+    the transition resolving while emitters move onto the label prefix, and stops a co-located agent's
+    handover (shared home) from being mistaken for this one's once the prefix is in use."""
     hd = os.path.join(abs_cwd, "handover")
     try:
         files = [os.path.join(hd, f) for f in os.listdir(hd) if f.endswith(".md")]
     except OSError:
         return ""
-    return max(files, key=os.path.getmtime) if files else ""
-
-
-def _live_bound_sid(surf):
-    """The sessionId of the freshest hook-store record on `surf` whose pid is ALIVE, or ''. THE live-pid
-    truth for 'which session is actually running on this seat right now'. poll_session's sessions[]
-    fallback returns the FIRST record that matches the surface — dict insertion order, i.e. usually the
-    OLD lingering entry cmux never drops post-respawn — so a confirm built on it can stare at a dead
-    ghost forever while the real fresh agent sits unconfirmed (the 2026-07-09 berg-sandbox recycle
-    misdetect: four recycles in a row 'no fresh session bound' with a live claude on the seat). A dead
-    pid cannot host a TUI, so filtering to live pids and taking the freshest is the record that IS the
-    running agent.
-    Canonical body: resolve.live_sid (step 1 of the v2 migration); this name stays as the recycle
-    confirm's call-site seam until step 3."""
-    from . import resolve as rs
-    return rs.live_sid(surf)
+    if not files:
+        return ""
+    if label:
+        owned = [f for f in files if os.path.basename(f).startswith(f"{label}-")]
+        if owned:
+            return max(owned, key=os.path.getmtime)
+    return max(files, key=os.path.getmtime)          # legacy fallback: newest handover of any prefix
 
 
 def _poll_session_back(surf, old_sid, mode, timeout=90):
     """Confirm the recycled agent re-bound a session to `surf`. respawn-pane fully REMOVES the old
     session entry from cmux's hook store (session-end), then the relaunch re-creates it:
-      FRESH  -> confirm on the LIVE-PID truth (_live_bound_sid): the freshest record on the surface
+      FRESH  -> confirm on the LIVE-PID truth (rs.live_sid): the freshest record on the surface
                 with an ALIVE pid is the running agent, whatever sid cmux assigned it. This replaced
                 the old sid-exclusion-vs-{old_sid, pre_sid} confirm, which rode poll_session's
                 arbitrary-first-record fallback and could stare at the dead lingering ghost forever
@@ -4318,7 +4417,7 @@ def _poll_session_back(surf, old_sid, mode, timeout=90):
     end = time.time() + timeout
     while time.time() < end:
         if mode == "fresh":
-            sid = _live_bound_sid(surf)
+            sid = rs.live_sid(surf)
             if sid and sid != old_sid:
                 return sid
         else:
@@ -4357,16 +4456,6 @@ def _binding_argv(command):
     while argv and not argv[0].startswith("-"):               # drop binary + subcommand + positional id
         argv.pop(0)
     return argv
-
-
-def _conductor_of(label):
-    """The LABEL of the agent this one reports to, from the registry (live, else archived). The registry is
-    the authority on parentage, so a recycle/revive re-derives $AGENT_CONDUCTOR instead of trusting a
-    captured binding's env — which is exactly how a restarted child would otherwise lose track of its
-    conductor. '' when unknown (an orphan, or a row that predates this)."""
-    from . import state as fs
-    e = fs.live_get(label) or fs.archive_get(label) or {}
-    return e.get("parent") or ""
 
 
 def _prepend_resume(args, tool, sid):
@@ -4408,8 +4497,9 @@ def _replay_binding_argv(argv, tool, role, label, cwd, caller_tokens, add_plugin
     base = _prepend_resume(base, tool, resume_session)           # claude --resume flag | codex resume subcmd
     # profile-pin a recycled/revived child too (bindings capture null env -> re-inject the build env)
     env = {**_profile_env(), "AGENT_ROLE": role, "AGENT_LABEL": label}
-    if _conductor_of(label):
-        env["AGENT_CONDUCTOR"] = _conductor_of(label)            # survives a recycle: parentage is in the registry
+    # No AGENT_CONDUCTOR (Ship 5d): parentage is derived from the registry at use-time, not carried in env —
+    # a captured binding's env goes stale across a recycle, the registry `parent` never does. Routing +
+    # `fleet peer-msg --to-parent` read it live.
     # ACCOUNT re-resolution (fix 1): a captured binding drops the account env (its own docstring: env is NOT
     # recoverable), so re-inject the re-resolved account env/args here — this is exactly why an ad-hoc
     # recycle used to revert to the ambient credential. render carries raw_env (spawn-time secret channel).
@@ -4498,7 +4588,7 @@ def _compose_from_registry(label, entry, caller_tokens, add_plugins, resume_sess
             "flags": _layer_tokens([list(entry.get("flags", [])), list(caller_tokens or [])]),
             "env": {}, "settings": entry.get("settings", "")}
     codex_home = (provider.get("env") or {}).get("CODEX_HOME") if provider else None
-    bin_name, args, env = adapter_compile(tool, spec, [], codex_home=codex_home, conductor=_conductor_of(label))
+    bin_name, args, env = adapter_compile(tool, spec, [], codex_home=codex_home)
     args = _prepend_resume(args, tool, resume_session)           # claude --resume flag | codex resume subcmd
     env, args, raw_env = _apply_provider(env, args, provider)
     return render_send_cmd(bin_name, args, env, abs_cwd, raw_env)
@@ -4530,8 +4620,7 @@ def _compose_from_roster(role, tool, label, caller_tokens, add_plugins, resume_s
     # thread the re-resolved codex home into adapter_compile so a codex seat's cruft-stripping flags are
     # enumerated from THAT home (same reason cmd_launch passes codex_home; a mismatch breaks codex start).
     codex_home = (provider.get("env") or {}).get("CODEX_HOME") if provider else None
-    bin_name, args, env = adapter_compile(tool, spec, caller_tokens, codex_home=codex_home,
-                                          conductor=_conductor_of(label))
+    bin_name, args, env = adapter_compile(tool, spec, caller_tokens, codex_home=codex_home)
     args = _prepend_resume(args, tool, resume_session)
     env, args, raw_env = _apply_provider(env, args, provider)    # fix 1: inject the re-resolved account env
     return render_send_cmd(bin_name, args, env, abs_cwd, raw_env)
@@ -4709,7 +4798,7 @@ def _recycle_plan(label, entry, caller, add_plugin, mode, session, force, prime_
         elif mode == "fresh":
             abs_cwd = entry.get("cwd", "")
             abs_cwd = abs_cwd if os.path.isabs(abs_cwd) else os.path.join(ROOT, abs_cwd)
-            ho = _latest_handover(abs_cwd)
+            ho = _latest_handover(abs_cwd, label)
             prime = (f"You were just recycled into a FRESH session (same identity: label '{label}', "
                      f"role '{entry.get('role')}', same surface). Re-orient from your latest handover"
                      + (f" at {ho}" if ho else " under ./handover/")
@@ -5228,7 +5317,7 @@ def _recycle_exec_one(p):
             return 1
         log("confirmed after direct-kill fallback")
     # (The old pre_sid snapshot + fresh-mode sid-exclusion lived here. Retired: the fresh confirm is now
-    # LIVE-PID-resolved (_live_bound_sid via _poll_session_back), so cmux's undropped stale sessions[]
+    # LIVE-PID-resolved (rs.live_sid via _poll_session_back), so cmux's undropped stale sessions[]
     # entry — a DEAD pid by this point, the respawn was just verified — can never false-confirm, and no
     # exclusion set is needed.)
     if _exec_launch_enabled():
@@ -5913,14 +6002,15 @@ VERB_USAGE = {
     "codex-login": "  codex-login [acct] [--timeout N] [--verify-only]  log codex SEATS into their OWN homes (each seat needs one: the backend keys a session per device, and the device id is per-home). NO acct = cycle every seat, SKIPPING any that already verify (a login supersedes, so re-logging a working seat breaks it). Opens a terminal tab with the login typed, waits, then VERIFIES with a backend 200 + the model actually speaking, and reports the account it really got",
     "find": "  find <query> [--turns N] [--json]                 content-aware session lookup (label/role/cwd or transcript)",
     "graph": "  graph [--scope mine|all|<label>] [--json] [--html] [--out FILE]  fleet parentage tree (text/JSON/HTML); default mine = your subtree; --scope all = full tree",
+    "groups": "  groups [--json]                                   the fleet's groups BY LABEL — members per cmux's REAL membership (not the stored `group` field); flags registry-vs-cmux divergence (ghost/unfiled)",
     "serve": "  serve [--port N]                                  thin read-only localhost view (graph HTML + vitals.json); no daemon",
     "paint": "  paint [--sidebar]                                 sync fleet state onto the cmux sidebar (status pills + ctx bars; --sidebar also feeds fleet.swift)",
     "worktree": "  worktree <ls | clean <label> [--wip-commit]>      manage fleet-owned git worktrees (config-gated, default-off)",
     "profile": "  profile <name> [--base DIR] [--root DIR] [--init]  emit env that pins ALL entrypoints at THIS build (eval it for multi-build isolation)",
     "daemon": "  daemon <start|stop|status|restart> [--foreground] [--heartbeat [SECS]]  run the router as a detached daemon (survives shell exit + recycle); start --foreground for launchd",
     "drive-child": "  drive-child <surface-uuid> <prompt...>            submit a prompt to a child's TUI (beats the paste-settle enter-race)",
-    "peer-msg": "  peer-msg <to-label> \"<body>\" [--no-reply] [--reply-to <id>] [--expect-reply] [--no-wake]\n"
-                "                                                    input-safe A2A: message a live PEER conductor (into its context, never its input box)",
+    "peer-msg": "  peer-msg <to-label>|--to-parent \"<body>\" [--no-reply] [--reply-to <id>] [--expect-reply] [--no-wake]\n"
+                "                                                    input-safe A2A: message a live PEER by label (or --to-parent: your registry-resolved conductor), into its context never its input box",
     "child-digest": "  child-digest <session-frag> [N]                   print a child's last N transcript turns (the reliable content source)",
     "inbox": "  inbox [--scope mine|<label>|all|conductors|children] [--json]  pending inbox on demand (default mine = yours; <label> peeks one; all = triage) — the catch-up read after a recycle",
     "inbox-ack": "  inbox-ack <seq> [--peer|--stale|--doctor] [--surface UUID]  mark shown completions/alerts/peer msgs handled so they stop re-surfacing",
@@ -6005,6 +6095,7 @@ def verb_table():
             "mute": lambda a: cmd_mute(a, mute=True), "unmute": lambda a: cmd_mute(a, mute=False),
             "rm": cmd_rm, "worktree": cmd_worktree, "profile": cmd_profile, "daemon": fd.cmd_daemon,
             "vitals": ff.cmd_vitals, "usage": ff.cmd_usage, "find": ff.cmd_find, "graph": ff.cmd_graph,
+            "groups": ff.cmd_groups,
             "conformance": cf.cmd_conformance, "_conformance-exec": cf.cmd_conformance_exec,
             "codex-setup": cmd_codex_setup,
             "codex-login": cmd_codex_login,

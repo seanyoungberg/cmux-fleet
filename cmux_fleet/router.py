@@ -33,9 +33,16 @@ HEALTH_STAMP_THROTTLE_S = 5.0                           # cap health writes to <
 _lock_fd = None   # module-global so the flock survives for the whole process (closing the fd drops it)
 _health = {"ts": 0.0, "frames": 0}   # router.health write-throttle + a rough consumed-frame counter
 
-# registry cache + a materialized surface->entry index (the live store is label-keyed; the router
-# needs surface->entry on each Stop, so build the inverse once per reload — critic issue #6).
-_reg = {"mtime": 0, "by_label": {}, "by_surface": {}}
+# A materialized surface->entry index (the live store is label-keyed; the router needs surface->entry on
+# each Stop, so build the inverse — critic issue #6). Rebuilt from a FRESH live read on EVERY call: there
+# is deliberately NO mtime cache (Ship 5b). The old 1s-granularity mtime gate was the ROOT the expected-
+# close tombstone existed to paper over — a just-written `live_del` could be invisible to the router until
+# the cached mtime advanced, so a deliberate rm/archive/move still resolved to a "live" member and
+# _archive_closed_surface mis-fired a duplicate archive + a spurious `kind='stale'` alert. A fresh read
+# per event sees the removal the instant the CLI writes it, which (with registry-before-close write order)
+# makes the tombstone redundant. The read is one small JSON parse of ~a dozen rows — negligible per frame.
+_reg_seen = {"sig": None}   # last-LOGGED membership signature — a log-dedup only (NOT a read cache): keeps
+                            # the bus log quiet across the now-per-event reload, nothing gates a read on it.
 _last = {}   # surface -> last-handled event ts (debounce the ~2 Stops/turn)
 
 # Event-driven idle-wake retry (design 2.2b): when an idle-wake is skipped because the parent was
@@ -126,18 +133,18 @@ def log(m):
 
 
 def registry():
-    try:
-        m = os.path.getmtime(fs.LIVE)
-    except OSError:
-        return _reg
-    if m != _reg["mtime"]:
-        data = fs.live_all()
-        _reg["by_label"] = data
-        _reg["by_surface"] = {v.get("surface"): {**v, "label": lbl} for lbl, v in data.items()}
-        _reg["mtime"] = m
+    """Fresh surface->entry index, rebuilt from a live read on EVERY call — no mtime cache (see the
+    _reg_seen note above for why: the stale cache was the tombstone's whole reason to exist). Logs only
+    when the live membership actually changes, so per-event reloads don't spam the bus log."""
+    data = fs.live_all()
+    reg = {"by_label": data,
+           "by_surface": {v.get("surface"): {**v, "label": lbl} for lbl, v in data.items()}}
+    sig = tuple(sorted((lbl, v.get("kind")) for lbl, v in data.items()))
+    if sig != _reg_seen["sig"]:
+        _reg_seen["sig"] = sig
         log(f"[registry] {len(data)} live member(s): "
             + ", ".join(f"{lbl}({v.get('kind')})" for lbl, v in data.items()))
-    return _reg
+    return reg
 
 
 # --- cmux hook store reads (truth) ---------------------------------------------------------
@@ -145,17 +152,10 @@ def store():
     return fs.read_hook_store()                              # union of all per-agent stores (tool-agnostic)
 
 
-def _rec_by_session(st, uuid):
-    for s in (st.get("sessions") or {}).values():
-        if s.get("sessionId") == uuid:
-            return s
-    return {}
-
-
 def _member_by_session(sid_bare, ev_tool=""):
     """Registry-truth fallback for a Stop whose hook-store `sessions{}` record has vanished or desynced
     (root cause #3: a running child whose surface was MOVED across workspaces loses its live session
-    record, leaving only a frozen `activeSessionsBySurface` pointer — so `_rec_by_session` finds no
+    record, leaving only a frozen `activeSessionsBySurface` pointer — so `rs.record_by_session` finds no
     surface). Recover the member straight from the fleet registry by matching the bus session id to a
     LIVE member's registered `session`. TOOL-AWARE when the bus tool is known (never bind a codex id onto
     a claude agent); FAIL-OPEN to a uuid-only match when the bus id is bare. Returns the entry with its
@@ -174,13 +174,13 @@ def _member_by_session(sid_bare, ev_tool=""):
 def surface_of(st, sid_raw):
     # the bus event's session_id is tool-prefixed (claude-<uuid> / codex-<uuid>); the store keys on
     # the bare uuid. bare_uuid strips ANY tool prefix so codex Stops map to a surface like claude's do.
-    return _rec_by_session(st, fs.bare_uuid(sid_raw)).get("surfaceId", "")
+    return rs.record_by_session(fs.bare_uuid(sid_raw), st).get("surfaceId", "")
 
 
 def transcript_of(st, surface):
     cur = ((st.get("activeSessionsBySurface") or {}).get(surface) or {}).get("sessionId", "")
     if cur:
-        r = _rec_by_session(st, cur)
+        r = rs.record_by_session(cur, st)
         if r:
             return r.get("transcriptPath", "")
     for s in (st.get("sessions") or {}).values():
@@ -210,7 +210,7 @@ def maybe_idle_wake(parent_surface, label):
     if fs.wake_if_idle(parent_surface, "(auto-wake) handle your pending fleet inbox items"):
         fs.presented_mark(parent_surface, pending, "wake")   # cooldown: the heartbeat won't re-nudge these
         log(f"[IDLE-WAKE] {label}: empty prompt -> submitted wake trigger")
-    elif fs.surface_busy(parent_surface):               # skip-on-RUNNING -> parent goes idle soon -> retry
+    elif rs.surface_busy(parent_surface):               # skip-on-RUNNING -> parent goes idle soon -> retry
         log(f"[idle-wake] skip {label}: mid-turn -> scheduling bounded retry")
         _schedule_idle_wake_retry(parent_surface, label)
     else:                                               # draft / no clean prompt -> heartbeat is the backstop
@@ -243,7 +243,7 @@ def _idle_wake_retry_loop(surface, label):
                 fs.presented_mark(surface, pending, "wake")
                 log(f"[idle-wake-retry] {label}: woke after ~{delay}s backoff")
                 return
-            if not fs.surface_busy(surface):            # turn ended but still not wakeable (draft/no prompt)
+            if not rs.surface_busy(surface):            # turn ended but still not wakeable (draft/no prompt)
                 log(f"[idle-wake-retry] {label}: parent idle but not wakeable (draft/no clean prompt) "
                     f"-> heartbeat backstop")
                 return
@@ -437,22 +437,17 @@ def _archive_closed_surface(ev):
     # LEAVES a workspace -- including a cross-workspace MOVE, where the surface still EXISTS in its new
     # workspace. Archiving here would EVICT a live child (three moved children auto-archived that day).
     # POSITIVELY confirm against the live tree: if the surface resolves to a workspace it MOVED, not
-    # closed -> never archive, never alert (nothing is wrong). Reconcile the registry `workspace` to
-    # where it lives NOW so ls/graph stay honest even for a RAW `cmux move` (no `fleet move`); the
-    # completion lane already self-recovers via _member_by_session, so `workspace` is the last stale
-    # field. Fails CLOSED (ws_now == '' on an unreadable tree) so a genuine external close still archives.
+    # closed -> never archive, never alert (nothing is wrong). Ship 5b RETIRED the workspace-reconcile that
+    # used to run here: `workspace` is a DERIVED field now (resolve.py reads the live tree), so there is
+    # nothing stored to bring up to date -- ls/graph/routing already read the agent's true workspace from
+    # cmux, and the completion lane self-recovers via _member_by_session. (Post-migrate the reconcile also
+    # went inert: `clean.get("workspace")` is always None, so `moved` was always True -> a redundant live_put
+    # + a misleading "reconciled" log on every move event.) Fails CLOSED (ws_now == '' on an unreadable
+    # tree) so a genuine external close still archives.
     ws_now = _surface_ws_now(surface)
     if ws_now:
-        clean = registry()["by_label"].get(label)
-        moved = bool(clean and clean.get("workspace") != ws_now)
-        if LIVE and moved:
-            fs.live_put(label, {**clean, "workspace": ws_now})
-            fs.log_event("moved", label=label, role=entry.get("role"), session=entry.get("session"),
-                         via="surface-move")
         log(f"[move] {label}: surface {surface[:8]} still present in workspace {ws_now[:8]} "
-            f"(MOVED, not closed); no archive"
-            + ("; reconciled registry workspace" if (LIVE and moved) else "")
-            + ("; (observe) would reconcile workspace" if (not LIVE and moved) else ""))
+            f"(MOVED, not closed); no archive")
         return
     if not LIVE:
         log(f"[stale] (observe) would archive {label}: surface {surface[:8]} closed outside fleet CLI")
@@ -774,12 +769,12 @@ def handle(ev):
     st = store()
     raw_sid = p.get("session_id") or ""
     sid_bare = fs.bare_uuid(raw_sid)
-    surface = _rec_by_session(st, sid_bare).get("surfaceId", "")
+    surface = rs.record_by_session(sid_bare, st).get("surfaceId", "")
     entry = registry()["by_surface"].get(surface) if surface else None
     if not entry:
         # ROOT CAUSE #3 (moved/desynced child): the hook store's `sessions{}` record for this Stop is
         # missing — a running child whose surface was MOVED across workspaces loses its live session
-        # record, leaving only a frozen `activeSessionsBySurface` pointer, so `_rec_by_session` resolves
+        # record, leaving only a frozen `activeSessionsBySurface` pointer, so `rs.record_by_session` resolves
         # NO surface. Do NOT drop the Stop (silent completion loss = the parent stalls, never woken).
         # Recover the member from fleet-REGISTRY truth by matching the bus session id, then fall through
         # to the normal queue+notify+wake path. The gist may be thin/empty because the cmux session

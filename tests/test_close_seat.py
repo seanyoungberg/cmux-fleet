@@ -280,7 +280,7 @@ def test_close_seat_refuses_the_callers_own_workspace(fs, cmux, monkeypatch):
     assert any("did NOT close" in n for n in notes)
 
 
-def test_close_seat_refuses_a_workspace_holding_an_untracked_live_agent(fs, cmux, monkeypatch):
+def test_close_seat_refuses_a_workspace_holding_an_untracked_live_agent(fs, rs, cmux, monkeypatch):
     """Guard 2b through the REAL `ps axeww` parse. The conductor's row has been archived (no label), but
     its claude is alive and self-referential (CMUX_CLAUDE_PID == own pid). The tab child's retirement must
     not close the workspace out from under it.
@@ -353,7 +353,7 @@ def test_close_seat_refuses_the_close_when_the_reanchor_does_not_take(fs, cmux):
     assert cmux.groups["groups"][0]["anchor_workspace_ref"] == R_COND      # group intact
 
 
-def test_close_seat_of_a_modelb_conductor_member_never_touches_the_empty_anchor(fs, monkeypatch):
+def test_close_seat_of_a_modelb_conductor_member_never_touches_the_empty_anchor(fs, rs, monkeypatch):
     """Model B live-group NO-DISTURB: the anchor is an EMPTY scaffold and the conductor is an ordinary
     MEMBER. Archiving the conductor closes ONLY its member workspace -- no re-anchor, no mint, the empty
     anchor and the group are left exactly as they were. This is the guarantee for the live groups already
@@ -413,11 +413,11 @@ def test_archive_closes_the_workspace_and_still_writes_a_revivable_row(fs, cmux,
     assert "closed workspace" in capsys.readouterr().out
 
 
-def test_rm_closes_the_workspace_of_a_workspace_placed_agent(fs, cmux, monkeypatch):
+def test_rm_closes_the_workspace_of_a_workspace_placed_agent(fs, rs, cmux, monkeypatch):
     monkeypatch.setattr(fleet, "_stop_agent_for_close", lambda *a: (True, ""))
     monkeypatch.setattr(fleet, "_resume_binding", lambda s: {})
-    monkeypatch.setattr(fs, "lifecycle", lambda s: "idle")
-    monkeypatch.setattr(fs, "surface_has_live_pid", lambda s: False)
+    monkeypatch.setattr(rs, "lifecycle", lambda s: "idle")
+    monkeypatch.setattr(rs, "surface_has_live_pid", lambda s: False)
     _seed(fs, "cond", S_COND, place="workspace", parent="")
     _seed(fs, "graph-view", S_GRAPH, place="workspace", parent="cond")
     assert fleet.cmd_rm(["graph-view"]) == 0
@@ -425,11 +425,11 @@ def test_rm_closes_the_workspace_of_a_workspace_placed_agent(fs, cmux, monkeypat
     assert fs.archive_get("graph-view") is not None                  # revivable
 
 
-def test_rm_of_a_tab_child_never_closes_the_conductors_workspace(fs, cmux, monkeypatch):
+def test_rm_of_a_tab_child_never_closes_the_conductors_workspace(fs, rs, cmux, monkeypatch):
     monkeypatch.setattr(fleet, "_stop_agent_for_close", lambda *a: (True, ""))
     monkeypatch.setattr(fleet, "_resume_binding", lambda s: {})
-    monkeypatch.setattr(fs, "lifecycle", lambda s: "idle")
-    monkeypatch.setattr(fs, "surface_has_live_pid", lambda s: False)
+    monkeypatch.setattr(rs, "lifecycle", lambda s: "idle")
+    monkeypatch.setattr(rs, "surface_has_live_pid", lambda s: False)
     _seed(fs, "cond", S_COND, place="workspace", parent="")
     _seed(fs, "tab-child", S_TAB, place="tab", parent="cond")
     assert fleet.cmd_rm(["tab-child"]) == 0
@@ -508,14 +508,14 @@ def test_archive_writes_the_registry_row_before_the_cmux_close(fs, cmux, monkeyp
 # success -- the close must be verified against a fresh TREE, and disagreement must be an error.
 # With [defaults] place = "workspace" now the norm, this was every agent, every teardown.
 
-def test_rm_never_reports_a_close_it_did_not_perform(fs, cmux, monkeypatch, capsys):
+def test_rm_never_reports_a_close_it_did_not_perform(fs, rs, cmux, monkeypatch, capsys):
     """The placeprobe repro. A guard downgrades the workspace-placed agent to close-surface; its surface
     is the workspace's only one, so cmux refuses. rm must NOT say "removed ... closed"."""
     monkeypatch.setenv("CMUX_SURFACE_ID", S_GRAPH)        # caller-workspace guard -> downgrade
     monkeypatch.setattr(fleet, "_stop_agent_for_close", lambda *a: (True, ""))
     monkeypatch.setattr(fleet, "_resume_binding", lambda s: {})
-    monkeypatch.setattr(fs, "lifecycle", lambda s: "idle")
-    monkeypatch.setattr(fs, "surface_has_live_pid", lambda s: False)
+    monkeypatch.setattr(rs, "lifecycle", lambda s: "idle")
+    monkeypatch.setattr(rs, "surface_has_live_pid", lambda s: False)
     _seed(fs, "graph-view", S_GRAPH, place="workspace", parent="cond")
     rc = fleet.cmd_rm(["graph-view"])
     out = capsys.readouterr().out

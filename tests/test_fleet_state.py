@@ -254,41 +254,41 @@ def _fake_cmux(screen, sink):
     return f
 
 
-def test_surface_busy_fresh_running_is_busy(fs, monkeypatch):
+def test_surface_busy_fresh_running_is_busy(fs, rs, monkeypatch):
     monkeypatch.setattr(fs, "read_hook_store", lambda: _store(_rec("S", "u1", "running", age_s=1)))
-    assert fs.surface_busy("S") is True
+    assert rs.surface_busy("S") is True
 
 
-def test_surface_has_live_agent_predicate(fs, monkeypatch):
+def test_surface_has_live_agent_predicate(fs, rs, monkeypatch):
     # the shared 'is this seat genuinely live?' authority behind ls STALE, bulk stale-skip, launch's
     # overwrite-guard, worktree-clean's refuse, and recycle's re-bind poll: non-terminal lifecycle AND a
     # live pid. All four sites read a dead-pid ghost as gone BECAUSE they route through this one predicate.
     monkeypatch.setattr(fs, "read_hook_store", lambda: _store(_rec("S", "u1", "running", age_s=1)))
-    assert fs.surface_has_live_agent("S") is True             # non-terminal + live pid -> genuinely live
+    assert rs.surface_has_live_agent("S") is True             # non-terminal + live pid -> genuinely live
     monkeypatch.setattr(fs, "read_hook_store", lambda: _store(_rec("S", "u1", "running", age_s=1, pid=None)))
-    assert fs.surface_has_live_agent("S") is False            # frozen 'running' on a DEAD pid -> gone (brick)
+    assert rs.surface_has_live_agent("S") is False            # frozen 'running' on a DEAD pid -> gone (brick)
     monkeypatch.setattr(fs, "read_hook_store", lambda: _store(_rec("S", "u1", "idle", age_s=1, pid=None)))
-    assert fs.surface_has_live_agent("S") is False            # frozen 'idle' on a dead pid -> gone too
+    assert rs.surface_has_live_agent("S") is False            # frozen 'idle' on a dead pid -> gone too
     monkeypatch.setattr(fs, "read_hook_store", lambda: _store(_rec("S", "u1", "ended", age_s=1)))
-    assert fs.surface_has_live_agent("S") is False            # terminal string (live pid mid-drop) -> gone
+    assert rs.surface_has_live_agent("S") is False            # terminal string (live pid mid-drop) -> gone
     monkeypatch.setattr(fs, "read_hook_store", lambda: _store())
-    assert fs.surface_has_live_agent("S") is False            # nothing on the surface -> gone
+    assert rs.surface_has_live_agent("S") is False            # nothing on the surface -> gone
 
 
-def test_surface_busy_dead_pid_running_not_busy(fs, monkeypatch):
+def test_surface_busy_dead_pid_running_not_busy(fs, rs, monkeypatch):
     # pid-aware wake gate (round 2, 2026-07-06): a FRESH 'running' record (age 1, well within the
     # staleness window) but on a DEAD pid is the SessionEnd-less brick, NOT a live turn -- must read
     # not-busy so the gate can still wake the (dead/idle) seat instead of being silenced by the frozen
     # string. The staleness guard alone would NOT catch this (the record is fresh); the pid does.
     monkeypatch.setattr(fs, "read_hook_store", lambda: _store(_rec("S", "u1", "running", age_s=1, pid=None)))
-    assert fs.surface_busy("S") is False
+    assert rs.surface_busy("S") is False
 
 
-def test_surface_busy_stale_running_not_busy(fs, monkeypatch):
+def test_surface_busy_stale_running_not_busy(fs, rs, monkeypatch):
     # a 'running' record frozen well past the staleness window is an orphan, not a live turn.
     monkeypatch.setattr(fs, "read_hook_store",
                         lambda: _store(_rec("S", "u1", "running", age_s=fs.LIFECYCLE_STALE_S + 120)))
-    assert fs.surface_busy("S") is False
+    assert rs.surface_busy("S") is False
 
 
 # real-UUID session ids: the fleet stores the tool-prefixed form ("claude-<uuid>"), the hook store
@@ -297,7 +297,7 @@ _BOUND = "11111111-1111-1111-1111-111111111111"
 _ORPHAN = "22222222-2222-2222-2222-222222222222"
 
 
-def test_surface_busy_prefers_bound_session_over_max_updatedat(fs, monkeypatch):
+def test_surface_busy_prefers_bound_session_over_max_updatedat(fs, rs, monkeypatch):
     # the cmux-advisor shape: a FRESH orphaned 'running' record (wrong session) alongside the fleet's
     # actual bound session sitting 'idle'. max-updatedAt would pick the orphan -> 'busy' (the stall);
     # the bound-session cross-check picks the real session -> not busy.
@@ -305,30 +305,30 @@ def test_surface_busy_prefers_bound_session_over_max_updatedat(fs, monkeypatch):
     monkeypatch.setattr(fs, "read_hook_store", lambda: _store(
         _rec("S", _ORPHAN, "running", age_s=1),         # freshest, but NOT the bound session
         _rec("S", _BOUND, "idle", age_s=30)))           # the fleet's bound session, idle
-    assert fs.surface_busy("S") is False
+    assert rs.surface_busy("S") is False
 
 
-def test_surface_busy_bound_session_genuinely_running(fs, monkeypatch):
+def test_surface_busy_bound_session_genuinely_running(fs, rs, monkeypatch):
     # regression: when the BOUND session is itself freshly running, still busy (never interrupt).
     fs.live_put("advisor", {"surface": "S", "session": f"claude-{_BOUND}", "kind": "conductor"})
     monkeypatch.setattr(fs, "read_hook_store", lambda: _store(
         _rec("S", _ORPHAN, "idle", age_s=1),
         _rec("S", _BOUND, "running", age_s=2)))
-    assert fs.surface_busy("S") is True
+    assert rs.surface_busy("S") is True
 
 
-def test_surface_busy_no_records_not_busy(fs, monkeypatch):
+def test_surface_busy_no_records_not_busy(fs, rs, monkeypatch):
     monkeypatch.setattr(fs, "read_hook_store", lambda: _store())
-    assert fs.surface_busy("S") is False
+    assert rs.surface_busy("S") is False
 
 
-def test_surface_busy_idle_not_busy(fs, monkeypatch):
+def test_surface_busy_idle_not_busy(fs, rs, monkeypatch):
     monkeypatch.setattr(fs, "read_hook_store", lambda: _store(_rec("S", "u1", "idle", age_s=1)))
-    assert fs.surface_busy("S") is False
+    assert rs.surface_busy("S") is False
 
 
-def test_wake_if_idle_wakes_on_clean_prompt(fs, monkeypatch):
-    monkeypatch.setattr(fs, "surface_busy", lambda s: False)
+def test_wake_if_idle_wakes_on_clean_prompt(fs, rs, monkeypatch):
+    monkeypatch.setattr(rs, "surface_busy", lambda s: False)
     sink = []
     monkeypatch.setattr(fs, "_cmux", _fake_cmux("some output\n❯ ", sink))
     assert fs.wake_if_idle("S", "wake up") is True
@@ -336,35 +336,35 @@ def test_wake_if_idle_wakes_on_clean_prompt(fs, monkeypatch):
     assert "send" in verbs and "send-key" in verbs           # injected + submitted
 
 
-def test_wake_if_idle_skips_when_busy(fs, monkeypatch):
-    monkeypatch.setattr(fs, "surface_busy", lambda s: True)
+def test_wake_if_idle_skips_when_busy(fs, rs, monkeypatch):
+    monkeypatch.setattr(rs, "surface_busy", lambda s: True)
     sink = []
     monkeypatch.setattr(fs, "_cmux", _fake_cmux("❯ ", sink))
     assert fs.wake_if_idle("S", "wake up") is False
     assert sink == []                                        # tier 1: never even reads/injects
 
 
-def test_wake_if_idle_preserves_human_draft(fs, monkeypatch):
-    monkeypatch.setattr(fs, "surface_busy", lambda s: False)
+def test_wake_if_idle_preserves_human_draft(fs, rs, monkeypatch):
+    monkeypatch.setattr(rs, "surface_busy", lambda s: False)
     sink = []
     monkeypatch.setattr(fs, "_cmux", _fake_cmux("❯ a half-typed thought", sink))
     assert fs.wake_if_idle("S", "wake up") is False
     assert [a for a in sink if a[0] in ("send", "send-key")] == []   # draft not clobbered
 
 
-def test_wake_if_idle_empty_read_skips(fs, monkeypatch):
+def test_wake_if_idle_empty_read_skips(fs, rs, monkeypatch):
     # empty-read path: a bad/stale screen read must NOT wake (retry+heartbeat catch it) and must NOT
     # inject blindly into a pane we cannot see.
-    monkeypatch.setattr(fs, "surface_busy", lambda s: False)
+    monkeypatch.setattr(rs, "surface_busy", lambda s: False)
     sink = []
     monkeypatch.setattr(fs, "_cmux", _fake_cmux("", sink))
     assert fs.wake_if_idle("S", "wake up") is False
     assert [a for a in sink if a[0] in ("send", "send-key")] == []
 
 
-def test_wake_if_idle_garbage_read_skips(fs, monkeypatch):
+def test_wake_if_idle_garbage_read_skips(fs, rs, monkeypatch):
     # garbage read (no compose prompt at all) -> no wake, no injection.
-    monkeypatch.setattr(fs, "surface_busy", lambda s: False)
+    monkeypatch.setattr(rs, "surface_busy", lambda s: False)
     sink = []
     monkeypatch.setattr(fs, "_cmux", _fake_cmux("\x1b[2Jgarbled tool output 42%|", sink))
     assert fs.wake_if_idle("S", "wake up") is False
@@ -393,7 +393,7 @@ def test_genuine_midturn_still_not_woken(fs, monkeypatch):
     assert sink == []
 
 
-def test_surface_busy_survives_summarizer_stomp_shape(fs, monkeypatch):
+def test_surface_busy_survives_summarizer_stomp_shape(fs, rs, monkeypatch):
     # The memsearch summarizer stomp (and any nested-claude Agent subagent) is the SAME class as the
     # reboot-orphan: a NON-live nested session leaves a FRESH 'running' record on the parent's surface,
     # outranking the parent's real (idle) bound session by max-updatedAt. The upstream fix is
@@ -404,7 +404,7 @@ def test_surface_busy_survives_summarizer_stomp_shape(fs, monkeypatch):
     monkeypatch.setattr(fs, "read_hook_store", lambda: _store(
         _rec("S", _ORPHAN, "running", age_s=1),         # the summarizer's fresh nested 'running' stomp
         _rec("S", _BOUND, "idle", age_s=20)))           # the conductor's real bound session, idle
-    assert fs.surface_busy("S") is False                # not fooled -> the wake still fires
+    assert rs.surface_busy("S") is False                # not fooled -> the wake still fires
 
 
 # --- draft-through: tier 3, opt-in clobber-with-log (design 2.3, Phase 4) -------------------------
@@ -421,22 +421,22 @@ def test_draft_through_clobber_and_preserve_are_opt_in(fs):
     assert fs.draft_through() == "preserve"
 
 
-def test_wake_preserves_fresh_draft_by_default(fs, monkeypatch):
+def test_wake_preserves_fresh_draft_by_default(fs, rs, monkeypatch):
     # default 'stale' gate: a FRESH draft (just appeared) is preserved -> protects active typing.
-    monkeypatch.setattr(fs, "surface_busy", lambda s: False)
+    monkeypatch.setattr(rs, "surface_busy", lambda s: False)
     sink = []
     monkeypatch.setattr(fs, "_cmux", _fake_cmux("❯ my half-typed draft", sink))
     assert fs.wake_if_idle("S", "wake") is False
     assert [a for a in sink if a[0] in ("send", "send-key")] == []   # not clobbered while fresh
 
 
-def test_wake_clobbers_stale_draft_by_default(fs, monkeypatch):
+def test_wake_clobbers_stale_draft_by_default(fs, rs, monkeypatch):
     # default 'stale' gate: a WALKED-AWAY draft (unchanged >= DRAFT_STALE_S) is clobbered + woken so it
     # can never silence the surface indefinitely (the codex should-fix acceptance).
     draft = "my half-typed draft"
     with open(fs.DRAFTMARKS, "w") as f:                  # seed the mark: draft has sat unchanged, abandoned
         json.dump({"S": {"text": draft, "since": time.time() - (fs.DRAFT_STALE_S + 30)}}, f)
-    monkeypatch.setattr(fs, "surface_busy", lambda s: False)
+    monkeypatch.setattr(rs, "surface_busy", lambda s: False)
     sink = []
     monkeypatch.setattr(fs, "_cmux", _fake_cmux(f"❯ {draft}", sink))
     assert fs.wake_if_idle("S", "wake") is True
@@ -454,25 +454,25 @@ def test_draft_age_resets_when_draft_changes(fs):
     assert fs._draft_age("S", "abcd", now + 101) == 0.0             # changed -> reset to 0
 
 
-def test_wake_clobbers_any_draft_when_clobber_opt_in(fs, monkeypatch):
+def test_wake_clobbers_any_draft_when_clobber_opt_in(fs, rs, monkeypatch):
     # 'clobber' opt-in -> immediate clobber even for a FRESH draft (no stale wait).
     with open(fs.DRAFTMODE, "w") as f:
         f.write("clobber")
-    monkeypatch.setattr(fs, "surface_busy", lambda s: False)
+    monkeypatch.setattr(rs, "surface_busy", lambda s: False)
     sink = []
     monkeypatch.setattr(fs, "_cmux", _fake_cmux("❯ fresh draft", sink))
     assert fs.wake_if_idle("S", "wake") is True
     assert ("send-key", "--surface", "S", "ctrl+u") in sink
 
 
-def test_wake_preserve_opt_in_never_clobbers(fs, monkeypatch):
+def test_wake_preserve_opt_in_never_clobbers(fs, rs, monkeypatch):
     # 'preserve' opt-in -> never clobber, even a long-stale draft (the fully conservative choice).
     draft = "left this here"
     with open(fs.DRAFTMODE, "w") as f:
         f.write("preserve")
     with open(fs.DRAFTMARKS, "w") as f:
         json.dump({"S": {"text": draft, "since": time.time() - (fs.DRAFT_STALE_S + 999)}}, f)
-    monkeypatch.setattr(fs, "surface_busy", lambda s: False)
+    monkeypatch.setattr(rs, "surface_busy", lambda s: False)
     sink = []
     monkeypatch.setattr(fs, "_cmux", _fake_cmux(f"❯ {draft}", sink))
     assert fs.wake_if_idle("S", "wake") is False

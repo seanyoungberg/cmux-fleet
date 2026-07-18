@@ -55,26 +55,26 @@ def test_include_muted_keeps_them(fs):
     assert skipped == []
 
 
-def test_bulk_skips_stale_non_live(fs, monkeypatch):
+def test_bulk_skips_stale_non_live(fs, rs, monkeypatch):
     # a child whose surface is gone (lifecycle ended) but still recorded a session = STALE -> bulk must
     # skip it (else respawn-pane targets a gone UUID / the quiet-gate burns on a dead surface).
     fs.live_put("kidA", {"kind": "child", "surface": "A", "parent": "me", "tool": "claude", "session": "claude-x"})
     fs.live_put("kidB", {"kind": "child", "surface": "B", "parent": "me", "tool": "claude", "session": "claude-y"})
-    monkeypatch.setattr(fs, "lifecycle", lambda surf: "ended" if surf == "A" else "idle")
-    monkeypatch.setattr(fs, "surface_has_live_pid", lambda surf: surf == "B")   # B is the genuinely-live one
+    monkeypatch.setattr(rs, "lifecycle", lambda surf: "ended" if surf == "A" else "idle")
+    monkeypatch.setattr(rs, "surface_has_live_pid", lambda surf: surf == "B")   # B is the genuinely-live one
     sel, skipped = cli._bulk_targets("children", "SELF", "me", include_muted=False)
     assert [l for l, _ in sel] == ["kidB"]                  # only the live one
     assert ("kidA", "stale/non-live") in skipped
 
 
-def test_bulk_skips_dead_pid_running_ghost(fs, monkeypatch):
+def test_bulk_skips_dead_pid_running_ghost(fs, rs, monkeypatch):
     # round-2 gap (2026-07-06): a child FROZEN 'running' on a DEAD pid (SessionEnd-less brick) must read
     # STALE here too -- CONSISTENT with cmd_ls -- so a bulk sweep skips it (reported) rather than burning
     # the quiet-gate on a dead seat. The operator then recovers it with an explicit (pid-aware) recycle.
     fs.live_put("kidA", {"kind": "child", "surface": "A", "parent": "me", "tool": "claude", "session": "claude-x"})
     fs.live_put("kidB", {"kind": "child", "surface": "B", "parent": "me", "tool": "claude", "session": "claude-y"})
-    monkeypatch.setattr(fs, "lifecycle", lambda surf: "running")               # BOTH read 'running'...
-    monkeypatch.setattr(fs, "surface_has_live_pid", lambda surf: surf == "B")  # ...but A's process is DEAD
+    monkeypatch.setattr(rs, "lifecycle", lambda surf: "running")               # BOTH read 'running'...
+    monkeypatch.setattr(rs, "surface_has_live_pid", lambda surf: surf == "B")  # ...but A's process is DEAD
     sel, skipped = cli._bulk_targets("children", "SELF", "me", include_muted=False)
     assert [l for l, _ in sel] == ["kidB"]                  # only the genuinely-live one
     assert ("kidA", "stale/non-live") in skipped            # the dead-pid 'running' ghost skipped as stale
@@ -83,11 +83,36 @@ def test_bulk_skips_dead_pid_running_ghost(fs, monkeypatch):
 # --- the shared per-target plan ------------------------------------------------------------------
 def test_recycle_plan_fresh_primes_from_handover(fs, monkeypatch):
     monkeypatch.setattr(cli, "_compose_recycle_cmd", lambda *a, **k: ("claude ...", ""))
-    monkeypatch.setattr(cli, "_latest_handover", lambda cwd: "/x/handover/h.md")
+    monkeypatch.setattr(cli, "_latest_handover", lambda cwd, label=None: "/x/handover/h.md")
     entry = {"kind": "child", "surface": "A", "tool": "claude", "role": "w", "cwd": "/x", "session": "claude-s"}
     p = cli._recycle_plan("kidA", entry, [], [], "fresh", "", False, None, False)
     assert p["mode"] == "fresh" and p["surface"] == "A" and p["old_session"] == "s"
     assert p["prime"] and "FRESH" in p["prime"] and "h.md" in p["prime"]
+
+
+def test_latest_handover_prefers_the_label_prefixed_then_falls_back(tmp_path):
+    """Ship 5d label-keyed discovery: prefer handover/<label>-*.md (this agent's own), newest by mtime;
+    fall back to any handover/*.md while emitters transition. A co-located agent's handover in a shared
+    home must not be picked once the label prefix is in use."""
+    hd = tmp_path / "handover"
+    hd.mkdir()
+    # legacy (unprefixed) + a sibling's + two of MINE, mine written LAST so mtime alone wouldn't disambiguate
+    (hd / "2026-01-01-old.md").write_text("legacy")
+    (hd / "otheragent-2026-06-01.md").write_text("sibling")
+    (hd / "redesign-builder-2026-05-01-a.md").write_text("mine older")
+    (hd / "redesign-builder-2026-05-02-b.md").write_text("mine newer")
+    got = cli._latest_handover(str(tmp_path), "redesign-builder")
+    assert got.endswith("redesign-builder-2026-05-02-b.md"), "must pick MY newest, not the sibling/legacy"
+
+    # no label-prefixed file present -> legacy fallback to the newest of any prefix
+    hd2 = tmp_path / "h2"
+    (hd2 / "handover").mkdir(parents=True)
+    (hd2 / "handover" / "2026-01-01-only-legacy.md").write_text("x")
+    got2 = cli._latest_handover(str(hd2), "redesign-builder")
+    assert got2.endswith("2026-01-01-only-legacy.md"), "fallback to any handover while emitters transition"
+
+    # no label -> newest of any (unchanged legacy behavior)
+    assert cli._latest_handover(str(tmp_path)).endswith(".md")
 
 
 def test_recycle_plan_resume_has_no_prime(fs, monkeypatch):
@@ -100,12 +125,12 @@ def test_recycle_plan_resume_has_no_prime(fs, monkeypatch):
 # --- Fix 2: bulk recycle live-print shows each agent's RESOLVED model/effort (provenance). A bulk
 #     recycle is exactly where a silent model/effort drift would slip by unseen, so the per-agent line
 #     must surface what each agent is coming back on — not just mode=. ---------------------------------
-def test_bulk_dryrun_prints_resolved_effort_model_per_agent(fs, monkeypatch, capsys):
+def test_bulk_dryrun_prints_resolved_effort_model_per_agent(fs, rs, monkeypatch, capsys):
     fs.live_put("me",   {"kind": "conductor", "surface": "SELF", "tool": "claude"})
     fs.live_put("kidA", {"kind": "child", "surface": "A", "parent": "me", "tool": "claude", "role": "w"})
     fs.live_put("kidB", {"kind": "child", "surface": "B", "parent": "me", "tool": "claude", "role": "w"})
     monkeypatch.setenv("CMUX_SURFACE_ID", "SELF")
-    monkeypatch.setattr(fs, "lifecycle", lambda surf: "idle")            # both live (not stale)
+    monkeypatch.setattr(rs, "lifecycle", lambda surf: "idle")            # both live (not stale)
     monkeypatch.setattr(cli, "_is_roster", lambda role: False)           # hermetic: no config read
     # compose emits the effort/model tokens the provenance reads back off the command.
     monkeypatch.setattr(cli, "_compose_recycle_cmd",

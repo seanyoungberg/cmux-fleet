@@ -101,7 +101,8 @@ def cmd_drive_child(argv):
 # Wake is the DEFAULT (idle peer woken now); --no-wake leaves it for the peer's next turn.
 # =================================================================================================
 def cmd_peer_msg(argv):
-    flags, pos = {"no_reply": False, "expect_reply": False, "no_wake": False, "reply_to": None}, []
+    flags, pos = {"no_reply": False, "expect_reply": False, "no_wake": False, "reply_to": None,
+                  "to_parent": False}, []
     i = 0
     while i < len(argv):
         a = argv[i]
@@ -113,18 +114,34 @@ def cmd_peer_msg(argv):
             flags["no_wake"] = True; i += 1
         elif a == "--wake":
             i += 1
+        elif a == "--to-parent":
+            flags["to_parent"] = True; i += 1
         elif a == "--reply-to":
             flags["reply_to"] = argv[i + 1] if i + 1 < len(argv) else None; i += 2
         else:
             pos.append(a); i += 1
-    if len(pos) < 2:
-        sys.exit('usage: fleet peer-msg <to-label> "<body>" [--no-reply] [--reply-to <id>] [--expect-reply] [--no-wake]')
-    to_label, body = pos[0], " ".join(pos[1:])
 
     from_surface = os.environ.get("CMUX_SURFACE_ID", "")
     if not from_surface:
         sys.exit("peer-msg: no $CMUX_SURFACE_ID (run inside a conductor's cmux terminal)")
     from_label = fs.label_for_surface(from_surface) or from_surface[:8]
+
+    if flags["to_parent"]:
+        # --to-parent: address the caller's parent conductor, resolved from the registry (Ship 5d — no
+        # AGENT_CONDUCTOR env). caller's surface -> caller's label -> its `parent` -> that label. The body
+        # is ALL of pos (no to-label positional).
+        if len(pos) < 1:
+            sys.exit('usage: fleet peer-msg --to-parent "<body>" [--no-reply] [--reply-to <id>] [--expect-reply] [--no-wake]')
+        body = " ".join(pos)
+        to_label = fs.parent_of(fs.label_for_surface(from_surface) or "")
+        if not to_label:
+            sys.exit(f"peer-msg --to-parent: '{from_label}' has no registry parent (a top-level agent reports to no one)")
+    else:
+        if len(pos) < 2:
+            sys.exit('usage: fleet peer-msg <to-label> "<body>" [--no-reply] [--reply-to <id>] [--expect-reply] [--no-wake]'
+                     '  |  fleet peer-msg --to-parent "<body>" [flags]')
+        to_label, body = pos[0], " ".join(pos[1:])
+
     to_surface = fs.surface_for_label(to_label)
     if not to_surface:
         known = ", ".join(fs.live_all().keys()) or "(none)"
@@ -169,11 +186,8 @@ def cmd_child_digest(argv):
 
     # Prefer cmux's AUTHORITATIVE transcriptPath from its hook stores (recorded from the hook, never
     # guessed) over globbing. The union store carries the right path for ANY tool; the globs are fallback.
-    path = None
-    for s in (fs.read_hook_store().get("sessions") or {}).values():
-        if frag and frag in (s.get("sessionId") or "") and s.get("transcriptPath"):
-            path = s["transcriptPath"]
-            break
+    from . import resolve as rs
+    path = rs.session_transcript(frag) or None
     if not path:
         for pat in (f"~/.claude/projects/*/*{frag}*.jsonl",          # claude
                     f"~/.codex/sessions/*/*/*/*{frag}*.jsonl"):       # codex

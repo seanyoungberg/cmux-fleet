@@ -112,15 +112,15 @@ def test_side_by_side_live_corpus_predicates(live_corpus):
     for surf in surfaces:
         # delegated fields must equal the canonical predicates verbatim
         s = rs.seat(surf, st=st, ws_map={})           # empty ws_map -> exercises the store fallback
-        assert s["present"] == fs.surface_has_live_agent(surf), surf
+        assert s["present"] == rs.surface_has_live_agent(surf), surf
         assert s["lifecycle"] == (ff._freshest_session(st, surf).get("agentLifecycle", "")), surf
         assert s["pids"] == ref_surface_pids(surf), surf
         assert rs.live_sid(surf, st=st) == ref_live_bound_sid(surf), surf
         assert s["session"] == fs.bare_uuid(ref_live_bound_sid(surf)), surf
         assert rs._ws_from_store(surf, st=st) == ref_ws_uuid_for_surface(surf), surf
         assert rs.freshest(surf, st=st) == ff._freshest_session(st, surf), surf
-        assert rs.bound_record(surf, st=st) == fs.resolve_bound_record(surf, st=st), surf
-        assert rs.busy(surf) == fs.surface_busy(surf), surf
+        assert rs.bound_record(surf, st=st) == rs.resolve_bound_record(surf, st=st), surf
+        assert rs.busy(surf) == rs.surface_busy(surf), surf
 
 
 def test_side_by_side_live_corpus_tree_workspace(live_corpus, monkeypatch):
@@ -157,7 +157,7 @@ def test_side_by_side_synthetic_matrix(monkeypatch):
     monkeypatch.setattr(fs, "read_hook_store", lambda: st)
     for surf in surfaces:
         s = rs.seat(surf, st=st, ws_map={})
-        assert s["present"] == fs.surface_has_live_agent(surf), surf
+        assert s["present"] == rs.surface_has_live_agent(surf), surf
         assert s["pids"] == ref_surface_pids(surf), surf
         assert rs.live_sid(surf, st=st) == ref_live_bound_sid(surf), surf
         assert rs._ws_from_store(surf, st=st) == ref_ws_uuid_for_surface(surf), surf
@@ -166,6 +166,35 @@ def test_side_by_side_synthetic_matrix(monkeypatch):
     assert rs.pids("S-MIXED", st=st) == {ME}
     # the brick is not present (dead pid outranks the frozen string)
     assert rs.seat("S-BRICK", st=st, ws_map={})["present"] is False
+
+
+# --- 1c. the by-session / by-fragment primitives (5b-2 finish: routed off the cli/router/helpers raw reads) ---
+def test_by_session_primitives_match_the_old_inline_reads():
+    """record_by_session / active_entry / session_transcript are exact ports of the hand-rolled reads that
+    lived in router._rec_by_session, cli._live_session_for, and helpers.cmd_child_digest. Pin the semantics
+    the ports must preserve: exact by-session record match, the FULL active-pointer entry (not just its sid,
+    case-insensitive), and first-transcript by session-id fragment gated on a recorded transcriptPath."""
+    st = {
+        "activeSessionsBySurface": {"S-UP": {"sessionId": "claude-abc", "extra": "keep-me"}},
+        "sessions": {
+            "r1": {"sessionId": "claude-abc", "surfaceId": "S-UP", "pid": 111, "transcriptPath": "/t/abc.jsonl"},
+            "r2": {"sessionId": "codex-def", "surfaceId": "S-DN", "pid": 222, "transcriptPath": "/t/def.jsonl"},
+            "r3": {"sessionId": "claude-ghi", "surfaceId": "S-DN", "pid": 333},   # no transcriptPath
+        },
+    }
+    # record_by_session: exact sessionId match; {} when absent
+    assert rs.record_by_session("codex-def", st=st)["surfaceId"] == "S-DN"
+    assert rs.record_by_session("nope", st=st) == {}
+    # active_entry: the FULL pointer entry (not just the sid), case-insensitive surface, {} when absent
+    assert rs.active_entry("S-UP", st=st) == {"sessionId": "claude-abc", "extra": "keep-me"}
+    assert rs.active_entry("s-up", st=st).get("extra") == "keep-me"     # case-insensitive
+    assert rs.active_entry("S-NONE", st=st) == {}
+    # session_transcript: first record whose sessionId CONTAINS the fragment AND has a transcriptPath
+    assert rs.session_transcript("abc", st=st) == "/t/abc.jsonl"
+    assert rs.session_transcript("def", st=st) == "/t/def.jsonl"
+    assert rs.session_transcript("ghi", st=st) == ""                   # id matches but no transcriptPath -> skip
+    assert rs.session_transcript("", st=st) == ""                     # empty fragment matches nothing
+    assert rs.session_transcript("zzz", st=st) == ""
 
 
 # --- 2. the attachment axis (invariant I4) --------------------------------------------------------------

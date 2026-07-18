@@ -74,6 +74,43 @@ def test_peer_msg_unknown_label_exits(two_peers):
         fh.cmd_peer_msg(["nobody", "hi", "--no-wake"])
 
 
+# --- --to-parent: registry-resolved parent addressing (Ship 5d, replaces $AGENT_CONDUCTOR) ----------
+@pytest.fixture
+def child_and_parent(fs, monkeypatch):
+    """A child whose registry `parent` names a live conductor, and the child is the CALLER."""
+    fs.live_put("theboss", {"surface": "BOSS", "kind": "conductor", "role": "c"})
+    fs.live_put("kid", {"surface": "KID", "kind": "child", "role": "w", "parent": "theboss"})
+    monkeypatch.setenv("CMUX_SURFACE_ID", "KID")
+    return fs
+
+
+def test_peer_msg_to_parent_resolves_the_registry_parent(child_and_parent):
+    fs = child_and_parent
+    rc = fh.cmd_peer_msg(["blocked: which config wins", "--to-parent", "--expect-reply", "--no-wake"])
+    assert rc == 0
+    pend = fs.inbox_pending("BOSS", kind="peer")           # landed on the PARENT's surface, not by name
+    assert len(pend) == 1
+    row = pend[0]
+    assert row["from_label"] == "kid" and row["to_label"] == "theboss"
+    assert row["body"] == "blocked: which config wins"
+    assert row["reply_expected"] is True
+
+
+def test_peer_msg_to_parent_takes_the_whole_body_no_to_label_positional(child_and_parent):
+    # --to-parent means the FIRST positional is already body, not a to-label — a multi-word body is intact.
+    fh.cmd_peer_msg(["done", "shipped", "the", "fix", "--to-parent", "--no-wake"])
+    row = child_and_parent.inbox_pending("BOSS", kind="peer")[0]
+    assert row["body"] == "done shipped the fix"
+
+
+def test_peer_msg_to_parent_exits_when_caller_is_top_level(fs, monkeypatch):
+    # a top-level conductor (parent=None/'') has no one to report to -> loud exit, never a misfire.
+    fs.live_put("topcond", {"surface": "TOP", "kind": "conductor", "role": "c", "parent": ""})
+    monkeypatch.setenv("CMUX_SURFACE_ID", "TOP")
+    with pytest.raises(SystemExit):
+        fh.cmd_peer_msg(["nobody upstream", "--to-parent", "--no-wake"])
+
+
 def test_peer_msg_muted_by_passive(two_peers, monkeypatch, capsys):
     # 'passive' is the fleet-wide wake mute (codex BLOCKER): peer-msg must NOT wake, but STILL queues.
     fs = two_peers

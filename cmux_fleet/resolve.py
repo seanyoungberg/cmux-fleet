@@ -11,14 +11,14 @@
 #   - The home of the NEW capabilities: the attachment axis (invariant I4), the detached detector,
 #     group-membership-from-cmux, and derived placement.
 #
-# WHAT IT DELIBERATELY IS NOT YET: the physical home of the predicate bodies. The liveness bodies
-# (surface_has_live_agent / surface_has_live_pid / lifecycle / surface_busy / resolve_bound_record)
-# stay canonical in state.py for this step and are DELEGATED to, because (a) they were already
-# consolidated there by the 2026-07-06..10 pid-authority fixes, and (b) the test suite's dominant
-# patch seams are state.read_hook_store and those state.* names — delegation keeps every existing
-# test seam live while call sites move onto THIS interface. Step 3 (schema v2) physically in-lines
-# the bodies here and deletes the state.py names. Do not add a new raw hook-store read anywhere
-# outside this module: that is the review's stale-ghost class (six instances, all fixed 2026-07-10).
+# THE PHYSICAL HOME OF THE LIVENESS BODIES (finish-5b-2 step 3, done). surface_has_live_agent /
+# surface_has_live_pid / lifecycle / surface_busy / resolve_bound_record are DEFINED here now — the
+# delegation seam to state.py is gone, and the suite's dominant patch seams (those `<name>` on the
+# state module) moved onto THIS module with them. The store's raw I/O stays canonical in state.py
+# (read_hook_store / pid_alive / bare_uuid / entry_for_surface / LIFECYCLE_STALE_S); the bodies here
+# reach it via `fs.*`. That split IS the invariant: resolve owns the liveness RULE, state owns the
+# store bytes. Do not add a new raw hook-store read anywhere outside this module: that is the review's
+# stale-ghost class (six instances, all fixed 2026-07-10; the ratchet in test_resolve_ratchet enforces it).
 #
 # LIVENESS (invariant I2, stated once): an agent is PRESENT on a surface iff the surface has a
 # hook-store record whose pid is alive (and, at kill sites, whose ps identity matches its tool).
@@ -121,7 +121,7 @@ def freshest(surface, st=None):
 
 def freshest_live(surface, st=None):
     """The newest record on `surface` with an ALIVE pid ({} if none) — the record that IS the agent
-    (the liveness rule). This is _live_bound_sid's selection, exposed as the record."""
+    (the liveness rule). This is `live_sid`'s selection, exposed as the record."""
     recs = live_records(surface, st)
     return max(recs, key=lambda s: s.get("updatedAt") or 0) if recs else {}
 
@@ -137,15 +137,91 @@ def active_ptr(surface, st=None):
     return sid or ""
 
 
-# --- the named predicates (delegates to the canonical state.py bodies; see module docstring) -------
+def active_entry(surface, st=None):
+    """The FULL activeSessionsBySurface entry dict cmux files for `surface` ({} if none) — the pointer
+    entry, not just its sessionId (see active_ptr). Same cmux cache that CAN lie; used as the bare-pointer
+    fallback where cmux names a session for a surface but no full sessions[] record backs the pointer."""
+    st = fs.read_hook_store() if st is None else st
+    e = (st.get("activeSessionsBySurface") or {}).get(surface) \
+        or (st.get("activeSessionsBySurface") or {}).get((surface or "").upper()) or {}
+    return e if isinstance(e, dict) else {}
+
+
+def record_by_session(sid, st=None):
+    """The hook-store sessions[] record whose sessionId == `sid` ({} if none). A BY-SESSION lookup (the
+    surface readers key on surfaceId; this keys on the session id cmux stamps into a bus event): the router
+    resolves a Stop's bus session id to its surface this way, and the register live-gate resolves cmux's
+    active pointer to its full record. Bare-uuid normalization is the caller's job."""
+    st = fs.read_hook_store() if st is None else st
+    for s in (st.get("sessions") or {}).values():
+        if s.get("sessionId") == sid:
+            return s
+    return {}
+
+
+def session_transcript(frag, st=None):
+    """The transcriptPath cmux RECORDED (from the hook, never guessed) for the first session whose id
+    CONTAINS `frag` ('' if none / empty frag). A by-fragment lookup: child-digest resolves a partial
+    session id to the authoritative transcript for any tool. Any-liveness (a completed child's transcript
+    is exactly what the digest wants), so no pid rule here — this is a path lookup, not a seat selection."""
+    if not frag:
+        return ""
+    st = fs.read_hook_store() if st is None else st
+    for s in (st.get("sessions") or {}).values():
+        if frag in (s.get("sessionId") or "") and s.get("transcriptPath"):
+            return s["transcriptPath"]
+    return ""
+
+
+# --- the named predicates: CANONICAL liveness bodies (finish-5b-2 step 3 moved these here from state.py;
+# the store reads route through fs.read_hook_store / fs.pid_alive — state.py stays the store's I/O home,
+# the liveness RULE lives here). The public-interface names (lifecycle / has_live_pid / present / busy /
+# bound_record) are what call sites use; the surface_* / resolve_bound_record names are the shared
+# authorities they compose from (and the suite's dominant patch seams). -----------------------------
 def lifecycle(surface):
-    """Advisory lifecycle string for display (freshest record of any liveness). Never act on it."""
-    return fs.lifecycle(surface)
+    """agentLifecycle for a surface from cmux's hook stores (idle|running|needsInput|unknown|''),
+    tool-agnostic via read_hook_store. Picks the freshest entry for the surface (an agent can leave
+    more than one session record on a surface; the newest updatedAt is the live one). Advisory only —
+    for display; never act on it (a frozen string outlives the agent; ask surface_has_live_agent)."""
+    best, best_ts = "", -1.0
+    try:
+        for s in (fs.read_hook_store().get("sessions") or {}).values():
+            if s.get("surfaceId") == surface:
+                ts = s.get("updatedAt") or 0
+                if ts >= best_ts:
+                    best, best_ts = s.get("agentLifecycle", ""), ts
+    except Exception:
+        pass
+    return best
+
+
+def surface_has_live_pid(surface):
+    """True iff any hook-store record for `surface` carries a live pid — the pid-authoritative answer
+    to 'is a real agent process still attached to this surface?' (used by recycle's respawn-verify to
+    refuse relaunching over a claude that survived the respawn, and to positively confirm death)."""
+    surf = (surface or "").upper()
+    for s in (fs.read_hook_store().get("sessions") or {}).values():
+        if (s.get("surfaceId") or "").upper() == surf and fs.pid_alive(s.get("pid")):
+            return True
+    return False
+
+
+def surface_has_live_agent(surface):
+    """True iff a GENUINELY-live agent occupies `surface`: cmux's lifecycle is non-terminal AND a real
+    process is still attached (a live pid). This is the SHARED 'is this seat actually live?' authority —
+    the negation ('gone/stale') is the single answer that `fleet ls` STALE-detection, bulk-recycle's
+    stale-skip, `launch`'s overwrite-guard, `worktree clean`'s refuse-if-live, and recycle's re-bind
+    poll must ALL agree on, so a SessionEnd-less brick (frozen 'running'/'idle'/'unknown' on a dead/None
+    pid — root-caused 2026-07-06) reads as gone EVERYWHERE, never as a false 'live' at whichever site
+    still trusts the lifecycle string alone. Stricter than surface_has_live_pid (pid only): this ALSO
+    requires the lifecycle to be non-terminal, so a surface mid-drop (terminal string, pid briefly
+    lingering) reads as gone too — the two conditions together are 'a live agent is actually here'."""
+    return lifecycle(surface) not in ("", "-", "ended") and surface_has_live_pid(surface)
 
 
 def has_live_pid(surface):
     """Any live pid attached to the surface (the raw pid floor under `present`)."""
-    return fs.surface_has_live_pid(surface)
+    return surface_has_live_pid(surface)
 
 
 def present(surface):
@@ -155,7 +231,7 @@ def present(surface):
     store, so this answers "can cmux SEE an agent here", which is a different question from "is one HERE".
     They diverge, permanently, and the gap has a name: see `dark()`. Anything whose verdict must survive
     that gap has to ask `alive()` instead."""
-    return fs.surface_has_live_agent(surface)
+    return surface_has_live_agent(surface)
 
 
 # --- the two authorities, kept apart on purpose ---------------------------------------------------
@@ -341,16 +417,69 @@ def dark(surface, tool=None):
     return alive(surface, tool) and not present(surface)
 
 
+def resolve_bound_record(surface, st=None, bound=None):
+    """The hook-store session record for `surface`'s FLEET-BOUND session (registry truth, kept honest by
+    the reconciliation lane), falling back to the freshest record on the surface when the binding can't
+    be matched; {} when nothing claims the surface. This is the shared record-resolution behind BOTH the
+    wake gate (surface_busy — 'is this a fresh live turn?') and its inverse in the fleet-doctor sweep
+    ('is this bound 'running' record frozen = a dead stall?' / 'is it at needsInput?'). Resolving against
+    the fleet BINDING rather than max-updatedAt is what defeats the days-old orphan records (e.g. surf
+    1A5E3168's ~3-day 'running' ghost, and the many stale 'needsInput' orphans) — an orphan belongs to a
+    session no live member is bound to, so it is simply never the resolved record for a live member.
+    `st`/`bound` may be passed to skip re-reading the hook store / registry per call — the sweep walks
+    every member off ONE store read and already holds each entry's bound session."""
+    st = fs.read_hook_store() if st is None else st
+    recs = [s for s in (st.get("sessions") or {}).values() if s.get("surfaceId") == surface]
+    if not recs:
+        return {}                               # nothing claims this surface
+    if bound is None:
+        bound = fs.bare_uuid((fs.entry_for_surface(surface) or {}).get("session", ""))
+    rec = None
+    if bound:
+        rec = next((s for s in recs if fs.bare_uuid(s.get("sessionId", "")) == bound), None)
+    if rec is None:                             # no fleet-bound record -> fall back to the freshest
+        rec = max(recs, key=lambda s: s.get("updatedAt") or 0)
+    return rec
+
+
+def surface_busy(surface, now=None):
+    """True ONLY when `surface` is genuinely mid-turn (a fresh, live 'running' record) — the single case
+    the wake gate must never interrupt. Hardened two ways against the stale read that stalled
+    cmux-advisor:
+      - liveness cross-check: prefer the record for the fleet's OWN bound session (registry truth, kept
+        honest by the reconciliation lane) over 'max updatedAt across all records on the surface'. The
+        pointer that lied in the incident was cmux's activeSessionsBySurface, not the fleet binding, so
+        resolving against the binding defeats the orphaned-'running' record directly.
+      - staleness guard: a 'running' record that has not ticked within LIFECYCLE_STALE_S is treated as
+        NOT a live turn (a real turn re-stamps continuously; a frozen one is an orphan).
+    Leans to NOT-busy on any ambiguity/read error: wake_if_idle then confirms an actual clean idle
+    prompt on screen before injecting, so a false 'not busy' can never corrupt a real turn, while a
+    false 'busy' — the failure we are killing — can never silence an idle surface."""
+    now = time.time() if now is None else now
+    try:
+        rec = resolve_bound_record(surface)
+        if not rec or rec.get("agentLifecycle") != "running":
+            return False
+        if not fs.pid_alive(rec.get("pid")):
+            return False                        # a DEAD pid cannot be mid-turn: a frozen 'running' brick
+                                                # (SessionEnd-less death, root-caused 2026-07-06), not a
+                                                # live turn. Same not-busy lean as the staleness guard
+                                                # below -- the pid is the shared liveness authority.
+        return (now - (rec.get("updatedAt") or 0)) <= fs.LIFECYCLE_STALE_S
+    except Exception:
+        return False                            # fail-open to not-busy; the screen read is the arbiter
+
+
 def busy(surface, now=None):
     """The wake gate's question: genuinely mid-turn, must not interrupt. Leans not-busy on doubt;
     the screen check in wake_if_idle is the second gate."""
-    return fs.surface_busy(surface, now=now)
+    return surface_busy(surface, now=now)
 
 
 def bound_record(surface, st=None, bound=None):
     """The record for the fleet-BOUND session (registry truth), freshest fallback. The doctor's
     record resolution."""
-    return fs.resolve_bound_record(surface, st=st, bound=bound)
+    return resolve_bound_record(surface, st=st, bound=bound)
 
 
 def pids(surface, st=None):
@@ -361,7 +490,10 @@ def pids(surface, st=None):
 
 def live_sid(surface, st=None):
     """The sessionId of the freshest ALIVE record ('' if none) — 'which session is actually running
-    on this seat right now' (canonical body here; cli._live_bound_sid delegates)."""
+    on this seat right now'. THE live-pid truth for the recycle confirm (`_poll_session_back`): a dead
+    pid cannot host a TUI, so the freshest live-pid record is the running agent, whatever sid cmux
+    assigned it (the 2026-07-09 berg-sandbox recycle-misdetect fix — the old sid-exclusion confirm rode
+    poll_session's arbitrary-first-record fallback and could stare at a dead ghost forever)."""
     return freshest_live(surface, st).get("sessionId", "")
 
 

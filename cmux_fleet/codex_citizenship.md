@@ -3,19 +3,20 @@
 This applies **only if `$AGENT_LABEL` is set**. If it is empty you are somebody's own codex session, not a
 fleet worker — ignore this whole block and carry on.
 
-## Announce your own completion. Nothing else does it for you.
+## Your completion reports itself. If you are blocked, ask.
 
-The last thing you do, on every job, is tell the agent that launched you that you are done:
+When your turn ends the fleet router delivers your completion to the agent that launched you
+automatically — the same inbox flow every child rides; you do not send a "done" message yourself.
+
+What still needs YOUR word is being BLOCKED: if you cannot finish without an answer, ask the agent that
+launched you and then read your inbox for the reply. You do not need to know its name — the fleet resolves
+your parent from the registry:
 
 ```sh
-fleet peer-msg "$AGENT_CONDUCTOR" 'done: <one line on what you did>. <where the output is>'
+fleet peer-msg --to-parent 'blocked: <the question>' --expect-reply
 ```
 
-Your conductor cannot see your screen. To it, an agent that finished and an agent still thinking look
-exactly alike — so if you stop without sending this, your work is invisible and your conductor waits on
-you forever. Send it when you succeed, when you fail, and when you are blocked and need an answer
-(`--expect-reply`, then read your inbox). Reporting a failure is worth as much as reporting a success;
-being silent is the only unrecoverable move.
+Reporting a block is worth as much as finishing; being silently stuck is the only unrecoverable move.
 
 ## Single-quote the body. Backticks are shell substitution.
 
@@ -44,8 +45,10 @@ fleet inbox-ack <seq>       # once you have handled one, so it stops resurfacing
 |---|---|
 | `$AGENT_LABEL` | your name in the fleet — this is how others address you |
 | `$AGENT_ROLE` | the role you were launched as |
-| `$AGENT_CONDUCTOR` | the agent that launched you; who you report to |
 | `$CMUX_SURFACE_ID` | the cmux surface you are running on |
+
+Who launched you is not an env var — the fleet derives it from the registry (`fleet peer-msg --to-parent`
+reaches your conductor without you naming it).
 
 ## Commit your own work, explicitly
 

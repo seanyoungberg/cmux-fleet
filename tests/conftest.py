@@ -65,6 +65,16 @@ def fs():
     return state
 
 
+@pytest.fixture
+def rs():
+    """The in-process resolve module — home of the liveness predicate bodies (surface_has_live_agent /
+    surface_has_live_pid / lifecycle / surface_busy / resolve_bound_record), inlined here from state.py
+    in finish-5b-2 step 3. Fetched fresh (parallel to `fs`) so a test patching rs.<predicate> patches the
+    SAME module object production resolves through, even after test_features pops the package."""
+    from cmux_fleet import resolve
+    return resolve
+
+
 @pytest.fixture(scope="session")
 def cmux_stub(tmp_path_factory):
     """A no-op `cmux` executable. The CLI shells out to it for close-surface/read-screen/etc.; the
