@@ -85,6 +85,15 @@ from .config import HOOKSTORE          # cmux's own dir: the hook stores + event
 # 213.8 minutes of skew. 600s clears any legitimate single long tool call (during which BOTH clocks
 # freeze together, skew ~0) without delaying detection meaningfully.
 ATTACH_SKEW_S = 600
+# TURN_GRACE_S: the record-age grace for a 'running' record (doctor-reliability, 2026-07-18). The comment
+# above assumed a long turn is a SINGLE tool call that freezes both clocks — but a MULTI-tool-call turn
+# advances the transcript (each tool round-trip is a turn line) while the record stays frozen at the
+# 'running' stamp cmux writes at turn START (no hook fires again until Stop). That skew is a HEALTHY long
+# turn, not a dead channel (3 live specimens: cmux-advisor flagged detached/STUCK mid 10-min turn). So the
+# behavioral rule ignores a 'running' record until it has been frozen past this grace — an implausibly long
+# 'running' (the dark-while-running case, e.g. berg-sandbox's 3.5h) still trips it; a NON-running frozen
+# record (agent works while cmux thinks it idle — genuinely dark) trips it with no grace, as before.
+TURN_GRACE_S = 1800
 
 
 def _cmux(*args):
@@ -778,18 +787,28 @@ def attachment(surface, st=None, ws_map=None, now=None):
         return out
     record_age = max(0.0, now - (rec.get("updatedAt") or 0))
     tage = _transcript_age(rec, now)
+    life = rec.get("agentLifecycle") or ""
     out["record_age_s"] = record_age
     out["transcript_age_s"] = tage
     reasons = []
-    # behavioral: working while cmux is deaf. Idle agents freeze BOTH clocks, so skew stays ~0.
-    if tage is not None and (record_age - tage) > ATTACH_SKEW_S:
+    # behavioral: working while cmux is deaf. Idle agents freeze BOTH clocks, so skew stays ~0. A LIVE long
+    # turn also freezes the record (cmux stamps 'running' at turn start, fires no hook until Stop) while its
+    # transcript advances (tool-call lines) — that is a healthy turn, NOT a dead channel. So a 'running'
+    # record is given TURN_GRACE_S before the skew is trusted as detachment (token-flow, not wall-clock); a
+    # NON-running frozen record advancing its transcript is genuinely dark and trips with no grace.
+    if (tage is not None and (record_age - tage) > ATTACH_SKEW_S
+            and (life != "running" or record_age > TURN_GRACE_S)):
         reasons.append("behavioral: transcript advancing while record frozen "
                        f"({record_age/60:.1f}m vs {tage/60:.1f}m)")
-    # env: conclusive (Gap A). Needs the tree to know where the surface actually is.
+    # env: conclusive for a DARK agent — its record is frozen HERE because its hooks write to another
+    # surfaceId. But a freshly-MOVED agent has a stale CMUX_WORKSPACE_ID env (a live move cannot rewrite the
+    # running process's env) while its record ADVANCES here — not detached. So trust the env mismatch only
+    # when the record is ALSO frozen (channel quiet past the skew), else a moved-but-live agent whose record
+    # is advancing reads detached (the 2026-07-16 move specimen). Needs the tree to know where the surface is.
     tree_ws = workspace(surface, st=st, ws_map=ws_map)
     env_ws = _env_workspace(rec.get("pid"))
     out["env_workspace"] = env_ws
-    if env_ws and tree_ws and env_ws.upper() != tree_ws.upper():
+    if (env_ws and tree_ws and env_ws.upper() != tree_ws.upper() and record_age > ATTACH_SKEW_S):
         reasons.append(f"env: CMUX_WORKSPACE_ID {env_ws[:8]} != tree workspace {tree_ws[:8]}")
     # diagnostic, never proof: has any post-SessionStart hook been heard from the live session?
     aptr = active_ptr(surface, st)

@@ -726,6 +726,13 @@ def snapshot():
         # per snapshot and only if some row actually needs it — a steady fleet never pays for it.
         unreg = (not present) and bool(surf) and bool(
             rs.pids_ps(surf, ps_out=_ps(), tool=e.get("tool", "claude")))
+        # stale-gone is a VERDICT, and a verdict may rest only on `alive` (the process table). `stale` is a
+        # TIME-based reading of a frozen/aged-out record: a long-idle agent whose cmux record aged out reads
+        # `lifecycle=''` -> `stale` by clock, but its live pid (unreg) proves it present — a live agent is
+        # never shown GONE (the 2026-07-18 worker specimen: a WORKER read STALE during a 44-min idle while
+        # live+idle at an empty prompt). Downgrade to the honest 'idle' (present, dormant), never gone.
+        if state == "stale" and unreg:
+            state = "idle"
         blocked, why = blocked_of(present=present, feed_gate=bool(sid) and sid in open_gates,
                                   transcript_gate=tgate, turn_done=tdone, unregistered=unreg)
         used, tmodel = _context_used(sess.get("transcriptPath", ""))
