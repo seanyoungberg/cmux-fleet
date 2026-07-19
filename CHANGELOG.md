@@ -6,6 +6,45 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [0.12.0] - 2026-07-19
+
+Adopts three branches cut off v0.11.0 and independently verified before the merge: fleet ergonomics, the
+doctor-reliability liveness rework, and the Ship 2 restore-reconciliation brought forward onto the v2
+registry. No single branch held all three, so the union was verified as a clean superset per file and the
+COMBINED tree run green — 1172 tests, 0 failures.
+
+### Added
+
+- **`fleet reparent <label> <parent|none>` — a surgical in-place reparent.** `move` forced a workspace move +
+  reparent-under-caller and `register` rebuilt the whole spec; there was no way to change *only* an agent's
+  registry `parent`. `reparent` sets it alone (to another label, or `none` → top-level), flocked through
+  `live_update`, every other field preserved, and cross-conductor guarded so you cannot reparent another
+  conductor's child out from under it.
+- **`fleet reconcile-restore [--close]` + an automatic relaunch-burst reconcile.** After cmux replays its
+  crash-restore snapshot the registry can hold husks (dead fleet-origin surfaces) and resume-orphans (a live
+  agent on a surface nobody owns). The verb surveys both; `--close` archives-first then closes only the
+  DETERMINISTIC husks (snapshot agent=nil + no live agent + not registered + fleet-origin), never a live agent
+  or a human shell. The router now also detects the `surface.created` burst a restore emits and fires one
+  debounced background reconcile on its own — the heal no longer waits for the next daemon start. LIVE +
+  reconcile-knob gated. (Ship 2, reworked onto v2: `surface_has_live_agent` moved state→resolve.)
+
+### Fixed
+
+- **A self-recycle no longer deadlocks to a 180s ABORT.** `fleet recycle --fresh` (non-forced) targeting your
+  OWN surface could never clear the quiet-gate — the caller *is* the running activity the gate waits to see
+  drain — so it burned 180s and aborted (berg-sandbox lost ~20 min to this). recycle now detects target ==
+  `$CMUX_SURFACE_ID` and auto-applies force with a one-line notice; a self-targeted recycle has no human draft
+  to protect. Folds in recycle plugin-writeback and a short-surface-prefix accept for `drive-child`.
+- **doctor liveness no longer false-alarms long-idle or long-turn agents.** The detached / stuck / stale-gone
+  verdicts were wall-clock based, so a live slow turn (pane streaming tokens, no hook events for 10+ minutes)
+  and a long idle looked identical to a dead stream — the heartbeat flagged healthy conductors STUCK and a
+  44-minute-idle worker STALE/surface-gone. All three verdicts, for workers as well as conductors, now gate on
+  **transcript-advance / token-flow**: a `running` record frozen past the threshold whose transcript is still
+  advancing is a live long turn, not a stall. Death-detection is preserved (tested both directions) and the
+  live-pid-is-never-told-DOWN safety invariant is byte-untouched — this kills noise, it does not add teeth.
+
+## [0.11.0] - 2026-07-18
+
 ### Added
 
 - **`fleet conformance` — an instrument that tells you whether a cmux build actually WORKS.** Berg is about
