@@ -29,7 +29,7 @@ import subprocess
 import sys
 import time
 
-from .config import STATE, SIDEBAR_PAINT
+from .config import STATE, SIDEBAR_PAINT, RECONCILE_RESTORE
 
 # The router is spawned as a module (`python -m cmux_fleet.router`) so it resolves THIS install's
 # package no matter where the tool venv lives — a plain file path wouldn't survive the package move.
@@ -305,6 +305,7 @@ def _run_daemon(heartbeat_secs):
     next_usage = time.time() + 5                       # first usage poll shortly after boot, then every USAGE_POLL_S
     next_cxhealth = time.time() + 120                   # first codex health check ~2 min after boot, then hourly
     next_paint = time.time() + 3 if SIDEBAR_PAINT else None   # sidebar auto-repaint (opt-in: [fleet].sidebar_paint)
+    next_reconcile = time.time() + 8 if RECONCILE_RESTORE else None   # restore reconciliation, once on start (Ship 2)
     while proc.poll() is None and not stopping["v"]:
         time.sleep(1)
         now = time.time()
@@ -341,6 +342,17 @@ def _run_daemon(heartbeat_secs):
             except Exception as e:                    # a bad paint must never kill the daemon (nor the router)
                 print(f"[sidebar] paint error: {e}", flush=True)
             next_paint = now + PAINT_POLL_S
+        if next_reconcile and now >= next_reconcile:   # Ship 2: reconcile the registry vs cmux's restore
+            try:                                        # snapshot ONCE on start (burst-triggered runs come
+                from . import reconcile as rc           # from the router). Archive-first closes det. husks.
+                rep = rc.reconcile_restore(close=True, log=lambda m: print(m, flush=True),
+                                           reason="daemon-start", force=True)
+                if rep.get("closed") or rep.get("resume_orphans"):
+                    print(f"[reconcile] start sweep: closed {len(rep.get('closed', []))} husk(s), "
+                          f"{len(rep.get('resume_orphans', []))} resume-orphan(s) flagged", flush=True)
+            except Exception as e:                      # a bad reconcile must never kill the daemon/router
+                print(f"[reconcile] start error: {e}", flush=True)
+            next_reconcile = None                       # run-once on start; the router handles relaunch bursts
         if now >= next_health:
             try:
                 _check_router_health(proc.pid)       # surface an alive-but-wedged router (silent-loss class)

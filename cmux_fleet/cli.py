@@ -6065,6 +6065,7 @@ VERB_USAGE = {
                "                                                    BULK restart (sequential + gated, skips self + muted); mine = your children; cross-conductor = the safe topology",
     "unstick": "  unstick [label] [--surface UUID] [--dry-run]      reap a frozen dead-pid hook-store ghost (SessionEnd-less death) so ls/recycle/doctor stop trusting a dead 'running'; never touches a LIVE record",
     "reap-surfaces": "  reap-surfaces [--all] [--json] [--close]          DRY-RUN survey of orphaned bare-shell HUSK surfaces (fleet launch artifact + no live agent + no registry); gated on the fleet env prefix + tail guard; --close is review-gated",
+    "reconcile-restore": "  reconcile-restore [--close] [--json]            reconcile the registry against cmux's crash-restore snapshot: survey resume-orphans + husks; --close archives-first + closes the DETERMINISTIC husks (snapshot agent=nil + no live agent + not registered + fleet-origin), never a live agent/human shell",
     "sessions": "  sessions <label> [--all] [--json]                 list resumable prior sessions for the agent's surface (id, age, size, snippet)",
     "broadcast": "  broadcast \"<msg>\" --scope mine|all|conductors|children [--no-wake] [--expect-reply] [--dry-run]\n"
                  "                                                    input-safe heads-up to live agents (e.g. after a toml/floor change); never restarts them; --scope REQUIRED (an act)",
@@ -6111,7 +6112,7 @@ INTERNAL_USAGE = {
 # worse, silently ignored — `fleet serve --help` STARTED THE HTTP SERVER and blocked).
 SELF_HELP_VERBS = frozenset({
     "launch", "config", "plugins", "revive", "register", "recycle", "move", "group", "unstick", "migrate",
-    "reap-surfaces", "sessions", "worktree", "profile", "daemon", "find", "codex-login", "codex-sync",
+    "reap-surfaces", "reconcile-restore", "sessions", "worktree", "profile", "daemon", "find", "codex-login", "codex-sync",
     # codex-setup is NOT here any more: it lost its ArgumentParser when it became a superseded-stub, so it
     # can no longer render its own --help. The guard now serves it from VERB_USAGE (which is the whole point
     # of the guard: a verb without a parser must never be RUN just to ask it for help).
@@ -6163,7 +6164,9 @@ def verb_table():
     from . import daemon as fd
     from . import helpers as fh
     from . import conformance as cf
+    from . import reconcile as rc
     return {"launch": cmd_launch, "config": cmd_config, "ls": cmd_ls, "plugins": cmd_plugins,
+            "reconcile-restore": rc.cmd_reconcile_restore,
             "archive": cmd_archive, "revive": cmd_revive, "register": cmd_register, "recycle": cmd_recycle,
             "move": cmd_move, "reparent": cmd_reparent, "group": cmd_group, "migrate": cmd_migrate,
             "unstick": cmd_unstick, "reap-surfaces": cmd_reap_surfaces, "sessions": cmd_sessions,

@@ -116,6 +116,15 @@ CONTEXT_WINDOW = int(_resolve("CMUX_FLEET_CONTEXT_WINDOW", "context_window", "0"
 SIDEBAR_PAINT = str(_resolve("CMUX_FLEET_SIDEBAR_PAINT", "sidebar_paint", "")).strip().lower() in (
     "1", "true", "yes", "on")
 
+# Restore reconciliation (redesign Ship 2): when truthy, the daemon runs `fleet reconcile-restore --close`
+# on start and on the post-relaunch surface.created burst — archive-first CLOSING the DETERMINISTIC husks
+# cmux's crash-restore recreates (snapshot agent=nil + no live agent + not registered + fleet-origin), and
+# FLAGGING resume-orphans. Defaults ON (this is the orphan/husk fix), but it is a surface-CLOSING auto-
+# action, so it is gated behind this one knob: set [fleet].reconcile_restore=false (or the env=0) to
+# disable the auto-sweep and keep `fleet reconcile-restore` a manual, dry-run-by-default verb.
+RECONCILE_RESTORE = str(_resolve("CMUX_FLEET_RECONCILE_RESTORE", "reconcile_restore", "true")).strip().lower() in (
+    "1", "true", "yes", "on")
+
 # The plugin INDEX (plugins.toml): env > [fleet].plugin_index > <toml-dir>/plugins.toml. Absent file ->
 # empty index (never an error). This is a SEPARATE file from the roster fleet.toml so the machine-
 # reconciled index and the hand-authored roster own themselves (design §2d). Resolution reads both.
