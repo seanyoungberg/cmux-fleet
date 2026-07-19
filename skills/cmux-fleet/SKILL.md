@@ -22,7 +22,7 @@ The common loop is **launch → drive → (completions arrive on their own) → 
 
 ## Spawn a child
 **`fleet launch <role> --parent $CMUX_SURFACE_ID`** (the `fleet` shim is on PATH via the plugin). **Spawns by default**; add `--dry-run` to preview the resolved launch first.
-- A child defaults to a **tab in your agents pane** (`place=tab`). Override with `--place pane|workspace`, `--tool <t>`, `--label <name>`, `--cwd <dir>`.
+- A child defaults to **its own workspace** (`place=workspace` — the ratified default in fleet.toml `[defaults]`), auto-joined to your conductor group. A bare launch is already correct: **do NOT pass `--place tab`** (per-workspace is deliberate — see Layout for why). Override only `--tool <t>`, `--label <name>`, `--cwd <dir>` as needed.
 - **Pass any tool flag verbatim after `--`:** `fleet launch research-agent -- --effort max --add-dir /tmp/x`. Everything after `--` is forwarded to the underlying tool; a caller flag overrides the same flag from the role/floor, repeatable flags stack.
 - **Scratch agent:** `fleet launch adhoc --label <name>` — the rostered scratch role: the name is the LABEL, the home is the shared flat `ad-hoc/` dir, and retiring it leaves no directory behind. Promote a recurring one to a real role by writing its toml block. *(The legacy `--adhoc <name>` flag still mints a per-name dir under `adhoc_subdir`; it is deprecated and aliases to the role path in the fleet-state-redesign's launcher round.)*
 - The roster is the fleet toml (`$CMUX_FLEET_TOML`, default `$XDG_CONFIG_HOME/cmux-fleet/fleet.toml`; role-first, tool-nested): a role owns orchestration (`cwd`/`place`/`group`/`kind`) once; per-tool sub-blocks carry that tool's `plugins`/`flags`/`env`/`settings`. `AGENT_ROLE` is auto-set. The launcher is a dumb builder over native flags/env/`--settings` — it invents no setting names, so any valid `claude`/`codex` flag just works.
@@ -64,23 +64,20 @@ Derived from live state every call (registry + hook stores + transcripts); no da
 - **`fleet paint`** — sync fleet state onto the cmux **sidebar**: a status pill (`set-status`) + a context progress bar (`set-progress`) per workspace, **on change only**, additive (never recolors/renames your workspaces). The native sidebar then shows each agent's state at a glance. For a dedicated board, install `sidebars/fleet.swift` (see README).
 
 ## Layout (DEFAULT — this is the canonical fleet layout)
-**Two panes stacked top/bottom, both full width. Never more than 2 panes (no side-by-side columns) unless the user explicitly asks.**
-- **BOTTOM pane = agents.** The conductor's own surface plus its children's surfaces live here as **tabs in this one pane**. A child you launch gets folded in as a tab.
-- **TOP pane = view.** Markdown / HTML / diff surfaces. Any agent that wants to expose something opens it here, as another tab in this same pane.
-- **General placement rule:** a new agent goes into a pane that already has agents; a new view (.md/html) goes into a pane that already has views. You almost never create a third pane.
+**Every agent gets its OWN workspace.** A child you launch lands in a fresh workspace auto-joined to your conductor group (one conductor = one group). This is the ratified default (`[defaults] place = "workspace"`), so a bare `fleet launch` is already right — **do NOT override to `--place tab`/`pane`.** The reason is load-bearing: cmux's native session and vault sidebars organize **one agent per workspace, per cwd**, so that is how you (and the user) actually SEE and navigate the fleet. Cramming several agents into one workspace as tabs muddles those native views (the user cannot tell whose session is whose), and it makes surface moves, recycles, and archives messier because a workspace no longer maps to a single agent. Per-workspace keeps each of those clean.
 
-Recipes (caller surface = `$CMUX_SURFACE_ID`, your bottom/agents pane). Use the `cmux-workspace` skill for the full CLI; `--focus false` always, never `focus-pane`/`select-workspace`/`drag-surface-to-split`:
-- **Fold a freshly-launched child into the agents pane (as a tab):** `cmux move-surface --surface <child-surface-uuid> --pane <agents-pane-uuid> --focus false` (a `--place pane` launch makes its own split first; fold it in to collapse back to 2 panes).
-- **Open a view above the agents:** `cmux markdown open <file> --direction up --surface $CMUX_SURFACE_ID --focus false` (splits a full-width view pane on top, agents stay on the bottom). Re-`open` more files to stack them as tabs in that view pane.
-- **Rebuild from sprawl:** fold every child into your pane, close stray view panes (`cmux close-surface --surface <s>`), then re-open the view with `--direction up`.
+**Inside any one workspace**, the 2-pane top/bottom split still applies for THAT agent (never more than 2 panes, no side-by-side columns unless asked):
+- **BOTTOM pane = the agent** (its own surface).
+- **TOP pane = views.** Markdown / HTML / diff surfaces the agent opens, as tabs in this one pane.
+- A new view goes into the pane that already has views; you almost never create a third pane in a workspace.
 
-### When a child gets its OWN workspace instead
-Dispatch a child to a **dedicated workspace in the conductor's group** (same top/bottom split inside it), NOT a tab, when any of:
-- it's an agent the user will work with **directly**, or
-- it will do **long-running** work, or
-- it's one of a **group of agents on the same task**.
+Recipes (caller surface = `$CMUX_SURFACE_ID`; `--focus false` always, never `focus-pane`/`select-workspace`/`drag-surface-to-split`):
+- **Open a view above your agent:** `cmux markdown open <file> --direction up --surface $CMUX_SURFACE_ID --focus false` (splits a full-width view pane on top). Re-`open` more files to stack them as tabs there.
+- **Give an already-launched child its own workspace** (if it landed shared): `fleet move <label> --own-workspace` — relocates natively, joins your group, pid/session/context intact.
+- **Rebuild from sprawl:** `fleet move <label> --own-workspace` each stray child out of your workspace, close stray view panes (`cmux close-surface --surface <s>`), re-open views with `--direction up`.
 
-Otherwise (the common case) children are tabs in the conductor's bottom pane. For the dedicated case just use `--place workspace`: a workspace child with **no** `--group` automatically **joins its parent conductor's group** (one conductor = one group), so you do not name the group. Pass `--group <name>` only to override that default and put the child in a different group. (`--place pane` + fold for the tab case.)
+### The tab-in-your-pane exception (legacy, rare)
+Only fold a child into your own agents pane as a tab for a **truly throwaway** agent you will retire within the same turn: `--place tab`, or `--place pane` then fold with `cmux move-surface --surface <child-surface-uuid> --pane <agents-pane-uuid> --focus false`. This is the exception, not the default. If you catch yourself reaching for it for real work, use a workspace.
 
 ## Drive a child
 `fleet drive-child <child-surface-uuid> "<prompt>"` — sends the text then a SEPARATE `send-key enter`. A trailing `\n` in `cmux send` only inserts a newline; it does NOT submit. It fails loud (non-zero) if a cmux call errors. Always target by surface UUID, never a bare `surface:N` ref.
