@@ -6,6 +6,31 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [0.15.1] - 2026-07-21
+
+Two small doctor-reliability / diagnostics fixes logged during the T6 arc. Patch on top of v0.15.0; no
+behavior change beyond the two verdicts below. Suite green: 1237 tests.
+
+### Fixed
+
+- **DETACHED false-alert on crash-restored / long-turn agents (doctor-reliability).** The `env` reason in
+  `resolve.attachment()` — a `CMUX_WORKSPACE_ID` env that disagrees with the tree workspace — fired on
+  `record_age` alone. A crash-restored agent carries a stale env (a live process's env can't be rewritten)
+  and, mid long-turn, freezes its record at the `running` stamp while its transcript keeps advancing, so
+  env-detach condemned a demonstrably healthy seat (graph-view, flagged DETACHED 3x/day while Berg-driven
+  and completing turns). The env reason now reuses the SAME transcript-advance tooth the behavioral/stall
+  gates use: it fires only when the record AND the transcript are both frozen past `ATTACH_SKEW_S` — an
+  agent still advancing either clock is not actionably detached. The behavioral reason and the genuinely-
+  dark discriminator (env mismatch + both clocks quiet) are unchanged.
+- **`fleet config` claimed CLAUDE.md loads regardless of setting_sources.** The "CLAUDE.md applied" line
+  listed the cwd / vault-root / user `CLAUDE.md` paths by existence alone, blind to the resolved
+  `setting_sources` gate. A role that narrows `setting_sources` (e.g. `user,local`, dropping `project`)
+  does not load the project/vault-root floor, yet `fleet config` still reported it as applied. The line is
+  now setting-sources-aware: the project-scope paths are claimed only when `project` is in the effective
+  sources (an empty `setting_sources` is claude's native default — all layers on), the user memory only
+  when `user` is; a present-but-suppressed project floor is surfaced with the reason rather than silently
+  dropped.
+
 ## [0.15.0] - 2026-07-20
 
 F1: the configurable floor FILE. Fleet now **places** a user-defined floor file into an agent's cwd (or

@@ -2005,10 +2005,24 @@ def cmd_config(argv):
     else:
         print("      (none set)")
 
-    # CLAUDE.md that applies
-    mds = [p for p in (os.path.join(cwd, "CLAUDE.md"), os.path.join(ROOT, "CLAUDE.md"),
-                       os.path.expanduser("~/.claude/CLAUDE.md")) if os.path.exists(p)]
+    # CLAUDE.md that applies — gated on the resolved setting_sources. An empty setting_sources is claude's
+    # NATIVE default (every layer loads); a role that narrows it (e.g. "user,local") does NOT load the
+    # project/vault-root CLAUDE.md (the F1 floor is dead-on-arrival there), and one without "user" skips the
+    # user memory. So the line must not claim a file the gate drops — else `fleet config` says CLAUDE.md
+    # applies when it does not (the setting-sources-blind bug).
+    ss = spec.get("setting_sources") or ""
+    _srcs = {s.strip() for s in ss.split(",") if s.strip()}
+    proj_on = (not _srcs) or ("project" in _srcs)          # empty == claude's default: all layers on
+    user_on = (not _srcs) or ("user" in _srcs)
+    proj_mds = [p for p in (os.path.join(cwd, "CLAUDE.md"), os.path.join(ROOT, "CLAUDE.md")) if os.path.exists(p)]
+    mds = list(proj_mds) if proj_on else []
+    user_md = os.path.expanduser("~/.claude/CLAUDE.md")
+    if user_on and os.path.exists(user_md):
+        mds.append(user_md)
     print(f"\n  CLAUDE.md applied: {', '.join(mds) if mds else '(none)'}")
+    if proj_mds and not proj_on:                           # present on disk but the gate drops it — say so
+        print(f"      (project CLAUDE.md present but NOT loaded — setting_sources={ss!r} excludes 'project': "
+              f"{', '.join(proj_mds)})")
 
     print("\nFLEET ADDS (CLI flags + env; flags OVERRIDE the settings/env above):")
     if spec.get("setting_sources"):

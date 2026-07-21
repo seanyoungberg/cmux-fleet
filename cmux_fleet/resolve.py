@@ -801,14 +801,18 @@ def attachment(surface, st=None, ws_map=None, now=None):
         reasons.append("behavioral: transcript advancing while record frozen "
                        f"({record_age/60:.1f}m vs {tage/60:.1f}m)")
     # env: conclusive for a DARK agent — its record is frozen HERE because its hooks write to another
-    # surfaceId. But a freshly-MOVED agent has a stale CMUX_WORKSPACE_ID env (a live move cannot rewrite the
-    # running process's env) while its record ADVANCES here — not detached. So trust the env mismatch only
-    # when the record is ALSO frozen (channel quiet past the skew), else a moved-but-live agent whose record
-    # is advancing reads detached (the 2026-07-16 move specimen). Needs the tree to know where the surface is.
+    # surfaceId. But a freshly-MOVED or crash-RESTORED agent carries a stale CMUX_WORKSPACE_ID env (a live
+    # process's env cannot be rewritten) while it keeps working — its record ADVANCES here (the 2026-07-16
+    # move specimen), OR its record freezes at the 'running' stamp of a long turn while its TRANSCRIPT keeps
+    # advancing (graph-view, flagged detached 3x/day while Berg-driven and completing turns). So trust the env
+    # mismatch only when the record AND the transcript are BOTH frozen past the skew (a genuinely quiet
+    # channel) — the SAME transcript-advance tooth the behavioral/stall gates use; an agent still advancing
+    # either clock is not actionably detached. Needs the tree to know where the surface is.
     tree_ws = workspace(surface, st=st, ws_map=ws_map)
     env_ws = _env_workspace(rec.get("pid"))
     out["env_workspace"] = env_ws
-    if (env_ws and tree_ws and env_ws.upper() != tree_ws.upper() and record_age > ATTACH_SKEW_S):
+    if (env_ws and tree_ws and env_ws.upper() != tree_ws.upper()
+            and record_age > ATTACH_SKEW_S and (tage is None or tage > ATTACH_SKEW_S)):
         reasons.append(f"env: CMUX_WORKSPACE_ID {env_ws[:8]} != tree workspace {tree_ws[:8]}")
     # diagnostic, never proof: has any post-SessionStart hook been heard from the live session?
     aptr = active_ptr(surface, st)

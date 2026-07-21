@@ -87,6 +87,37 @@ def test_config_renders(cli_env, tmp_path):
     assert "fleet config" in p.stdout and "FLEET ADDS" in p.stdout
 
 
+def _applied_line(stdout):
+    # the single "CLAUDE.md applied: ..." line (NOT the suppressed-note line under it)
+    return next((ln for ln in stdout.splitlines() if "CLAUDE.md applied:" in ln), "")
+
+
+def test_config_claude_md_gated_on_setting_sources(cli_env, tmp_path):
+    # `fleet config` must not claim CLAUDE.md loads when the role's setting_sources drops the project layer.
+    # A default role (no setting_sources = claude's native default, project ON) DOES load the cwd CLAUDE.md;
+    # a role narrowed to "user,local" (project OFF) does NOT — the F1 floor is dead-on-arrival there. ROOT is
+    # an isolated tmp with no CLAUDE.md, so the cwd file is the only project-scope floor in play.
+    proj = tmp_path / "proj"
+    proj.mkdir()
+    claude_md = proj / "CLAUDE.md"
+    claude_md.write_text("# floor\n")
+    toml = tmp_path / "fleet.toml"
+    toml.write_text('[role.deflt]\ncwd = "agents/d"\n[role.deflt.claude]\n'
+                    '[role.narrow]\ncwd = "agents/n"\n'
+                    '[role.narrow.claude]\nsetting_sources = "user,local"\n')
+    env = {**cli_env, "CMUX_FLEET_TOML": str(toml)}
+
+    # default sources: project ON -> the cwd CLAUDE.md is claimed as applied
+    d = run_fleet(env, "config", "deflt", "--cwd", str(proj))
+    assert str(claude_md) in _applied_line(d.stdout)
+
+    # narrowed to user,local: project OFF -> the cwd CLAUDE.md is NOT on the applied line, and the reason
+    # (present-but-suppressed) is surfaced so the diagnostic doesn't silently drop it.
+    n = run_fleet(env, "config", "narrow", "--cwd", str(proj))
+    assert str(claude_md) not in _applied_line(n.stdout)
+    assert "NOT loaded" in n.stdout and "excludes 'project'" in n.stdout and str(claude_md) in n.stdout
+
+
 # --- the full state lifecycle --------------------------------------------------------------------
 def test_lifecycle_ls_archive_revive_rm(cli_env, fs, state_dir):
     label = "e2e-worker"

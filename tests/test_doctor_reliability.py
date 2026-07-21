@@ -92,6 +92,29 @@ def test_dark_agent_env_mismatch_with_frozen_record_is_detached(monkeypatch, tmp
     assert att["attached"] is False and any(r.startswith("env") for r in att["reasons"])
 
 
+def test_long_turn_with_stale_env_not_detached_despite_frozen_record(monkeypatch, tmp_path):
+    # HEALTHY (the graph-view false-alert): a crash-restored agent mid long-turn — cmux stamped 'running' so
+    # its record is frozen (12m) and its CMUX_WORKSPACE_ID env is stale (a live process's env can't be
+    # rewritten), but its TRANSCRIPT is advancing (30s). Env-mismatch on a seat whose transcript is still
+    # advancing is not actionably detached — the env branch reuses the transcript-advance tooth. Fails on the
+    # pre-fix code (env fired on record_age alone; flagged detached 3x/day while Berg-driven, completing turns).
+    surf, st, ws_map, now = _seat(monkeypatch, tmp_path, life="running", record_age=720, transcript_age=30,
+                                  env_ws="WS-OLD", ws_tree="WS-NEW")
+    att = rs.attachment(surf, st=st, ws_map=ws_map, now=now)
+    assert att["attached"] is True and att["reasons"] == []
+
+
+def test_long_turn_with_stale_env_still_detached_when_transcript_also_frozen(monkeypatch, tmp_path):
+    # STILL FLAGGED (the discriminator): the SAME running seat + stale env as above, holding record_age and
+    # env constant, but the TRANSCRIPT is frozen too (12m). Record AND transcript both quiet past the skew is
+    # a genuinely dark channel — the transcript gate keeps its teeth. Varying only transcript_age (30s vs 12m)
+    # isolates the new gate: advancing clears, frozen still condemns.
+    surf, st, ws_map, now = _seat(monkeypatch, tmp_path, life="running", record_age=720, transcript_age=720,
+                                  env_ws="WS-OLD", ws_tree="WS-NEW")
+    att = rs.attachment(surf, st=st, ws_map=ws_map, now=now)
+    assert att["attached"] is False and any(r.startswith("env") for r in att["reasons"])
+
+
 # ==================== VERDICT 2 — stall (STUCK): via the real doctor sweep ====================
 def _doctor_world(monkeypatch, tmp_path, *, life, record_age, transcript_age):
     monkeypatch.setattr(router, "fs", fs)
