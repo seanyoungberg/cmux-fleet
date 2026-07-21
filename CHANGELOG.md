@@ -6,6 +6,37 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [0.14.0] - 2026-07-20
+
+`fleet mint` — define a new role from the CLI. Closes the
+can't-spawn-a-new-top-level-conductor gap: a new role (a top-level conductor especially) no longer needs a
+hand-edit of `fleet.toml`. Composes with the v0.13.0 boot contract — a minted agent gets the turn-one boot
+prompt and `--brief` for free via the shared launch path. Suite green: 1210 tests.
+
+### Added
+
+- **`fleet mint <name>` — define a role (home + roster block), optionally launch it.** DEFINE (the
+  default, idempotent) creates the role's home directory, seeds a thin identity stub, and registers the
+  role by appending a `[role.<name>]` block to `fleet.toml`. `--kind conductor` mints a top-level
+  conductor (own workspace group `Conductor - <name>`, home under `_meta/agents/conductors/`, launches
+  `--parent none --place workspace`); the default `child` gets a home under `_meta/agents/` and joins the
+  dispatcher's group. `--cwd` / `--group` override the conventions; `--dry-run` previews the block and
+  launch argv without writing.
+- **`--launch` opt-in.** DEFINE is config; `--launch` also spawns, handing off to the existing `fleet
+  launch` path unchanged — so a minted agent gets the v0.13.0 turn-one boot prompt for free and the
+  workspace group-join uses launch's own robust machinery (mint never name-keys a group). A minted
+  conductor's `kind` resolves for `/loom:prime` because the same `fleet.toml` it lands in is the roster
+  the prime kind-resolver reads.
+- **Append-only roster write.** The `[role.<name>]` block is *appended* as text; no existing byte is ever
+  rewritten, so hand-authored roles and comments survive by construction. `mint` only ever *creates* a
+  role (edit/remove stays a hand-edit) and refuses a name that already exists (a `tomllib` read-first
+  check). Absent roster → refuses with the seed hint rather than minting a preamble-less phantom file.
+- **Thin identity stub, F1-configurable.** The seeded `CLAUDE.md` is a strict pointer to `/loom:prime`
+  (never boot content — role knowledge lives in the governed boot pages, per the role-owned-agent-homes
+  ruling); it never clobbers an existing `CLAUDE.md`. Wording is configurable via
+  `[fleet].mint_identity_template` (env `CMUX_FLEET_MINT_IDENTITY_TEMPLATE`), the same cwd-floor-file seam,
+  with `{name}`/`{kind}` substituted.
+
 ## [0.13.0] - 2026-07-20
 
 The T6 boot contract: `fleet launch` now owns turn one. A fleet-launched agent primes itself and can be
