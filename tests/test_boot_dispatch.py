@@ -10,52 +10,55 @@
 import pytest
 
 from cmux_fleet import cli as fleet
+from cmux_fleet import config as cfg
 from cmux_fleet import helpers as fh
 from cmux_fleet import router
 from cmux_fleet import state as fs
 
 
-# ============================ 1. the ONE turn-one boot prompt (converged source) ============================
-def test_boot_prime_prompt_carries_the_four_placeholder_elements(tmp_path):
-    """Identity + run /loom:prime --role <role> + handover discovery + report-when-primed (T6 point 7)."""
-    p = fleet._boot_prime_prompt("kidA", "cmux-dev", str(tmp_path), event="launched")
-    assert "kidA" in p and "cmux-dev" in p                       # identity line
-    assert "/loom:prime --role cmux-dev" in p                    # the load-bearing prime directive
-    assert "Report when primed" in p                             # report-when-primed
-    assert "PLACEHOLDER" in p                                    # marked pending prime-architect review
+# ============================ 1. the ONE config-driven turn-one boot prompt ============================
+def test_boot_prime_prompt_defaults_to_the_frozen_template(monkeypatch):
+    """Default wording = the co-signed frozen prime-architect template, with {AGENT_ROLE}/{AGENT_LABEL}
+    substituted by the launcher. Carries: run /loom:prime --role <role>, report-ready, drain fleet inbox
+    for the brief, and the report-and-stop failure clause."""
+    monkeypatch.setattr(cfg, "BOOT_PROMPT", "")                  # no override -> built-in default
+    p = fleet._boot_prime_prompt("kidA", "cmux-dev")
+    assert "role 'cmux-dev'" in p and "label 'kidA'" in p        # identity, substituted
+    assert "{AGENT_ROLE}" not in p and "{AGENT_LABEL}" not in p  # no leftover tokens
+    assert "/loom:prime --role cmux-dev" in p                    # the load-bearing prime directive, --role-flagged
+    assert "report ready" in p                                   # step 2 report-ready
+    assert "fleet inbox" in p                                    # step 3: the brief arrives via the inbox
+    assert "cannot run, report exactly that and stop" in p       # the report-and-stop failure clause
 
 
-def test_boot_prime_prompt_does_handover_discovery(tmp_path):
-    """When a handover exists it is named (prime picks it up); when none, the clean-boot clause fires."""
-    hd = tmp_path / "handover"
-    hd.mkdir()
-    (hd / "kidA-2026-07-20.md").write_text("state")
-    got = fleet._boot_prime_prompt("kidA", "cmux-dev", str(tmp_path), event="launched")
-    assert "kidA-2026-07-20.md" in got                           # handover discovery surfaced the file
-    # a fresh home with no handover -> the clean-boot clause, never a dangling "at ." path
-    clean = fleet._boot_prime_prompt("kidA", "cmux-dev", str(tmp_path / "empty"), event="launched")
-    assert "No handover yet" in clean
+def test_boot_prompt_is_config_driven_literal_and_file(monkeypatch, tmp_path):
+    """The WORDING is user-configurable (F2): [fleet].boot_prompt read at compose time, as a literal
+    string OR a template-file path. It is NOT hardcoded."""
+    monkeypatch.setattr(cfg, "BOOT_PROMPT", "CUSTOM boot for {AGENT_ROLE}/{AGENT_LABEL}")
+    assert fleet._boot_prime_prompt("kidA", "w") == "CUSTOM boot for w/kidA"
+    f = tmp_path / "boot.txt"
+    f.write_text("FROM FILE: prime {AGENT_ROLE}")
+    monkeypatch.setattr(cfg, "BOOT_PROMPT", str(f))             # a path -> read the file at compose time
+    assert fleet._boot_prime_prompt("kidA", "w") == "FROM FILE: prime w"
 
 
-@pytest.mark.parametrize("event,marker", [("launched", "LAUNCHED"), ("recycled", "FRESH"), ("revived", "REVIVED")])
-def test_boot_prime_prompt_event_only_varies_the_opening(tmp_path, event, marker):
-    """The event varies ONLY the opening clause; the /loom:prime body is identical across all three so
-    there is exactly ONE boot-prompt source (T6 converge mandate)."""
-    p = fleet._boot_prime_prompt("kidA", "cmux-dev", str(tmp_path), event=event)
-    assert marker in p
-    assert "/loom:prime --role cmux-dev" in p and "Report when primed" in p
+def test_boot_prompt_override_wins(monkeypatch):
+    """--prime (override) is returned verbatim, ahead of the config template."""
+    monkeypatch.setattr(cfg, "BOOT_PROMPT", "ignored")
+    assert fleet._boot_prime_prompt("kidA", "w", override="MY OWN PROMPT") == "MY OWN PROMPT"
 
 
-def test_recycle_fresh_converges_onto_the_boot_prompt(fs, monkeypatch):
-    """recycle --fresh now sends the SAME boot prompt (identity + /loom:prime + handover + report), not
-    the old inline 're-orient from your handover' string that never told the agent to prime."""
+def test_launch_and_recycle_read_the_SAME_config_value(fs, monkeypatch):
+    """Berg's ruling: ONE config value serves BOTH launch and recycle. recycle --fresh composes from the
+    same [fleet].boot_prompt template launch does (converged single source) — both --role-flagged."""
+    monkeypatch.setattr(cfg, "BOOT_PROMPT", "SHARED-TEMPLATE prime {AGENT_ROLE}")
     monkeypatch.setattr(fleet, "_compose_recycle_cmd", lambda *a, **k: ("claude ...", ""))
-    monkeypatch.setattr(fleet, "_latest_handover", lambda cwd, label=None: "/x/handover/h.md")
     entry = {"kind": "child", "surface": "A", "tool": "claude", "role": "cmux-dev", "cwd": "/x",
              "session": "claude-s"}
     p = fleet._recycle_plan("kidA", entry, [], [], "fresh", "", False, None, False)
-    assert "/loom:prime --role cmux-dev" in p["prime"]           # CONVERGED: recycle now primes explicitly
-    assert "h.md" in p["prime"] and "FRESH" in p["prime"]        # ...still does handover discovery
+    assert p["prime"] == "SHARED-TEMPLATE prime cmux-dev"        # recycle read the SAME config value
+    # a resume recycle still carries no prime (unchanged)
+    assert fleet._recycle_plan("kidA", entry, [], [], "resume", "", False, None, False)["prime"] is None
 
 
 # ============================ 2 + 3. brief queue + post-prime idle-wake delivery ============================
@@ -84,7 +87,7 @@ def test_launch_sends_boot_prompt_as_turn_one(fs, monkeypatch, tmp_path):
     sends = [a for a in sent if a and a[0] == "send"]
     assert sends, "launch must send a turn-one boot prompt"
     boot = sends[0][3]                                            # ("send","--surface","SURF",<boot text>)
-    assert "/loom:prime --role adhoc" in boot and "Report when primed" in boot
+    assert "/loom:prime --role adhoc" in boot and "fleet inbox" in boot
     assert ("send-key", "--surface", "SURF", "enter") in sent    # ...and SUBMIT it
 
 

@@ -24,6 +24,15 @@
 #                                   #   record into each agent workspace's DESCRIPTION (a subtitle in the
 #                                   #   BUILT-IN sidebar), so only enable it when you run the custom sidebar.
 #                                   #   env: CMUX_FLEET_SIDEBAR_PAINT
+# boot_prompt  = ""                 # the TURN-ONE boot prompt `fleet launch` (and recycle/revive --fresh)
+#                                   #   sends as the agent's first turn: it tells the agent to run
+#                                   #   /loom:prime, report ready, then drain `fleet inbox` for its --brief.
+#                                   #   "" -> the built-in frozen default. Override with the literal prompt
+#                                   #   text (TOML triple-quote for multi-line) OR a path to a file holding
+#                                   #   it; read at compose time, so an edit goes live with no tool release.
+#                                   #   {AGENT_ROLE}/{AGENT_LABEL} are substituted by the launcher. ONE value
+#                                   #   serves both launch and recycle. --prime overrides per-invocation.
+#                                   #   env: CMUX_FLEET_BOOT_PROMPT
 
 # ----------------------------------------------------------------------------------------------
 # ROSTER: role-first, tool-nested. A role owns its tool-agnostic ORCHESTRATION (cwd/place/group/
