@@ -248,6 +248,29 @@ Every agent carries four identity fields:
 A conductor self-identifies via `$CMUX_SURFACE_ID`, which the hooks and the CLI
 read to answer "who am I" and "what is in my inbox".
 
+## Minting a role (`fleet mint`)
+
+Roles are hand-authored in `fleet.toml`, but a *new* one no longer requires a
+hand-edit — `fleet mint <name>` **defines** a role and closes the
+can't-spawn-a-new-top-level-conductor gap. It creates the role's home directory,
+seeds a thin identity stub (a pointer to `/loom:prime`; never boot content — role
+knowledge lives in the governed boot pages, not an agent-writable cwd file), and
+**appends** a `[role.<name>]` block to `fleet.toml`. The append is text-only and
+never rewrites a byte of the existing file, so hand-authored roles and comments
+survive by construction; `mint` only ever *creates* (edit/remove is a hand-edit),
+and it refuses a name that already exists (a `tomllib` read-first check).
+
+`kind` drives the convention: a `conductor` gets its own workspace group and a
+home under `_meta/agents/conductors/`; a `child` gets a home under
+`_meta/agents/`. Defining is idempotent config; `--launch` is the opt-in to also
+spawn, and it hands off to `cmd_launch` unchanged — so a minted agent picks up
+the turn-one boot prompt for free and the group-join uses launch's own robust
+machinery (mint never name-keys a group). This is why the roster is the single
+source of truth for `kind`: the same `fleet.toml` a minted conductor lands in is
+what `/loom:prime` reads to resolve it as a conductor at boot. The identity
+stub's wording is configurable via `[fleet].mint_identity_template`. See
+`docs/operations.md` for the verb.
+
 ## The router daemon
 
 `cmux_fleet/router.py` is one long-lived process, not a hook, and serves every
