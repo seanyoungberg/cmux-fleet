@@ -175,8 +175,9 @@ needs to know the flag. Placement is `tab`, `pane`, or `workspace`. A
 not exist it is auto-created on the conductor's own workspace (no manual
 `workspace-group create`), and a conductor with no explicit `group` defaults it
 to its label. A `place = workspace` child joins its parent conductor's group. An
-`--adhoc` agent is off-roster, gets a cwd under `adhoc_subdir`, and (if a floor
-`CLAUDE.md` is configured) inherits it via a symlink. Add `--dry-run` to resolve
+`--adhoc` agent is off-roster, gets a cwd under `adhoc_subdir`, and (if the legacy
+`floor_claudemd` is configured and no `floor_file` is — see the floor-file section
+below) inherits a floor `CLAUDE.md` via a symlink. Add `--dry-run` to resolve
 and print the launch command without spawning.
 
 Check what a role would launch with, base settings plus what fleet stacks on
@@ -246,6 +247,42 @@ frozen prime-architect template; the launcher substitutes `{AGENT_ROLE}` /
 `{AGENT_LABEL}`. `--prime "<text>"` overrides it for one launch; `--no-prime`
 sends no boot prompt (a non-loom or hand-driven agent). `drive-child` is
 unchanged — it stays the tool for mid-flight steering.
+
+### The floor file (`[tool.<t>.floor_file]`)
+
+The boot prompt is the **primary** floor; the **backup** is a floor FILE fleet
+**places** into the agent's cwd (or home) at launch. It exists so a **vendored**
+install with no vault-root `CLAUDE.md` can still deliver a floor, and so the
+backup floor is declarative and fleet-managed rather than hand-placed. Fleet only
+*places* the file — the tool **loads** it the way it already loads any floor:
+claude via your `setting_sources` project walk (include `project`), codex from
+`$CODEX_HOME`. No new load path, and it does not collide with the boot prompt.
+
+Configure it per-tool (the two runtimes read different filenames), overridable
+per-role in `[role.<name>.<t>.floor_file]`:
+
+```toml
+[tool.claude.floor_file]
+source = "~/floor/CLAUDE.floor.md"   # a path to a file, OR literal inline content
+mode   = "append"                    # append | write | overwrite | symlink
+target = "cwd"                       # cwd | home  (default is per-tool)
+```
+
+- **`append`** (default) — a fenced, marker-guarded block. Never clobbers your
+  own text, idempotent so a re-launch never duplicates, and its markers are
+  distinct from codex citizenship's so both blocks coexist in one `AGENTS.md`.
+- **`write`** — place only into an empty slot; if a file already exists, skip and
+  warn (never clobber).
+- **`overwrite`** — replace the whole file (the only clobbering mode).
+- **`symlink`** — a relative symlink (skipped if a real file exists); `source`
+  must be a file, not inline. This is the legacy adhoc-floor behavior, generalized.
+
+`target` defaults per-tool: claude → `cwd/CLAUDE.md`, codex → `$CODEX_HOME/AGENTS.md`
+(the one file codex reads from every cwd). `filename` overrides the default name.
+Placement is idempotent and **fail-open** — a floor that can't be placed warns and
+the launch proceeds. The legacy `[fleet].floor_claudemd` symlink stays as the adhoc
+fallback **only when no `floor_file` is configured**. Do not also keep a vault-root
+backup floor loading through the same walk, or you stack two floors.
 
 ## Worktrees (code repos)
 

@@ -101,6 +101,16 @@ only **after** the agent has primed — an unprimed agent never receives a raw
 brief. The wording is configurable (`[fleet].boot_prompt`); `--prime` overrides
 it per launch, `--no-prime` opts out.
 
+That boot prompt is the **primary** floor. Its **backup** — for a vendored
+install with no vault-root `CLAUDE.md`, or to manage the file declaratively — is
+`[tool.<t>.floor_file]`: fleet **places** a floor FILE into the agent's cwd (or
+home) at launch. Give it a `source` (a path or inline content) and a `mode` —
+`append` (default: a fenced, idempotent block that never clobbers your text),
+`write`, `overwrite`, or `symlink`. The file targets `cwd` for claude (loaded via
+your `setting_sources` project walk) and `$CODEX_HOME` for codex by default, and
+is per-role overridable. Fleet only *places* it; the tool loads it — F1 adds no
+new load path. See `fleet.toml.example`.
+
 The router watches the bus; when the child finishes a turn, the conductor sees
 the completion in its context on its next turn (or sooner, depending on the
 mode dial below).
@@ -153,7 +163,7 @@ no vault assumption, marketplace and floor disabled.
 | `CMUX_STATE_DIR` | `state_dir` | `$XDG_STATE_HOME/cmux-fleet` (`~/.local/state/cmux-fleet`) |
 | `CMUX_BIN` | `cmux_bin` | `which cmux`, else `/Applications/cmux.app/Contents/Resources/bin/cmux` |
 | `CMUX_FLEET_PLUGIN_INDEX` | `plugin_index` | `<toml-dir>/plugins.toml` (the plugin index; declares `[marketplace.*]`) |
-| `CMUX_FLEET_FLOOR` | `floor_claudemd` | `""` (no ad-hoc `CLAUDE.md` symlink) |
+| `CMUX_FLEET_FLOOR` | `floor_claudemd` | `""` (legacy ad-hoc `CLAUDE.md` symlink; superseded by `[tool.<t>.floor_file]`, kept as the fallback when no `floor_file` is set) |
 | `CMUX_HOOKSTORE_DIR` | `hookstore_dir` | `~/.cmuxterm` (cmux-owned) |
 | `CMUX_FLEET_ADHOC_SUBDIR` | `adhoc_subdir` | `agents/ad-hoc` (relative to root) |
 | `CMUX_FLEET_CONTEXT_WINDOW` | `context_window` | `0` (guess per model; set to your window, e.g. `200000` / `1000000`, for an exact `vitals` ctx %) |

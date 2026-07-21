@@ -16,7 +16,11 @@
 # plugin_index = ""                 # path to the plugins.toml INDEX (see plugins.toml.example); "" ->
 #                                   #   <this-file's-dir>/plugins.toml. Absent file = empty index, no error.
 #                                   #   The index powers the `plugins = [...]` roster key.  env: CMUX_FLEET_PLUGIN_INDEX
-# floor_claudemd = ""               # CLAUDE.md symlinked into the shared ad-hoc home; "" = none.  env: CMUX_FLEET_FLOOR
+# floor_claudemd = ""               # LEGACY floor: a CLAUDE.md symlinked into the shared ad-hoc home; "" =
+#                                   #   none. Superseded by the first-class, per-tool `[tool.<t>.floor_file]`
+#                                   #   below (write/append/overwrite/symlink into cwd|home) — floor_claudemd
+#                                   #   stays as the adhoc fallback ONLY when no floor_file is configured.
+#                                   #   env: CMUX_FLEET_FLOOR
 #                                   # (`--adhoc <name>` is now an alias for the [role.adhoc] block below —
 #                                   #  one shared flat home, <name> becomes the LABEL. No adhoc_subdir key.)
 # mint_identity_template = ""       # template FILE `fleet mint` seeds as the new home's CLAUDE.md; "" -> a
@@ -62,6 +66,23 @@ place = "tab"
 #                                   #   name must be in the index (via a [marketplace.<n>] block) or be an
 #                                   #   absolute path. Unioned floor ∪ role.
 flags   = "--effort high"
+
+# [tool.claude.floor_file]          # F1: a floor FILE fleet PLACES into the agent's cwd (or home) at launch,
+#                                   #   so a vendored install with no vault-root CLAUDE.md still delivers a
+#                                   #   floor, declaratively. It only PLACES the file; claude LOADS it via
+#                                   #   your setting_sources project walk (set `setting_sources` to include
+#                                   #   `project` below). A per-role override lives in [role.<n>.claude.floor_file].
+# source   = "~/floor/CLAUDE.floor.md"   # a PATH to a file, OR literal inline content (like boot_prompt).
+#                                        #   Shorthand: `floor_file = "~/floor/CLAUDE.floor.md"` = just source.
+# mode     = "append"               # append | write | overwrite | symlink. DEFAULT append: a fenced,
+#                                   #   marker-guarded block — never clobbers your own text, idempotent so a
+#                                   #   re-launch never duplicates. write = place only into an empty slot
+#                                   #   (skip+warn if a file exists). overwrite = replace the whole file (the
+#                                   #   only clobbering mode). symlink = a relative symlink (skip if a real
+#                                   #   file exists); source must be a FILE, not inline.
+# target   = "cwd"                  # cwd | home. DEFAULT is per-tool: claude -> cwd, codex -> home. `home` is
+#                                   #   ~/.claude/CLAUDE.md for claude, $CODEX_HOME/AGENTS.md for codex.
+# filename = "CLAUDE.md"            # override the per-tool default filename (claude CLAUDE.md, codex AGENTS.md).
 
 [tool.codex]
 # flags = "-a never -s workspace-write"   # never-prompt but sandboxed; codex's autonomous-worker posture

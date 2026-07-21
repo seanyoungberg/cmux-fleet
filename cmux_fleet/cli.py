@@ -187,6 +187,13 @@ def resolve(cfg, role, tool_override, adhoc_name):
     # setting_sources -> --setting-sources (which settings layers claude loads; excluding 'project' keeps
     # our launches from reading the agent's own .claude/, unlike an ad-hoc launch).
     setting_sources = rtool.get("setting_sources") or tdef.get("setting_sources") or ""
+    # floor_file (F1): the declarative floor placed into cwd|home at launch. Same per-tool <- per-role
+    # override as settings (whole-table replace). A bare string is shorthand for {source = "<string>"}.
+    floor_file = rtool.get("floor_file") or tdef.get("floor_file") or {}
+    if isinstance(floor_file, str):
+        floor_file = {"source": floor_file}
+    elif not isinstance(floor_file, dict):
+        floor_file = {}
 
     return {
         "tool": tool, "role": role, "label": label,   # role = behavioral type; label defaults to it (adhoc: role='adhoc', label=NAME)
@@ -196,6 +203,7 @@ def resolve(cfg, role, tool_override, adhoc_name):
         "cwd": orch.get("cwd", ""),
         "plugins": plugins, "flags": flags, "env": env, "settings": settings,
         "setting_sources": setting_sources,
+        "floor_file": floor_file,                      # F1: declarative floor placed at launch (may be {})
         # worktree (config-gated, default-off): isolate this agent in a git worktree off its repo cwd.
         "worktree": bool(orch.get("worktree", False)),
         "worktree_base": orch.get("worktree_base", ""),
@@ -965,6 +973,137 @@ def _link_floor_claudemd(abs_cwd):
         print(f"[fleet] warn: could not link floor CLAUDE.md into {abs_cwd}: {e}")
 
 
+# ---- F1: the declarative floor FILE (fleet places a user-defined CLAUDE.md/AGENTS.md into cwd|home) -----
+# One config surface (`[tool.<t>.floor_file]`, per-role-overridable) unifies what already half-existed
+# twice: the adhoc CLAUDE.md symlink above, and codex citizenship's fenced AGENTS.md write. It only
+# PLACES the file; loading is the live setting_sources project walk (claude) / $CODEX_HOME (codex) — F1
+# adds no load path. Fenced-append is the DEFAULT (safe + idempotent + marker-guarded so re-launch never
+# duplicates); the fence markers are DISTINCT from codex citizenship's so both blocks coexist in one file.
+FLOOR_FENCE_BEGIN = "<!-- >>> cmux-fleet: floor (managed — fleet re-places this block on launch) -->"
+FLOOR_FENCE_END = "<!-- <<< cmux-fleet: floor -->"
+_FLOOR_MODES = ("write", "append", "overwrite", "symlink")
+
+
+def _floor_atomic_write(path, data):
+    """Write `data` to `path` via a temp + os.replace, so a crash mid-write never leaves a half-file
+    (matching providers._atomic_write; kept local to keep floor placement self-contained in cli)."""
+    tmp = f"{path}.tmp.{os.getpid()}"
+    with open(tmp, "w") as f:
+        f.write(data)
+    os.replace(tmp, path)
+
+
+def _floor_default_filename(tool):
+    # The two runtimes read different filenames — the whole reason floor_file composes per-tool.
+    return "AGENTS.md" if tool == "codex" else "CLAUDE.md"
+
+
+def _floor_target_path(spec, floor, codex_home):
+    """The FILE F1 will place. target = cwd|home, defaulting PER TOOL (claude->cwd, loaded via the
+    setting_sources project walk; codex->home $CODEX_HOME, the one slot codex reads from every cwd).
+    filename overrides the per-tool default. For codex+home with no explicit filename, honor the file
+    codex actually reads (AGENTS.override.md if the operator has one — else a floor written to AGENTS.md
+    would sit unread)."""
+    tool = spec["tool"]
+    name = (floor.get("filename") or "").strip() or _floor_default_filename(tool)
+    target = (floor.get("target") or "").strip().lower() or ("home" if tool == "codex" else "cwd")
+    if target == "home":
+        if tool == "codex":
+            from . import providers as pv
+            home = os.path.expanduser(codex_home or CODEX_DEFAULT_HOME)
+            return os.path.join(home, name) if floor.get("filename") else pv.codex_agents_file(home)
+        return os.path.join(os.path.expanduser("~/.claude"), name)      # claude's user-level floor
+    return os.path.join(spec["abs_cwd"], name)
+
+
+def _floor_source_text(source):
+    """The floor CONTENT. `source` is EITHER a path to a file OR literal inline content — the same
+    dual-meaning boot_prompt uses. Returns the text, or None when it's a path that can't be read
+    (fail-open: the caller warns and skips, never aborts the launch)."""
+    expanded = os.path.expanduser(source)
+    if os.path.isfile(expanded):
+        try:
+            return open(expanded).read()
+        except OSError:
+            return None
+    return source                                                       # inline content
+
+
+def _floor_fenced(existing, body):
+    """The full text that places/refreshes the floor fence in `existing`, or None when it's already
+    byte-identical (so an idempotent re-launch writes nothing). Replaces ONLY inside the fence and keeps
+    everything outside it — a user's own text, and a codex citizenship block, both survive. Mirrors
+    providers._codex_citizen_plan; a separate helper so codex's shipped path is left untouched."""
+    block = f"{FLOOR_FENCE_BEGIN}\n{body.strip()}\n{FLOOR_FENCE_END}\n"
+    b, e = existing.find(FLOOR_FENCE_BEGIN), existing.find(FLOOR_FENCE_END)
+    if b != -1 and e != -1 and e > b:
+        if existing[b:e + len(FLOOR_FENCE_END)] + "\n" == block:
+            return None                                                 # current: nothing to write
+        outside = existing[:b] + existing[e + len(FLOOR_FENCE_END):]
+    else:
+        outside = existing
+    outside = outside.strip()
+    return (outside + "\n\n" + block) if outside else block
+
+
+def _place_floor_file(spec, codex_home=None):
+    """Place the configured floor file at launch (F1). No-op when unconfigured. Idempotent and
+    clobber-SAFE per mode: append fences a managed block (never touches a user's own text); write places
+    only into an empty slot; symlink never replaces a real file; overwrite is the ONLY mode that replaces
+    a whole file, and only when explicitly chosen. FAIL-OPEN throughout — a floor that cannot be placed
+    WARNS and the launch proceeds (the floor is a backup; the turn-one boot prompt is the primary)."""
+    floor = spec.get("floor_file") or {}
+    source = (floor.get("source") or "").strip()
+    if not source:
+        return                                                          # unconfigured -> nothing to do
+    mode = (floor.get("mode") or "append").strip().lower()
+    if mode not in _FLOOR_MODES:
+        print(f"[fleet] warn: floor_file mode '{mode}' unknown (want {'|'.join(_FLOOR_MODES)}); skipping")
+        return
+    path = _floor_target_path(spec, floor, codex_home)
+    try:
+        os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
+    except OSError as e:
+        print(f"[fleet] warn: floor_file target dir for {path} unwritable ({e}); skipping")
+        return
+
+    if mode == "symlink":
+        src = os.path.expanduser(source)
+        if not os.path.isfile(src):                                     # can't symlink inline content
+            print(f"[fleet] warn: floor_file mode=symlink needs source to be a readable FILE "
+                  f"('{source}'); skipping")
+            return
+        if os.path.lexists(path):
+            return                                                      # never clobber an existing file
+        try:
+            os.symlink(os.path.relpath(src, os.path.dirname(path)), path)
+        except OSError as e:
+            print(f"[fleet] warn: could not symlink floor_file into {path}: {e}")
+        return
+
+    text = _floor_source_text(source)
+    if text is None:
+        print(f"[fleet] warn: floor_file source unreadable ('{source}'); skipping")
+        return
+
+    if mode == "write":
+        if os.path.lexists(path):                                       # skip+warn: never clobber (fork B)
+            print(f"[fleet] note: floor_file target {path} already exists; not overwriting (mode=write). "
+                  f"Use mode=append for a managed block, or mode=overwrite to replace.")
+            return
+        _floor_atomic_write(path, text if text.endswith("\n") else text + "\n")
+    elif mode == "overwrite":
+        _floor_atomic_write(path, text if text.endswith("\n") else text + "\n")
+    else:                                                               # append (fenced) — the default
+        try:
+            existing = open(path).read()
+        except OSError:
+            existing = ""
+        new = _floor_fenced(existing, text)
+        if new is not None:
+            _floor_atomic_write(path, new)
+
+
 def render_send_cmd(bin_name, args, env, abs_cwd, raw_env=None):
     parts = [f"cd {shlex.quote(abs_cwd)} &&"]
     for k, v in env.items():
@@ -1583,7 +1722,9 @@ def cmd_launch(argv):
                      f"or re-run with --force if you KNOW the old surface is already dead.")
 
     os.makedirs(spec["abs_cwd"], exist_ok=True)
-    if a.adhoc:                                          # the shared adhoc home has no role plugins/CLAUDE.md ->
+    _place_floor_file(spec, codex_home)                  # F1: declarative floor -> cwd|home; no-op if unconfigured
+    if a.adhoc and not (spec.get("floor_file") or {}).get("source"):
+        # legacy adhoc symlink stays the fallback, but ONLY when the new floor_file is not configured
         _link_floor_claudemd(spec["abs_cwd"])            # symlink the floor CLAUDE.md so they inherit it
     if spec["tool"] == "codex":                          # design the update modal out (Berg: always
         note = _codex_update_preflight()                 # allow the update); the pane scan below is the
