@@ -12,7 +12,8 @@ fleet daemon start [--heartbeat]            # detached router (survives shell ex
 fleet daemon status | stop | restart
 echo auto > "$CMUX_STATE_DIR/notify-mode"   # passive (mute) | auto (default, wake-now)
 
-# spawn + drive   (launch sends a turn-one boot prompt: the agent runs /loom:prime itself)
+# define + spawn + drive   (launch sends a turn-one boot prompt: the agent runs /loom:prime itself)
+fleet mint <name> [--kind conductor|child] [--group G] [--launch] [--dry-run]   # DEFINE a new role (home + roster block); --launch also spawns it
 fleet launch <role> [--brief "<task>"] [--place tab|pane|workspace] [--prime T|--no-prime] [--dry-run] [-- <tool flags>]
 fleet launch <role> --brief "<task>"        # one-command dispatch: brief -> child inbox, surfaces AFTER prime
 fleet launch --adhoc <name> --tool claude -- --model opus
@@ -185,6 +186,34 @@ top, without launching:
 fleet config <role>
 fleet config --adhoc scratch --cwd /some/dir
 ```
+
+### Minting a new role (`fleet mint`)
+
+A new role no longer needs a hand-edit of `fleet.toml` — this closes the
+can't-spawn-a-new-top-level-conductor gap. `fleet mint <name>` **defines** a
+role: it creates the home directory, seeds a thin identity stub (a pointer to
+`/loom:prime`, never boot content), and **appends** a `[role.<name>]` block to
+`fleet.toml`. The append is text-only and never rewrites an existing line, so
+hand-authored roles and comments survive untouched; `mint` only ever *creates* a
+role (edit or remove it by hand). It refuses a name that is already a role.
+
+```
+fleet mint payments-lead --kind conductor          # a new top-level conductor: own group + conductors/ home
+fleet mint helper-bot                               # a worker (default kind child)
+fleet mint payments-lead --kind conductor --launch  # define AND spawn in one command
+fleet mint <name> --dry-run                         # preview the block + launch argv, write nothing
+```
+
+Kind drives the convention: a `conductor` gets its own workspace group
+(`Conductor - <name>`) and a home under `_meta/agents/conductors/`, and launches
+top-level (`--parent none --place workspace`); a `child` gets a home under
+`_meta/agents/` and joins the dispatcher's group. `--cwd` / `--group` override.
+Define is idempotent config; **`--launch` is the opt-in** to also spawn — it
+hands off to the normal `fleet launch` path, so a minted agent gets the turn-one
+boot prompt (below) for free and the group-join uses launch's own machinery. The
+identity stub's wording is configurable via `[fleet].mint_identity_template`
+(the same cwd-floor-file seam), `{name}`/`{kind}` substituted. A minted role
+inherits only the `[tool.<t>]` floor loadout; tune its plugins by hand.
 
 ### The boot-and-dispatch contract (turn one + `--brief`)
 

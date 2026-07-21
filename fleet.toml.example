@@ -19,6 +19,11 @@
 # floor_claudemd = ""               # CLAUDE.md symlinked into the shared ad-hoc home; "" = none.  env: CMUX_FLEET_FLOOR
 #                                   # (`--adhoc <name>` is now an alias for the [role.adhoc] block below —
 #                                   #  one shared flat home, <name> becomes the LABEL. No adhoc_subdir key.)
+# mint_identity_template = ""       # template FILE `fleet mint` seeds as the new home's CLAUDE.md; "" -> a
+#                                   #   built-in THIN stub (a pointer to /loom:prime, never boot content).
+#                                   #   {name}/{kind} are substituted.  env: CMUX_FLEET_MINT_IDENTITY_TEMPLATE
+#                                   #   (`fleet mint <name>` DEFINES a new role: home dir + thin identity +
+#                                   #    an appended [role.<name>] block; --launch also spawns it.)
 # sidebar_paint = false             # daemon auto-repaints the custom fleet.swift sidebar (~every 4s, on-change)
 #                                   #   so state/ctx/model/last stay live. OFF by default: it writes a FLEET
 #                                   #   record into each agent workspace's DESCRIPTION (a subtitle in the
