@@ -287,6 +287,9 @@ def _inbox_line(r):
         body = (r.get("body") or "").strip().replace("\n", " ")[:100]
         rexp = " · REPLY EXPECTED" if r.get("reply_expected") else ""
         summary = f"({r.get('ptype','peer-msg')} {r.get('msg_id','?')}) {body}{rexp}"
+    elif kind == "brief":                                      # T6: a launch-queued work brief
+        body = (r.get("body") or "").strip().replace("\n", " ")[:200]
+        summary = f"(work brief from {r.get('from_label','?')}) {body}"
     else:
         summary = "(unknown kind)"
     return f"seq {seq}  [{kind}]  {who}: {summary}"
@@ -302,9 +305,9 @@ def _print_inbox_block(label, surface, pending):
     print(f"[inbox] {label} (surface {surface[:8]}): {len(pending)} pending (oldest first)")
     for r in pending:
         print("  " + _inbox_line(r))
-    flag = {"completion": "", "peer": " --peer", "stale": " --stale", "doctor": " --doctor"}
+    flag = {"completion": "", "peer": " --peer", "stale": " --stale", "doctor": " --doctor", "brief": " --brief"}
     hints = [f"{fs.ACK} {fs.max_seq([r for r in pending if r.get('kind') == k])}{flag[k]}"
-             for k in ("completion", "peer", "stale", "doctor")
+             for k in ("completion", "peer", "stale", "doctor", "brief")
              if any(r.get("kind") == k for r in pending)]
     print("  ack when handled: " + "   ".join(hints))
 
@@ -397,11 +400,13 @@ def cmd_inbox_ack(argv):
         args.remove("--stale"); kind_flag = "stale"
     if "--doctor" in args:
         args.remove("--doctor"); kind_flag = "doctor"
+    if "--brief" in args:
+        args.remove("--brief"); kind_flag = "brief"
     if "--surface" in args:
         i = args.index("--surface"); surface = args[i + 1]; del args[i:i + 2]
 
     if not args or not args[0].lstrip("-").isdigit():
-        sys.exit("usage: fleet inbox-ack <seq> [--peer | --stale | --doctor] [--surface <surfaceId>]")
+        sys.exit("usage: fleet inbox-ack <seq> [--peer | --stale | --doctor | --brief] [--surface <surfaceId>]")
     if not surface:
         sys.exit("inbox-ack: no surface (set $CMUX_SURFACE_ID or pass --surface)")
     seq = int(args[0])

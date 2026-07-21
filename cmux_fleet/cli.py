@@ -1371,10 +1371,25 @@ def cmd_launch(argv):
                     "[providers.<tool>] for THIS launch (accepts NAME or tool:NAME). A subscription "
                     "token is injected per-launch so session logs stay in the tool's DEFAULT dir; no "
                     "config-dir swap. Omit to use the tool's configured default.")
+    ap.add_argument("--brief", metavar="TASK",
+                    help="queue a work-brief to the child's INBOX at launch (input-safe, label-addressed). "
+                         "It surfaces via idle-wake the moment the child goes idle AFTER priming — turn one "
+                         "is the boot prompt, prime runs, THEN the brief. An unprimed agent never sees it. "
+                         "Keeps dispatch to one command: fleet launch <role> --brief \"<task>\".")
+    ap.add_argument("--prime", metavar="PROMPT",
+                    help="override the machine-composed turn-one boot prompt with your own text")
+    ap.add_argument("--no-prime", action="store_true",
+                    help="do NOT send the turn-one boot prompt (opt-out for a non-loom / hand-driven agent; "
+                         "contradicts --brief, which needs prime)")
     ap.add_argument("--dry-run", action="store_true", help="resolve + print, do NOT spawn")
     a = ap.parse_args(argv)
     if not a.role and not a.adhoc:
         ap.error("need a <role> or --adhoc <name>")
+    # --brief rides the POST-prime idle-wake; --no-prime means no prime ever fires -> the brief could only
+    # reach an UNPRIMED agent, which the T6 contract forbids ("an unprimed agent can NEVER receive a raw
+    # brief"). Refuse the contradiction up front rather than silently stranding the brief.
+    if a.brief and a.no_prime:
+        ap.error("--brief needs the boot prompt (prime); --no-prime + --brief is contradictory")
     # none-vs-unset on the two placement axes (Ship 5d R-5d-1 / item 7-creation): the launch arg spec must
     # express an EXPLICIT "none" distinct from "unset/default".
     #   --parent none  -> a TOP-LEVEL agent (registry parent=None). Distinct from unset (=$CMUX_SURFACE_ID).
@@ -1674,6 +1689,27 @@ def cmd_launch(argv):
             print(f"[fleet]     fleet rm {spec['label']} --kill")
             print(f"[fleet]     fleet launch {a.role or ('--adhoc ' + a.adhoc)} ...   # fix the flags first")
             return 2
+    # --- T6: turn-one boot prompt (converged with recycle --fresh) + the optional --brief queue --------
+    # The launcher OWNS turn one: it composes and SENDS the boot prompt (the SAME _boot_prime_prompt
+    # recycle --fresh / revive --fresh use — one source, T6 converge mandate), so a fleet-launched agent
+    # primes itself instead of booting context-blind. The dispatcher never types the boot.
+    if not a.no_prime:
+        boot = a.prime or _boot_prime_prompt(spec["label"], spec["role"], spec["abs_cwd"], event="launched")
+        time.sleep(8 if lazy else 3)                 # let the fresh TUI settle before input (mirrors recycle)
+        cmuxq("send", "--surface", surf, boot)
+        cmuxq("send-key", "--surface", surf, "enter")
+        print(f"[fleet] boot prompt sent (turn one): {spec['label']} -> run /loom:prime --role {spec['role']}")
+        # QUEUE the brief ONLY AFTER the boot prompt is submitted: the child is now busy priming, so the
+        # inbox idle-wake (wake_if_idle's busy-gate) cannot fire until its FIRST post-prime Stop. That is
+        # the structural guarantee that the brief surfaces AFTER prime, never before — and it rides the
+        # SAME idle-wake rail child completions use (router self-wakes the child on a pending brief).
+        if a.brief:
+            from_label = fs.label_for_surface(a.parent) or "operator"
+            seq = fs.inbox_put("brief", surf,
+                               {"label": spec["label"], "from_label": from_label, "body": a.brief},
+                               event_key=f"brief:{surf}")
+            print(f"[fleet] brief queued to {spec['label']}'s inbox (seq {seq}); surfaces via idle-wake "
+                  f"AFTER prime completes")
     if sid:
         print(f"[fleet] DONE: {spec['label']} = surface {surf} (session {sid}, place {spec['place']}, tool {spec['tool']})")
     else:
@@ -3512,10 +3548,8 @@ def cmd_revive(argv):
                  # command; plugins deterministic from the entry + --plugin union (already in spec).
                  effective={**_sendcmd_session_prefs(send_cmd), "plugins": spec["plugins"]})
     if a.fresh:                                                   # shed -> prime from the handover (like a fresh recycle)
-        ho = _latest_handover(spec["abs_cwd"], a.label)
-        prime = (f"You were just REVIVED into a FRESH session (same identity: label '{a.label}', "
-                 f"role '{spec.get('role')}'). Re-orient from your latest handover"
-                 + (f" at {ho}" if ho else " under ./handover/") + ", then continue where it left off.")
+        # CONVERGED onto the ONE turn-one boot prompt (T6): same single source as launch + recycle --fresh.
+        prime = _boot_prime_prompt(a.label, spec.get("role"), spec["abs_cwd"], event="revived")
         time.sleep(3)                                            # let the fresh TUI settle before input
         cmuxq("send", "--surface", surf, prime)
         cmuxq("send-key", "--surface", surf, "enter")
@@ -4439,6 +4473,35 @@ def _latest_handover(abs_cwd, label=None):
     return max(files, key=os.path.getmtime)          # legacy fallback: newest handover of any prefix
 
 
+# ---------------------------------------------------------------- the ONE turn-one boot prompt
+# T6 boot contract (cmux-advisor, Berg 2026-07-20): the launcher — not the dispatcher — owns turn one.
+# A fresh LAUNCH, a `recycle --fresh`, and a `revive --fresh` all send the SAME machine-composed boot
+# prompt as the agent's first turn: an identity line, "run /loom:prime", handover discovery, and
+# "report when primed". ONE template, ONE source (this function) — two boot-path variants is how drift
+# starts (T6 design (c)). The bug this fixes: LAUNCH never primed at all (native CLAUDE.md floor delivery
+# is dead-on-arrival under user,local setting-sources), so a fleet-launched agent booted context-blind.
+def _boot_prime_prompt(label, role, abs_cwd, event="launched"):
+    """Compose the turn-one boot/prime prompt. Shared by launch + recycle --fresh + revive --fresh so
+    the wording lives in exactly ONE place (T6 converge mandate). `event` (launched|recycled|revived)
+    varies ONLY the opening clause; the load-bearing body — run /loom:prime, handover discovery,
+    report-when-primed — is identical across all three, which is what makes this a single source.
+
+    WORDING IS A PLACEHOLDER, pending prime-architect's co-signed draft (T6 point 7 / F2). Build the
+    MECHANICS here; the final words land later — do not bikeshed them. The role-awareness (e.g. skipping
+    /loom:prime for a non-loom tool) is the future configurable launch-prompt (F2); v1 is one wording."""
+    ho = _latest_handover(abs_cwd, label)
+    opening = {
+        "launched": f"You were just LAUNCHED as '{label}' (role '{role}'). This is turn one — nothing is primed yet.",
+        "recycled": f"You were just recycled into a FRESH session (same identity: label '{label}', role '{role}', same surface).",
+        "revived":  f"You were just REVIVED into a FRESH session (same identity: label '{label}', role '{role}').",
+    }.get(event, f"You were just {event} as '{label}' (role '{role}').")
+    ho_clause = (f" Your latest handover is at {ho}; prime picks it up as your instance state."
+                 if ho else " (No handover yet — a clean boot; prime handles that.)")
+    return (f"{opening} Run /loom:prime --role {role} now to load your boot pages (the all-agents floor, "
+            f"your kind module, and your role module when one exists).{ho_clause} Report when primed and "
+            f"ready for your brief. [fleet turn-one boot prompt — PLACEHOLDER wording, pending prime-architect review]")
+
+
 def _poll_session_back(surf, old_sid, mode, timeout=90):
     """Confirm the recycled agent re-bound a session to `surf`. respawn-pane fully REMOVES the old
     session entry from cmux's hook store (session-end), then the relaunch re-creates it:
@@ -4858,11 +4921,11 @@ def _recycle_plan(label, entry, caller, add_plugin, mode, session, force, prime_
         elif mode == "fresh":
             abs_cwd = entry.get("cwd", "")
             abs_cwd = abs_cwd if os.path.isabs(abs_cwd) else os.path.join(ROOT, abs_cwd)
-            ho = _latest_handover(abs_cwd, label)
-            prime = (f"You were just recycled into a FRESH session (same identity: label '{label}', "
-                     f"role '{entry.get('role')}', same surface). Re-orient from your latest handover"
-                     + (f" at {ho}" if ho else " under ./handover/")
-                     + ", then continue where it left off.")
+            # CONVERGED onto the ONE turn-one boot prompt (T6): recycle --fresh now sends the SAME
+            # identity + run-/loom:prime + handover-discovery + report-when-primed prompt launch does,
+            # from a single source. (Was an inline "re-orient from your handover" string that never told
+            # the agent to prime — the same dead-on-arrival floor bug, latent on the recycle path too.)
+            prime = _boot_prime_prompt(label, entry.get("role"), abs_cwd, event="recycled")
     return {"label": label, "surface": surf, "send_cmd": send_cmd, "mode": mode,
             "tool": entry.get("tool", "claude"), "force": force, "prime": prime, "old_session": old_sid,
             "cwd": _cwd_of_sendcmd(send_cmd),          # effective launch cwd, persisted after a FRESH bind
@@ -6046,7 +6109,8 @@ USAGE_HEADER = ("usage: fleet <launch|config|ls|plugins|archive|revive|register|
                 "sessions|broadcast|mute|unmute|rm|vitals|usage|find|graph|serve|paint|worktree|profile|"
                 "daemon|drive-child|peer-msg|child-digest|inbox|inbox-ack> ...")
 VERB_USAGE = {
-    "launch": "  launch <role|--adhoc NAME> [--tool t] [--place p] [--parent s] [--effort L] [--model M] [--plugin NAME] [--provider NAME] [--dry-run] [-- <tool flags>]",
+    "launch": "  launch <role|--adhoc NAME> [--tool t] [--place p] [--parent s] [--effort L] [--model M] [--plugin NAME] [--provider NAME] [--brief \"<task>\"] [--prime T|--no-prime] [--dry-run] [-- <tool flags>]\n"
+              "                                                    spawns + sends a turn-one boot prompt (run /loom:prime); --brief queues a work brief to the child's inbox, surfaced via idle-wake AFTER prime",
     "config": "  config <role|--adhoc NAME|--cwd DIR> [--tool t]   effective config (base settings + fleet adds)",
     "ls": "  ls [--scope mine|all|conductors|children] [--json] live fleet x hook store; flags STALE + archived (default mine = you + your children; --scope all = the world)",
     "plugins": "  plugins <add|reconcile|ls|show|describe> ...      the plugin INDEX: add-from-URL (safe: never enables) + reconcile + on-demand discovery",
@@ -6091,7 +6155,7 @@ VERB_USAGE = {
                 "                                                    input-safe A2A: message a live PEER by label (or --to-parent: your registry-resolved conductor), into its context never its input box",
     "child-digest": "  child-digest <session-frag> [N]                   print a child's last N transcript turns (the reliable content source)",
     "inbox": "  inbox [--scope mine|<label>|all|conductors|children] [--json]  pending inbox on demand (default mine = yours; <label> peeks one; all = triage) — the catch-up read after a recycle",
-    "inbox-ack": "  inbox-ack <seq> [--peer|--stale|--doctor] [--surface UUID]  mark shown completions/alerts/peer msgs handled so they stop re-surfacing",
+    "inbox-ack": "  inbox-ack <seq> [--peer|--stale|--doctor|--brief] [--surface UUID]  mark shown completions/alerts/peer msgs/briefs handled so they stop re-surfacing",
 }
 # `unmute` shares mute's entry (one blob line covers both verbs) — alias it so `fleet unmute --help`
 # resolves. Without this it would fall through the guard and (un)mute a label named '--help'.

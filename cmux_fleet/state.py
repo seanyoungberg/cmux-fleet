@@ -5,7 +5,7 @@
 #
 # Stores (one inbox mechanism):
 #   inbox.jsonl        unified append-only message stream. One line: {seq, ts, kind, to, event_key,
-#                      **payload}. kind = "completion" | "peer" | "stale" | "doctor".
+#                      **payload}. kind = "completion" | "peer" | "stale" | "doctor" | "brief".
 #   inbox.seq          atomic monotonic counter behind `seq` (router AND peer-msg both append).
 #   inbox-cursors.json {surface: {kind: seq}} — per-(surface,kind) ack high-water (batch clears).
 #   inbox-acked.json   {surface: {event_key: ts}} — EVENT-level ack ledger: one ack clears that event
@@ -175,8 +175,9 @@ def inbox_next_seq():
 
 
 def inbox_put(kind, to_surface, payload, event_key=None):
-    """Append one message addressed to a surface. kind: 'completion' | 'peer' | 'stale' | 'doctor'. ALL
-    carry a single `to` field (normalized, critic issue #7) so one reader selects 'for me'.
+    """Append one message addressed to a surface. kind: 'completion' | 'peer' | 'stale' | 'doctor' |
+    'brief' (a launch-queued work brief, T6). ALL carry a single `to` field (normalized, critic issue
+    #7) so one reader selects 'for me'.
 
     `event_key` is the row's durable EVENT identity (see row_event_key). A put whose key `to_surface`
     already ACKED is REFUSED (returns 0, no row): the agent handled that event, so a producer replaying

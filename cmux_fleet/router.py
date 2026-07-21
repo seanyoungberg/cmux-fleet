@@ -207,9 +207,14 @@ def last_assistant_text(path, cap=160):
 
 
 def _alert_pending(surface):
-    """Wake-worthy inbox rows: child completions OR stale-member alerts. Peer messages are excluded on
-    purpose — their send path (fleet peer-msg) does its own wake."""
-    return fs.inbox_pending(surface, kind="completion") or fs.inbox_pending(surface, kind="stale")
+    """Wake-worthy inbox rows: child completions, stale-member alerts, OR a launch-queued work brief.
+    Peer messages are excluded on purpose — their send path (fleet peer-msg) does its own synchronous
+    wake. A brief is the OPPOSITE case (T6): it is queued at LAUNCH, before the agent is even up, so its
+    send path CANNOT wake it — the router carries it here, surfacing the brief the moment the freshly
+    primed agent first goes idle."""
+    return (fs.inbox_pending(surface, kind="completion")
+            or fs.inbox_pending(surface, kind="stale")
+            or fs.inbox_pending(surface, kind="brief"))
 
 
 def maybe_idle_wake(parent_surface, label):
@@ -891,6 +896,15 @@ def handle(ev):
     label, kind = entry.get("label"), entry.get("kind")
     log(f"[event] Stop {label}/{kind} surface={surface[:8]}")
     if kind == "child":                                 # branch on KIND, not role (critic issue #1)
+        # T6 brief delivery: a child launched with --brief has its work brief queued to its OWN inbox at
+        # launch. This first post-prime Stop is exactly when it should surface — turn one was the boot
+        # prompt (= /loom:prime), so the child is now PRIMED and idle. Self-wake it on the SAME idle-wake
+        # rail completions ride, on the child's own surface. Gated on a pending brief so a normal child
+        # (whose own inbox holds no wake-worthy rows) is untouched; nothing wakes the child before this
+        # Stop, so an UNPRIMED child can never receive the brief. Mute is about the parent-facing
+        # completion push, not the child's own assignment, so this runs even for a muted child.
+        if fs.inbox_pending(surface, kind="brief"):
+            maybe_idle_wake(surface, label)
         if entry.get("muted"):                          # muted child: suppress push (no inbox row, no
             log(f"[muted] {label}: completion suppressed (parent reads on demand)")
             return                                       # notify, no idle-wake). Parent reads on demand.
