@@ -139,6 +139,14 @@ BOOT_PROMPT = _resolve("CMUX_FLEET_BOOT_PROMPT", "boot_prompt", "")
 # reconciled index and the hand-authored roster own themselves (design §2d). Resolution reads both.
 PLUGIN_INDEX = _resolve_path("CMUX_FLEET_PLUGIN_INDEX", "plugin_index", os.path.join(TOML_DIR, "plugins.toml"))
 
+# The per-home identity STUB `fleet mint` seeds into a new role's home. It is a THIN POINTER to /loom:prime,
+# never a boot surface — role knowledge lives in the governed prime pages, per the role-owned-agent-homes
+# ruling (an agent-writable cwd boot file is the CLAUDE.md accretion disease it names). "" -> the built-in
+# thin stub (see cli._MINT_IDENTITY_STUB). Set to a template FILE path to override — the F1 cwd-floor-file
+# seam, so mint composes with that feature rather than growing its own; {name}/{kind} are substituted.
+# env > [fleet].mint_identity_template. Empty passes through as "" (default stub); a path expands + anchors.
+MINT_IDENTITY_TEMPLATE = _resolve_path("CMUX_FLEET_MINT_IDENTITY_TEMPLATE", "mint_identity_template", "")
+
 
 def load_plugin_index(path=None):
     """Parse the plugins.toml INDEX into {"marketplaces": {...}, "plugins": {...}}. Absent/unreadable ->

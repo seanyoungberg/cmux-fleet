@@ -27,7 +27,8 @@
 # [defaults] (orchestration) -> [role] scalars -> tool config [tool.<t>] -> [role.<t>] -> caller `--`.
 import argparse, json, os, re, shlex, subprocess, sys, tempfile, time
 
-from .config import ROOT, STATE, CMUX, FLOOR, FLEET_TOML, PLUGIN_INDEX, HOOKSTORE, HOOKSTORE_EXPLICIT, load_plugin_index  # path resolver
+from .config import (ROOT, STATE, CMUX, FLOOR, FLEET_TOML, PLUGIN_INDEX, HOOKSTORE, HOOKSTORE_EXPLICIT,
+                     MINT_IDENTITY_TEMPLATE, load_plugin_index)  # path resolver
 
 # The checkout/build root: the dir that holds bin/, .claude-plugin/, fleet.toml.example next to the
 # cmux_fleet package. In a repo/editable install this is the repo root (unchanged from the flat layout,
@@ -3863,15 +3864,76 @@ def _mint_launch_argv(name, orch):
     return [name, "--place", orch.get("place", "workspace")]
 
 
-def cmd_mint(argv):
-    """Define (and optionally launch) a NEW fleet role — the mint plumbing for the
-    can't-spawn-a-new-top-level-conductor gap. DEFINE resolves the role's home/kind convention, creates the
-    home dir, (will) seed a thin identity stub, and (will) register the role by APPENDING a [role.<name>]
-    block to fleet.toml. LAUNCH is opt-in (--launch): it calls the existing launch path.
+# The built-in thin identity stub (Fork B). STRICTLY a pointer to /loom:prime — an identity line + the
+# prime pointer, NO role knowledge (that lives in the governed boot pages; a cwd boot file that accretes it
+# is the disease the role-owned-agent-homes ruling names). Overridable via [fleet].mint_identity_template
+# (the F1 seam). {name}/{kind} are substituted. Kept to a few lines on purpose.
+_MINT_IDENTITY_STUB = """# {name}
 
-    SCAFFOLD: the roster append (Fork A) + identity seed (Fork B) are NOT wired yet. mint resolves, creates
-    the home dir, and PREVIEWS the block/argv it would write; forky steps print a held-for-sign-off notice
-    and write nothing to the roster (so --launch cannot yet spawn — the role isn't in the roster)."""
+You are **{name}**, a cmux-fleet {kind}. Your identity, mandate, and boot knowledge load at
+boot — run `/loom:prime` (it reads the floor, your kind module, and your role module when one exists).
+
+This file is a POINTER, not a boot surface: role knowledge lives in the governed prime pages, never
+here. Do not accrete instructions into it.
+"""
+
+
+def _seed_identity(abs_cwd, name, kind):
+    """Seed the thin per-home identity stub into a freshly-minted home (Fork B). Best-effort: NEVER clobber
+    an existing CLAUDE.md (a hand-authored plaque is authoritative, same guard as _link_floor_claudemd), and
+    a write failure warns rather than aborts the mint (the roster append is the authoritative step). Content
+    is the [fleet].mint_identity_template file when set (the F1 seam), else the built-in stub; {name}/{kind}
+    substitute via replace (not .format, so literal braces in an operator template survive)."""
+    dst = os.path.join(abs_cwd, "CLAUDE.md")
+    if os.path.lexists(dst):
+        print(f"[fleet] mint: home already has a CLAUDE.md; leaving it untouched")
+        return
+    body = _MINT_IDENTITY_STUB
+    if MINT_IDENTITY_TEMPLATE:
+        try:
+            body = open(MINT_IDENTITY_TEMPLATE).read()
+        except OSError as e:
+            print(f"[fleet] mint: warn: could not read mint_identity_template {MINT_IDENTITY_TEMPLATE} "
+                  f"({e}); using the built-in stub")
+    body = body.replace("{name}", name).replace("{kind}", kind)
+    try:
+        with open(dst, "w") as f:
+            f.write(body)
+        print(f"[fleet] mint: seeded identity stub {dst}")
+    except OSError as e:
+        print(f"[fleet] mint: warn: could not seed identity stub into {abs_cwd}: {e}")
+
+
+def _append_role_block(path, block_text):
+    """APPEND-ONLY roster write (Fork A): append `block_text` to fleet.toml WITHOUT rewriting a single
+    existing byte, so hand-authored roles + comments survive by construction (the whole reason this is a
+    text append, not a tomlkit round-trip). Ensures exactly one blank-line separator before the new block,
+    tags it with a provenance comment, and never touches the prior content. The caller does the tomllib
+    read-first duplicate check; this is purely the write."""
+    with open(path) as f:
+        existing = f.read()
+    if existing.endswith("\n\n"):
+        sep = ""
+    elif existing.endswith("\n") or existing == "":
+        sep = "\n"
+    else:
+        sep = "\n\n"
+    with open(path, "a") as f:
+        f.write(sep + "# minted by `fleet mint`\n" + block_text)
+
+
+def cmd_mint(argv):
+    """Define (and optionally launch) a NEW fleet role — the mint plumbing that closes the
+    can't-spawn-a-new-top-level-conductor gap.
+
+    DEFINE (the default, idempotent config act): resolve the role's home/kind convention, create the home
+    dir, seed a thin identity stub (Fork B), and register the role by APPENDING a [role.<name>] block to
+    fleet.toml (Fork A: append-only text — hand-authored roles + comments survive untouched; mint CREATES,
+    never edits/removes). LAUNCH is opt-in (--launch, Fork C): define is idempotent config, launch is a
+    runtime side-effect that can fail on surface-bind and must not fail the definition, so it is separate.
+    --launch calls the EXISTING launch path (cmd_launch) — no composer/boot-prompt/--brief changes, and the
+    group-join is launch's own robust machinery (mint never name-keys a group). A minted agent gets the
+    boot prompt for free via the shared launch path."""
     caller = []
     if "--" in argv:                                         # `--` passthrough is forwarded to launch
         i = argv.index("--")
@@ -3909,29 +3971,47 @@ def cmd_mint(argv):
     print(f"[fleet] mint: {name}  kind={orch['kind']}  tool={tool}"
           + (f"  group={orch['group']}" if orch.get("group") else ""))
     print(f"[fleet] mint: home = {abs_cwd}")
-    print(f"[fleet] mint: would append to {FLEET_TOML}:")
+    verb = "would append to" if a.dry_run else "append to"
+    print(f"[fleet] mint: {verb} {FLEET_TOML}:")
     for line in block.splitlines():
         print(f"[fleet]     {line}")
 
     if a.dry_run:
         print("[fleet] mint: dry-run — nothing written")
+        if a.launch:
+            print(f"[fleet] mint: --launch would run:  fleet launch "
+                  f"{' '.join(_mint_launch_argv(name, orch) + (['--', *caller] if caller else []))}")
         return 0
 
-    # UNCONTROVERSIAL, brief-sanctioned side effect: create the role home dir, exactly as launch does.
+    # The roster append is an APPEND to an EXISTING fleet.toml (the authoritative roster you are adding to).
+    # Absent file -> refuse with the seeding path rather than mint a phantom one-role roster with no
+    # [fleet]/[defaults] preamble. (Checked only on a real run: dry-run previews without a roster.)
+    if not os.path.exists(FLEET_TOML):
+        sys.exit(f"[fleet] mint: no roster at {FLEET_TOML} to append to. Seed one first "
+                 f"(`fleet profile <name> --init`), or create it, then re-run.")
+
+    # DEFINE — the three write steps. Home dir (as launch does) -> thin identity stub (never clobbers) ->
+    # the authoritative roster append. Order matters: the append is the commit; the home/seed precede it so
+    # a role never lands in the roster without a home.
     os.makedirs(abs_cwd, exist_ok=True)
     print(f"[fleet] mint: created home dir {abs_cwd}")
+    _seed_identity(abs_cwd, name, orch["kind"])
+    _append_role_block(FLEET_TOML, block)
+    print(f"[fleet] mint: appended [role.{name}] to {FLEET_TOML}")
 
-    # FORKY — HELD for design sign-off. The roster append (Fork A) and identity-stub seed (Fork B) are not
-    # wired; mint writes nothing to the roster until those are ruled. Named so the operator (and the review)
-    # see exactly what is pending rather than a silent no-op.
-    print("[fleet] mint: roster append + identity seed are HELD for design sign-off (Fork A/B); "
-          "nothing was written to the roster.")
-    if a.launch:
-        launch_argv = _mint_launch_argv(name, orch) + (["--", *caller] if caller else [])
-        print(f"[fleet] mint: --launch would run:  fleet launch {' '.join(launch_argv)}")
-        print("[fleet] mint: launch is HELD until the roster append lands (launch needs the role in the "
-              "roster). Re-run `fleet launch ...` once the block exists, or wait for sign-off.")
-    return 0
+    from . import state as fs
+    fs.log_event("minted", label=name, role=name, kind=orch["kind"], tool=tool, cwd=abs_cwd)
+
+    if not a.launch:
+        launch_argv = _mint_launch_argv(name, orch)
+        print(f"[fleet] mint: defined (not launched). To spawn it:  fleet launch {' '.join(launch_argv)}")
+        return 0
+
+    # LAUNCH (opt-in): hand off to the existing launch path. It re-reads the roster (fresh load_config),
+    # so the just-appended role resolves; the group-join, surface creation, and boot prompt are all its own.
+    launch_argv = _mint_launch_argv(name, orch) + (["--", *caller] if caller else [])
+    print(f"[fleet] mint: launching:  fleet launch {' '.join(launch_argv)}")
+    return cmd_launch(launch_argv)
 
 
 def _self_entry(surface_flag=""):
