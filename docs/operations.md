@@ -12,10 +12,11 @@ fleet daemon start [--heartbeat]            # detached router (survives shell ex
 fleet daemon status | stop | restart
 echo auto > "$CMUX_STATE_DIR/notify-mode"   # passive (mute) | auto (default, wake-now)
 
-# spawn + drive
-fleet launch <role> [--place tab|pane|workspace] [--dry-run] [-- <tool flags>]
+# spawn + drive   (launch sends a turn-one boot prompt: the agent runs /loom:prime itself)
+fleet launch <role> [--brief "<task>"] [--place tab|pane|workspace] [--prime T|--no-prime] [--dry-run] [-- <tool flags>]
+fleet launch <role> --brief "<task>"        # one-command dispatch: brief -> child inbox, surfaces AFTER prime
 fleet launch --adhoc <name> --tool claude -- --model opus
-fleet drive-child <surface> "<prompt>"
+fleet drive-child <surface> "<prompt>"      # mid-flight steering (unchanged)
 fleet child-digest <session-frag> 5
 
 # inventory + lifecycle   (scope-aware reads default --scope mine = you + your children; --scope all = the world)
@@ -184,6 +185,38 @@ top, without launching:
 fleet config <role>
 fleet config --adhoc scratch --cwd /some/dir
 ```
+
+### The boot-and-dispatch contract (turn one + `--brief`)
+
+`fleet launch` **owns turn one**. After the surface binds, it sends a
+machine-composed boot prompt as the agent's first turn — identity, **run
+`/loom:prime`** (the agent primes itself: kind from the live roster, boot pages,
+latest handover), report-ready, then **drain `fleet inbox`** for its brief. The
+same boot prompt is sent by `recycle --fresh` and `revive --fresh`, from one
+source — so a launched or shed-and-reprimed agent is always primed, never
+context-blind. (This closed the delivery hole where a fleet-launched agent
+loaded no floor at all under `setting_sources = user,local`.)
+
+```
+fleet launch <role> --brief "<task>"        # dispatch in one command
+```
+
+`--brief "<task>"` queues the task to the **child's inbox** at launch
+(input-safe, label-addressed — never its input box). It surfaces via idle-wake
+the moment the child goes idle **after** priming: turn one is the boot prompt,
+prime runs, *then* the brief. An **unprimed agent can never receive a raw
+brief** — the ordering is structural (the brief is queued only after the boot
+prompt is submitted, so nothing wakes the child for it until its first
+post-prime idle). The child reads it with `fleet inbox` and clears it with
+`fleet inbox-ack <seq>`. `--brief` cannot combine with `--no-prime`.
+
+The boot-prompt **wording is user-configurable** — `[fleet].boot_prompt` (env
+`CMUX_FLEET_BOOT_PROMPT`), a literal string or a path to a template file, read
+at compose time so a toml edit goes live with no reinstall. It defaults to the
+frozen prime-architect template; the launcher substitutes `{AGENT_ROLE}` /
+`{AGENT_LABEL}`. `--prime "<text>"` overrides it for one launch; `--no-prime`
+sends no boot prompt (a non-loom or hand-driven agent). `drive-child` is
+unchanged — it stays the tool for mid-flight steering.
 
 ## Worktrees (code repos)
 
