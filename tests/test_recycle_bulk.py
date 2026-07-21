@@ -82,12 +82,15 @@ def test_bulk_skips_dead_pid_running_ghost(fs, rs, monkeypatch):
 
 # --- the shared per-target plan ------------------------------------------------------------------
 def test_recycle_plan_fresh_primes_from_handover(fs, monkeypatch):
+    # T6: recycle --fresh now sends the CONVERGED, config-driven turn-one boot prompt (the SAME
+    # [fleet].boot_prompt template launch uses), which tells the agent to run /loom:prime — prime itself
+    # then discovers the handover (its job, per the floor). Was an inline "re-orient from your handover"
+    # string that never invoked prime — the same dead-on-arrival floor bug, latent on the recycle path.
     monkeypatch.setattr(cli, "_compose_recycle_cmd", lambda *a, **k: ("claude ...", ""))
-    monkeypatch.setattr(cli, "_latest_handover", lambda cwd, label=None: "/x/handover/h.md")
     entry = {"kind": "child", "surface": "A", "tool": "claude", "role": "w", "cwd": "/x", "session": "claude-s"}
     p = cli._recycle_plan("kidA", entry, [], [], "fresh", "", False, None, False)
     assert p["mode"] == "fresh" and p["surface"] == "A" and p["old_session"] == "s"
-    assert p["prime"] and "FRESH" in p["prime"] and "h.md" in p["prime"]
+    assert p["prime"] and "/loom:prime --role w" in p["prime"]   # converged: recycle --fresh primes explicitly
 
 
 def test_latest_handover_prefers_the_label_prefixed_then_falls_back(tmp_path):

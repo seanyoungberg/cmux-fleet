@@ -89,9 +89,17 @@ first. There is no network fallback; the plugin requires the app.
 
    ```
    fleet launch worker
+   fleet launch worker --brief "audit the retry logic in foo.py"   # one-command dispatch
    fleet launch --adhoc scratch --tool claude -- --model opus
    fleet ls
    ```
+
+`fleet launch` owns **turn one**: it sends a machine-composed boot prompt that
+tells the agent to run `/loom:prime`, report ready, then drain `fleet inbox`.
+`--brief "<task>"` queues that task to the child's **inbox**, where it surfaces
+only **after** the agent has primed — an unprimed agent never receives a raw
+brief. The wording is configurable (`[fleet].boot_prompt`); `--prime` overrides
+it per launch, `--no-prime` opts out.
 
 The router watches the bus; when the child finishes a turn, the conductor sees
 the completion in its context on its next turn (or sooner, depending on the
@@ -101,7 +109,7 @@ mode dial below).
 
 | Verb | What it does |
 | --- | --- |
-| `fleet launch <role\|--adhoc N>` | spawn an agent (`--place tab\|pane\|workspace`, `--dry-run`, `-- <tool flags>`) |
+| `fleet launch <role\|--adhoc N>` | spawn an agent; sends a turn-one boot prompt (the agent runs `/loom:prime`). `--brief "<task>"` queues a work brief to its inbox that surfaces only after prime — one-command dispatch. (`--place tab\|pane\|workspace`, `--prime`/`--no-prime`, `--dry-run`, `-- <tool flags>`) |
 | `fleet ls [--scope …]` | live fleet reconciled against cmux's hook store (flags STALE / pending / MUTED); defaults `--scope mine` (you + your children), `--scope all` for the world |
 | `fleet recycle [label]` | restart in place, same surface and identity (default RESUME; `--fresh` sheds, `--session <id>`, `--force`; bulk `--scope mine\|all\|conductors\|children`) |
 | `fleet sessions <label>` | list resumable prior sessions for the agent's surface (id, age, size, snippet) |
@@ -149,6 +157,7 @@ no vault assumption, marketplace and floor disabled.
 | `CMUX_HOOKSTORE_DIR` | `hookstore_dir` | `~/.cmuxterm` (cmux-owned) |
 | `CMUX_FLEET_ADHOC_SUBDIR` | `adhoc_subdir` | `agents/ad-hoc` (relative to root) |
 | `CMUX_FLEET_CONTEXT_WINDOW` | `context_window` | `0` (guess per model; set to your window, e.g. `200000` / `1000000`, for an exact `vitals` ctx %) |
+| `CMUX_FLEET_BOOT_PROMPT` | `boot_prompt` | `""` (the built-in frozen template). The turn-one boot prompt launch/recycle send; a literal string or a template-file path, read at compose time. `{AGENT_ROLE}`/`{AGENT_LABEL}` substituted by the launcher; `--prime` overrides per-launch |
 
 `CMUX_FLEET_ROOT` is the workspace root that a role's relative `cwd` composes
 against. It defaults to `$HOME`, so a config file in `~/.config` does not silently

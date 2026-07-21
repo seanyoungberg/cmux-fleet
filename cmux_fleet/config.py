@@ -125,6 +125,15 @@ SIDEBAR_PAINT = str(_resolve("CMUX_FLEET_SIDEBAR_PAINT", "sidebar_paint", "")).s
 RECONCILE_RESTORE = str(_resolve("CMUX_FLEET_RECONCILE_RESTORE", "reconcile_restore", "true")).strip().lower() in (
     "1", "true", "yes", "on")
 
+# The turn-one BOOT PROMPT (T6 boot contract / F2 productization): the wording `fleet launch` and
+# `recycle --fresh`/`revive --fresh` send as the agent's first turn. USER-CONFIGURABLE, read at compose
+# time (each launch/recycle is a fresh CLI process, so a toml edit goes live with no tool release):
+# env > [fleet].boot_prompt > the built-in frozen default (cli._DEFAULT_BOOT_PROMPT). The value is EITHER
+# the literal prompt text OR a path to a file holding it (cli._boot_prompt_template resolves which at
+# compose time). "" here = use the built-in default. ONE value serves BOTH launch and recycle (Berg's
+# ruling 2026-07-20); the {AGENT_ROLE}/{AGENT_LABEL} substitution stays the launcher's.
+BOOT_PROMPT = _resolve("CMUX_FLEET_BOOT_PROMPT", "boot_prompt", "")
+
 # The plugin INDEX (plugins.toml): env > [fleet].plugin_index > <toml-dir>/plugins.toml. Absent file ->
 # empty index (never an error). This is a SEPARATE file from the roster fleet.toml so the machine-
 # reconciled index and the hand-authored roster own themselves (design §2d). Resolution reads both.

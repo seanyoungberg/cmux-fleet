@@ -1371,10 +1371,25 @@ def cmd_launch(argv):
                     "[providers.<tool>] for THIS launch (accepts NAME or tool:NAME). A subscription "
                     "token is injected per-launch so session logs stay in the tool's DEFAULT dir; no "
                     "config-dir swap. Omit to use the tool's configured default.")
+    ap.add_argument("--brief", metavar="TASK",
+                    help="queue a work-brief to the child's INBOX at launch (input-safe, label-addressed). "
+                         "It surfaces via idle-wake the moment the child goes idle AFTER priming — turn one "
+                         "is the boot prompt, prime runs, THEN the brief. An unprimed agent never sees it. "
+                         "Keeps dispatch to one command: fleet launch <role> --brief \"<task>\".")
+    ap.add_argument("--prime", metavar="PROMPT",
+                    help="override the machine-composed turn-one boot prompt with your own text")
+    ap.add_argument("--no-prime", action="store_true",
+                    help="do NOT send the turn-one boot prompt (opt-out for a non-loom / hand-driven agent; "
+                         "contradicts --brief, which needs prime)")
     ap.add_argument("--dry-run", action="store_true", help="resolve + print, do NOT spawn")
     a = ap.parse_args(argv)
     if not a.role and not a.adhoc:
         ap.error("need a <role> or --adhoc <name>")
+    # --brief rides the POST-prime idle-wake; --no-prime means no prime ever fires -> the brief could only
+    # reach an UNPRIMED agent, which the T6 contract forbids ("an unprimed agent can NEVER receive a raw
+    # brief"). Refuse the contradiction up front rather than silently stranding the brief.
+    if a.brief and a.no_prime:
+        ap.error("--brief needs the boot prompt (prime); --no-prime + --brief is contradictory")
     # none-vs-unset on the two placement axes (Ship 5d R-5d-1 / item 7-creation): the launch arg spec must
     # express an EXPLICIT "none" distinct from "unset/default".
     #   --parent none  -> a TOP-LEVEL agent (registry parent=None). Distinct from unset (=$CMUX_SURFACE_ID).
@@ -1674,6 +1689,27 @@ def cmd_launch(argv):
             print(f"[fleet]     fleet rm {spec['label']} --kill")
             print(f"[fleet]     fleet launch {a.role or ('--adhoc ' + a.adhoc)} ...   # fix the flags first")
             return 2
+    # --- T6: turn-one boot prompt (converged with recycle --fresh) + the optional --brief queue --------
+    # The launcher OWNS turn one: it composes and SENDS the boot prompt (the SAME _boot_prime_prompt
+    # recycle --fresh / revive --fresh use — one source, T6 converge mandate), so a fleet-launched agent
+    # primes itself instead of booting context-blind. The dispatcher never types the boot.
+    if not a.no_prime:
+        boot = _boot_prime_prompt(spec["label"], spec["role"], override=a.prime)
+        time.sleep(8 if lazy else 3)                 # let the fresh TUI settle before input (mirrors recycle)
+        cmuxq("send", "--surface", surf, boot)
+        cmuxq("send-key", "--surface", surf, "enter")
+        print(f"[fleet] boot prompt sent (turn one): {spec['label']} -> run /loom:prime --role {spec['role']}")
+        # QUEUE the brief ONLY AFTER the boot prompt is submitted: the child is now busy priming, so the
+        # inbox idle-wake (wake_if_idle's busy-gate) cannot fire until its FIRST post-prime Stop. That is
+        # the structural guarantee that the brief surfaces AFTER prime, never before — and it rides the
+        # SAME idle-wake rail child completions use (router self-wakes the child on a pending brief).
+        if a.brief:
+            from_label = fs.label_for_surface(a.parent) or "operator"
+            seq = fs.inbox_put("brief", surf,
+                               {"label": spec["label"], "from_label": from_label, "body": a.brief},
+                               event_key=f"brief:{surf}")
+            print(f"[fleet] brief queued to {spec['label']}'s inbox (seq {seq}); surfaces via idle-wake "
+                  f"AFTER prime completes")
     if sid:
         print(f"[fleet] DONE: {spec['label']} = surface {surf} (session {sid}, place {spec['place']}, tool {spec['tool']})")
     else:
@@ -3511,11 +3547,10 @@ def cmd_revive(argv):
                  # ledger parity with log_launch/recycled: ground-truth effort/model off the composed
                  # command; plugins deterministic from the entry + --plugin union (already in spec).
                  effective={**_sendcmd_session_prefs(send_cmd), "plugins": spec["plugins"]})
-    if a.fresh:                                                   # shed -> prime from the handover (like a fresh recycle)
-        ho = _latest_handover(spec["abs_cwd"], a.label)
-        prime = (f"You were just REVIVED into a FRESH session (same identity: label '{a.label}', "
-                 f"role '{spec.get('role')}'). Re-orient from your latest handover"
-                 + (f" at {ho}" if ho else " under ./handover/") + ", then continue where it left off.")
+    if a.fresh:                                                   # shed -> re-boot fresh (like a fresh recycle)
+        # CONVERGED onto the ONE config-driven boot prompt (T6): same single source + [fleet].boot_prompt
+        # template as launch + recycle --fresh.
+        prime = _boot_prime_prompt(a.label, spec.get("role"))
         time.sleep(3)                                            # let the fresh TUI settle before input
         cmuxq("send", "--surface", surf, prime)
         cmuxq("send-key", "--surface", surf, "enter")
@@ -4439,6 +4474,66 @@ def _latest_handover(abs_cwd, label=None):
     return max(files, key=os.path.getmtime)          # legacy fallback: newest handover of any prefix
 
 
+# ---------------------------------------------------------------- the ONE turn-one boot prompt
+# T6 boot contract (cmux-advisor, Berg 2026-07-20): the launcher — not the dispatcher — owns turn one.
+# A fresh LAUNCH, a `recycle --fresh`, and a `revive --fresh` all send the SAME machine-composed boot
+# prompt as the agent's first turn. ONE template, ONE source (_boot_prime_prompt) — two boot-path
+# variants is how drift starts (T6 design (c)). The bug this fixes: LAUNCH never primed at all (native
+# CLAUDE.md floor delivery is dead-on-arrival under user,local setting-sources), so a fleet-launched
+# agent booted context-blind.
+#
+# The WORDING is USER-CONFIGURABLE (F2 productization, Berg 2026-07-20): the composer reads its template
+# from [fleet].boot_prompt (config.BOOT_PROMPT) at compose time, defaulting to the co-signed frozen
+# prime-architect template below — it does NOT hardcode the string. ONE config value serves BOTH launch
+# and recycle (Berg's ruling), so both prime `--role`-flagged from the same launcher role resolution;
+# there is no bare-vs-flagged split. Only {AGENT_ROLE}/{AGENT_LABEL} substitution is the launcher's — env
+# stays authoritative for prime itself. The default is FROZEN (berg-sandbox+advisor co-signed); Berg's
+# final glance is the only gate left, and it stays swappable via the config value.
+_DEFAULT_BOOT_PROMPT = (
+    "You are a cold-launched fleet agent: role '{AGENT_ROLE}', label '{AGENT_LABEL}' (both also in your "
+    "env). Boot now, in order:\n"
+    "1. Run /loom:prime --role {AGENT_ROLE}. It resolves your kind from the live roster, reads your boot "
+    "pages, and picks up this seat's newest handover (a missing handover is normal for a fresh seat).\n"
+    "2. When primed, report ready in one short line; your completion is delivered on its own.\n"
+    "3. Then run `fleet inbox` and take the oldest pending item: your work brief arrives there, not in "
+    "this prompt. If the inbox is empty, park and await it; do not invent work.\n"
+    "\n"
+    "If /loom:prime cannot run, report exactly that and stop. Do not improvise a boot."
+)
+
+
+def _boot_prompt_template():
+    """The turn-one boot-prompt TEMPLATE, resolved at compose time (F2). The user-configurable
+    [fleet].boot_prompt / $CMUX_FLEET_BOOT_PROMPT (config.BOOT_PROMPT) may be EITHER the literal prompt
+    text OR a path to a file holding it; empty falls back to the built-in frozen default. Read fresh here
+    (config resolves it per CLI process, which is per-compose for launch/recycle/revive) so a toml edit
+    goes live with no tool release. {AGENT_ROLE}/{AGENT_LABEL} are substituted by the caller."""
+    from . import config
+    v = (config.BOOT_PROMPT or "").strip()
+    if v:
+        if os.path.isfile(v):                     # a template-FILE path -> read it at compose time
+            try:
+                return open(v).read().strip("\n")
+            except OSError:
+                pass                              # unreadable -> fall through to the built-in default
+        else:
+            return config.BOOT_PROMPT             # a literal prompt string
+    return _DEFAULT_BOOT_PROMPT
+
+
+def _boot_prime_prompt(label, role, override=None):
+    """Compose the turn-one boot prompt. ONE source shared by launch + recycle --fresh + revive --fresh
+    (T6 converge mandate). WORDING is user-configurable via [fleet].boot_prompt (default = the frozen
+    prime-architect template); --prime (`override`) wins per-invocation. Only the {AGENT_ROLE}/
+    {AGENT_LABEL} substitution is the launcher's; env stays authoritative for prime. Launch and recycle
+    both flag --role from the same launcher role resolution — one config value, no bare-vs-flagged split."""
+    if override:
+        return override
+    return (_boot_prompt_template()
+            .replace("{AGENT_ROLE}", role or "")
+            .replace("{AGENT_LABEL}", label or ""))
+
+
 def _poll_session_back(surf, old_sid, mode, timeout=90):
     """Confirm the recycled agent re-bound a session to `surf`. respawn-pane fully REMOVES the old
     session entry from cmux's hook store (session-end), then the relaunch re-creates it:
@@ -4852,17 +4947,13 @@ def _recycle_plan(label, entry, caller, add_plugin, mode, session, force, prime_
     else:
         resolved_plugins = list(entry.get("plugins", []))
     prime = None
-    if not no_prime:
-        if prime_override:
-            prime = prime_override
-        elif mode == "fresh":
-            abs_cwd = entry.get("cwd", "")
-            abs_cwd = abs_cwd if os.path.isabs(abs_cwd) else os.path.join(ROOT, abs_cwd)
-            ho = _latest_handover(abs_cwd, label)
-            prime = (f"You were just recycled into a FRESH session (same identity: label '{label}', "
-                     f"role '{entry.get('role')}', same surface). Re-orient from your latest handover"
-                     + (f" at {ho}" if ho else " under ./handover/")
-                     + ", then continue where it left off.")
+    if not no_prime and (prime_override or mode == "fresh"):
+        # CONVERGED onto the ONE config-driven boot prompt (T6): recycle --fresh reads the SAME
+        # [fleet].boot_prompt template launch does (Berg: one config value serves both), so it finally
+        # tells the agent to prime. (Was an inline "re-orient from your handover" string that never
+        # invoked prime — the same dead-on-arrival floor bug, latent on the recycle path too.) --prime
+        # still overrides per-invocation.
+        prime = _boot_prime_prompt(label, entry.get("role"), override=prime_override)
     return {"label": label, "surface": surf, "send_cmd": send_cmd, "mode": mode,
             "tool": entry.get("tool", "claude"), "force": force, "prime": prime, "old_session": old_sid,
             "cwd": _cwd_of_sendcmd(send_cmd),          # effective launch cwd, persisted after a FRESH bind
@@ -6046,7 +6137,8 @@ USAGE_HEADER = ("usage: fleet <launch|config|ls|plugins|archive|revive|register|
                 "sessions|broadcast|mute|unmute|rm|vitals|usage|find|graph|serve|paint|worktree|profile|"
                 "daemon|drive-child|peer-msg|child-digest|inbox|inbox-ack> ...")
 VERB_USAGE = {
-    "launch": "  launch <role|--adhoc NAME> [--tool t] [--place p] [--parent s] [--effort L] [--model M] [--plugin NAME] [--provider NAME] [--dry-run] [-- <tool flags>]",
+    "launch": "  launch <role|--adhoc NAME> [--tool t] [--place p] [--parent s] [--effort L] [--model M] [--plugin NAME] [--provider NAME] [--brief \"<task>\"] [--prime T|--no-prime] [--dry-run] [-- <tool flags>]\n"
+              "                                                    spawns + sends a turn-one boot prompt (run /loom:prime); --brief queues a work brief to the child's inbox, surfaced via idle-wake AFTER prime",
     "config": "  config <role|--adhoc NAME|--cwd DIR> [--tool t]   effective config (base settings + fleet adds)",
     "ls": "  ls [--scope mine|all|conductors|children] [--json] live fleet x hook store; flags STALE + archived (default mine = you + your children; --scope all = the world)",
     "plugins": "  plugins <add|reconcile|ls|show|describe> ...      the plugin INDEX: add-from-URL (safe: never enables) + reconcile + on-demand discovery",
@@ -6091,7 +6183,7 @@ VERB_USAGE = {
                 "                                                    input-safe A2A: message a live PEER by label (or --to-parent: your registry-resolved conductor), into its context never its input box",
     "child-digest": "  child-digest <session-frag> [N]                   print a child's last N transcript turns (the reliable content source)",
     "inbox": "  inbox [--scope mine|<label>|all|conductors|children] [--json]  pending inbox on demand (default mine = yours; <label> peeks one; all = triage) — the catch-up read after a recycle",
-    "inbox-ack": "  inbox-ack <seq> [--peer|--stale|--doctor] [--surface UUID]  mark shown completions/alerts/peer msgs handled so they stop re-surfacing",
+    "inbox-ack": "  inbox-ack <seq> [--peer|--stale|--doctor|--brief] [--surface UUID]  mark shown completions/alerts/peer msgs/briefs handled so they stop re-surfacing",
 }
 # `unmute` shares mute's entry (one blob line covers both verbs) — alias it so `fleet unmute --help`
 # resolves. Without this it would fall through the guard and (un)mute a label named '--help'.

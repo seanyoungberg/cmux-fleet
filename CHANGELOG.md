@@ -6,6 +6,40 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [0.13.0] - 2026-07-20
+
+The T6 boot contract: `fleet launch` now owns turn one. A fleet-launched agent primes itself and can be
+dispatched in one command — closing the silent-delivery hole where a launched agent loaded no home floor at
+all under `setting_sources = user,local` (only auto-memory `MEMORY.md` survived), so every floor file was
+dead-on-arrival. Suite green: 1184 tests.
+
+### Added
+
+- **Launch sends a machine-composed boot prompt as turn one.** After the surface binds, `fleet launch`
+  composes and sends the agent's first turn itself — an identity line, **run `/loom:prime`** (the agent
+  primes: kind from the live roster, boot pages, latest handover), report-ready, then drain `fleet inbox`
+  for its brief. The dispatcher never hand-types a prime prompt. Converged onto ONE source shared with
+  `recycle --fresh` / `revive --fresh` (`_boot_prime_prompt`), so there is exactly one boot-path template,
+  never two to drift.
+- **`fleet launch <role> --brief "<task>"` — one-command dispatch.** The brief is queued to the child's
+  INBOX at launch (input-safe, label-addressed, new inbox `kind="brief"`) and surfaces via idle-wake the
+  moment the child goes idle AFTER priming — turn one is the boot prompt, prime runs, *then* the brief. An
+  unprimed agent can never receive a raw brief: the brief is queued only after the boot prompt is
+  submitted, so nothing wakes the child for it until its first post-prime idle, and the router self-wakes
+  the child on a pending brief. `--brief` cannot combine with `--no-prime`.
+- **User-configurable boot prompt: `[fleet].boot_prompt` (env `CMUX_FLEET_BOOT_PROMPT`).** The composer
+  reads its wording from config at compose time (a toml edit goes live with no reinstall), defaulting to
+  the co-signed frozen prime-architect template; the value is a literal string OR a path to a template
+  file. `{AGENT_ROLE}`/`{AGENT_LABEL}` are substituted by the launcher; `--prime "<text>"` overrides per
+  launch, `--no-prime` opts out. One config value serves both launch and recycle.
+
+### Fixed
+
+- **`recycle --fresh` / `revive --fresh` now actually invoke `/loom:prime`.** They previously sent an
+  inline "re-orient from your latest handover" prompt that never told the agent to prime — the same
+  dead-on-arrival floor bug as launch, latent on the recycle/revive path. Converging them onto the shared
+  boot prompt gives every fresh boot a real prime.
+
 ## [0.12.0] - 2026-07-19
 
 Adopts three branches cut off v0.11.0 and independently verified before the merge: fleet ergonomics, the
