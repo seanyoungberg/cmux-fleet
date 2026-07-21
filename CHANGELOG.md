@@ -6,6 +6,39 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [0.15.0] - 2026-07-20
+
+F1: the configurable floor FILE. Fleet now **places** a user-defined floor file into an agent's cwd (or
+home) at launch — declaratively, per-tool — so a vendored install with no vault-root `CLAUDE.md` still
+delivers a floor, and the backup floor is fleet-managed rather than hand-placed. This unifies the two
+placement mechanisms that already existed unreconciled: the ad-hoc `CLAUDE.md` symlink and codex
+citizenship's fenced `AGENTS.md` write. It only *places* the file; loading rides the live `setting_sources`
+project walk (claude) / `$CODEX_HOME` (codex), adding no new load path and not colliding with the turn-one
+boot prompt (which stays the primary floor). Rebased onto v0.14.0 (mint); combined suite green: 1234 tests.
+
+### Added
+
+- **`[tool.<t>.floor_file]` — a declarative floor file placed at launch.** Keys: `source` (a path to a
+  file OR literal inline content, dual-meaning like `boot_prompt`; a bare string is shorthand for
+  `source`), `mode`, `target` (`cwd` | `home`), and `filename`. Composes per-tool with a per-role override
+  in `[role.<name>.<t>.floor_file]` via the existing resolve merge (whole-table replace). The two runtimes
+  read different filenames, so the default is per-tool: claude → `CLAUDE.md`, codex → `AGENTS.md`.
+- **Four placement modes, clobber-safe and idempotent.** `append` (default) writes a fenced,
+  marker-guarded block that never clobbers the user's own text and never duplicates on re-launch — with
+  markers distinct from codex citizenship's, so both blocks coexist in one `AGENTS.md`. `write` places only
+  into an empty slot (skip + warn if a file exists). `overwrite` replaces the whole file (the only
+  clobbering mode). `symlink` writes a relative symlink, skipped if a real file exists (the legacy adhoc
+  floor behavior, generalized). Placement is **fail-open**: a floor that can't be placed warns and the
+  launch proceeds.
+- **Per-tool `target` default.** claude → the cwd (loaded via the `setting_sources` project walk); codex →
+  `$CODEX_HOME` (the one file codex reads from every cwd). Overridable with `target = "home" | "cwd"`.
+
+### Changed
+
+- **`[fleet].floor_claudemd` (env `CMUX_FLEET_FLOOR`) is now the legacy fallback.** The ad-hoc `CLAUDE.md`
+  symlink it configures still works, but only fires when no `[tool.<t>.floor_file]` is configured —
+  superseded by the first-class, per-tool floor file. Non-breaking: existing setups are unchanged.
+
 ## [0.14.0] - 2026-07-20
 
 `fleet mint` — define a new role from the CLI. Closes the
