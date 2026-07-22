@@ -771,3 +771,23 @@ def test_stall_row_for_a_live_child_is_inspect_first(fs):
                                    "child_surface": SANDBOX_SURF, "stalled_s": 600})
     _assert_safe_for_live(line, "child stall row", "worker", SANDBOX_SURF)
     assert f"capture-pane --surface {SANDBOX_SURF}" in line     # the FULL uuid -> the command is runnable
+
+
+def test_detached_row_is_inspect_first_and_notes_the_cutover_self_heal(fs):
+    """F5: the detached child row previously fell through to the generic 'needs attention (detached)',
+    dropping its evidence/remedy. It now leads with INSPECT and names the cutover-window TRANSIENT freeze
+    that self-heals on the next turn, carries the runnable capture-pane + the recycle remedy, and offers no
+    destructive/down remedy for what may be a perfectly healthy agent."""
+    line = hookverbs._doctor_line({"reason": "detached", "label": "worker", "seq": 2,
+                                   "child_surface": SANDBOX_SURF, "record_frozen_min": 15,
+                                   "transcript_age_min": 1,
+                                   "remedy": "fleet recycle worker (resume) reattaches in ~8s"})
+    low = _scrub(line, "worker", SANDBOX_SURF)
+    assert "detached" in low and "inspect" in low
+    assert "self-heal" in low and "cutover" in low             # the transient-freeze self-heal note (F5)
+    assert f"capture-pane --surface {SANDBOX_SURF}" in line    # the FULL uuid -> a runnable command
+    assert "recycle" in low                                    # the remedy survives (no longer swallowed)
+    assert "needs attention" not in low                        # ...the generic fallback is gone for this reason
+    assert "down" not in low
+    for verb in DESTRUCTIVE:
+        assert verb not in low, f"detached row offered destructive {verb!r} for a maybe-healthy agent -- {line!r}"

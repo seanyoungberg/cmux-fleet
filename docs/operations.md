@@ -789,6 +789,18 @@ and `CMUX_STATE_DIR`. These decide whether a symlink/app swap reaches it.
 4. Apply the chosen agent strategy (A: flip the `CMUX_FLEET_BIN` symlink; B:
    `fleet recycle` each conductor).
 
+> **Transient DETACHED during the window (F5, do NOT recycle on it).** The per-agent
+> hook-store record is written by **cmux**, not the fleet. During the app-swap +
+> daemon-restart window cmux can briefly stall that write (`updatedAt` freezes) while
+> its bus keeps emitting Stops — so the doctor's behavioral-detach may paint an
+> otherwise-healthy agent **DETACHED** for a few minutes (the 2026-07-20 adopt
+> specimen: an idle-healthy conductor flagged ~15m after its adopt turn). It
+> **self-heals on that agent's next turn's hooks.** The doctor's own `detached` line
+> now says this ("if a fleet app-swap / daemon-restart just ran … INSPECT first").
+> Treat a DETACHED that appears during/just-after a cutover as expected transient
+> noise: confirm the agent is completing turns and let it clear — recycle only if it
+> stays dark past its next turn.
+
 ### Verify (this is the gate for "no recycle")
 
 On an **already-running** conductor (not a fresh one), confirm its hook path now

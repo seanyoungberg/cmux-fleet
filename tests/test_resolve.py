@@ -492,11 +492,12 @@ def test_detached_or_names_the_state_and_never_masks_a_gate():
     from cmux_fleet import features as ff
 
     # time-based readings of a frozen record are lies -> say detached
-    for masked in ("working", "ready", "idle", "done", "stale"):
+    for masked in ("working", "ready", "idle", "stale"):
         assert ff.detached_or(masked, False) == "detached", masked
 
-    # actionable, live-Feed / seat states are NEVER masked
-    for preserved in ("needs-input", "review", "error", "pending"):
+    # actionable Feed / STRUCTURED-halt / seat states are NEVER masked (needs-input from the live Feed;
+    # errored / limit-parked read straight from the transcript; pending describes a seat, not the channel)
+    for preserved in ("needs-input", "errored", "limit-parked", "pending"):
         assert ff.detached_or(preserved, False) == preserved, preserved
 
     # attached, or unjudgeable (no live agent), changes nothing

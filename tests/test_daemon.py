@@ -104,7 +104,7 @@ def test_heartbeat_muted_when_passive(monkeypatch):
 def test_sidebar_paint_tick_repaints_the_board_from_the_live_snapshot(monkeypatch):
     # the daemon's paint tick feeds the LIVE snapshot to _paint so state/ctx/model/kind/last stay fresh.
     # Native de-jank: sidebar_blob=False — pills+progress+carrier are still painted (the ⟐kind⟐last the
-    # native fleet-proto sidebar reads), and the FLEET4 description blob is CLEARED, not written, each tick.
+    # native fleet sidebar reads), and the FLEET4 description blob is CLEARED, not written, each tick.
     from cmux_fleet import features as ff
     seen = {}
     monkeypatch.setattr(ff, "snapshot", lambda: [{"label": "a", "ws": "w1"}])

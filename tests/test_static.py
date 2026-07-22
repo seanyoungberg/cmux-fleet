@@ -83,7 +83,7 @@ def test_hooks_json_parses_and_wrapper():
     assert "hooks" in h, "plugin hooks.json must use the {hooks:{...}} wrapper, not the bare settings form"
 
 
-@pytest.mark.parametrize("event", ["UserPromptSubmit", "Stop"])
+@pytest.mark.parametrize("event", ["UserPromptSubmit", "Stop", "StopFailure", "Notification"])
 def test_hook_event_command_paths_resolve(event):
     events = _load(HOOKS_JSON)["hooks"]
     assert event in events

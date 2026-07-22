@@ -1,5 +1,5 @@
 {
-  "//": "cmux-fleet conductor hooks. Loaded per-agent via `claude --plugin-dir <this plugin>` (the cmux-claude-wrapper deep-merges these with cmux's own lifecycle hooks; arrays concatenate, so both run). These files are THIN fail-open shims (scripts/hooks/_shim.py): they shell into the installed app's `fleet hook-awareness` / `fleet hook-drain` verbs, which self-ID the conductor via $CMUX_SURFACE_ID and read/write state under $CMUX_STATE_DIR. If the `fleet` app is not on PATH the shim silently no-ops (blank stdout, exit 0) — install the app to activate fleet hooks.",
+  "//": "cmux-fleet conductor hooks. Loaded per-agent via `claude --plugin-dir <this plugin>` (the cmux-claude-wrapper deep-merges these with cmux's own lifecycle hooks; arrays concatenate, so both run). These files are THIN fail-open shims (scripts/hooks/_shim.py): they shell into the installed app's `fleet hook-awareness` / `fleet hook-drain` / `fleet hook-stopfailure` / `fleet hook-notification` verbs, which self-ID the agent via $CMUX_SURFACE_ID and read/write state under $CMUX_STATE_DIR. StopFailure fires when a turn ends on an API error (Stop never does) and records the structured halt (limit-parked / errored); Notification is machine-typed and corroborates recovery. If the `fleet` app is not on PATH the shim silently no-ops (blank stdout, exit 0) — install the app to activate fleet hooks.",
   "hooks": {
     "UserPromptSubmit": [
       {
@@ -14,6 +14,22 @@
         "matcher": "",
         "hooks": [
           { "type": "command", "command": "python3 ${CLAUDE_PLUGIN_ROOT}/scripts/hooks/drain.py", "timeout": 10 }
+        ]
+      }
+    ],
+    "StopFailure": [
+      {
+        "matcher": "",
+        "hooks": [
+          { "type": "command", "command": "python3 ${CLAUDE_PLUGIN_ROOT}/scripts/hooks/stopfailure.py", "timeout": 10 }
+        ]
+      }
+    ],
+    "Notification": [
+      {
+        "matcher": "",
+        "hooks": [
+          { "type": "command", "command": "python3 ${CLAUDE_PLUGIN_ROOT}/scripts/hooks/notification.py", "timeout": 10 }
         ]
       }
     ]

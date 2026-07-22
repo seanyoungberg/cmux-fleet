@@ -81,6 +81,43 @@ def _submit(surf, text):
     return False
 
 
+DELIVERY_POLLS = 6             # ~6s: wait for the child's user row to land in its transcript, then compare
+DELIVERY_INTERVAL = 1.0
+
+
+def _last_user_row(surf):
+    """The child's LAST user-row text from its LIVE transcript ('' if unresolved/absent). The read-back side
+    of the delivery guard — the transcript is authoritative (the pane shows the prompt WE typed, so a paneread
+    would false-pass a drop)."""
+    from . import resolve as rs
+    tpath = (rs.freshest_live(surf) or {}).get("transcriptPath", "")
+    return fs.last_user_text(tpath) if tpath else ""
+
+
+def _verify_delivery(surf, sent):
+    """Read the child's LAST user row back from its transcript and compare to what we SENT — the guard for a
+    long `cmux send` that dropped the MIDDLE of the prompt (the head+tail survive, so `_submit`'s tail-only
+    settle/clear check passes BLIND to the loss; F6, the specimen that corrupted a real dispatch). Returns
+    ('ok' | 'truncated' | 'unverified', got_len). The user row is written when the child STARTS its turn,
+    slightly after the box clears, so it polls.
+
+    FAIL-SAFE against a false alarm: 'truncated' is reported ONLY when the read-back row IS our delivery —
+    it carries our distinctive TAIL (which `_submit` already settled on, so the tail survives a middle-drop)
+    — yet lacks the full text. A row WITHOUT our tail is an unrelated/queued row (a busy child still on its
+    prior turn, or an injected notification/user row) -> 'unverified', never 'truncated' — so we never tell
+    the operator to RESEND a delivery that actually landed (which would double-submit)."""
+    want = _norm(sent)
+    if not want:
+        return "ok", 0
+    tail = want[-24:]                           # the distinctive tail _submit settled on; survives a mid-drop
+    for _ in range(DELIVERY_POLLS):
+        row = _norm(_last_user_row(surf))
+        if row and tail in row:                 # this row IS our delivery (its tail landed in the transcript)
+            return ("ok", len(row)) if want in row else ("truncated", len(row))
+        time.sleep(DELIVERY_INTERVAL)
+    return "unverified", 0                       # our send's tail never appeared in a user row -> can't prove a drop
+
+
 def _resolve_surface_handle(handle):
     """Resolve a surface HANDLE to a full surface UUID (fleet-ergonomics FIX 4). Accepts a full UUID
     (passthrough) OR an UNAMBIGUOUS PREFIX of a live agent's surface — so the 8-char short surface that
@@ -107,13 +144,24 @@ def cmd_drive_child(argv):
     if len(argv) < 2:
         sys.exit('usage: fleet drive-child <surface-uuid> <prompt...>')
     surf, text = _resolve_surface_handle(argv[0]), " ".join(argv[1:])
-    if _submit(surf, text):
-        print(f"[drive] submitted to {surf[:8]}")
-        return 0
-    sys.stderr.write(f"[drive] WARN: could not confirm submission to {surf[:8]} after "
-                     f"{SUBMIT_TRIES} Enter retries; the prompt may still be sitting in the input "
-                     f"box — check the surface.\n")
-    return 1
+    if not _submit(surf, text):
+        sys.stderr.write(f"[drive] WARN: could not confirm submission to {surf[:8]} after "
+                         f"{SUBMIT_TRIES} Enter retries; the prompt may still be sitting in the input "
+                         f"box — check the surface.\n")
+        return 1
+    # DELIVERY GUARD (F6): the box cleared, but a long `cmux send` can drop the MIDDLE while head+tail
+    # survive — invisible to the tail-only settle check. Read the child's user row back and compare.
+    status, got_len = _verify_delivery(surf, text)
+    if status == "truncated":
+        sys.stderr.write(
+            f"[drive] DELIVERY-TRUNCATED: {surf[:8]} received {got_len} of {len(_norm(text))} chars — the "
+            f"child's last user row does NOT contain the full prompt (a long `cmux send` can drop the MIDDLE "
+            f"while head+tail survive). RESEND, or deliver via the inbox path (`fleet peer-msg`), which is "
+            f"not paste-chunked.\n")
+        return 1
+    note = "" if status == "ok" else " (delivery UNVERIFIED — no user row read back yet; check the surface)"
+    print(f"[drive] submitted to {surf[:8]}{note}")
+    return 0
 
 
 # =================================================================================================

@@ -1,6 +1,6 @@
 {
   "name": "cmux-fleet",
-  "version": "0.15.1",
+  "version": "0.15.2",
   "description": "Native cmux parent/child agent orchestration: an input-safe completion + peer notify flow, surfaceId-keyed identity, and a conductor skill for launching and driving child agents.",
   "author": {
     "name": "Sean Youngberg"

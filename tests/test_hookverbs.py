@@ -185,3 +185,79 @@ def test_drain_block_guard_does_not_reblock(fs):
     second = _run("hook-drain")   # same un-acked peer, block-mark already set
     assert second.returncode == 0
     assert second.stdout.strip() == ""
+
+
+# --- hook-stopfailure / hook-notification (F2: hooks-first structured halt truth) ----------------
+def _park_halt():
+    return {"api_error": True, "error": "rate_limit", "api_status": 429, "stop_reason": "", "detail": "resets 12:10am"}
+
+
+def test_stopfailure_rate_limit_records_a_limit_parked_park(fs):
+    from cmux_fleet import features as ff
+    stdin = json.dumps({"error_type": "rate_limit", "session_id": "sid-x",
+                        "error_message": "You've hit your session limit · resets 12:10am (America/New_York)"})
+    p = _run("hook-stopfailure", surface="SURF-SF", stdin=stdin)
+    assert p.returncode == 0 and p.stdout.strip() == ""          # a recorder: injects nothing into context
+    h = fs.halt_get("SURF-SF")
+    assert h and h["api_error"] is True and h["error"] == "rate_limit" and h["api_status"] == 429
+    assert h["detail"] == "resets 12:10am"                        # resets-HH:MM extracted from error_message
+    assert ff._classify("needsInput", True, h) == "limit-parked"  # structure -> park, never red/error
+
+
+def test_stopfailure_other_error_type_records_errored(fs):
+    from cmux_fleet import features as ff
+    p = _run("hook-stopfailure", surface="SURF-ER",
+             stdin=json.dumps({"error_type": "overloaded", "session_id": "s", "error_message": "busy"}))
+    assert p.returncode == 0
+    h = fs.halt_get("SURF-ER")
+    assert h["api_error"] is True and h["api_status"] is None and h["detail"] == "overloaded"
+    assert ff._classify("idle", True, h) == "errored"
+
+
+def test_stopfailure_unknown_error_type_is_recorded_not_dropped_and_logged_loudly(fs):
+    from cmux_fleet import features as ff
+    p = _run("hook-stopfailure", surface="SURF-UN",
+             stdin=json.dumps({"error_type": "brand_new_type", "session_id": "s", "error_message": "?"}))
+    assert p.returncode == 0
+    h = fs.halt_get("SURF-UN")
+    assert h and ff._classify("idle", True, h) == "errored"       # recorded (never dropped)
+    assert os.path.exists(fs.HOOK_ANOMALY_LOG)                    # ...and logged LOUDLY for triage
+    assert "brand_new_type" in open(fs.HOOK_ANOMALY_LOG).read()
+
+
+def test_stopfailure_no_surface_is_a_safe_noop(fs):
+    p = _run("hook-stopfailure", surface=None,
+             stdin=json.dumps({"error_type": "rate_limit", "session_id": "s"}))
+    assert p.returncode == 0 and p.stdout.strip() == ""
+
+
+def test_notification_completed_clears_the_park_but_needs_input_leaves_it(fs):
+    # agent_completed = a turn finished (a parked agent never completes) -> clear the park (ready corroboration);
+    # a needs-input notification must NOT touch it (the Feed gate stays authoritative).
+    fs.halt_set("SURF-N", "s", _park_halt())
+    p = _run("hook-notification", surface="SURF-N",
+             stdin=json.dumps({"notification_type": "agent_completed", "session_id": "s"}))
+    assert p.returncode == 0 and fs.halt_get("SURF-N") is None
+    fs.halt_set("SURF-N2", "s", _park_halt())
+    _run("hook-notification", surface="SURF-N2", stdin=json.dumps({"notification_type": "agent_needs_input"}))
+    assert fs.halt_get("SURF-N2") is not None                     # gate-authoritative type leaves the park
+
+
+def test_notification_idle_prompt_does_NOT_clear_a_fresh_park(fs):
+    # THE trap (live specimen: a Notification fired ~60s after the halt while the agent sat idle waiting for
+    # the reset). A rate-limit park reads AS idle-at-the-prompt, so idle_prompt must NEVER clear the park it
+    # would otherwise wipe the state F2 just recorded, seconds after recording it.
+    fs.halt_set("SURF-IDLE", "s", _park_halt())
+    p = _run("hook-notification", surface="SURF-IDLE",
+             stdin=json.dumps({"notification_type": "idle_prompt", "session_id": "s"}))
+    assert p.returncode == 0 and fs.halt_get("SURF-IDLE") is not None   # park SURVIVES an idle notification
+
+
+def test_awareness_and_drain_clear_a_recorded_park(fs):
+    # forward progress — a new prompt (awareness) or a clean Stop (drain) — means the agent moved PAST the halt.
+    fs.halt_set(SURF, "s", _park_halt())
+    _run("hook-awareness")
+    assert fs.halt_get(SURF) is None
+    fs.halt_set(SURF, "s", _park_halt())
+    _run("hook-drain")
+    assert fs.halt_get(SURF) is None

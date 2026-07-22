@@ -76,29 +76,30 @@ def _surface_ws_map(ttl=2.0):
     return mapping or _WS_MAP["map"]
 
 
-# ─── status inference (keyword tables, NO LLM) ────────────────────────────────────────────────
-# cmux's agentLifecycle (idle|running|needsInput) is the authoritative base. The keyword tables only
-# REFINE an idle agent — they tell apart "idle: finished cleanly", "idle: hit an error", "idle:
-# wants review" — from the agent's own last transcript line. Substring match, lowercased, cheap.
-ERROR_HINTS  = ("error:", "traceback", "exception", "fatal:", "panic:", "✗", "failed", "rate limit",
-                "rate-limit", "usage limit", "context low", "compact")
-BLOCK_HINTS  = ("[y/n]", "(y/n)", "approve?", "permission", "press enter", "waiting for", "shall i",
-                "do you want", "should i", "confirm")
-REVIEW_HINTS = ("diff --git", "opened pull request", "ready for review", "please review", "pr #")
-DONE_HINTS   = ("✓ done", "all tests passed", "0 errors", "complete", "finished", "done.", "✅")
+# ─── status inference (STRUCTURE, never prose — NO LLM) ────────────────────────────────────────
+# cmux's agentLifecycle (idle|running|needsInput) is the authoritative base. Everything layered on it is
+# STRUCTURAL: an open Feed gate (needs-input), the transcript's end-of-turn signal (working vs ready), and
+# the last assistant row's STRUCTURED halt fields (isApiErrorMessage / apiErrorStatus / error / stop_reason
+# -> errored / limit-parked). The old prose keyword tables (ERROR/REVIEW/DONE_HINTS) were DELETED: matching
+# an agent's own words ('rate limit', 'compact', 'usage limit', 'complete') stamped a state on any agent
+# that merely MENTIONED the phrase (Berg mandate 2026-07-20: status derives from structure, never prose).
 
 # state -> (sidebar pill color, SF-Symbol icon, urgency rank). Lower rank = more urgent = sorts first
 # (the "NEED YOU floats to top" triage from agentmaster). cheapest-first = act on the cheap signal.
 STATE_STYLE = {
-    "error":       ("#E5484D", "exclamationmark.triangle.fill", 0),
+    "errored":     ("#E5484D", "exclamationmark.triangle.fill", 0),   # structured API-error halt (not a rate limit)
     "needs-input": ("#F5A623", "hand.raised.fill",              1),
-    "review":      ("#3E63DD", "eye.fill",                      2),
+    # rate-limited: the last turn halted on a 429 / rate_limit — a transient SERVER throttle (auto-retried,
+    # ~2min typical on-disk) OR a genuine ACCOUNT park. They are structurally INDISTINGUISHABLE (both are
+    # rate_limit/429; telling them apart needs the banner PROSE, which is banned), and self-healing either
+    # way — so NEVER red and NEVER named 'error': warm amber, distinct from needs-input's brighter amber. The
+    # detail carries 'resets HH:MM' when the banner has one (an account park), and is empty for a throttle.
+    "limit-parked":("#D9822B", "pause.circle.fill",            2),
     # alive and working, but its cmux hook channel is dead — every TIME-based signal about it is a lie.
     # A WARNING, not an error: distinct from 'stale' (gone) and from 'working' (we can still hear it).
     # Violet, not amber, so it can never be misread as 'needs-input'. Remedy is a recycle (re-exports env).
     "detached":    ("#A45CDB", "antenna.radiowaves.left.and.right.slash", 3),
     "working":     ("#30A46C", "gearshape.fill",                4),
-    "done":        ("#46A758", "checkmark.circle.fill",         5),
     "ready":       ("#3DB9A0", "circle.fill",                   6),   # teal presence dot — finished, available
     "idle":        ("#8B8D98", "moon.zzz.fill",                 7),   # asleep — only after QUIET_S of no activity
     "pending":     ("#8B8D98", "hourglass",                     8),
@@ -420,40 +421,35 @@ def turn_ended(transcript_path):
     return msg.get("stop_reason") in _TERMINAL_STOP
 
 
-def _refine(last_text, default):
-    """Keyword-refine a not-actively-working agent from its last transcript line. Returns error / review /
-    done, else `default`. NOTE: no longer emits 'needs-input' — a real block is now signalled ONLY by an
-    open Feed gate (see _classify), so stale block-phrases in the transcript can't raise a false alarm."""
-    text = (last_text or "").lower()
-    if any(h in text for h in ERROR_HINTS):
-        return "error"
-    if any(h in text for h in REVIEW_HINTS):
-        return "review"
-    if any(h in text for h in DONE_HINTS):
-        return "done"
-    return default
-
-
-def _classify(life, has_session, last_text, open_gate=False, turn_done=False, quiet=False):
-    """PURE state classifier, NO LLM (unit-testable). An open Feed GATE (unreplied AskUserQuestion /
-    permission / ExitPlan) is the authoritative 'needs-input' signal — the agent truly cannot proceed.
-    `turn_done` is the transcript's real-time end-of-turn signal: cmux's agentLifecycle lags ~60s at
-    'running' after a turn closes, so when the transcript proves the turn ended we treat it as finished at
-    once instead of showing a stale 'working'. `quiet` = last activity older than QUIET_S: a just-finished
-    agent reads 'ready' (present, available); only a long-dormant one reads 'idle' (asleep). Stateless."""
+def _classify(life, has_session, halt, open_gate=False, turn_done=False, quiet=False):
+    """PURE state classifier, NO LLM, STRUCTURE-ONLY (unit-testable). `halt` is the last assistant row's
+    STRUCTURED halt dict (fs.last_halt): an API-error halt on the last turn is a real, structural stop —
+    NOT a prose scan of the body. An open Feed GATE (unreplied AskUserQuestion / permission / ExitPlan) is
+    the authoritative 'needs-input' signal — the agent truly cannot proceed. `turn_done` is the transcript's
+    real-time end-of-turn signal: cmux's agentLifecycle lags ~60s at 'running' after a turn closes, so when
+    the transcript proves the turn ended we treat it as finished at once instead of a stale 'working'.
+    `quiet` = last activity older than QUIET_S: a just-finished agent reads 'ready' (present, available);
+    only a long-dormant one reads 'idle' (asleep). Stateless."""
     if life == "running" and not turn_done:
         return "working"                                      # genuinely mid-turn (cmux running, turn open),
-        # so `running` OUTRANKS an open gate. cmux stamps needsInput for a REAL gate, never running, so a
-        # gate seen alongside a still-open `running` turn is a stale non-terminal Feed row (e.g. a resume
-        # picker answered by a key-send, which never marks the row terminal) -- honoring it resurrects the FP.
+        # so `running` OUTRANKS both an open gate AND a stale halt row from a PRIOR turn: a live new turn has
+        # not yet written its assistant row, so last_halt still points at the old halt — don't resurrect it.
+        # cmux stamps needsInput for a REAL gate, never running, so a gate seen alongside a still-open turn
+        # is a stale non-terminal Feed row (a resume picker answered by a key-send) -- honoring it is the FP.
+    if isinstance(halt, dict) and halt.get("api_error"):
+        # the last turn HALTED on a structured API error (turn ended, or cmux lags at 'running' but the
+        # transcript proves the error stop). rate_limit / 429 is a self-healing PARK, not an error.
+        if halt.get("error") in fs.RATE_LIMIT_ERRORS or halt.get("api_status") == 429:
+            return "limit-parked"
+        return "errored"
     if open_gate and not turn_done:
         return "needs-input"                                  # unreplied Feed gate -> genuinely blocked
         # (a proven end_turn can't be a live gate, so `turn_done` also retires a lingering stale gate row).
     if life in ("", "ended", "unknown") and not turn_done:
         return "pending" if not has_session else "stale"
-    # turn ended (cmux needsInput/idle, OR cmux lags at 'running' but the transcript closed the turn):
-    # refine from last words; default 'ready' (recently active, available) unless quiet a while -> 'idle'.
-    return _refine(last_text, "idle" if quiet else "ready")
+    # turn ended (cmux needsInput/idle, OR cmux lags at 'running' but the transcript closed the turn), no
+    # structured halt: 'ready' (recently active, available) unless quiet a while -> 'idle'. NO prose refine.
+    return "idle" if quiet else "ready"
 
 
 _GATE_KINDS = ("question", "permission", "exitplan", "exit_plan", "askuser", "askuserquestion")
@@ -642,11 +638,12 @@ def blocked_of(present, feed_gate, transcript_gate, turn_done, unregistered=Fals
     return None, "mid-turn, no gate evidence either way — capture-pane to settle"
 
 
-# I4: states that must NEVER be masked by `detached`. needs-input / review come from the live cmux Feed
-# and are actionable NOW; error and pending describe a seat, not a hook channel. Everything else
-# (working / ready / idle / done / stale) is a TIME-based reading of a frozen record — for a detached
-# agent those readings are lies, and saying "detached" is the only honest answer.
-_ATTACH_PRESERVE = ("needs-input", "review", "error", "pending")
+# I4: states that must NEVER be masked by `detached`. needs-input comes from the live cmux Feed and is
+# actionable NOW; errored / limit-parked are STRUCTURED halts read straight from the transcript (a channel
+# we can still read is not fully dark, and a rate-limit park self-heals on its own clock); pending describes
+# a seat, not a hook channel. Everything else (working / ready / idle / stale) is a TIME-based reading of a
+# frozen record — for a detached agent those readings are lies, and saying "detached" is the only honest one.
+_ATTACH_PRESERVE = ("needs-input", "errored", "limit-parked", "pending")
 
 
 def detached_or(state, attached):
@@ -665,22 +662,55 @@ def detached_or(state, attached):
     return state
 
 
-def _infer_state(entry, session, open_gates=frozenset(), now=None, turn_done=None):
+def _infer_state(entry, session, open_gates=frozenset(), now=None, turn_done=None, halt=None):
     """state for one agent: read live signals, then classify (the impure edge over _classify). `open_gates`
     is the set of session uuids with an unreplied Feed gate (computed once per snapshot). Lifecycle reads
     route through resolve (the one resolver; step 1 of the v2 migration). Also reads the transcript's
-    end-of-turn signal (beats cmux's ~60s lifecycle lag) and how long the agent has been quiet (ready vs
-    idle). `turn_done` may be passed in when the caller already read the transcript tail (snapshot does,
-    for `blocked`) — it is the same signal, so re-reading the file per row would be pure waste."""
+    end-of-turn signal (beats cmux's ~60s lifecycle lag), the last row's STRUCTURED halt fields (errored /
+    limit-parked), and how long the agent has been quiet (ready vs idle). `turn_done` and `halt` may be
+    passed in when the caller already read the transcript (snapshot does) — same signals, so re-reading the
+    file per row would be pure waste."""
     from . import resolve as rs
     sid = fs.bare_uuid(session.get("sessionId", ""))
     tpath = session.get("transcriptPath", "")
     updated = session.get("updatedAt") or 0
     quiet = bool(updated) and ((now or time.time()) - updated) > QUIET_S
     return _classify(rs.lifecycle(entry.get("surface", "")), bool(entry.get("session")),
-                     fs.last_agent_text(tpath, cap=400),
+                     fs.last_halt(tpath) if halt is None else halt,
                      open_gate=bool(sid) and sid in open_gates,
                      turn_done=turn_ended(tpath) if turn_done is None else turn_done, quiet=quiet)
+
+
+_UNSET = object()
+
+
+def seat_state(entry, session, store, open_gates=frozenset(), ws_map=None, now=None,
+               turn_done=None, halt=None, unreg=None, attached=_UNSET):
+    """The status axis for ONE seat — the SHARED classify path `fleet ls`, `fleet vitals`, and `fleet paint`
+    all route through so they can never disagree (fleet ls once read raw lifecycle and showed 'working' for
+    18h on a stalled seat while vitals said idle). Reads the transcript end-of-turn + structured-halt signals
+    (unless the caller already has them), classifies, applies the I4 detached overlay, then the live-pid
+    stale->idle downgrade. Returns (state, detail) where detail carries a limit-park's 'resets HH:MM'.
+    Signals may be INJECTED (snapshot already reads them) to avoid re-reading the transcript / re-running the
+    per-row `ps` per row — `attached`/`unreg` unset means compute here (the cheap tier `fleet ls` uses)."""
+    from . import resolve as rs
+    surf = entry.get("surface", "")
+    tpath = session.get("transcriptPath", "")
+    now = now or time.time()
+    tdone = turn_ended(tpath) if turn_done is None else turn_done
+    # halt: StopFailure-hook park PRIMARY, transcript last_halt CATCH-UP (unless the caller injected one)
+    hd = halt if halt is not None else (fs.halt_get(surf, fs.bare_uuid(session.get("sessionId", "")))
+                                        or fs.last_halt(tpath))
+    state = _infer_state(entry, session, open_gates, now=now, turn_done=tdone, halt=hd)
+    att = attached if attached is not _UNSET else rs.attachment(surf, st=store, ws_map=ws_map, now=now)["attached"]
+    state = detached_or(state, att)
+    if state == "stale":
+        # a live pid on a stale-classified seat -> present, dormant (a live agent is never shown gone).
+        u = unreg if unreg is not None else (bool(surf) and not rs.freshest_live(surf, st=store)
+                                             and bool(rs.pids_ps(surf, tool=entry.get("tool", "claude"))))
+        if u:
+            state = "idle"
+    return state, hd.get("detail", "")
 
 
 def snapshot():
@@ -711,12 +741,13 @@ def snapshot():
         surf = e.get("surface", "")
         sess = rs.freshest(surf, st=store)
         tpath = sess.get("transcriptPath", "")
-        # the two transcript reads `blocked` needs, taken ONCE and shared with the state classifier
+        # the transcript reads `blocked`/state need, taken ONCE and shared with the state classifier
         tdone, tgate = turn_ended(tpath), pending_interactive_gate(tpath)
         sid = fs.bare_uuid(sess.get("sessionId", ""))
-        state = _infer_state(e, sess, open_gates, now=now, turn_done=tdone)
+        # halt: the StopFailure hook's recorded park is PRIMARY (structure at the source); the transcript
+        # last_halt is the CATCH-UP layer that reconstructs it after hook/daemon downtime.
+        halt = fs.halt_get(surf, sid) or fs.last_halt(tpath)
         att = rs.attachment(surf, st=store, ws_map=ws_map, now=now)
-        state = detached_or(state, att["attached"])
         # `blocked` reads the SEAT (a live-pid record), never the lifecycle string — see blocked_of.
         # This is the CHEAP tier: no pane read. Rows it cannot settle come back None and are probed by
         # probe_blocked() (one capture-pane each, only for those rows).
@@ -726,13 +757,12 @@ def snapshot():
         # per snapshot and only if some row actually needs it — a steady fleet never pays for it.
         unreg = (not present) and bool(surf) and bool(
             rs.pids_ps(surf, ps_out=_ps(), tool=e.get("tool", "claude")))
-        # stale-gone is a VERDICT, and a verdict may rest only on `alive` (the process table). `stale` is a
-        # TIME-based reading of a frozen/aged-out record: a long-idle agent whose cmux record aged out reads
-        # `lifecycle=''` -> `stale` by clock, but its live pid (unreg) proves it present — a live agent is
-        # never shown GONE (the 2026-07-18 worker specimen: a WORKER read STALE during a 44-min idle while
-        # live+idle at an empty prompt). Downgrade to the honest 'idle' (present, dormant), never gone.
-        if state == "stale" and unreg:
-            state = "idle"
+        # THE state axis — the shared classify path (also `fleet ls`), fed the already-read signals so it
+        # re-reads nothing and re-runs no `ps`. seat_state applies the I4 detached overlay + the live-pid
+        # stale->idle downgrade (a long-idle agent whose cmux record aged out reads stale by clock, but a
+        # live pid proves it present — a live agent is never shown GONE; the 2026-07-18 worker specimen).
+        state, state_detail = seat_state(e, sess, store, open_gates, ws_map=ws_map, now=now,
+                                         turn_done=tdone, halt=halt, unreg=unreg, attached=att["attached"])
         blocked, why = blocked_of(present=present, feed_gate=bool(sid) and sid in open_gates,
                                   transcript_gate=tgate, turn_done=tdone, unregistered=unreg)
         used, tmodel = _context_used(sess.get("transcriptPath", ""))
@@ -763,6 +793,7 @@ def snapshot():
             # alone: it collapses moved agents onto their launch workspace.
             "ws": ws_map.get(surf.upper()) or e.get("workspace") or sess.get("workspaceId", ""),
             "state": state,
+            "state_detail": state_detail,                              # e.g. a limit-park's 'resets HH:MM'
             "rank": STATE_STYLE.get(state, ("", "", 9))[2],
             "ctx_used": used, "ctx_pct_remaining": pct_remaining, "window": window,
             "model": model, "effort": effort or "",                     # Fix 2: effort + cwd surfaced
@@ -924,12 +955,13 @@ def _render_vitals(rows):
     lines = [f"FLEET VITALS ({len(rows)})   ctx = used / REAL per-agent window",
              f"    {'label':<17}{'state':<12}{'blocked':<9}{'ctx-left':<15}{'model':<13}{'eff':<7}{'cwd':<17}{'idle':<6}last"]
     for r in rows:
-        glyph = {"error": "✗", "needs-input": "◍", "review": "⊙", "working": "▶", "detached": "⚠",
-                 "done": "✓", "ready": "◌", "idle": "·", "pending": "…", "stale": "?", "gone": "✗"}.get(r["state"], "·")
+        glyph = {"errored": "✗", "needs-input": "◍", "limit-parked": "⏸", "working": "▶", "detached": "⚠",
+                 "ready": "◌", "idle": "·", "pending": "…", "stale": "?", "gone": "✗"}.get(r["state"], "·")
         muted = " M" if r["muted"] else ""
+        detail = f"  ({r['state_detail']})" if r.get("state_detail") else ""   # a limit-park's 'resets HH:MM'
         lines.append(f"  {glyph} {_fit(r['label'], 16):<17}{r['state']:<12}{_blk(r):<9}{_ctx(r):<15}"
                      f"{_fit(_short_model(r['model']), 12):<13}{_fit(r['effort'] or '-', 6):<7}"
-                     f"{_fit(_short_cwd(r['cwd']), 16):<17}{_age(r['last_age_s']):<6}{_fit(r['last_text'], 26)}{muted}")
+                     f"{_fit(_short_cwd(r['cwd']), 16):<17}{_age(r['last_age_s']):<6}{_fit(r['last_text'], 26)}{muted}{detail}")
     waiting = [r for r in rows if r.get("blocked") is True]
     if waiting:
         lines.append(f"\n  ◍ {len(waiting)} WAITING ON YOU: " + ", ".join(r["label"] for r in waiting))

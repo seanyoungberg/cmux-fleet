@@ -818,6 +818,14 @@ def create_surface(spec, parent_surf, direction):
                 print(f"[fleet] ABORT: could not resolve {m.group(1)} to a workspace UUID"); return None, None
             return ws, _term_surface_in(ws)
         gref = _group_ref(group)
+        if not gref and spec.get("kind") == "conductor" and not group.startswith("Conductor - "):
+            # REUSE the existing group by name-to-ref across the naming-convention split (F4): a conductor's
+            # group is minted as "Conductor - <name>" but a bare-label launch/revive stores just "<label>",
+            # so a name-keyed join under the bare spelling misses the real group and MINTS A DUPLICATE.
+            # Probe ONLY the "Conductor - <name>" convention (a specific, collision-unlikely name); the reverse
+            # (probing a BARE name) is deliberately NOT done — a group literally named "<label>" is likely an
+            # unrelated group, and joining it would be worse than a clean bootstrap.
+            gref = _group_ref(f"Conductor - {spec['label']}")
         if gref:                                              # group EXISTS -> join it
             out = cmuxq("new-workspace", "--group", gref, "--name", spec["label"],
                         "--cwd", spec["abs_cwd"], "--focus", "false")
@@ -826,7 +834,24 @@ def create_surface(spec, parent_surf, direction):
                 print(f"[fleet] ABORT: new-workspace gave no workspace ref: {out.strip()}"); return None, None
             ws = _ref_to_uuid("workspace", m.group(1))
             return ws, _term_surface_in(ws)
-        # group does NOT exist -> BOOTSTRAP it (one conductor = one group). Model B (empty-anchor,
+        # group does NOT exist -> BOOTSTRAP. Bootstrap mints a NEW cmux group AND a 'Conductor - <label>'
+        # scaffold anchor, so it is CONDUCTOR-ONLY (F4): a child must NEVER own a group anchor named for
+        # itself. A worker that reached here (its intended group did not resolve — a stale/own group string,
+        # or an explicit --group for a group that does not exist) once minted a 'Conductor - <worker>'
+        # scaffold + a duplicate group. Land it STANDALONE instead — no conductor furniture, no duplicate.
+        if spec.get("kind") != "conductor":
+            print(f"[fleet] warn: {spec['label']} (kind={spec.get('kind', 'child')}) --place workspace but "
+                  f"group '{group}' does not exist; a non-conductor never bootstraps a 'Conductor -' anchor "
+                  f"— landing STANDALONE. Join an existing group via a resolvable --group, or use --place tab.")
+            out = cmuxq("new-workspace", "--name", spec["label"], "--cwd", spec["abs_cwd"], "--focus", "false")
+            m = re.search(r"(workspace:\d+)", out)
+            if not m:
+                print(f"[fleet] ABORT: new-workspace gave no workspace ref: {out.strip()}"); return None, None
+            ws = _ref_to_uuid("workspace", m.group(1))
+            if not ws:
+                print(f"[fleet] ABORT: could not resolve {m.group(1)} to a workspace UUID"); return None, None
+            return ws, _term_surface_in(ws)
+        # conductor bootstrap (one conductor = one group). Model B (empty-anchor,
         # ratified 2026-07-10): the group anchor is an EMPTY scaffold titled 'Conductor - <label>' and
         # the conductor runs as an ordinary MEMBER in its own '<label>' workspace. Create the conductor's
         # workspace standalone, THEN `workspace-group create --from <that ref>` with an ALWAYS-EXPLICIT
@@ -2916,13 +2941,13 @@ def cmd_ls(argv):
     for label, v in sorted(live.items()):
         surf = v.get("surface", "")
         life = rs.lifecycle(surf)
-        # classified fleet state (coarse - no transcript read here, so no review/done refine): an open Feed
-        # gate -> needs-input; needsInput-no-gate -> ready; running -> working; else idle/pending/stale.
-        _sid = fs.bare_uuid(rs.freshest(surf, st=store).get("sessionId", ""))
-        state = ff._classify(life or "", bool(v.get("session")), "", open_gate=bool(_sid) and _sid in open_gates)
-        # I4: a detached agent's lifecycle string is frozen, so every state derived from it is a lie.
-        # Same rule as vitals (ff.detached_or), so the two views can never disagree about the axis.
-        state = ff.detached_or(state, rs.attachment(surf, st=store)["attached"])
+        # STATE: the SHARED classifier path (ff.seat_state) — the SAME one vitals/paint use, so ls can never
+        # disagree with them again. It was `ff._classify(life, ..., "")` with turn_done defaulting False and
+        # NO transcript read, so a seat frozen at lifecycle='running' showed 'working' for 18h while vitals
+        # (which reads the transcript's end-of-turn) said idle. seat_state reads that signal + the structured
+        # halt + the I4 detached overlay; the state_detail carries a limit-park's 'resets HH:MM'.
+        sess = rs.freshest(surf, st=store)
+        state, state_detail = ff.seat_state(v, sess, store, open_gates)
         # STALE if NO genuinely-live agent holds the surface: lifecycle terminal, OR frozen non-terminal
         # on a DEAD pid (the SessionEnd-less brick, root-caused 2026-07-06). Routed through the shared
         # liveness rule (rs.present) so the pid -- not the lifecycle string -- is the authority: a
@@ -2934,7 +2959,7 @@ def cmd_ls(argv):
         else:
             status = v.get("status", "live")
         live_rows.append({"label": label, "role": v.get("role"), "kind": v.get("kind"),
-                          "state": state,
+                          "state": state, "state_detail": state_detail,
                           "status": status, "lifecycle": life or None, "surface": surf,
                           "muted": bool(v.get("muted"))})
     if as_json:
@@ -2946,7 +2971,8 @@ def cmd_ls(argv):
     print(f"LIVE FLEET ({scope_tag}{len(live)}):  {'label':<24}{'role':<16}{'kind':<11}{'state':<12}{'status':<8}{'lifecycle':<11}surface")
     for r in live_rows:
         muted = "  MUTED" if r["muted"] else ""
-        print(f"  {r['label']:<24}{(r['role'] or '-'):<16}{(r['kind'] or '-'):<11}{r['state']:<12}{r['status']:<8}{(r['lifecycle'] or '-'):<11}{r['surface'][:8]}{muted}")
+        detail = f"  ({r['state_detail']})" if r.get("state_detail") else ""   # e.g. a limit-park's 'resets HH:MM'
+        print(f"  {r['label']:<24}{(r['role'] or '-'):<16}{(r['kind'] or '-'):<11}{r['state']:<12}{r['status']:<8}{(r['lifecycle'] or '-'):<11}{r['surface'][:8]}{muted}{detail}")
     if arch:
         print(f"\nARCHIVED ({len(arch)}, revivable):")
         for label, v in sorted(arch.items()):
@@ -6648,9 +6674,11 @@ def main():
     sub, rest = sys.argv[1], sys.argv[2:]
     # Hook verbs are the per-turn hot path (a plugin shim shells into them on every UserPromptSubmit/Stop).
     # Dispatch them FIRST, before the heavier feature/daemon/helper imports, to keep that path lean.
-    if sub in ("hook-awareness", "hook-drain"):
+    if sub in ("hook-awareness", "hook-drain", "hook-stopfailure", "hook-notification"):
         from . import hookverbs as hv
-        return (hv.cmd_hook_awareness if sub == "hook-awareness" else hv.cmd_hook_drain)(rest)
+        return {"hook-awareness": hv.cmd_hook_awareness, "hook-drain": hv.cmd_hook_drain,
+                "hook-stopfailure": hv.cmd_hook_stopfailure,
+                "hook-notification": hv.cmd_hook_notification}[sub](rest)
     # `fleet <verb> --help` for the hand-rolled verbs, BEFORE they get a chance to run. Fires ONLY when
     # -h/--help is the FIRST token: peer-msg/drive-child/broadcast carry free text, so a message body that
     # mentions --help must still be DELIVERED, never swallowed by help. Never scan the tail.

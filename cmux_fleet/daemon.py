@@ -380,7 +380,7 @@ def _sidebar_paint_tick():
     isolates it so a bad paint can never kill the daemon/router.
 
     sidebar_blob=False completes the native de-jank: `_paint` still writes the per-agent pills + progress bars
-    (with the ⟐kind⟐last suffix the native fleet-proto sidebar reads) + the subscriptions carrier, and its
+    (with the ⟐kind⟐last suffix the native fleet sidebar reads) + the subscriptions carrier, and its
     else-branch CLEARS the FLEET4 description blob every tick so it stops garbling the built-in sidebar.
     NOTE: [fleet].sidebar_paint gates this WHOLE tick — turning it OFF stops pills/progress too (and never
     clears the blob), so it is NOT the way to retire the blob; sidebar_blob here is. The blob is still

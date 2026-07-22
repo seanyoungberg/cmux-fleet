@@ -52,23 +52,29 @@ def test_workspace_bootstrap_modelb_titles_scaffold_and_keeps_conductor_a_member
     # bootstrap KEEPS that scaffold as the anchor and TITLES it 'Conductor - <label>' -- it does NOT
     # re-anchor onto the conductor (that made the conductor a bare folder shim) and does NOT close it.
     calls = []
+    st = {"created": False}
     def fake_cmuxq(*args):
         calls.append(args)
+        if args[:2] == ("workspace-group", "create"):
+            st["created"] = True
         if args[:1] == ("new-workspace",):
             return "created workspace:7\n"
         if args[:3] == ("workspace-group", "list", "--json"):
             return _modelb_group_list()
         return ""
     monkeypatch.setattr(fleet, "cmuxq", fake_cmuxq)
-    refs = iter(["", "workspace_group:3"])                       # absent on first check, present after create
-    monkeypatch.setattr(fleet, "_group_ref", lambda g: next(refs))
+    # name-aware: 'g1' resolves ONLY after create; the F4 'Conductor - cond' name-to-ref reuse probe is
+    # absent too (this is a fresh bootstrap), so both pre-create lookups miss and the bootstrap runs.
+    monkeypatch.setattr(fleet, "_group_ref",
+                        lambda g: "workspace_group:3" if (g == "g1" and st["created"]) else "")
     monkeypatch.setattr(fleet, "_ref_to_uuid",
                         lambda kind, ref, tree=None: {"workspace:7": "WS-MEMBER",
                                                       "workspace:88": "WS-SCAFFOLD"}.get(ref, ""))
     monkeypatch.setattr(fleet, "_term_surface_in", lambda ws, pane=None: "SF")
 
     ws, surf = fleet.create_surface(
-        {"place": "workspace", "group": "g1", "label": "cond", "abs_cwd": "/tmp/x"}, "PARENT", "down")
+        {"place": "workspace", "group": "g1", "label": "cond", "kind": "conductor", "abs_cwd": "/tmp/x"},
+        "PARENT", "down")
     assert (ws, surf) == ("WS-MEMBER", "SF")                     # the AGENT's return is its OWN member ws
     nw = [c for c in calls if c[0] == "new-workspace"][0]
     assert "--group" not in nw and "--name" in nw and "cond" in nw  # conductor's own ws, standalone + titled
@@ -82,6 +88,57 @@ def test_workspace_bootstrap_modelb_titles_scaffold_and_keeps_conductor_a_member
     # ...and the conductor is NEVER re-anchored onto and no scaffold is reaped (strictly less code than A).
     assert not [c for c in calls if c[:2] == ("workspace-group", "set-anchor")]
     assert not [c for c in calls if c[0] == "close-workspace"]
+
+
+def test_child_with_unresolved_group_lands_standalone_never_a_conductor_anchor(monkeypatch):
+    # F4 REGRESSION: a NON-conductor launched --place workspace whose group does not resolve must NEVER
+    # bootstrap a 'Conductor - <child>' scaffold + a duplicate group (the live specimen: a worker minted
+    # 'Conductor - fleet-tool-fixes' + workspace_group:5). It lands STANDALONE instead — no group create,
+    # no rename, no anchor. The kind-guard is the fix.
+    calls = []
+    def fake_cmuxq(*args):
+        calls.append(args)
+        if args[:1] == ("new-workspace",):
+            return "created workspace:7\n"
+        return ""
+    monkeypatch.setattr(fleet, "cmuxq", fake_cmuxq)
+    monkeypatch.setattr(fleet, "_group_ref", lambda g: "")        # the child's group does NOT exist in cmux
+    monkeypatch.setattr(fleet, "_ref_to_uuid", lambda kind, ref, tree=None: "WS-CHILD")
+    monkeypatch.setattr(fleet, "_term_surface_in", lambda ws, pane=None: "SF")
+
+    ws, surf = fleet.create_surface(
+        {"place": "workspace", "group": "orphan-grp", "label": "fleet-tool-fixes", "kind": "child",
+         "abs_cwd": "/tmp/x"}, "PARENT", "down")
+    assert (ws, surf) == ("WS-CHILD", "SF")                      # it still lands, just standalone
+    nw = [c for c in calls if c[0] == "new-workspace"]
+    assert len(nw) == 1 and "--group" not in nw[0]               # ONE plain workspace, NOT grouped
+    assert not [c for c in calls if c[:2] == ("workspace-group", "create")]   # no group minted
+    assert not [c for c in calls if c[0] == "rename-workspace"]  # no 'Conductor - <child>' anchor titled
+
+
+def test_conductor_reuses_existing_group_by_alt_name_never_duplicates(monkeypatch):
+    # F4 REGRESSION: a conductor launched with the BARE-label group string must REUSE its existing
+    # 'Conductor - <name>' group (the mint convention) via the name-to-ref probe, never mint a duplicate.
+    calls = []
+    def fake_cmuxq(*args):
+        calls.append(args)
+        if args[:1] == ("new-workspace",):
+            return "created workspace:7\n"
+        return ""
+    monkeypatch.setattr(fleet, "cmuxq", fake_cmuxq)
+    # the bare 'cond' group does NOT exist, but 'Conductor - cond' (the minted convention) DOES -> reuse it
+    monkeypatch.setattr(fleet, "_group_ref",
+                        lambda g: "workspace_group:9" if g == "Conductor - cond" else "")
+    monkeypatch.setattr(fleet, "_ref_to_uuid", lambda kind, ref, tree=None: "WS-COND")
+    monkeypatch.setattr(fleet, "_term_surface_in", lambda ws, pane=None: "SF")
+
+    ws, surf = fleet.create_surface(
+        {"place": "workspace", "group": "cond", "label": "cond", "kind": "conductor", "abs_cwd": "/tmp/x"},
+        "PARENT", "down")
+    assert (ws, surf) == ("WS-COND", "SF")
+    nw = [c for c in calls if c[0] == "new-workspace"][0]
+    assert "--group" in nw and "workspace_group:9" in nw         # JOINED the existing group by its ref
+    assert not [c for c in calls if c[:2] == ("workspace-group", "create")]   # NO duplicate group minted
 
 
 def test_title_group_anchor_scaffold_renames_the_scaffold_not_the_member(monkeypatch):

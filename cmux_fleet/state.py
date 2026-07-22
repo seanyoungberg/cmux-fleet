@@ -375,7 +375,68 @@ def block_set(surface, kind, seq):
     m = _read_json(BLOCKS, {})
     m.setdefault(surface, {})[kind] = int(seq)
     _atomic_write(BLOCKS, json.dumps(m, indent=2))
-    return int(seq)
+
+
+# --- structured API-error HALT store (the StopFailure hook is the PRIMARY halt signal) --------------
+# Claude Code's StopFailure hook fires when a turn ends on an API error (Stop never does), typed
+# error_type + error_message. The hook records the halt HERE, keyed by surface + tagged with the session,
+# so the classifier paints limit-parked / errored from STRUCTURE at the source — never a prose scan. The
+# transcript `last_halt` read is the CATCH-UP layer that reconstructs the same halt after hook downtime.
+HALT = os.path.join(STATE, "halt.json")
+HOOK_ANOMALY_LOG = os.path.join(STATE, "hook-anomalies.log")
+
+
+def halt_set(surface, sid, halt, now=None):
+    """Record a structured API-error HALT for a surface (the StopFailure hook's job). `halt` is a
+    last_halt-shaped dict {api_error,error,api_status,stop_reason,detail}. Tagged with the session `sid`
+    so a recycled surface can't inherit the prior session's park. Fail-open (best-effort)."""
+    if not surface:
+        return
+    try:
+        m = _read_json(HALT, {})
+        m[surface] = {"sid": bare_uuid(sid or ""), "halt": halt, "ts": now or time.time()}
+        _atomic_write(HALT, json.dumps(m, indent=2))
+    except Exception:
+        pass
+
+
+def halt_get(surface, sid=None):
+    """The recorded halt dict for a surface, or None. When `sid` is given, a halt tagged with a DIFFERENT
+    session is ignored (a recycled surface must never inherit the prior session's park)."""
+    try:
+        e = _read_json(HALT, {}).get(surface or "")
+        if not e:
+            return None
+        if sid is not None and e.get("sid") and bare_uuid(sid) != e.get("sid"):
+            return None
+        h = e.get("halt")
+        return h if isinstance(h, dict) else None
+    except Exception:
+        return None
+
+
+def halt_clear(surface):
+    """Drop a surface's recorded halt — the agent moved PAST it (a new turn, a clean Stop, or a
+    completed/idle Notification). Fail-open."""
+    if not surface:
+        return
+    try:
+        m = _read_json(HALT, {})
+        if surface in m:
+            del m[surface]
+            _atomic_write(HALT, json.dumps(m, indent=2))
+    except Exception:
+        pass
+
+
+def hook_anomaly(msg, now=None):
+    """Append a LOUD, never-dropped note about an unexpected hook payload (e.g. an unknown StopFailure
+    error_type) to a greppable log, so a new upstream type surfaces for triage instead of vanishing."""
+    try:
+        with open(HOOK_ANOMALY_LOG, "a") as f:
+            f.write(f"{int(now or time.time())} {msg}\n")
+    except Exception:
+        pass
 
 
 # --- schema v2 (Ship 5 thin-registry): identity + spec + binding, workspace/status derived ----------
@@ -947,6 +1008,107 @@ def last_agent_text(path, cap=160):
             if t and t.strip():
                 text = t.strip()
         return text.replace("\n", " ")[:cap]
+    except Exception:
+        return ""
+
+
+RATE_LIMIT_ERRORS = ("rate_limit", "rate-limit", "usage_limit", "usage-limit")   # structured `error` values that mean a self-healing PARK
+_RESETS_RE = re.compile(r"resets\s+[^()\n]+", re.I)
+_HALT_TAIL_BYTES = 262144        # transcripts reach megabytes; the last assistant/user row is always near EOF
+
+
+def _tail_lines(path, tail_bytes=_HALT_TAIL_BYTES):
+    """The lines of the transcript TAIL (last `tail_bytes`, partial first line dropped) — the last relevant
+    row is always near EOF, so the halt/user-row readers avoid reading a multi-MB file whole. [] on error."""
+    try:
+        size = os.path.getsize(path)
+        with open(path, "rb") as f:
+            if size > tail_bytes:
+                f.seek(size - tail_bytes)
+                f.readline()                     # drop the partial first line
+            chunk = f.read().decode("utf-8", "replace")
+        return chunk.splitlines()
+    except OSError:
+        return []
+
+
+def _resets_hint(text):
+    """The 'resets HH:MM' slice of a session-limit banner (e.g. 'You've hit your session limit · resets
+    12:10am (America/New_York)' -> 'resets 12:10am'), '' if absent. Stops before the timezone paren."""
+    m = _RESETS_RE.search(text or "")
+    return m.group(0).strip() if m else ""
+
+
+def last_halt(path):
+    """STRUCTURED halt signals of the transcript's LAST assistant row — the structural truth for status
+    (NEVER a prose keyword scan of the body: 'rate limit' / 'compact' in an agent's prose is not a halt).
+    Claude stamps an API-error halt as an `assistant` row carrying TOP-LEVEL `isApiErrorMessage` /
+    `apiErrorStatus` / `error` with the banner as its text; a rate-limit park reads `error=='rate_limit'`
+    or `apiErrorStatus==429`. Returns
+        {api_error: bool, error: str, api_status: int|None, stop_reason: str, detail: str}
+    `detail` carries the 'resets HH:MM' extracted from a rate-limit banner so the operator sees when the
+    park self-heals. Benign (api_error False) on a clean turn. Fails safe to a no-halt dict on any error."""
+    out = {"api_error": False, "error": "", "api_status": None, "stop_reason": "", "detail": ""}
+    if not path:
+        return out
+    try:
+        halt = None
+        for line in _tail_lines(path):
+            if '"assistant"' not in line:                    # cheap reject before json.loads
+                continue
+            try:
+                e = json.loads(line)
+            except Exception:
+                continue
+            if e.get("type") == "assistant":                 # claude assistant row (API-error rows included)
+                halt = e                                      # the LAST one is the current halt
+        if halt is None:
+            return out
+        msg = halt.get("message") or {}
+        out["api_error"] = bool(halt.get("isApiErrorMessage"))
+        out["error"] = halt.get("error") if isinstance(halt.get("error"), str) else ""
+        out["api_status"] = halt.get("apiErrorStatus")
+        out["stop_reason"] = halt.get("stop_reason") or (msg.get("stop_reason") if isinstance(msg, dict) else "") or ""
+        if out["api_error"] and (out["error"] in RATE_LIMIT_ERRORS or out["api_status"] == 429):
+            c = msg.get("content") if isinstance(msg, dict) else ""
+            banner = c if isinstance(c, str) else (
+                " ".join(b.get("text", "") for b in c if isinstance(b, dict) and b.get("type") == "text")
+                if isinstance(c, list) else "")
+            out["detail"] = _resets_hint(banner)
+        return out
+    except Exception:
+        return out
+
+
+def last_user_text(path, cap=100000):
+    """The transcript's LAST USER message, tool-agnostic — the readback side of the drive delivery guard
+    (compare what a child RECEIVED against what the parent sent). claude: {"type":"user","message":
+    {"content": str | [text-blocks]}}; codex: {"type":"event_msg","payload":{"type":"user_message",
+    "message":...}}. tool_result-only user rows carry no text and are skipped; the last real prompt wins.
+    '' when unreadable/none. Not truncated by default (the guard length/substring-compares the whole)."""
+    if not path:
+        return ""
+    try:
+        text = ""
+        for line in _tail_lines(path):
+            try:
+                e = json.loads(line)
+            except Exception:
+                continue
+            typ = e.get("type")
+            t = ""
+            if typ == "user":                                            # claude
+                c = (e.get("message") or {}).get("content")
+                t = c if isinstance(c, str) else (
+                    "\n".join(b.get("text", "") for b in c if isinstance(b, dict) and b.get("type") == "text")
+                    if isinstance(c, list) else "")
+            elif typ == "event_msg":                                     # codex
+                pl = e.get("payload") or {}
+                if pl.get("type") == "user_message" and isinstance(pl.get("message"), str):
+                    t = pl.get("message", "")
+            if t and t.strip():
+                text = t.strip()
+        return text[:cap]
     except Exception:
         return ""
 

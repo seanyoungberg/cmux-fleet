@@ -26,6 +26,71 @@ def _read_stdin():
         return b""
 
 
+def _hook_payload():
+    """The harness event JSON from stdin as a dict (best-effort; {} on any parse failure)."""
+    raw = _read_stdin()
+    try:
+        obj = json.loads(raw.decode("utf-8", "replace")) if raw else {}
+        return obj if isinstance(obj, dict) else {}
+    except Exception:
+        return {}
+
+
+# Claude Code StopFailure `error_type` matcher (docs v2.1.216). Any type OUTSIDE this set is still recorded
+# (as errored, never dropped) and logged loudly, so a new upstream type surfaces for triage.
+_KNOWN_ERROR_TYPES = ("rate_limit", "overloaded", "authentication_failed", "oauth_org_not_allowed",
+                      "billing_error", "invalid_request", "model_not_found", "server_error",
+                      "max_output_tokens", "unknown")
+
+
+def cmd_hook_stopfailure(argv):
+    """StopFailure (the turn ended on an API error — Stop NEVER fires on errors): record the structured halt
+    so the fleet paints limit-parked / errored from STRUCTURE at the source, never a prose scan. rate_limit /
+    429 -> a self-healing PARK (extract 'resets HH:MM' from error_message); any other typed error -> errored;
+    an UNKNOWN error_type is STILL recorded (never dropped) and logged loudly. Keyed by $CMUX_SURFACE_ID +
+    the payload session. Blank stdout, fail-open (any error -> exit 0)."""
+    payload = _hook_payload()
+    try:
+        surface = os.environ.get("CMUX_SURFACE_ID", "")
+        if not surface:
+            return 0
+        etype = str(payload.get("error_type") or "").strip().lower()
+        emsg = str(payload.get("error_message") or "")
+        sid = payload.get("session_id") or ""
+        is_rate = etype in fs.RATE_LIMIT_ERRORS
+        detail = fs._resets_hint(emsg) if is_rate else (etype or "api-error")
+        halt = {"api_error": True, "error": etype, "api_status": 429 if is_rate else None,
+                "stop_reason": "", "detail": detail}
+        fs.halt_set(surface, sid, halt)
+        if etype and etype not in _KNOWN_ERROR_TYPES:
+            fs.hook_anomaly(f"StopFailure UNKNOWN error_type={etype!r} surface={surface[:8]} msg={emsg[:120]!r}")
+        return 0
+    except Exception:
+        return 0
+
+
+def cmd_hook_notification(argv):
+    """Notification (machine-typed: agent_completed / idle_prompt / agent_needs_input / permission_prompt /
+    auth_success / elicitation_*): CORROBORATE state without overruling the authoritative Feed-gate logic.
+    Only a GENUINE-RECOVERY type clears a recorded park: agent_completed (a turn finished — a parked agent
+    never completes) or auth_success (re-authed). CRUCIALLY it must NOT clear on idle_prompt: a rate-limit
+    park reads AS idle-at-the-prompt (the live specimen fired a Notification ~60s after the halt while the
+    agent sat waiting for the reset), so clearing on idle would wipe the park it just recorded. needs-input /
+    permission are left to the Feed gate. The prose `body` is display-only, never a state input. Keyed by
+    $CMUX_SURFACE_ID. Blank stdout, fail-open. (The park also clears on the next UserPromptSubmit / clean Stop.)"""
+    payload = _hook_payload()
+    try:
+        surface = os.environ.get("CMUX_SURFACE_ID", "")
+        if not surface:
+            return 0
+        ntype = str(payload.get("notification_type") or "").strip().lower()
+        if ntype in ("agent_completed", "auth_success"):
+            fs.halt_clear(surface)              # genuine recovery -> no longer parked (ready corroboration)
+        return 0
+    except Exception:
+        return 0
+
+
 def _doctor_line(r):
     """One rendered line for a kind='doctor' heartbeat-sweep alert. Most rows flag a still-LIVE member
     (inspect/drive/recycle, NOT revive — contrast the archived 'stale' rows); the two conductor-liveness
@@ -51,6 +116,20 @@ def _doctor_line(r):
                   f"runs out mid-task")
     elif reason == "needs-input":
         detail = "NEEDS INPUT — waiting at a question/permission gate; answer or drive it"
+    elif reason == "detached":
+        # DETACHED = the cmux hook-store record froze while the transcript kept advancing (the hook channel
+        # is dead). But that record ALSO freezes TRANSIENTLY during a fleet app-swap / daemon-restart CUTOVER
+        # window — cmux stalls its per-agent store write while its bus keeps emitting Stops — painting a FALSE
+        # detached that SELF-HEALS on the next turn's hooks (F5, the 2026-07-20 adopt specimen). So lead with
+        # INSPECT and carry the rich evidence/remedy the generic 'needs attention' used to drop.
+        frozen = int(r.get("record_frozen_min") or 0)
+        tage = r.get("transcript_age_min")
+        remedy = r.get("remedy") or f"fleet recycle {label} (resume) reattaches in ~8s"
+        detail = (f"DETACHED? — hook record froze ~{frozen}m ago"
+                  + (f" while the transcript advanced ~{tage}m ago" if tage is not None else "")
+                  + f". If a fleet app-swap / daemon-restart just ran, this is a TRANSIENT cutover freeze that "
+                  f"self-heals on the next turn — INSPECT first (`cmux capture-pane --surface {full}`); "
+                  f"recycle ONLY if it is genuinely dark: {remedy}")
     elif reason == "never-bound":
         mins = int(r.get("pending_s") or 0) // 60
         err = (r.get("pane_error") or "").strip()
@@ -77,6 +156,8 @@ def cmd_hook_awareness(argv):
     _read_stdin()
     try:
         surface = os.environ.get("CMUX_SURFACE_ID", "")
+        if surface:
+            fs.halt_clear(surface)          # a NEW prompt/turn -> the agent moved past any API-error park
         comp = fs.inbox_pending(surface, kind="completion") if surface else []
         stale = fs.inbox_pending(surface, kind="stale") if surface else []
         doctor = fs.inbox_pending(surface, kind="doctor") if surface else []
@@ -148,6 +229,7 @@ def cmd_hook_drain(argv):
         surface = os.environ.get("CMUX_SURFACE_ID", "")
         if not surface:
             return 0
+        fs.halt_clear(surface)              # a clean Stop -> not parked (StopFailure, not Stop, fires on errors)
 
         comp, comp_hi = [], 0
         stale, stale_hi = [], 0

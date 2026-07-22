@@ -75,30 +75,27 @@ func stateOf(_ w) -> String {
   if l.hasPrefix("working · ") { return "working" }
   if l.hasPrefix("idle · ") { return "idle" }
   if l.hasPrefix("needs-input · ") { return "needs-input" }
-  if l.hasPrefix("error · ") { return "error" }
-  if l.hasPrefix("review · ") { return "review" }
-  if l.hasPrefix("done · ") { return "done" }
+  if l.hasPrefix("errored · ") { return "errored" }
+  if l.hasPrefix("limit-parked · ") { return "limit-parked" }
   if l.hasPrefix("ready · ") { return "ready" }
   if l.hasPrefix("detached · ") { return "detached" }
   return ""
 }
 func stateColor(_ s) -> String {
-  if s == "error" { return "#E5484D" }
+  if s == "errored" { return "#E5484D" }
   if s == "needs-input" { return "#F5A623" }
-  if s == "review" { return "#3E63DD" }
+  if s == "limit-parked" { return "#D9822B" }   // warm amber — rate-limited, parked; never red, never 'error'
   if s == "working" { return "#30A46C" }
-  if s == "done" { return "#46A758" }
   if s == "ready" { return "#3DB9A0" }
   if s == "detached" { return "#A45CDB" }
   if s == "idle" { return "#8B8D98" }
   return ""
 }
 func stateIcon(_ s) -> String {
-  if s == "error" { return "exclamationmark.triangle.fill" }
+  if s == "errored" { return "exclamationmark.triangle.fill" }
   if s == "needs-input" { return "hand.raised.fill" }
-  if s == "review" { return "eye.fill" }
+  if s == "limit-parked" { return "pause.circle.fill" }
   if s == "working" { return "gearshape.fill" }
-  if s == "done" { return "checkmark.circle.fill" }
   if s == "ready" { return "circle.fill" }
   if s == "detached" { return "antenna.radiowaves.left.and.right.slash" }
   if s == "idle" { return "moon.zzz.fill" }

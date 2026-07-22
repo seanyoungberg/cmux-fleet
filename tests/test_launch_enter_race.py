@@ -173,3 +173,59 @@ def test_drive_reports_failure_when_box_never_clears(monkeypatch):
     monkeypatch.setattr(drive, "cmux", lambda *a: None)
     monkeypatch.setattr(drive, "_capture", lambda surf: "❯ stuck prompt text here")  # never clears
     assert drive._submit("SURF", "stuck prompt text here") is False
+
+
+# --- F6: the delivery guard reads the child's user row back to catch a MIDDLE-drop ----------------
+# A REAL middle-drop keeps the HEAD and the distinctive TAIL (the last 24 chars _submit settled on) and
+# loses the interior — so the read-back row still carries the tail.
+_SENT = "PLEASE-HEAD then a big middle that cmux truncated DISTINCT-TAIL-MARKER-END"   # tail = last 24 chars
+_MIDDROP = "PLEASE-HEAD DISTINCT-TAIL-MARKER-END"                                       # head + tail, middle gone
+
+
+def test_verify_delivery_classifies_intact_truncated_and_unverified(monkeypatch):
+    # the tail-only settle check is BLIND to a dropped middle; the transcript readback is the guard.
+    drive = _load_drive()
+    monkeypatch.setattr(drive.time, "sleep", lambda *_: None)
+    monkeypatch.setattr(drive, "_last_user_row", lambda surf: "  " + _SENT + "  ")   # intact (+ chrome) -> ok
+    assert drive._verify_delivery("SURF", _SENT)[0] == "ok"
+    monkeypatch.setattr(drive, "_last_user_row", lambda surf: _MIDDROP)              # middle gone, tail survives
+    status, got_len = drive._verify_delivery("SURF", _SENT)
+    assert status == "truncated" and got_len < len(drive._norm(_SENT))
+    monkeypatch.setattr(drive, "_last_user_row", lambda surf: "")                    # never read back -> unverified
+    assert drive._verify_delivery("SURF", _SENT)[0] == "unverified"
+
+
+def test_verify_delivery_unrelated_row_is_unverified_not_truncated(monkeypatch):
+    # THE false-positive fix: a BUSY child still on its prior turn (or an injected notification/user row)
+    # exposes a LAST user row that is NOT our delivery — it lacks our tail. That must read 'unverified',
+    # NEVER 'truncated', so we never tell the operator to RESEND a delivery that actually landed.
+    drive = _load_drive()
+    monkeypatch.setattr(drive.time, "sleep", lambda *_: None)
+    monkeypatch.setattr(drive, "_last_user_row", lambda surf: "an earlier, unrelated prompt to this child")
+    assert drive._verify_delivery("SURF", _SENT)[0] == "unverified"
+    monkeypatch.setattr(drive, "_last_user_row",
+                        lambda surf: "[SYSTEM NOTIFICATION - NOT USER INPUT] a task event landed here")
+    assert drive._verify_delivery("SURF", _SENT)[0] == "unverified"
+
+
+def test_drive_child_flags_delivery_truncated_passes_intact_and_is_quiet_when_unverified(monkeypatch, capsys):
+    # END-TO-END: `_submit` reports the box cleared (tail-only), but the readback proves the middle dropped
+    # -> loud DELIVERY-TRUNCATED + non-zero exit; an intact readback -> clean 'submitted', exit 0; a busy
+    # child whose readback isn't our row -> exit 0 with an UNVERIFIED note, NEVER a false TRUNCATED.
+    drive = _load_drive()
+    monkeypatch.setattr(drive.time, "sleep", lambda *_: None)
+    monkeypatch.setattr(drive, "_resolve_surface_handle", lambda h: h)
+    monkeypatch.setattr(drive, "_submit", lambda surf, text: True)                  # box cleared, tail intact
+    parts = _SENT.split()                                                           # cmd joins argv[1:] w/ spaces
+    monkeypatch.setattr(drive, "_last_user_row", lambda surf: _MIDDROP)             # middle vanished
+    rc = drive.cmd_drive_child(["SURF1234"] + parts)
+    err = capsys.readouterr().err
+    assert rc == 1 and "DELIVERY-TRUNCATED" in err and "RESEND" in err
+    monkeypatch.setattr(drive, "_last_user_row", lambda surf: _SENT)               # intact readback -> ok
+    rc = drive.cmd_drive_child(["SURF1234"] + parts)
+    cap = capsys.readouterr()
+    assert rc == 0 and "submitted to" in cap.out and "DELIVERY-TRUNCATED" not in cap.err
+    monkeypatch.setattr(drive, "_last_user_row", lambda surf: "unrelated busy-turn prompt")   # not our row
+    rc = drive.cmd_drive_child(["SURF1234"] + parts)
+    cap = capsys.readouterr()
+    assert rc == 0 and "UNVERIFIED" in cap.out and "DELIVERY-TRUNCATED" not in cap.err        # never a false alarm

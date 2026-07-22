@@ -6,6 +6,71 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [0.15.2] - 2026-07-21
+
+**status-truth**: agent status now derives from STRUCTURE, never prose (Berg mandate 2026-07-20). Six fixes
++ a stale-ref sweep. Suite green: 1256 tests. MERGE != LIVE.
+
+### Changed
+
+- **F1 — killed prose status classification.** Deleted the `ERROR_HINTS` / `REVIEW_HINTS` / `DONE_HINTS`
+  keyword tables (and the dead `BLOCK_HINTS`) and the `_refine` keyword path. Matching an agent's own words
+  stamped a state on any agent that merely MENTIONED the phrase — "rate limit" / "usage limit" / "compact"
+  read as `error`, "opened pull request" as `review`. The classifier is now structure-only: cmux lifecycle
+  + open Feed gate + the transcript's end-of-turn + the last row's structured halt fields. The prose-derived
+  `error` / `review` / `done` states are retired.
+- **F3 — unified `fleet ls` onto the shared classifier.** `fleet ls` classified from raw lifecycle with no
+  transcript read, so a seat frozen at `running` showed `working` for 18h while `fleet vitals` said idle. Its
+  state column now routes through the same `features.seat_state` path vitals and paint use (reads the
+  transcript end-of-turn + structured halt + the I4 detached overlay), so the two views can never disagree.
+
+### Added
+
+- **F2 — hooks-first structured API-error states (the centerpiece).** Claude Code's **`StopFailure`** hook
+  fires when a turn ends on an API error (Stop never does), typed `error_type` + `error_message`. Two new
+  fleet hook shims (thin, fail-open, like the existing awareness/drain) record status from STRUCTURE at the
+  source — never a prose scan:
+    - **`StopFailure`** → `fleet hook-stopfailure`: `error_type=rate_limit` (or a 429) records a
+      **`limit-parked`** halt — a transient server throttle OR an account park, structurally indistinguishable
+      and self-healing either way (warm amber, never red, never named error; the `resets HH:MM` is extracted
+      from `error_message` into the row detail when the banner carries one); any other typed error records
+      **`errored`** (the type in the detail); an UNKNOWN `error_type` is still recorded (never dropped) and
+      logged loudly to `hook-anomalies.log`.
+    - **`Notification`** → `fleet hook-notification` (machine-typed): a `agent_completed` / `idle_prompt` /
+      `auth_success` type clears the recorded park (ready corroboration); `needs-input` / `permission` types
+      are left to the authoritative Feed gate; the prose `body` is display-only, never a state input.
+  The halt rides a per-surface fleet store (`state.halt_*`), session-tagged so a recycled surface can't
+  inherit a stale park, and cleared on any forward progress (new prompt, clean Stop, completed/idle). The
+  transcript-structured read (`state.last_halt`, parsing `isApiErrorMessage` / `error` / `apiErrorStatus` /
+  `stop_reason`) stays as the **catch-up layer** that reconstructs the same halt after hook/daemon downtime.
+  `STATE_STYLE`, the vitals/ls render, and `sidebars/fleet.swift` (`stateOf`/`stateColor`/`stateIcon`) carry
+  the new `limit-parked` / `errored` vocabulary. *DOCS-SILENT caveat (verify on first live fire): whether
+  `StopFailure` fires on a USAGE-limit exhaustion vs an API 429 is unconfirmed upstream; the specimen's
+  transcript classified the session-limit halt as `error: rate_limit`, so it is expected to.*
+- **F6 — drive-child delivery guard.** A long `cmux send` can drop the MIDDLE of a prompt while head+tail
+  survive, so `_submit`'s tail-only settle check passes blind (this corrupted a real dispatch). After submit,
+  `fleet drive-child` now reads the child's last USER row back from its transcript (new `state.last_user_text`)
+  and compares it to what was sent; a mismatch emits a loud `[drive] DELIVERY-TRUNCATED` with a resend / use-
+  the-inbox-path hint and a non-zero exit. Fail-safe: an unreadable row is `UNVERIFIED`, never a false alarm.
+
+### Fixed
+
+- **F4 — launch group-ensure no longer mints a child anchor or a duplicate group.** `create_surface`'s
+  workspace bootstrap titled a `Conductor - <label>` scaffold anchor + minted a cmux group with no kind guard,
+  so a worker placed `--place workspace` with an unresolved group minted `Conductor - <worker>` furniture +
+  a duplicate group. The bootstrap is now conductor-only (a non-conductor lands standalone), and it reuses an
+  existing conductor group by name-to-ref across the `Conductor - <name>` / bare-`<label>` convention split
+  instead of duplicating it.
+- **F5 — doctor DETACHED row now inspect-first + a cutover-window runbook caveat.** The per-agent hook-store
+  record is written by cmux, not the fleet; during an app-swap + daemon-restart cutover cmux can transiently
+  freeze that write while its bus keeps emitting Stops, so behavioral-detach paints a healthy agent DETACHED
+  for a few minutes until its next turn's hooks self-heal it. The doctor's child `detached` line (previously a
+  generic "needs attention" that dropped the evidence) now leads with INSPECT, names the transient cutover
+  freeze + self-heal, and carries the runnable capture-pane + recycle remedy. `docs/operations.md`'s cutover
+  runbook gains a matching "do not recycle on a transient DETACHED" caveat.
+- **Swept stale `fleet-proto` sidebar references** (`daemon.py`, `tests/test_daemon.py`) — the sidebar is
+  `fleet.swift` now (the `fleet-proto` → `fleet` rename landed in 85bc620).
+
 ## [0.15.1] - 2026-07-21
 
 Two small doctor-reliability / diagnostics fixes logged during the T6 arc. Patch on top of v0.15.0; no

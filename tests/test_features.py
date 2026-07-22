@@ -69,37 +69,128 @@ def test_classify_pending_vs_stale_when_no_session():
     assert ff._classify("", True, "") == "stale"             # had one, surface gone
 
 
-def test_classify_keyword_refines_finished_turn_and_idle():
-    ff = _ff()
-    # a finished turn (needsInput, no gate) refines to error/review/done, else 'ready'
-    assert ff._classify("needsInput", True, "Traceback (most recent call last)") == "error"
-    assert ff._classify("needsInput", True, "opened pull request #42") == "review"
-    assert ff._classify("needsInput", True, "all tests passed ✓ done") == "done"
-    assert ff._classify("needsInput", True, "wrapped up, standing by") == "ready"
-    # keywords refine the same way whether recent or quiet; the DEFAULT is ready (recent) vs idle (quiet)
-    assert ff._classify("idle", True, "opened pull request #42", quiet=True) == "review"
-    assert ff._classify("idle", True, "still chugging on the refactor", quiet=True) == "idle"
-    # a stale block-phrase in the transcript NO LONGER forces needs-input (Feed gate is authoritative)
-    assert ff._classify("idle", True, "Do you want to proceed? [y/n]", quiet=True) == "idle"
-    assert ff._classify("needsInput", True, "approve? [y/n]") == "ready"
+def _halt(**kw):
+    """A structured last-row halt dict (fs.last_halt shape), benign unless fields are set."""
+    d = {"api_error": False, "error": "", "api_status": None, "stop_reason": "", "detail": ""}
+    d.update(kw)
+    return d
 
 
-def test_classify_keywords_only_apply_when_not_working():
+def test_classify_finished_turn_is_structure_only():
+    # STRUCTURE, NOT PROSE (Berg mandate): a finished turn with NO structured halt reads ready/idle by TIME
+    # alone. The deleted ERROR/REVIEW/DONE keyword tables no longer manufacture error/review/done; there is
+    # no body-text input to the classifier at all.
     ff = _ff()
-    # a running agent that happens to print "error" mid-work stays working (lifecycle wins)
-    assert ff._classify("running", True, "error: transient") == "working"
+    assert ff._classify("needsInput", True, None) == "ready"            # recent -> ready
+    assert ff._classify("needsInput", True, None, quiet=True) == "idle"  # long-quiet -> idle
+    assert ff._classify("idle", True, _halt(), quiet=True) == "idle"
+
+
+def test_classify_ignores_a_legacy_prose_string_arg():
+    # the 3rd arg is now the structured `halt` dict; a stray STRING (a legacy caller, or an agent's own
+    # prose) must be IGNORED — never crash, never classified. This is prose-classification staying dead:
+    # each of these would have tripped a deleted keyword table.
+    ff = _ff()
+    for prose in ("Traceback (most recent call last)", "opened pull request #42",
+                  "all tests passed ✓ done", "You've hit your usage limit", "approve? [y/n]"):
+        assert ff._classify("needsInput", True, prose) == "ready"       # finished turn -> ready, not error/review/done
+        assert ff._classify("running", True, prose) == "working"        # mid-turn -> working, body ignored
+
+
+def test_classify_structured_halt_limit_parked_and_errored():
+    # STRUCTURED halt fields (isApiErrorMessage/error/apiErrorStatus) drive the API-error states — NOT prose.
+    ff = _ff()
+    # rate_limit / 429 is a self-healing PARK (never red, never 'errored')
+    assert ff._classify("needsInput", True, _halt(api_error=True, error="rate_limit", api_status=429)) == "limit-parked"
+    assert ff._classify("idle", True, _halt(api_error=True, api_status=429)) == "limit-parked"
+    # any OTHER structured API error -> errored
+    assert ff._classify("needsInput", True, _halt(api_error=True, error="overloaded_error", api_status=529)) == "errored"
+    # a live NEW turn OUTRANKS a stale halt row from the prior turn (running, turn still open) -> working
+    assert ff._classify("running", True, _halt(api_error=True, error="rate_limit", api_status=429)) == "working"
+    # ...but once the turn closes while cmux lags at 'running', the halt surfaces
+    assert ff._classify("running", True, _halt(api_error=True, error="rate_limit", api_status=429),
+                        turn_done=True) == "limit-parked"
 
 
 def test_classify_turn_done_clears_the_lagged_running():
-    # Fix 1: cmux's lifecycle lags ~60s at 'running' after a turn closes; the transcript's end_turn flips
-    # at once. turn_done retires the stale 'working' -> the just-finished agent reads 'ready' immediately.
+    # cmux's lifecycle lags ~60s at 'running' after a turn closes; the transcript's end_turn flips at once.
+    # turn_done retires the stale 'working' -> the just-finished agent reads 'ready' immediately.
     ff = _ff()
-    assert ff._classify("running", True, "wrapped up", turn_done=True) == "ready"
-    assert ff._classify("running", True, "opened pull request #42", turn_done=True) == "review"
+    assert ff._classify("running", True, None, turn_done=True) == "ready"
     # turn_done also retires a lingering stale Feed gate (a proven end_turn can't be a live gate)
-    assert ff._classify("running", True, "", open_gate=True, turn_done=True) == "ready"
+    assert ff._classify("running", True, None, open_gate=True, turn_done=True) == "ready"
     # still mid-turn when the transcript hasn't closed the turn
-    assert ff._classify("running", True, "", turn_done=False) == "working"
+    assert ff._classify("running", True, None, turn_done=False) == "working"
+
+
+def test_last_halt_classify_reachable_green(tmp_path):
+    # THE paired reachable-green fixture (session 8c710949 line 139 shape): a REAL captured 429 session-limit
+    # row -> limit-parked, with the resets time extracted into the detail so the operator sees the self-heal.
+    ff = _ff()
+    from cmux_fleet import state as fs
+    limit = tmp_path / "limit.jsonl"
+    limit.write_text(json.dumps({"type": "assistant", "isApiErrorMessage": True, "apiErrorStatus": 429,
+        "error": "rate_limit", "message": {"model": "<synthetic>", "stop_reason": "stop_sequence",
+        "content": "You've hit your session limit · resets 12:10am (America/New_York)"}}) + "\n")
+    h = fs.last_halt(str(limit))
+    assert h["api_error"] is True and h["error"] == "rate_limit" and h["api_status"] == 429
+    assert h["detail"] == "resets 12:10am"
+    assert ff._classify("needsInput", True, h) == "limit-parked"
+    # PAIRED CONTROL: a CLEAN closed turn whose TEXT merely SAYS 'usage limit' (no structured error) is NOT
+    # parked -> ready. Prose that would have tripped the old ERROR_HINTS is structurally inert now.
+    clean = tmp_path / "clean.jsonl"
+    clean.write_text(json.dumps({"type": "assistant", "message": {"stop_reason": "end_turn",
+        "content": "All done — note we brushed the usage limit earlier but recovered fine."}}) + "\n")
+    hc = fs.last_halt(str(clean))
+    assert hc["api_error"] is False and hc["detail"] == ""
+    assert ff._classify("needsInput", True, hc) == "ready"
+
+
+def test_seat_state_reads_the_transcript_so_ls_and_vitals_agree(tmp_path, monkeypatch):
+    # F3: fleet ls once classified from RAW lifecycle with turn_done defaulting False and no transcript read,
+    # so a seat frozen at lifecycle='running' showed 'working' for 18h while vitals (which reads the
+    # transcript's end-of-turn) said ready. seat_state is now the ONE shared path both use — given a CLOSED
+    # transcript turn, a lagged 'running' lifecycle reads 'ready', NOT 'working'.
+    import time
+    ff = _ff()
+    from cmux_fleet import state as fs
+    from cmux_fleet import resolve as rs
+    monkeypatch.setattr(rs, "lifecycle", lambda surf: "running")     # cmux LAGS at 'running' after the close
+    monkeypatch.setattr(rs, "attachment", lambda *a, **k: {"attached": True, "reasons": []})
+    entry = {"surface": "S1", "session": "sid1", "tool": "claude"}
+    closed = tmp_path / "closed.jsonl"                               # last turn CLOSED (end_turn, nothing after)
+    closed.write_text(json.dumps({"type": "assistant", "message": {"stop_reason": "end_turn", "content": "done"}}) + "\n")
+    sess = {"sessionId": "sid1", "transcriptPath": str(closed), "updatedAt": time.time()}
+    state, _ = ff.seat_state(entry, sess, {}, frozenset())
+    assert state == "ready"                                          # the fix: transcript closed -> not 'working'
+    # CONTROL: a still-OPEN turn (last row ends on a tool_use, not a terminal stop) stays 'working'
+    openturn = tmp_path / "open.jsonl"
+    openturn.write_text(json.dumps({"type": "assistant", "message": {"stop_reason": "tool_use", "content": "..."}}) + "\n")
+    sess2 = {"sessionId": "sid1", "transcriptPath": str(openturn), "updatedAt": time.time()}
+    state2, _ = ff.seat_state(entry, sess2, {}, frozenset())
+    assert state2 == "working"
+
+
+def test_seat_state_prefers_hook_recorded_halt_over_transcript(tmp_path, monkeypatch):
+    # F2 HOOKS-FIRST: the StopFailure-hook park is PRIMARY; a CLEAN transcript must not override it. (The
+    # transcript last_halt is only the CATCH-UP layer for when the hook was down.)
+    import time
+    ff = _ff()
+    from cmux_fleet import state as fs
+    from cmux_fleet import resolve as rs
+    monkeypatch.setattr(rs, "lifecycle", lambda surf: "needsInput")
+    monkeypatch.setattr(rs, "attachment", lambda *a, **k: {"attached": True, "reasons": []})
+    clean = tmp_path / "clean.jsonl"                              # transcript shows a CLEAN closed turn...
+    clean.write_text(json.dumps({"type": "assistant", "message": {"stop_reason": "end_turn", "content": "ok"}}) + "\n")
+    entry = {"surface": "S9", "session": "sid9", "tool": "claude"}
+    sess = {"sessionId": "sid9", "transcriptPath": str(clean), "updatedAt": time.time()}
+    fs.halt_set("S9", "sid9", {"api_error": True, "error": "rate_limit", "api_status": 429,   # ...but the hook parked it
+                               "stop_reason": "", "detail": "resets 12:10am"})
+    state, detail = ff.seat_state(entry, sess, {}, frozenset())
+    assert state == "limit-parked" and detail == "resets 12:10am"  # hook wins over the clean transcript
+    fs.halt_clear("S9")                                            # once cleared, it falls back to the transcript (ready)
+    state2, _ = ff.seat_state(entry, sess, {}, frozenset())
+    assert state2 == "ready"
 
 
 def test_classify_ready_vs_idle_is_time_based():
