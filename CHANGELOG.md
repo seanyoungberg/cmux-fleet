@@ -6,6 +6,21 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [0.15.4] - 2026-07-22
+
+**securestorage seeded-guard**: a claude securestorage namespace that was never logged in has no keychain
+item, so claude SILENTLY falls back to the ambient credential — a pinned seat then runs and BILLS on the
+wrong account with no error. `providers.securestorage_seeded()` detects it by keychain item EXISTENCE
+(`security find-generic-password -s <service>` without `-w`: exit 0 = seeded, 44 = never seeded; no secret
+decrypt, no prompt), and every spawn path (launch, recycle, revive) now emits a loud WARN naming both the
+hazard and the fix. WARN, not ABORT, deliberately: seeding a namespace requires launching a pane on it and
+running `/login` inside, which an ABORT would block. Fails OPEN where `security` is absent so it never cries
+wolf on a real account. `securestorage:` is also now documented in fleet.toml.example.
+
+**usage footer disambiguation**: same identity on two tools rendered as duplicate rows (one `sean@berglabs.net`
+line for claude and another for codex). Field 0 of the usage carrier is now tool-prefixed
+(`claude · sean@berglabs.net`), tool first so a truncation keeps the disambiguator.
+
 ## [0.15.3] - 2026-07-22
 
 **role account-pin**: a DURABLE per-seat account. `[role.<r>.<tool>].account = "<name>"` layers ABOVE the
