@@ -419,6 +419,10 @@ writes.
   inbox row + idle-wake on the caller's surface — so a conductor that ran `fleet
   recycle` learns the outcome instead of seeing only `SCHEDULED`. (An operator driving
   the CLI directly, with no `$CMUX_SURFACE_ID`, gets the terminal log as before.)
+  This **includes a self-recycle that fails**: an ABORT does not respawn, so the seat
+  is still alive with its inbox intact and is notified on its own surface. Only a
+  *successful* self-recycle stays quiet — the respawned instance boots fresh from its
+  handover, so a completion note in the inbox it just shed would be noise.
 
   ```
   fleet recycle                 # recycle self, RESUME (preserve context) — the default

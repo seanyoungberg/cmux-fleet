@@ -6,6 +6,26 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [0.15.6] - 2026-07-22
+
+**self-recycle ABORT reaches the seat that ran it.** v0.15.5 closed "a detached recycle's terminal result is
+silent to the caller" everywhere except the fleet's single most common recycle shape — a conductor recycling
+itself. Reported independently by both peer conductors (berg-sandbox, cf-conductor) within minutes, each with
+a pending self-recycle. Suite green: 1289 tests.
+
+### Fixed
+
+- **A self-recycle that ABORTs now notifies its own seat.** `_recycle_notify_caller` skipped the invoker
+  unconditionally whenever it was the recycled surface, justified as "its inbox is being respawned away" —
+  true only for DONE. On a non-DONE outcome the recycle explicitly does *not* respawn (no half-kill), so the
+  original process is still alive with an intact inbox, and it is precisely the party that needs to know its
+  own recycle failed; it saw `SCHEDULED` and never learned otherwise. The skip is now conditioned on the
+  outcome: self + DONE stays quiet (the respawned instance boots fresh off its handover — a completion note
+  there is noise), self + any other terminal outcome is delivered. Non-self DONE/ABORT and the no-invoker
+  operator case are unchanged. Delivery still runs through `state.wake_if_idle`, whose busy-check and
+  screen-read prompt gate mean a seat that aborted *because* it was genuinely mid-turn gets a durable inbox
+  row and no injection.
+
 ## [0.15.5] - 2026-07-22
 
 **recycle quiet-gate pair** (cmux-advisor batch; berg-sandbox bug report). Both defects from the graph-view

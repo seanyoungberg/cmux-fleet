@@ -92,13 +92,29 @@ def test_notify_caller_skips_when_no_invoker(fs, monkeypatch):
     assert fleet_state.inbox_pending("S", kind="peer") == []
 
 
-def test_notify_caller_skips_self_recycle(fs, monkeypatch):
-    # a self-recycle: the invoker IS the seat being respawned -> no separate caller, and its inbox is going
-    # away -> skip (never message the surface that's being recycled out from under itself).
+def test_notify_caller_skips_self_recycle_on_done(fs, monkeypatch):
+    # a self-recycle that SUCCEEDED: the seat is being respawned away, and the new instance boots fresh from
+    # its handover -> a completion note in an inbox that is going away is pure noise. Stay quiet.
     from cmux_fleet import state as fleet_state
     p = {"label": "w", "surface": "S", "mode": "fresh", "invoker_surface": "S", "invoker_label": "w"}
     fleet._recycle_notify_caller(p, "DONE", "ok")
     assert fleet_state.inbox_pending("S", kind="peer") == []
+
+
+def test_notify_caller_self_recycle_abort_notifies_self(fs, monkeypatch):
+    # THE fix: on ABORT the recycle explicitly does NOT respawn (no half-kill), so the seat is still alive
+    # with an intact inbox -- and it is precisely the party that must learn its own recycle failed. Before
+    # this it saw 'SCHEDULED' and nothing, ever (defect 2, verbatim, for the most common recycle shape).
+    from cmux_fleet import state as fleet_state
+    woke = []
+    monkeypatch.setattr(fleet_state, "wake_if_idle", lambda surf, msg: woke.append(surf) or True)
+    monkeypatch.setattr(fleet_state, "idlewake_on", lambda: True)
+    p = {"label": "w", "surface": "S", "mode": "fresh", "invoker_surface": "S", "invoker_label": "w"}
+    fleet._recycle_notify_caller(p, "ABORT", "still mid-turn after 180s")
+    rows = fleet_state.inbox_pending("S", kind="peer")
+    assert len(rows) == 1
+    assert rows[0]["from_label"] == "fleet-recycle" and "ABORT" in rows[0]["body"]
+    assert woke == ["S"]                                                    # wake is gated by wake_if_idle
 
 
 def test_recycle_exec_abort_notifies_caller(fs, rs, monkeypatch):

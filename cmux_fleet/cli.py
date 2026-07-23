@@ -5815,14 +5815,22 @@ def _recycle_notify_caller(p, outcome, detail):
     The invoker is recorded at schedule time (payload `invoker_surface`), so this reaches the ACTUAL caller
     even when that differs from the seat's registry parent (which is who `_escalate_recycle_failure`
     alerts — a complementary, not duplicate, signal). Skips when there is no identified invoker (an
-    operator driving the CLI directly, e.g. Berg — no $CMUX_SURFACE_ID) or when the invoker IS the recycled
-    seat itself (a self-recycle has no separate caller, and its inbox is being respawned away). Best-effort:
-    never masks the recycle's own exit path."""
+    operator driving the CLI directly, e.g. Berg — no $CMUX_SURFACE_ID), and on a SELF-recycle skips only
+    the DONE case: the respawned instance boots fresh off its handover, so a completion note in the inbox
+    being respawned away is noise. A self-recycle that ends any OTHER way is notified on its own surface —
+    a non-DONE outcome means the recycle explicitly did NOT respawn (no half-kill), so the original process
+    is still alive with an intact inbox and is exactly the party that must learn its recycle failed;
+    skipping it there was defect 2 verbatim for the fleet's most common recycle shape (a self-recycling
+    conductor). Delivery stays gated by fs.wake_if_idle, which never injects into a live turn — so
+    notifying a seat that aborted BECAUSE it was mid-turn queues durably instead of wedging it.
+    Best-effort: never masks the recycle's own exit path."""
     from . import state as fs
     import secrets
     inv_surf = (p.get("invoker_surface") or "").strip()
-    if not inv_surf or inv_surf == p.get("surface"):
-        return
+    if not inv_surf:
+        return                                           # no identified invoker (operator-driven CLI)
+    if inv_surf == p.get("surface") and outcome == "DONE":
+        return                                           # self-recycle that worked: the inbox is going away
     label, mode = p.get("label", ""), p.get("mode", "")
     inv_label = p.get("invoker_label") or fs.label_for_surface(inv_surf) or ""
     body = f"[recycle] {label} ({mode}): {outcome}" + (f" — {detail}" if detail else "")
