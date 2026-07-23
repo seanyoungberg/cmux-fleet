@@ -833,7 +833,8 @@ Until a staging run proves strategy A end-to-end, treat conductor **recycle**
 The optional `[providers]` block (see `fleet.toml.example`) declares, per tool, the
 inference providers you can run under and how each is tracked. `fleet usage` shows the
 polled subscription windows; `fleet launch <role> --provider <name>` picks one for a
-launch.
+launch. To keep a seat on an account durably (across recycle/revive, not just one launch),
+pin it — see **Durable per-seat account** below.
 
 - **Types:** `subscription` (track 5h + 7-day windows), `api` (metered; budget stub),
   `vertex` (env-file; nothing tracked).
@@ -849,7 +850,15 @@ launch.
 - **Codex account switching is PROVISIONAL:** the codex READ poller is final, but the
   account-SELECT mechanism (`CODEX_HOME`-per-profile vs an env-token path) is pending a
   verdict — `--provider codex:<non-default>` warns and is a stub. Do not treat it as settled.
-- **Phase-1 limitations:** `recycle` does NOT re-inject a provider token (it rebuilds from
-  the roster), so an agent pinned to a non-default account must be **re-launched**, not
-  recycled, to keep that account (recycle-with-account is Phase 2). An invalid/expired
-  injected token silently falls back to the default keychain account.
+- **Account follows config on recycle/revive:** every spawn path — launch, recycle, revive —
+  re-resolves the account through one chokepoint (`_resolve_account_name`), so a recycled
+  agent stays on its account instead of reverting to the ambient credential. When the resolved
+  account differs from the one recorded at launch (a moved `default`, or a newly-added pin),
+  the respawn moves to the new account and says so loudly (`account MOVED` / `account DROPPED`).
+- **Durable per-seat account (the pin):** `account = "<name>"` under `[role.<r>.<tool>]` pins a
+  seat to an account across launch/recycle/revive — it layers ABOVE the tool `default`.
+  Precedence: `--provider` flag (one-off) > role account pin > `[providers.<tool>].default`.
+  Only `account` is read (`provider` is not a pin key — the registry's `provider` field records
+  the RESOLVED choice). A pin (or default) naming an account with no `[providers.<tool>]` block
+  ABORTS loudly, never a silent ambient fallback. `fleet config <role>` prints the resolved
+  account and where it came from (flag / role pin / default).

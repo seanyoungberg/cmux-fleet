@@ -134,6 +134,8 @@ cwd = "agents/ad-hoc"
 kind = "child"
 place = "tab"
 cwd  = "agents/worker"
+# [role.worker.claude]
+# account = "berg-max"           # DURABLE pin: this seat always launches/recycles on berg-max (see [providers])
 
 [role.lead]
 kind  = "conductor"
@@ -166,6 +168,13 @@ worktree = true                    # opt in. default false. CLI: --worktree / --
 #   vertex        just env vars (an env-file); nothing to track.
 # `fleet launch <role> --provider <name>` selects one for a launch (omit → the tool's `default`).
 # `fleet usage` shows the polled windows. The daemon poll writes ~/.local/state/cmux-fleet/provider-usage.json.
+#
+# DURABLE per-seat account (the pin): give a role `account = "<name>"` under [role.<r>.<tool>] and that seat
+# stays on that account across recycle/revive/launch — it layers ABOVE the tool `default`, so a respawn no
+# longer silently reverts to the default. A `--provider <name>` flag is still one-off and wins for that one
+# launch. PRECEDENCE:  --provider flag  >  role account pin  >  [providers.<tool>].default.
+# A pin naming an account with no [providers.<tool>] block ABORTS loudly (never a silent ambient fallback).
+# `fleet config <role>` prints the resolved account and WHERE it came from (flag / role pin / default).
 #
 # auth = "<method>:<arg>":
 #   keychain:<service>  read the tool's OAuth blob from the macOS keychain (the CURRENT logged-in acct;

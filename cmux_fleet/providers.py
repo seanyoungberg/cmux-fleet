@@ -88,23 +88,23 @@ class ProviderTransientError(ProviderError):
 
 
 # --- config parse -------------------------------------------------------------------------------
-def _providers_doc():
-    """Parse the top-level [providers] table from the fleet toml. Shape returned:
-        {tool: {"default": <name|"">, "providers": {name: {type, auth, track}}}}
+def _load_fleet_toml():
+    """Parse the fleet toml into its raw dict, or {} when there is no toml at all (feature opt-out: no
+    reader, or the file is absent).
 
-    ABSENT (no toml reader, file missing, or no [providers] table) → {}: the feature is optional, and a
-    fleet with no [providers] behaves exactly as before (single-account opt-in). UNREADABLE (a TOML parse
-    error, or the file can't be read) is NOT absent — collapsing it to {} is the unknown-is-not-absence bug
-    (`default_provider` returns "", every launch injects nothing, and the WHOLE fleet silently routes to the
-    ambient account off one bad character). So a parse/read failure RAISES ProviderError, named; callers
-    (launch, recycle/revive, poll_all) turn that into a loud abort or a painted error, never a silent {}."""
+    An UNREADABLE or UNPARSEABLE toml is NOT absent — collapsing it to {} is the unknown-is-not-absence bug
+    (every account read then returns "", every launch injects nothing, and the WHOLE fleet silently routes
+    to the ambient account off one bad character). So a parse/read failure RAISES ProviderError, named;
+    callers (launch, recycle/revive, poll_all) turn that into a loud abort or a painted error, never a
+    silent {}. Both the [providers] table AND the [role.<r>.<t>].account pin read through here, so one bad
+    character can't silently drop a seat's pinned account any more than it can the default."""
     if not tomllib or not os.path.exists(FLEET_TOML):
         return {}
     try:
         with open(FLEET_TOML, "rb") as f:
-            raw = tomllib.load(f)
+            return tomllib.load(f)
     except tomllib.TOMLDecodeError as e:
-        # A parse error is all-or-nothing: tomllib can't tell us whether it was the [providers] table or an
+        # A parse error is all-or-nothing: tomllib can't tell us whether it was the accounts config or an
         # unrelated block that broke, so we can't tell "no accounts configured" from "the accounts config is
         # broken". Refuse rather than guess — collapsing to {} would silently route a multi-account fleet to
         # the ambient credential. Fix the syntax and the recycle/launch proceeds.
@@ -113,7 +113,16 @@ def _providers_doc():
                             f"parse.")
     except OSError as e:
         raise ProviderError(f"could not read the fleet toml ({FLEET_TOML}): {e}")
-    root = raw.get("providers") or {}                # absent table → {} (legal single-account opt-out)
+
+
+def _providers_doc():
+    """Parse the top-level [providers] table from the fleet toml. Shape returned:
+        {tool: {"default": <name|"">, "providers": {name: {type, auth, track}}}}
+
+    ABSENT (no toml reader, file missing, or no [providers] table) → {}: the feature is optional, and a
+    fleet with no [providers] behaves exactly as before (single-account opt-in). UNREADABLE is handled by
+    `_load_fleet_toml` (raises ProviderError; never a silent {})."""
+    root = _load_fleet_toml().get("providers") or {}  # absent table → {} (legal single-account opt-out)
     out = {}
     for tool, block in root.items():
         if not isinstance(block, dict):
@@ -138,6 +147,28 @@ def _providers_doc():
 def default_provider(tool):
     """The configured default provider name for a tool ("" if none/unconfigured)."""
     return (_providers_doc().get(tool) or {}).get("default", "")
+
+
+def role_account(tool, role):
+    """The account NAME durably pinned for a role's tool via `[role.<role>.<tool>].account`, or "" if no
+    pin. This is the per-seat account layer: it sits ABOVE `[providers.<tool>].default`, so
+    `_resolve_account_name` returns it in preference to the default and every spawn path (launch, recycle,
+    revive) picks it up through the one chokepoint. Only the `account` key is read — `provider` is
+    deliberately NOT accepted (one name, one meaning; the registry's `provider` field records the RESOLVED
+    choice, not the pin). Raises ProviderError on an unreadable toml (unknown-is-not-absence, via
+    `_load_fleet_toml`): a broken toml aborts loudly rather than silently reading as 'no pin' and reverting
+    the seat to the tool default. A pin naming an account that does not exist is NOT rejected here — it's
+    resolved (and refused) at `resolve_launch`, exactly as an unknown default is."""
+    if not role or not tool:
+        return ""
+    rblock = (_load_fleet_toml().get("role") or {}).get(role)
+    if not isinstance(rblock, dict):
+        return ""
+    tblock = rblock.get(tool)
+    if not isinstance(tblock, dict):
+        return ""
+    acct = tblock.get("account")
+    return acct if isinstance(acct, str) else ""
 
 
 def get_provider(tool, name):

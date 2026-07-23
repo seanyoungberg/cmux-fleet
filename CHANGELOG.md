@@ -6,6 +6,39 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [0.15.3] - 2026-07-22
+
+**role account-pin**: a DURABLE per-seat account. `[role.<r>.<tool>].account = "<name>"` layers ABOVE the
+tool default and resolves through the ONE chokepoint every spawn path shares, so a seat stays on its account
+across recycle/revive/launch instead of silently reverting to the default on the next respawn (the incident:
+a seat drifting off `berg-max`). Suite green: 1270 tests.
+
+### Added
+
+- **`[role.<role>.<tool>].account` pin (review #7 seam).** A role can now name the account its seat launches
+  under, durably. Precedence, proven end-to-end: **`--provider` flag (one-off) > role `account` pin >
+  `[providers.<tool>].default`**. Only `account` is read — `provider` is deliberately NOT accepted (one name,
+  one meaning; the registry's `provider` field records the RESOLVED choice, not the pin). `providers.role_account`
+  reads it through the same `_load_fleet_toml` the `[providers]` table uses, so an unreadable toml ABORTS
+  loudly (unknown-is-not-absence) rather than silently reading as "no pin" and reverting the seat.
+
+### Changed
+
+- **One chokepoint for account resolution across launch, recycle, and revive.** `_resolve_account_name`
+  (which recycle/revive already resolved through) now parses the pin, and `cmd_launch` was pointed at it —
+  so "launch-minus-flag == the shared function" is finally TRUE (the recycle-path docstring promised it; the
+  launch path had its own duplicated `default_provider` call). A recycle/revive re-resolves the pin exactly
+  as it re-resolves the loadout: a recorded account ≠ the pin now moves to the pin, with the existing loud
+  `account MOVED` warn; the healthy no-pin case is byte-identical to before.
+- **Failure semantics unchanged, now covering the pin.** A NAMED account that fails to resolve — including a
+  pin naming an account with no `[providers.<tool>]` block — ABORTS loudly on every path, never a silent
+  ambient fallback. The launch abort message is now source-neutral (`[fleet] ABORT:`) since flag, pin, and
+  default all resolve through the one path.
+- **`fleet config` account honesty.** The effective-config dump now prints the account a launch WILL resolve
+  for the role and WHERE it came from (`source: role pin …` / `default …` / `none — ambient`), flagging a
+  pinned account that resolves to no provider entry (which would ABORT at spawn) so it's seen in config, not
+  discovered at launch.
+
 ## [0.15.2] - 2026-07-21
 
 **status-truth**: agent status now derives from STRUCTURE, never prose (Berg mandate 2026-07-20). Six fixes

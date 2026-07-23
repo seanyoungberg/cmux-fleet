@@ -1657,23 +1657,28 @@ def cmd_launch(argv):
         if ptool != spec["tool"]:
             sys.exit(f"[fleet] --provider tool '{ptool}' != this launch's tool '{spec['tool']}'")
     if not pname:
-        # A configured DEFAULT is a real SELECTION, not a label — resolve+inject it so a plain launch runs on
-        # a deliberate account, never on whatever happens to be ambient. For codex the provider names the HOME
-        # (home IS the account); for claude a securestorage default names the keychain namespace. A `keychain:`
-        # default resolves to nothing injected, so this stays byte-identical to today for the ambient case;
-        # only an explicit securestorage/home default changes the launch. (default_provider("") for a tool with
-        # no [providers.<tool>] block is "", so a single-account user still gets zero injection — opt-in holds.)
-        # default_provider raises ProviderError on an UNREADABLE toml (fix 2): abort loudly rather than
-        # let a broken parse fall through to "" (zero injection = the whole fleet on the ambient account).
+        # No one-off `--provider` flag → resolve the account FOLLOWING CONFIG through the SAME chokepoint
+        # recycle/revive use (`_resolve_account_name`): role account-pin → tool default. A pinned or default
+        # account is a real SELECTION, not a label — resolve+inject it so a plain launch runs on a deliberate
+        # account, never on whatever happens to be ambient. For codex the account names the HOME (home IS the
+        # account); for claude a securestorage account names the keychain namespace. A `keychain:` account
+        # resolves to nothing injected, so this stays byte-identical to today for the ambient case; only an
+        # explicit securestorage/home account changes the launch. (No pin and no [providers.<tool>] default →
+        # "", so a single-account user still gets zero injection — opt-in holds.) It raises ProviderError on
+        # an UNREADABLE toml (fix 2): abort loudly rather than let a broken parse fall through to "" (zero
+        # injection = the whole fleet on the ambient account). This is the "launch-minus-flag == the shared
+        # function" the recycle-path docstring promises — one resolver, no duplicated precedence.
         try:
-            pname = pv.default_provider(spec["tool"])
+            pname = _resolve_account_name(spec["tool"], spec.get("role"))
         except pv.ProviderError as e:
             sys.exit(f"[fleet] ABORT: {e}")
     if pname:
         try:
             pr = pv.resolve_launch(spec["tool"], pname)
         except pv.ProviderError as e:
-            sys.exit(f"[fleet] --provider: {e}")
+            # pname may be the --provider flag, a role account-pin, or the tool default — all resolve here,
+            # so the abort is source-neutral (a pin naming an unknown account aborts loudly, no spawn).
+            sys.exit(f"[fleet] ABORT: {e}")
         codex_home = (pr.get("env") or {}).get("CODEX_HOME")   # the home this codex launch will really use
 
     bin_name, args, env = adapter_compile(spec["tool"], spec, caller, codex_home=codex_home)
@@ -2067,6 +2072,7 @@ def cmd_config(argv):
     if spec["settings"]:
         print(f"  --settings: {spec['settings']}")
     print(f"  env: {', '.join(f'{k}={v}' for k, v in env.items())}")
+    print(f"  {_account_config_line(spec['tool'], spec.get('role'))}")
 
     # call out the highest-leverage override
     user = _settings_summary(_read_json(os.path.expanduser("~/.claude/settings.json"))) or {}
@@ -5038,16 +5044,40 @@ def _replay_binding_argv(argv, tool, role, label, cwd, caller_tokens, add_plugin
 
 
 def _resolve_account_name(tool, role):
-    """The account NAME a recycle/revive resolves for `tool`, FOLLOWING CONFIG — the same precedence
-    `fleet launch` uses MINUS the one-off `--provider` flag (one-off flags are one-off by design):
-    role account-pin → tool default. Role pins are not parsed yet (that is review #7, out of scope here),
-    so today this is the tool default. It resolves THROUGH default_provider — the same seam launch
-    resolves through — rather than hardcoding "default", so once #7 lands and layers a
-    [role.<role>.<tool>].account pin ABOVE the tool default, both recycle and revive pick it up here for
-    free. Raises ProviderError on an unreadable toml (fix 2), same as the launch path."""
+    """The account NAME every spawn path resolves for `tool`, FOLLOWING CONFIG — the shared chokepoint for
+    launch, recycle, and revive alike (MINUS the one-off `--provider` flag, which launch layers on top;
+    one-off flags are one-off by design). Precedence: role account-pin → tool default.
+
+    The pin is `account = "<name>"` under `[role.<role>.<tool>]` — a DURABLE per-seat account that layers
+    ABOVE `[providers.<tool>].default`, so a seat stays on its account across recycle/revive/launch instead
+    of silently reverting to the tool default on the next respawn. When a role names no pin, this is the
+    tool default, unchanged. Raises ProviderError on an unreadable toml (fix 2), same as the launch path —
+    role_account and default_provider both read through providers._load_fleet_toml."""
     from . import providers as pv
-    _ = role                                                    # review #7 seam: role account-pin layers here
-    return pv.default_provider(tool)
+    return pv.role_account(tool, role) or pv.default_provider(tool)
+
+
+def _account_config_line(tool, role):
+    """The account line `fleet config` prints: the account a launch WILL resolve for this role + WHERE it
+    came from (role pin vs tool default vs neither) — the honesty the seam owes so an operator can SEE
+    which account a seat is pinned to without reading the toml by hand. Mirrors `_resolve_account_name`'s
+    precedence exactly (minus the launch-only `--provider` flag, which config never has). Flags a named
+    account that resolves to no [providers.<tool>] entry, because that is precisely what makes a launch
+    ABORT — better shown here than discovered at spawn."""
+    from . import providers as pv
+    try:
+        pin = pv.role_account(tool, role)
+        dflt = pv.default_provider(tool)
+    except pv.ProviderError as e:
+        return f"account: UNRESOLVABLE — {e}"
+    name = pin or dflt
+    if not name:
+        return "account: (none — ambient / single-account; no role pin, no [providers] default)"
+    src = (f"role pin [role.{role}.{tool}].account" if pin
+           else f"default [providers.{tool}].default")
+    missing = "" if pv.get_provider(tool, name) else \
+        f"  — NOT FOUND under [providers.{tool}]; launch/recycle will ABORT"
+    return f"account: {tool}:{name}  (source: {src}){missing}"
 
 
 def _resolve_recycle_provider(tool, role, recorded_provider):
