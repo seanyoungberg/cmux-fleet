@@ -98,6 +98,9 @@ def cli_env(cmux_stub, tmp_path):
     hookstore.mkdir(exist_ok=True)
     env["CMUX_HOOKSTORE_DIR"] = str(hookstore)  # keep _pid_for_surface off the host's real ~/.cmuxterm
     env["PYTHONPATH"] = REPO + os.pathsep + env.get("PYTHONPATH", "")
+    # the securestorage seeded-guard is hermetic by default in subprocess tests too (see _hermetic_securestorage):
+    # assume seeded, so a launch never shells the real keychain. A guard test overrides this to "none" to trip it.
+    env["CMUX_FLEET_SECURESTORAGE_SEEDED"] = "assume"
     return env
 
 
@@ -120,3 +123,15 @@ def _hermetic_ps_sweep(monkeypatch):
     no_agents = ("  501   ??  Ss     0:01.23 /sbin/launchd\n"
                  "  777   ??  S      0:00.10 /usr/sbin/cfprefsd agent\n")
     monkeypatch.setattr(_resolve, "_ps_axeww", lambda: no_agents)
+
+
+@pytest.fixture(autouse=True)
+def _hermetic_securestorage(monkeypatch):
+    """The claude securestorage seeded-guard (`providers.securestorage_seeded`) shells `security find-generic-
+    password` per launch. A REAL probe inside the suite is machine-dependent (which namespaces happen to be
+    logged in on the dev's mac) and absent on Linux/CI — the same box-dependence `_hermetic_ps_sweep` kills
+    for `ps`. Hermetic default: assume every namespace seeded, so the guard never fires unless a test opts in
+    (`monkeypatch.setenv('CMUX_FLEET_SECURESTORAGE_SEEDED', 'none')` to trip it, or monkeypatch the predicate).
+    The unit test of the REAL probe deletes this env and stubs subprocess.run, keeping the parse under test.
+    Reaches subprocess tests too: cli_env copies os.environ, so this setenv rides into the child's env."""
+    monkeypatch.setenv("CMUX_FLEET_SECURESTORAGE_SEEDED", "assume")

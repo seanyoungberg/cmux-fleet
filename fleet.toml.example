@@ -182,6 +182,16 @@ worktree = true                    # opt in. default false. CLI: --worktree / --
 #   file:<path>         a long-lived token from `claude setup-token`; relative → under the state dir
 #                       (e.g. providers/<name>.token, chmod 0600). Injected at launch as
 #                       CLAUDE_CODE_OAUTH_TOKEN via a spawn-time $(cat …) so the secret is never printed.
+#   securestorage:<dir> a SECOND claude subscription keyed by CLAUDE_SECURESTORAGE_CONFIG_DIR — namespaces
+#                       ONLY the keychain credential (session logs/hooks/settings stay in the default
+#                       ~/.claude, no config-dir swap). The dir is a keychain KEY, not a home; it need not
+#                       exist on disk. MUST BE SEEDED: log in ONCE per namespace by launching a pane on the
+#                       account and running /login inside it. An UNSEEDED namespace has no keychain item, so
+#                       claude SILENTLY FALLS BACK to the ambient credential — a launch billing the WRONG
+#                       account under a pin. The launch guard detects this (keychain-item existence probe)
+#                       and WARNs loudly on every spawn path (never silent; WARN not ABORT, so the seeding
+#                       launch itself still runs). Use securestorage for NON-default accounts; keep the
+#                       default account on keychain:Claude Code-credentials (its native unsuffixed entry).
 #   codex-home:<path>   CODEX_HOME for a codex account. REQUIRED for every codex seat, and never guessed.
 #                       SETTLED 2026-07-12 (three seats ran concurrently, none killed another): the ChatGPT
 #                       backend keys one active session per DEVICE, the device id (installation_id) is a file

@@ -847,6 +847,20 @@ pin it — see **Durable per-seat account** below.
   swapped, so session JSONL stays in `~/.claude`, and the token value never appears in the
   rendered/printed launch command. Tokens live at `~/.local/state/cmux-fleet/providers/<name>.token`
   (0600). **Roadmap (not built):** fold these secrets into the SOPS env-var mechanism.
+- **Seeded-guard for claude securestorage (silent-wrong-account):** a `securestorage:<dir>`
+  account must be LOGGED IN once per namespace (launch a pane on it, run `/login` inside).
+  An UNSEEDED namespace has no keychain item, so claude silently falls back to the ambient
+  credential — a launch that BILLS THE WRONG ACCOUNT under a pin (proven 2026-07-22: pinned
+  `berg-max` windows read identical to `berglabs` until the namespace was seeded). Launch,
+  recycle, and revive now probe keychain-item existence (`security find-generic-password`, no
+  secret decrypt) and WARN loudly when the namespace is unseeded — never silent. It is a WARN,
+  not an ABORT: seeding *requires* launching a pane on the namespace, so an abort would block
+  the bootstrap. On Linux/headless (no `security`) the probe fails OPEN (assume seeded, never a
+  false alarm); `CMUX_FLEET_SECURESTORAGE_SEEDED=assume` forces that off explicitly.
+- **Usage footer distinguishes same-email accounts:** the sidebar subscriptions footer draws
+  one row per subscription off its identity email; two accounts on the same email but different
+  tools (e.g. `claude:berglabs-max` and `codex:berglabs`, both `sean@berglabs.net`) now render
+  tool-prefixed (`claude · sean@…` / `codex · sean@…`) instead of as an apparent duplicate row.
 - **Codex account switching is PROVISIONAL:** the codex READ poller is final, but the
   account-SELECT mechanism (`CODEX_HOME`-per-profile vs an env-token path) is pending a
   verdict — `--provider codex:<non-default>` warns and is a stub. Do not treat it as settled.

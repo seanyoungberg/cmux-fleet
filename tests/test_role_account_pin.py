@@ -264,3 +264,116 @@ def test_role_account_raises_on_unreadable_toml(monkeypatch, tmp_path):
 def test_role_account_empty_when_no_toml(monkeypatch, tmp_path):
     monkeypatch.setattr(pv, "FLEET_TOML", str(tmp_path / "nope.toml"))
     assert pv.role_account("claude", "secure-child") == ""        # absent file -> no pin (opt-out), not an error
+
+
+# ================================ scope-add 1 — securestorage seeded-guard ========================
+# The silent-wrong-account hazard: an UNSEEDED securestorage namespace has no keychain item, so claude
+# falls back to the ambient credential — a launch that BILLS the wrong account under a pin. The guard warns
+# LOUDLY (never ABORT — an abort would block the /login-in-a-pane seeding bootstrap) on every spawn path.
+
+class _Proc:
+    def __init__(self, rc, stderr=""):
+        self.returncode = rc
+        self.stdout = ""
+        self.stderr = stderr
+
+
+def test_securestorage_seeded_probe_parses_existence(monkeypatch):
+    # the REAL detector's parse: `security find-generic-password -s <svc>` exits 0 when the item exists
+    # (seeded) and 44/errSecItemNotFound when it never was. Bypass the hermetic env seam; stub subprocess.
+    monkeypatch.delenv("CMUX_FLEET_SECURESTORAGE_SEEDED", raising=False)
+    monkeypatch.setattr(pv.subprocess, "run", lambda *a, **k: _Proc(0))
+    assert pv.securestorage_seeded("~/.claude-seeded") is True     # item present -> seeded
+    monkeypatch.setattr(pv.subprocess, "run",
+                        lambda *a, **k: _Proc(44, "security: SecKeychainSearchCopyNext: ... could not be found"))
+    assert pv.securestorage_seeded("~/.claude-never") is False     # errSecItemNotFound -> never seeded
+
+
+def test_securestorage_seeded_fails_open(monkeypatch):
+    # a broken/absent `security` (Linux/headless) must NEVER fabricate 'unseeded' and cry wolf on a real acct.
+    monkeypatch.delenv("CMUX_FLEET_SECURESTORAGE_SEEDED", raising=False)
+    monkeypatch.setattr(pv.subprocess, "run", lambda *a, **k: (_ for _ in ()).throw(FileNotFoundError()))
+    assert pv.securestorage_seeded("~/.claude-x") is True          # OSError -> fail-open (seeded)
+    monkeypatch.setattr(pv.subprocess, "run", lambda *a, **k: _Proc(1, "some other error"))
+    assert pv.securestorage_seeded("~/.claude-x") is True          # unknown nonzero rc -> fail-open
+
+
+def test_securestorage_seeded_env_seam(monkeypatch):
+    monkeypatch.setenv("CMUX_FLEET_SECURESTORAGE_SEEDED", "assume")
+    assert pv.securestorage_seeded("~/.claude-anything") is True   # forced seeded, no probe
+    monkeypatch.setenv("CMUX_FLEET_SECURESTORAGE_SEEDED", "none")
+    assert pv.securestorage_seeded("~/.claude-anything") is False  # forced unseeded, no probe
+
+
+# --- launch guard: unseeded namespace WARNs loudly but still LAUNCHES (WARN, not ABORT) -----------
+def _guard_body():
+    return """
+        [tool.claude]
+        flags = "--effort high"
+        [role.worker]
+        kind = "child"
+        place = "tab"
+        cwd = "worker"
+        [providers.claude]
+        default = "acct"
+        [providers.claude.acct]
+        type = "subscription"
+        auth = "securestorage:~/.claude-guard-e2e"
+    """
+
+
+def test_launch_unseeded_securestorage_warns_but_launches(cli_env, tmp_path):
+    env = dict(cli_env, CMUX_FLEET_TOML=_toml(tmp_path, _guard_body()),
+               CMUX_FLEET_SECURESTORAGE_SEEDED="none")            # force unseeded (hermetic; no real keychain)
+    p = subprocess.run([sys.executable, "-m", "cmux_fleet", "launch", "worker", "--dry-run"],
+                       env=env, capture_output=True, text=True)
+    assert p.returncode == 0, p.stderr                            # WARN, NOT abort — the seeding bootstrap must launch
+    assert "WARN" in p.stdout and "SILENTLY FALLS BACK" in p.stdout
+    assert "/login" in p.stdout                                   # names the fix
+    launch = next(l for l in p.stdout.splitlines() if "[fleet] launch:" in l)
+    assert "CLAUDE_SECURESTORAGE_CONFIG_DIR=" in launch           # ...and the namespace is still on the line
+
+
+def test_launch_seeded_securestorage_no_warn(cli_env, tmp_path):
+    env = dict(cli_env, CMUX_FLEET_TOML=_toml(tmp_path, _guard_body()),
+               CMUX_FLEET_SECURESTORAGE_SEEDED="assume")          # seeded -> clean, no guard noise
+    p = subprocess.run([sys.executable, "-m", "cmux_fleet", "launch", "worker", "--dry-run"],
+                       env=env, capture_output=True, text=True)
+    assert p.returncode == 0, p.stderr
+    assert "SILENTLY FALLS BACK" not in p.stdout                  # seeded namespace: no guard warning
+
+
+# --- recycle carries the guard too (every spawn path, never silent) -------------------------------
+def test_recycle_unseeded_securestorage_warns(fs, monkeypatch, tmp_path):
+    _providers_toml(tmp_path, monkeypatch, """
+        [providers.claude]
+        default = "acct"
+        [providers.claude.acct]
+        type = "subscription"
+        auth = "securestorage:~/.claude-guard-recycle"
+    """)
+    monkeypatch.setattr(pv, "securestorage_seeded", lambda d: False)   # force unseeded (in-process)
+    fleet_state.live_put("w", {"role": "secure-child", "tool": "claude", "surface": "S", "cwd": "/x",
+                               "session": "claude-OLD", "kind": "child", "provider": "claude:acct"})
+    _stub_roster(monkeypatch, "secure-child", "claude")
+    rc, out = _run(["recycle", "w", "--dry-run"])
+    assert rc == 0
+    assert "WARN" in out and "SILENTLY FALLS BACK" in out         # the guard fires on recycle too
+    launch = next(l for l in out.splitlines() if "[fleet] launch:" in l)
+    assert "CLAUDE_SECURESTORAGE_CONFIG_DIR=" in launch           # still injected (WARN, not abort)
+
+
+def test_recycle_seeded_securestorage_no_warn(fs, monkeypatch, tmp_path):
+    _providers_toml(tmp_path, monkeypatch, """
+        [providers.claude]
+        default = "acct"
+        [providers.claude.acct]
+        type = "subscription"
+        auth = "securestorage:~/.claude-guard-recycle"
+    """)
+    monkeypatch.setattr(pv, "securestorage_seeded", lambda d: True)    # seeded
+    fleet_state.live_put("w", {"role": "secure-child", "tool": "claude", "surface": "S", "cwd": "/x",
+                               "session": "claude-OLD", "kind": "child", "provider": "claude:acct"})
+    _stub_roster(monkeypatch, "secure-child", "claude")
+    rc, out = _run(["recycle", "w", "--dry-run"])
+    assert rc == 0 and "SILENTLY FALLS BACK" not in out

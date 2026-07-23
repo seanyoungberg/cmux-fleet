@@ -210,6 +210,39 @@ def _securestorage_service(config_dir):
     return "Claude Code-credentials-" + hashlib.sha256(d.encode()).hexdigest()[:8]
 
 
+def securestorage_seeded(config_dir):
+    """True if the claude securestorage namespace for `config_dir` has been LOGGED IN — i.e. its keychain
+    item exists. An UNSEEDED namespace has no item, so claude silently falls back to the AMBIENT credential
+    at launch: the launch runs (and BILLS) on the wrong account under a pin. This detects exactly that.
+
+    EXISTENCE is the sound signal (effect-tested 2026-07-22): `security find-generic-password -s <service>`
+    WITHOUT `-w` does not decrypt the secret (no keychain prompt) and exits 0 iff the item exists; a
+    never-logged-in namespace exits 44 (errSecItemNotFound). Reading the item's ATTRS is NOT sound — they
+    can come back empty for a live item — which is why an attrs-only probe missed this; existence is.
+
+    FAIL-OPEN by design (returns True on anything but a DEFINITE not-found): a flaky/absent `security`
+    (Linux, headless, sandbox) must never fabricate an 'unseeded' verdict and cry wolf on a real account —
+    the guard it feeds is meant to be heeded, so it fires ONLY when the item is provably absent. The
+    `CMUX_FLEET_SECURESTORAGE_SEEDED` env forces the verdict without touching the keychain ('assume' = all
+    seeded, the hermetic-test/Linux default; 'none' = nothing seeded)."""
+    forced = os.environ.get("CMUX_FLEET_SECURESTORAGE_SEEDED", "")
+    if forced == "assume":
+        return True
+    if forced == "none":
+        return False
+    service = _securestorage_service(config_dir)
+    try:
+        p = subprocess.run(["security", "find-generic-password", "-s", service],
+                           capture_output=True, text=True, timeout=10)
+    except (OSError, subprocess.SubprocessError):
+        return True                                  # no/blocked `security` → fail-open, never a false 'unseeded'
+    if p.returncode == 0:
+        return True                                  # item present → seeded
+    if p.returncode == 44 or "could not be found" in (p.stderr or ""):
+        return False                                 # errSecItemNotFound → provably never seeded
+    return True                                      # any other outcome → unknown → fail-open (no false WARN)
+
+
 # --- launch-time auth resolution (per tool/type) ------------------------------------------------
 def resolve_launch(tool, name):
     """Resolve the env a launch needs to run `tool` under provider `name` (default if name==""). Returns:
@@ -264,6 +297,18 @@ def resolve_launch(tool, name):
         d = os.path.expanduser(arg)
         base["env"]["CLAUDE_SECURESTORAGE_CONFIG_DIR"] = d
         base["note"] = f"claude securestorage namespace {d} (keychain-only; config dir unchanged)"
+        if not securestorage_seeded(d):
+            # SILENT-WRONG-ACCOUNT guard: an unseeded namespace has no keychain item, so claude falls back to
+            # the AMBIENT credential — the spawn BILLS THE WRONG ACCOUNT under a pin (proven 2026-07-22:
+            # berg-max windows read identical to berglabs until the namespace was /login-seeded). Codex's
+            # env-token path has needs_refresh for its analogous hazard; claude securestorage had none. WARN,
+            # not ABORT: seeding REQUIRES launching a pane on this namespace and running /login inside it, so
+            # an abort would block the very bootstrap. Loud on every spawn path; clears once the item exists.
+            base["unseeded"] = True
+            base["unseeded_msg"] = (
+                f"account '{label}' pins securestorage namespace {d}, but it is NOT logged in (no keychain "
+                f"item) — this spawn SILENTLY FALLS BACK to the ambient credential (WRONG account, wrong "
+                f"billing). Seed it: launch a pane on '{resolved}' and run /login inside it, then relaunch.")
         return base
     raise ProviderError(f"provider '{label}': unsupported auth method '{method}' for a claude subscription")
 

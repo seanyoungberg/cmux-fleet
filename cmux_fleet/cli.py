@@ -1699,6 +1699,8 @@ def cmd_launch(argv):
         if pr.get("provisional"):
             print(f"[fleet] WARN: {pr['label']} account selection is PROVISIONAL (codex mechanism "
                   f"verdict pending; not yet final)")
+        if pr.get("unseeded"):                                # securestorage ambient-fallback guard (never silent)
+            print(f"[fleet] WARN: {pr['unseeded_msg']}")
     # no else: pr is None ONLY when no provider is configured at all (default_provider returned "") — a
     # single-account launch with nothing to attribute or inject.
     send_cmd = render_send_cmd(bin_name, args, env, spec["abs_cwd"], raw_env)
@@ -5113,12 +5115,14 @@ def _resolve_recycle_provider(tool, role, recorded_provider):
     except pv.ProviderError as e:
         sys.exit(f"[fleet] ABORT: provider resolution failed for {tool}: {e}")
     announce = f"[fleet] provider: {pr['label']}" + (f"  ({pr['note']})" if pr.get("note") else "")
-    warn = ""
+    warns = []
     if recorded_provider and recorded_provider != pr["label"]:
-        warn = (f"[fleet] WARN: account MOVED since launch — the registry recorded '{recorded_provider}', "
-                f"re-resolving to '{pr['label']}' (following config). The agent resumes on the NEW account; "
-                f"intended if you flipped the default/pin, a surprise otherwise.")
-    return pr, announce, warn
+        warns.append(f"[fleet] WARN: account MOVED since launch — the registry recorded '{recorded_provider}', "
+                     f"re-resolving to '{pr['label']}' (following config). The agent resumes on the NEW "
+                     f"account; intended if you flipped the default/pin, a surprise otherwise.")
+    if pr.get("unseeded"):                                       # securestorage ambient-fallback guard, on respawn too
+        warns.append(f"[fleet] WARN: {pr['unseeded_msg']}")
+    return pr, announce, "\n".join(warns)
 
 
 def _apply_provider(env, args, provider):

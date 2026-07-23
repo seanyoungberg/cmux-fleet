@@ -979,8 +979,10 @@ def test_usage_lines_from_the_accessor(monkeypatch):
         {"kind": "api", "account": "vertex-x", "ok": True, "stale": False, "windows": []},   # not a sub -> skip
     ]})
     assert ff._usage_lines() == [
-        "Berg~0~5h~44~7d~34~2h~claude~berg-max~5d~Fable~90~1d",  # 5h+7d each own reset; claude chip; Fable surfaced
-        "sean@x.com~1~-~-~-~-~-~codex~berg-team~-~-~-~-",        # stale -> flag+tool+acct, no numbers (one clean line)
+        # field 0 is TOOL-PREFIXED so same-email-different-tool rows are distinguishable (the sidebar draws
+        # field 0 only); tool FIRST so a truncation keeps the disambiguator.
+        "claude · Berg~0~5h~44~7d~34~2h~claude~berg-max~5d~Fable~90~1d",  # 5h+7d each own reset; Fable surfaced
+        "codex · sean@x.com~1~-~-~-~-~-~codex~berg-team~-~-~-~-",         # stale -> flag+tool+acct, no numbers
     ]
 
 
@@ -993,7 +995,25 @@ def test_usage_lines_use_label_not_config_id_and_one_window(monkeypatch):
          "ok": True, "stale": False, "windows": [{"label": "30d", "pct": 12.0, "resets_in_s": 200000}]},
     ]})
     assert ff._usage_lines() == [
-        "sean.youngberg@gmail.com~0~30d~12~-~-~2d~codex~berg-team~-~-~-~-"]   # label shown; 2nd window + Fable '-'
+        "codex · sean.youngberg@gmail.com~0~30d~12~-~-~2d~codex~berg-team~-~-~-~-"]  # tool-prefixed label; 2nd win + Fable '-'
+
+
+def test_usage_lines_distinguish_same_email_different_tool(monkeypatch):
+    # THE duplicate-row bug: two subscriptions on the SAME identity email but DIFFERENT tools (claude vs
+    # codex). The sidebar renders field 0 only, so without a prefix both paint as identical `sean@berglabs.net`
+    # rows. Field 0 must now carry the tool so the two are distinguishable.
+    ff = _ff()
+    from cmux_fleet import providers as pv
+    monkeypatch.setattr(pv, "usage_for_paint", lambda: {"schema": 1, "providers": [
+        {"kind": "subscription", "account": "berglabs-max", "label": "sean@berglabs.net", "tool": "claude",
+         "ok": True, "stale": False, "windows": [{"label": "5h", "pct": 20.0, "resets_in_s": 3600}]},
+        {"kind": "subscription", "account": "berglabs", "label": "sean@berglabs.net", "tool": "codex",
+         "ok": True, "stale": False, "windows": [{"label": "5h", "pct": 30.0, "resets_in_s": 3600}]},
+    ]})
+    lines = ff._usage_lines()
+    field0 = [ln.split("~")[0] for ln in lines]
+    assert field0 == ["claude · sean@berglabs.net", "codex · sean@berglabs.net"]  # distinct, tool-prefixed
+    assert len(set(field0)) == 2                                                  # no longer a duplicate row
 
 
 def test_usage_lines_gate_on_schema(monkeypatch):

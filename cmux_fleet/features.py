@@ -1742,9 +1742,16 @@ def _usage_lines():
             continue
         if p.get("kind") != "subscription":
             continue
-        label = _blob_clean(p.get("label") or p.get("account") or "?", 32)   # fits a full email; swift truncates
         tool = _blob_clean(p.get("tool") or "", 8)
         acct = _blob_clean(p.get("account") or "", 24)       # config/dir id (dim tag; ties display to naming)
+        # field 0 is the ONE field the sidebar draws as the row TITLE (fleet.swift `usageLine` reads field 0
+        # only; the tool/acct fields 7-8 ride the line but are NOT rendered). Two subscriptions on the SAME
+        # identity email but DIFFERENT tools (claude vs codex) otherwise paint as identical rows — Berg read
+        # it as a duplicate-row bug. Prefix the tool so same-email-different-tool rows are distinguishable,
+        # tool FIRST so the 32-char truncation never drops the disambiguator. Append-only-safe: field 0 is
+        # free text, so an un-adopted sidebar just shows "claude <email>" as the title, never garbled.
+        ident = p.get("label") or p.get("account") or "?"
+        label = _blob_clean(f"{tool} · {ident}" if tool != E else str(ident), 32)
         allw = p.get("windows") or []
         wins = [w for w in allw if not w.get("scoped")]      # rolling windows (5h, 7d), shortest first
         sc = next((w for w in allw if w.get("scoped")), None)  # the scoped weekly sub-limit (Fable/Opus)

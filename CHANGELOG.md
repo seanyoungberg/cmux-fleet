@@ -11,7 +11,8 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 **role account-pin**: a DURABLE per-seat account. `[role.<r>.<tool>].account = "<name>"` layers ABOVE the
 tool default and resolves through the ONE chokepoint every spawn path shares, so a seat stays on its account
 across recycle/revive/launch instead of silently reverting to the default on the next respawn (the incident:
-a seat drifting off `berg-max`). Suite green: 1270 tests.
+a seat drifting off `berg-max`). Plus two spawn-path account-correctness follow-ons: a claude securestorage
+seeded-guard and a usage-footer display fix. Suite green: 1278 tests.
 
 ### Added
 
@@ -21,6 +22,14 @@ a seat drifting off `berg-max`). Suite green: 1270 tests.
   one meaning; the registry's `provider` field records the RESOLVED choice, not the pin). `providers.role_account`
   reads it through the same `_load_fleet_toml` the `[providers]` table uses, so an unreadable toml ABORTS
   loudly (unknown-is-not-absence) rather than silently reading as "no pin" and reverting the seat.
+- **claude securestorage seeded-guard (silent-wrong-account).** An UNSEEDED `securestorage:<dir>` namespace
+  has no keychain item, so claude silently falls back to the ambient credential — a spawn that BILLS THE
+  WRONG ACCOUNT under a pin (proven 2026-07-22: pinned `berg-max` windows read identical to `berglabs` until
+  the namespace was `/login`-seeded). `providers.securestorage_seeded` probes keychain-item existence
+  (`security find-generic-password`, no secret decrypt, no prompt) — the sound signal an attrs-only probe
+  missed. Wired as a loud WARN on launch/recycle/revive (never silent). WARN, not ABORT: seeding *requires*
+  launching a pane on the namespace and running `/login` inside it, so an abort would block the bootstrap.
+  Fail-OPEN where `security` is absent (Linux/headless), so it never cries wolf on a real account.
 
 ### Changed
 
@@ -38,6 +47,11 @@ a seat drifting off `berg-max`). Suite green: 1270 tests.
   for the role and WHERE it came from (`source: role pin …` / `default …` / `none — ambient`), flagging a
   pinned account that resolves to no provider entry (which would ABORT at spawn) so it's seen in config, not
   discovered at launch.
+- **Usage footer distinguishes same-email accounts.** The sidebar subscriptions footer (`features._usage_lines`)
+  renders one row per subscription keyed on its identity email; two accounts on the same email but different
+  tools (`claude:berglabs-max` / `codex:berglabs`, both `sean@berglabs.net`) rendered as an apparent duplicate
+  row (fleet.swift draws field 0 only). Field 0 is now tool-prefixed (`claude · sean@…` / `codex · sean@…`),
+  tool first so a truncation keeps the disambiguator; append-only-safe (free-text field, no index shift).
 
 ## [0.15.2] - 2026-07-21
 
