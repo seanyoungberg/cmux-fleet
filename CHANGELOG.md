@@ -6,6 +6,30 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [0.15.5] - 2026-07-22
+
+**recycle quiet-gate pair** (cmux-advisor batch; berg-sandbox bug report). Both defects from the graph-view
+incident — a lavish long-poll held the gate 180s to an ABORT while the agent was done-idle at its prompt,
+and the calling conductor only ever saw `SCHEDULED`. Sharp during an account migration, where every conductor
+recycling its subtree is exposed to the silent ABORT. Suite green: 1288 tests.
+
+### Fixed
+
+- **Recycle quiet-gate no longer blocks on a background shell.** A lavish long-poll (standard on review-driving
+  agents) keeps the session PID alive for hours, so `_quiet_gate`'s live-pid check could never clear on a seat
+  that was done-idle at its prompt — the gate burned its full 180s to an ABORT. The gate now also consults the
+  transcript's turn-close signal (`features.turn_ended`, the same classifier signal `fleet ls`/vitals/`rm`
+  read): a `running` seat whose last turn CLOSED is quiet even while cmux's lifecycle lags and a poll runs (a
+  child process dies with the respawn — it is not a live TURN to interrupt, Berg's ruling). Fails CLOSED, so a
+  genuinely mid-turn seat (turn not closed) still blocks, unchanged.
+- **A detached recycle's terminal result now reaches the caller.** The recycle runs detached and only logged, so
+  the calling conductor saw `SCHEDULED` and never learned DONE or ABORT (the quiet-gate ABORT was fully silent).
+  The invoker is now recorded at schedule time (`_recycle_plan` reads `$CMUX_SURFACE_ID`) and every terminal
+  result — DONE and every ABORT — is delivered to that surface completion-style (a `peer` inbox row + idle-wake,
+  via `_recycle_notify_caller`, funneled through one `_finish` closure over all five terminal returns). It
+  targets the ACTUAL caller (which need not be the seat's registry parent, whom `_escalate_recycle_failure`
+  still alerts separately); skips an operator-driven CLI (no `$CMUX_SURFACE_ID`) and a self-recycle.
+
 ## [0.15.4] - 2026-07-22
 
 **securestorage seeded-guard**: a claude securestorage namespace that was never logged in has no keychain

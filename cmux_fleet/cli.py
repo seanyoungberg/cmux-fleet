@@ -4820,14 +4820,22 @@ def _quiet_gate(surf, timeout, force):
     still ran the lifecycle check could NEVER satisfy the gate and burned the full timeout to an ABORT —
     identical to a non-force run (the exact bug this fixes).
 
-    NON-force (the default) is UNCHANGED: block until a NON-'running' lifecycle AND an empty draft,
-    re-checked after a 2s settle to avoid racing a turn start. Never half-kills a live turn.
+    NON-force (the default): block until the seat is QUIET — NOT genuinely mid-turn (lifecycle 'running'
+    with a live pid AND the transcript's last turn NOT closed) AND an empty draft, re-checked after a 2s
+    settle to avoid racing a turn start. Never half-kills a live turn.
     'unknown' counts as quiet: cmux's session-start sets agentLifecycle='unknown' on a fresh start OR a
     resume and explicitly does NOT claim 'running', so an agent that resumed-but-was-never-driven (no
     Stop hook yet -> never reaches 'idle') sits at 'unknown' awaiting input. Excluding it made a
     just-resumed agent un-recyclable (the gate would block until the ABORT) -- so back-to-back resume
-    recycles deadlocked."""
+    recycles deadlocked.
+    A background SHELL is not a live turn: a lavish long-poll (standard on review-driving agents) keeps
+    the session pid alive for hours, so a live-pid check alone would NEVER clear on a poll-armed seat idle
+    at its prompt (berg-sandbox's graph-view burned the full 180s to an ABORT). The transcript turn-close
+    signal (`turn_ended`, the SAME classifier signal `fleet ls`/vitals/rm read) distinguishes the TUI's
+    OWN turn state from its child processes (Berg's ruling: children die with the respawn) — so a done-at-
+    prompt seat is quiet even while cmux's lifecycle lags at 'running' and a poll runs."""
     from . import resolve as rs
+    from . import features as ff                          # turn_ended: the classifier's codex-aware turn-close signal
     if force:
         return True          # --force = respawn now, no wait (consistent with rm --force). See docstring.
     def quiet():
@@ -4839,6 +4847,13 @@ def _quiet_gate(surf, timeout, force):
         # --force. The pid, not the string, is the authority (see _confirmed_gone).
         if lc == "running" and not rs.has_live_pid(surf):
             return True
+        # ...and a 'running' record whose TRANSCRIPT proves the turn already CLOSED is done-at-prompt, NOT
+        # mid-turn: cmux's agentLifecycle lags at 'running' after a turn ends, and a background shell (a
+        # lavish long-poll) keeps the session PID alive, so the live-pid path alone can never clear. Neither
+        # is a live TURN to interrupt (Berg's ruling: child processes die with the respawn; only the TUI's
+        # own turn state gates). turn_ended fails CLOSED, so an unprovable case still waits on lifecycle.
+        if lc == "running" and ff.turn_ended((rs.freshest(surf) or {}).get("transcriptPath", "")):
+            return not _input_draft_nonempty(surf)
         return lc in ("idle", "needsInput", "unknown") and not _input_draft_nonempty(surf)
     end = time.time() + timeout
     while time.time() < end:
@@ -5376,8 +5391,17 @@ def _recycle_plan(label, entry, caller, add_plugin, mode, session, force, prime_
         # invoked prime — the same dead-on-arrival floor bug, latent on the recycle path too.) --prime
         # still overrides per-invocation.
         prime = _boot_prime_prompt(label, entry.get("role"), override=prime_override)
+    # INVOKER (defect 2): who ran `fleet recycle`, recorded at SCHEDULE time (this process still carries the
+    # caller's $CMUX_SURFACE_ID; the detached worker later runs with a different/null env). The worker
+    # notifies this surface of the terminal result — the caller otherwise sees only 'SCHEDULED' and never
+    # learns DONE or ABORT. It is the ACTUAL caller, which need not be the seat's registry parent. Empty =
+    # an operator driving the CLI directly (no $CMUX_SURFACE_ID); the worker then notifies nobody.
+    from . import state as _fs
+    inv_surf = (os.environ.get("CMUX_SURFACE_ID") or "").strip()
+    inv_label = _fs.label_for_surface(inv_surf) if inv_surf else ""
     return {"label": label, "surface": surf, "send_cmd": send_cmd, "mode": mode,
             "tool": entry.get("tool", "claude"), "force": force, "prime": prime, "old_session": old_sid,
+            "invoker_surface": inv_surf, "invoker_label": inv_label,   # defect 2: caller-notify target
             "cwd": _cwd_of_sendcmd(send_cmd),          # effective launch cwd, persisted after a FRESH bind
             # deterministic plugin set for the recycled event's `effective` field AND the row writeback
             # (FIX 3): the RESOLVED set (toml-authoritative for a roster role) unioned with the --plugin
@@ -5782,14 +5806,50 @@ def _escalate_recycle_failure(label, surf, mode, reason, detail):
         print(f"[recycle] escalation error (non-fatal): {e}", flush=True)
 
 
+def _recycle_notify_caller(p, outcome, detail):
+    """Deliver a DETACHED recycle's TERMINAL result (DONE / ABORT) to whoever INVOKED it (defect 2). The
+    caller saw only 'recycle SCHEDULED' and — because the worker runs detached and just logs — would
+    otherwise NEVER learn the outcome (berg-sandbox's silent 180s quiet-gate ABORT: the caller sees
+    SCHEDULED and nothing, ever). Completion-style: a `peer` inbox row on the invoker's surface + an
+    idle-wake, so it shows in their `fleet inbox` like any peer message and pulls an idle caller forward.
+    The invoker is recorded at schedule time (payload `invoker_surface`), so this reaches the ACTUAL caller
+    even when that differs from the seat's registry parent (which is who `_escalate_recycle_failure`
+    alerts — a complementary, not duplicate, signal). Skips when there is no identified invoker (an
+    operator driving the CLI directly, e.g. Berg — no $CMUX_SURFACE_ID) or when the invoker IS the recycled
+    seat itself (a self-recycle has no separate caller, and its inbox is being respawned away). Best-effort:
+    never masks the recycle's own exit path."""
+    from . import state as fs
+    import secrets
+    inv_surf = (p.get("invoker_surface") or "").strip()
+    if not inv_surf or inv_surf == p.get("surface"):
+        return
+    label, mode = p.get("label", ""), p.get("mode", "")
+    inv_label = p.get("invoker_label") or fs.label_for_surface(inv_surf) or ""
+    body = f"[recycle] {label} ({mode}): {outcome}" + (f" — {detail}" if detail else "")
+    try:
+        ekey = f"recycle-result:{label}:{p.get('surface','')}:{outcome}:{int(time.time())}"
+        seq = fs.inbox_put("peer", inv_surf, {
+            "ptype": "peer-msg", "to_label": inv_label,
+            "from_surface": "", "from_label": "fleet-recycle",
+            "msg_id": secrets.token_hex(3), "reply_to": None, "reply_expected": False, "body": body,
+        }, event_key=ekey)
+        if seq and fs.idlewake_on():
+            if fs.wake_if_idle(inv_surf, f"(fleet recycle) {label}: {outcome} — handle your fleet inbox"):
+                fs.presented_mark(inv_surf, [{"event_key": ekey}], "wake")
+    except Exception as e:
+        print(f"[recycle] caller-notify error (non-fatal): {e}", flush=True)
+
+
 def _recycle_exec_one(p):
     """Run ONE recycle: quiet-gate -> respawn-pane (verified) -> confirm new session -> reconcile the
     registry -> auto-prime. Never half-kills: aborts before respawn if the surface won't go quiet, and
     never sends the launch unless the old session is confirmed dead (see _respawn_and_verify) -- a
     respawn-pane timeout that goes unverified leaves the old claude ALIVE, and blindly firing the launch
     types it as an unsubmitted draft into that live TUI (the 9h berg-sandbox silent-recycle failure).
-    Every terminal failure ESCALATES to an actor via _escalate_recycle_failure (parent conductor /
-    peer-conductor fan-out) — a banner on the failed seat itself reaches nobody.
+    Every bind/respawn failure ESCALATES to an actor via _escalate_recycle_failure (parent conductor /
+    peer-conductor fan-out) — a banner on the failed seat itself reaches nobody — and EVERY terminal result
+    (DONE and every ABORT) is delivered to the INVOKER via _recycle_notify_caller (defect 2), since the
+    detached worker only logs and the caller otherwise sees just 'SCHEDULED'.
     Shared by the single `_recycle-exec` verb and the sequential `_recycle-bulk-exec` orchestrator.
     Returns 0 when the respawn proceeded (bound or lazy), 1 on a pre-respawn / verify-respawn /
     resume-gate abort."""
@@ -5800,6 +5860,10 @@ def _recycle_exec_one(p):
     def log(m):
         print(f"[recycle {time.strftime('%H:%M:%S')}] {label}: {m}", flush=True)
 
+    def _finish(rc, outcome, detail):
+        _recycle_notify_caller(p, outcome, detail)       # defect 2: caller learns DONE/ABORT (they saw SCHEDULED)
+        return rc
+
     # ledger parity with log_launch: the EFFECTIVE effort/model, read off the composed command itself
     # (_sendcmd_session_prefs -- the only source that sees a one-off --effort/--model on THIS recycle).
     effective = {**_sendcmd_session_prefs(send_cmd), "plugins": p.get("plugins", [])}
@@ -5807,7 +5871,7 @@ def _recycle_exec_one(p):
     log(f"start mode={mode} surface={surf} force={force}")
     if not _quiet_gate(surf, 180, force):
         log("ABORT: surface never went quiet within 180s; NOT respawning (no half-kill). Re-run when idle or pass --force.")
-        return 1
+        return _finish(1, "ABORT", "still genuinely mid-turn after 180s; not respawned. Re-run when idle or pass --force.")
     # PRE-LAUNCH account-token guard (fix 1), mirroring cmd_launch (cli ~1643-1647): if the re-resolved
     # account carries a refresh target, refresh it BEFORE we tear the old agent down (a dead/revoked token
     # aborts loudly instead of spawning a seat into a 401 — and never a silent ambient fall-back). Inert in
@@ -5824,7 +5888,7 @@ def _recycle_exec_one(p):
             fs.log_event("recycle_abort", label=label, surface=surf, mode=mode, reason="token-refresh-failed")
             _escalate_recycle_failure(label, surf, mode, "token-refresh-failed",
                                       f"account '{needs_refresh}' token refresh failed at recycle; re-login it")
-            return 1
+            return _finish(1, "ABORT", f"account '{needs_refresh}' token refresh failed; re-login it, then re-run.")
     # respawn-pane natively tears down the old agent + restarts the pane in the SAME seat. We restart
     # it as a fresh INTERACTIVE login shell (not the agent directly): cmux exposes `claude` as a zsh
     # FUNCTION via its shell integration, so the agent must launch from a shell that sourced ~/.zshrc
@@ -5899,7 +5963,7 @@ def _recycle_exec_one(p):
             _escalate_recycle_failure(label, surf, mode, "respawn-not-confirmed",
                                       "respawn didn't take; the OLD session is (almost certainly) "
                                       "still live on the seat; re-run fleet recycle when it is idle")
-            return 1
+            return _finish(1, "ABORT", "respawn didn't take; the OLD session is still live on the seat; re-run when idle.")
         log("confirmed after direct-kill fallback")
     # (The old pre_sid snapshot + fresh-mode sid-exclusion lived here. Retired: the fresh confirm is now
     # LIVE-PID-resolved (rs.live_sid via _poll_session_back), so cmux's undropped stale sessions[]
@@ -5947,7 +6011,7 @@ def _recycle_exec_one(p):
                 _escalate_recycle_failure(label, surf, mode, "resume-menu-wedged",
                                           "resume-summary menu never resolved; the seat is unbound/"
                                           "unregistered; re-run fleet recycle once it settles")
-                return 1
+                return _finish(1, "ABORT", "resume-summary menu never resolved; seat unbound; re-run once it settles.")
         sid = _poll_session_back(surf, old_sid, mode, 90)
         if not sid and mode == "fresh" and not _exec_launch_enabled():
             # SELF-HEAL (PASTE PATH ONLY): the paste can crash into the bare shell (PATH not ready ->
@@ -6005,7 +6069,7 @@ def _recycle_exec_one(p):
         cmuxq("send-key", "--surface", surf, "enter")
         log("primed")
     log("DONE")
-    return 0
+    return _finish(0, "DONE", "respawned; session re-binds on first turn.")
 
 
 def cmd_recycle_exec(argv):

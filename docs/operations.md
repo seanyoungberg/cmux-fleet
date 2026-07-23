@@ -410,6 +410,16 @@ writes.
   skipping self and muted agents: `--scope mine|all|conductors|children` (`mine` =
   your children; `--include-muted` to force).
 
+  The quiet-gate reads the transcript's **turn-close** signal, not just cmux's
+  lifecycle: a background shell (a lavish long-poll, standard on review-driving
+  agents) keeps the session PID alive but is **not** a live turn — it dies with the
+  respawn — so a seat that is done-idle at its prompt recycles cleanly instead of
+  burning the 180s gate to an ABORT. Because the recycle is **detached**, its terminal
+  result (DONE and every ABORT) is delivered back to **whoever invoked it** — a `peer`
+  inbox row + idle-wake on the caller's surface — so a conductor that ran `fleet
+  recycle` learns the outcome instead of seeing only `SCHEDULED`. (An operator driving
+  the CLI directly, with no `$CMUX_SURFACE_ID`, gets the terminal log as before.)
+
   ```
   fleet recycle                 # recycle self, RESUME (preserve context) — the default
   fleet recycle --fresh         # shed context + prime from the handover (the handover pattern)
