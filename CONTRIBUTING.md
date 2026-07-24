@@ -3,6 +3,27 @@
 Thanks for helping with cmux-fleet. This is a small, dependency-free plugin;
 the bar is that a change keeps it that way.
 
+## Reading cmux (the vendor): pin the source, never infer from runtime
+
+The fleet is a thin overlay on cmux, so every claim about how cmux behaves must
+come from cmux's **source**, not from probing the running app and guessing. Keep
+a checkout at `~/builds/cmux-upstream` and **check out the exact version prod
+runs** before reading it:
+
+```sh
+git -C ~/builds/cmux-upstream fetch --tags
+git -C ~/builds/cmux-upstream checkout v<running-version>   # e.g. v0.64.20
+```
+
+Reading a stale checkout, or inferring "almost certainly" from a `cmux rpc` /
+`sqlite` dump, is how native constructs get mis-scoped: the Vault (durable
+per-cwd transcript history) and the Feed (`feed.list`, a telemetry stream whose
+prompts are stored but whose responses are read from the transcript) were both
+under-measured that way until the Swift source settled it outright. Swift core
+lives in `Sources/` and `Packages/macOS/CmuxControlSocket/`; the feed TUI in
+`Resources/feed-tui/`. UI-surfaced constructs have no CLI verb pointing at them,
+so a CLI-first enumeration misses them every time — read the code.
+
 ## Branching
 
 - `main` is always releasable. Do not commit work-in-progress to it.
