@@ -84,12 +84,7 @@ def test_moved_agent_with_advancing_record_not_detached_despite_stale_env(monkey
 
 
 def test_moved_seat_that_parks_is_not_detached_book_keeper_regression(monkeypatch, tmp_path):
-    # INVERTED 2026-07-25 (was test_dark_agent_env_mismatch_with_frozen_record_is_detached). THE
-    # regression for the false positive Berg retired: a seat moved while live, which then PARKS. Both
-    # clocks freeze past the skew — indistinguishable from any healthy idle agent — and the stale env is
-    # a fellow-traveller of the move, not evidence of darkness. Live receipt: book-keeper (979296CC)
-    # flagged twice on 2026-07-24 in exactly this shape while its hook record kept re-stamping (115 min
-    # of advance BETWEEN the two flags). A dark surface never re-stamps.
+    # A moved seat that parks: both clocks freeze past the skew, same as any healthy idle agent.
     surf, st, ws_map, now = _seat(monkeypatch, tmp_path, life="idle", record_age=1200, transcript_age=1200,
                                   env_ws="WS-OLD", ws_tree="WS-NEW")
     att = rs.attachment(surf, st=st, ws_map=ws_map, now=now)
@@ -109,12 +104,7 @@ def test_long_turn_with_stale_env_not_detached_despite_frozen_record(monkeypatch
 
 
 def test_quiet_seat_with_stale_env_is_not_detached_after_env_retirement(monkeypatch, tmp_path):
-    # INVERTED 2026-07-25 (was test_long_turn_with_stale_env_still_detached_when_transcript_also_frozen).
-    # Both clocks quiet + stale env used to be the env rule's last stronghold. With the env trigger
-    # retired it reads ATTACHED, which is the deliberate trade: an idle dark agent is passively
-    # undetectable (its parent settles it with a driven probe) rather than every parked moved seat being
-    # condemned. The behavioral rule below still covers the case that actually matters — working while
-    # cmux is deaf.
+    # Both clocks quiet + stale env. Reads attached: an idle dark agent is the parent's driven probe.
     surf, st, ws_map, now = _seat(monkeypatch, tmp_path, life="running", record_age=720, transcript_age=720,
                                   env_ws="WS-OLD", ws_tree="WS-NEW")
     att = rs.attachment(surf, st=st, ws_map=ws_map, now=now)

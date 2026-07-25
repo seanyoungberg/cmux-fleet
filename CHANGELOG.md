@@ -8,30 +8,16 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [0.15.7] - 2026-07-25
 
-**The env-mismatch detached trigger is retired; it could only misfire.** The doctor condemned an agent as
-DETACHED when its process `CMUX_WORKSPACE_ID` disagreed with the tree's workspace. That rule rested on one
-premise, measured 2026-07-10: *a surface moved while live goes dark, conclusively, at any idleness.* The
-native `fleet move` rewrite (2026-07-16, cmux 0.64.18+) falsified it. cmux heals the moved surface, and the
-hooks address it by `CMUX_SURFACE_ID`, which a move does not change. `CMUX_WORKSPACE_ID` still goes stale (a
-live process's env cannot be rewritten) but nothing in the hook path reads it, so a mismatch now means only
-"this seat was moved while live" — healthy.
+**Retired the env-mismatch detached trigger.** It rested on "a moved surface goes dark", which the native
+`fleet move` rewrite (2026-07-16, cmux 0.64.18+) falsified: cmux heals the move and hooks key on
+`CMUX_SURFACE_ID`, not `CMUX_WORKSPACE_ID`. Every remaining firing shape was a healthy moved seat that had
+parked. Specimen: book-keeper `979296CC` flagged twice while its record re-stamped between the flags.
 
-With the premise dead, every remaining firing shape was a false positive: a moved seat that later parks
-freezes both clocks past the skew, which is indistinguishable from any healthy idle agent. Live receipt
-(book-keeper, surface `979296CC`): flagged env-detached twice on 2026-07-24 while parked, and its hook record
-**re-stamped 115 minutes between the two flags**. A dark surface never re-stamps. Cost so far: two inspect
-round-trips on one seat in one day, plus an emitted remedy (`fleet recycle`) that `resolve.py`'s own REMEDY
-note documents as the wrong fix for detachment.
-
-- `attachment()` no longer appends an `env:` reason. The mismatch is reported as the new
-  `env_workspace_stale` boolean and rendered as a breadcrumb; it never reaches a verdict.
-- The behavioral rule is now the only detached trigger, and it is the one that matters: an agent working
-  while cmux is deaf to it.
-- Accepted trade, stated plainly: an idle, env-correct, genuinely dark agent is passively undetectable. It
-  already was for every seat that had never moved, and its parent settles it with a driven probe. That beats
-  condemning every healthy parked seat that was ever relocated.
-- Three tests inverted rather than deleted, each keeping its original shape as a regression against the false
-  positive (`test_resolve.py`, `test_doctor_reliability.py` ×2). 1289 pass.
+- `attachment()` reports `env_workspace_stale` instead of appending an `env:` reason. Behavioral is now the
+  only trigger.
+- Trade: an idle, env-correct dark agent is passively undetectable, as it already was for any seat that never
+  moved. The parent settles it with a driven probe.
+- Three tests inverted, keeping their shapes as regressions. 1289 pass.
 
 ## [0.15.6] - 2026-07-22
 

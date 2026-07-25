@@ -37,15 +37,9 @@
 #                long after its last turn, so mtime advances while the agent sits at the prompt. The
 #                mtime rule shipped in step 1 and read usage-ops and sidebar-build as detached while
 #                both were merely idle; the turn timestamp is the signal, the mtime is noise;
-#   env        — RETIRED as a trigger 2026-07-25; now display-only (`env_workspace_stale`). It read a
-#                CMUX_WORKSPACE_ID/tree mismatch as proof the surface was moved-while-live and therefore
-#                dark. Both halves are now false: cmux 0.64.18+ heals a moved surface (native `fleet
-#                move`, 2026-07-16), and hooks address the surface by CMUX_SURFACE_ID, which a move does
-#                not change. The stale env was ALREADY known not to be the mechanism (falsified
-#                2026-07-10: probed post-move with the correct workspace id -> still no stamp), so once
-#                moves stopped going dark the signal had nothing left to detect. Proof it was firing on
-#                healthy seats: book-keeper (979296CC) re-stamped its record 115 min BETWEEN two
-#                env-detached flags, 2026-07-24. A dark surface never re-stamps.
+#   env        — display-only (`env_workspace_stale`); retired as a trigger 2026-07-25. A stale
+#                CMUX_WORKSPACE_ID means the seat was moved while live. cmux 0.64.18+ heals the move and
+#                hooks key on CMUX_SURFACE_ID, so it never proved darkness; it only fired on parked seats.
 # The active-session pointer is NOT a signal in either direction (cmux-advisor, measured twice,
 # self-corrected once): its write is PATH-DEPENDENT — absent on a fresh-surface launch until the
 # first completed turn, yet replaced at SessionStart on an exec respawn — so it can be legitimately
@@ -772,12 +766,9 @@ def attachment(surface, st=None, ws_map=None, now=None):
          env_workspace_stale, active_ptr, ever_heard: bool|None}
     attached is None when no live agent is present (no channel to judge). Detached iff:
         behavioral: record frozen while the transcript advances (skew > ATTACH_SKEW_S).
-    That is now the ONLY trigger — the env check was retired 2026-07-25 (see the block above); a stale
-    CMUX_WORKSPACE_ID means "moved while live", which cmux heals, so it is reported as
-    `env_workspace_stale` and never condemns. An idle agent (both clocks frozen together) can never trip
-    the behavioral path by construction, so an idle dark agent is passively undetectable and its PARENT
-    settles it with a driven probe — accepted, because the alternative condemned healthy moved seats.
-    The active pointer is a forensic
+    That is the only trigger; `env_workspace_stale` is reported but never condemns. An idle agent (both
+    clocks frozen together) cannot trip it by construction, so an idle dark agent is passively
+    undetectable and its PARENT settles it with a driven probe. The active pointer is a forensic
     breadcrumb only (`ever_heard`: does the pointer name the live record's session?) — its write is
     path-dependent (first-turn on fresh surfaces, SessionStart on exec respawns), so it is unsound
     as a detector in both directions (cmux-advisor finding 1, self-corrected). A genuinely
@@ -805,20 +796,7 @@ def attachment(surface, st=None, ws_map=None, now=None):
             and (life != "running" or record_age > TURN_GRACE_S)):
         reasons.append("behavioral: transcript advancing while record frozen "
                        f"({record_age/60:.1f}m vs {tage/60:.1f}m)")
-    # env: RETIRED as a detachment trigger 2026-07-25 (Berg's call). It rested on one premise — "a moved
-    # surface is dark, conclusive at any idleness" (measured 2026-07-10, pre-native-move) — and the
-    # 2026-07-16 native `fleet move` rewrite falsified it: cmux 0.64.18+ heals the moved surface, and the
-    # hooks address it by CMUX_SURFACE_ID, which a move does NOT change. CMUX_WORKSPACE_ID goes stale (a
-    # live process's env cannot be rewritten) but nothing in the hook path reads it, so the mismatch now
-    # means only "this seat was moved while live" = HEALTHY. Receipt (book-keeper, surface 979296CC,
-    # 2026-07-24): flagged env-detached twice while parked, and its record RE-STAMPED 115 min BETWEEN the
-    # two flags — a dark surface never re-stamps. Every remaining firing shape is that false positive: a
-    # moved seat that later parks freezes both clocks past the skew, which is exactly a healthy idle agent.
-    # Keeping it cost two inspect round-trips on one seat in one day and emitted a remedy (`fleet recycle`)
-    # the REMEDY note above calls wrong. The field stays as a forensic/display breadcrumb, never a verdict.
-    # What still catches a genuinely dark agent: the behavioral rule above (working while cmux is deaf).
-    # An idle, env-correct, dark agent remains passively undetectable BY DESIGN — its parent settles it
-    # with a driven probe (see the doctrine block at the top of this file).
+    # env: display-only since 2026-07-25 (see the header). Mismatch means "moved while live", not dark.
     tree_ws = workspace(surface, st=st, ws_map=ws_map)
     env_ws = _env_workspace(rec.get("pid"))
     out["env_workspace"] = env_ws

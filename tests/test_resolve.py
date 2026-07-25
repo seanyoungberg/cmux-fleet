@@ -246,17 +246,13 @@ def test_idle_agent_never_reads_detached_resume_research_shape(monkeypatch, tmp_
 
 
 def test_idle_with_env_mismatch_is_NOT_detached_moved_seat_shape(monkeypatch, tmp_path):
-    # INVERTED 2026-07-25 (was test_idle_with_env_mismatch_is_detached_usage_ops_shape). The old
-    # assertion encoded "a moved surface is dark", which the native-move rewrite falsified: hooks
-    # address the surface by CMUX_SURFACE_ID (unchanged by a move), so a stale CMUX_WORKSPACE_ID means
-    # only "moved while live" = healthy. This is book-keeper's exact live shape (idle clocks + stale
-    # env), false-flagged twice on 2026-07-24 while its record kept re-stamping.
+    # A moved-then-parked seat: idle clocks + stale env. Healthy (book-keeper's live shape).
     surf, st, ws_map, now = _attach_env(monkeypatch, tmp_path, record_age=5000, transcript_age=5000,
                                         env_ws="WS-OLD")
     att = rs.attachment(surf, st=st, ws_map=ws_map, now=now)
     assert att["attached"] is True
     assert att["reasons"] == []
-    assert att["env_workspace_stale"] is True   # still REPORTED, just never a verdict
+    assert att["env_workspace_stale"] is True   # reported, never a verdict
 
 
 def test_stale_pointer_alone_never_detaches(monkeypatch, tmp_path):
