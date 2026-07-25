@@ -83,13 +83,17 @@ def test_moved_agent_with_advancing_record_not_detached_despite_stale_env(monkey
     assert att["attached"] is True and att["reasons"] == []
 
 
-def test_dark_agent_env_mismatch_with_frozen_record_is_detached(monkeypatch, tmp_path):
-    # STILL FLAGGED: a genuinely dark agent — env mismatch AND the record frozen (channel quiet 20m). The
-    # env signal keeps its teeth once the channel is also quiet (this is the usage-ops shape).
+def test_moved_seat_that_parks_is_not_detached_book_keeper_regression(monkeypatch, tmp_path):
+    # INVERTED 2026-07-25 (was test_dark_agent_env_mismatch_with_frozen_record_is_detached). THE
+    # regression for the false positive Berg retired: a seat moved while live, which then PARKS. Both
+    # clocks freeze past the skew — indistinguishable from any healthy idle agent — and the stale env is
+    # a fellow-traveller of the move, not evidence of darkness. Live receipt: book-keeper (979296CC)
+    # flagged twice on 2026-07-24 in exactly this shape while its hook record kept re-stamping (115 min
+    # of advance BETWEEN the two flags). A dark surface never re-stamps.
     surf, st, ws_map, now = _seat(monkeypatch, tmp_path, life="idle", record_age=1200, transcript_age=1200,
                                   env_ws="WS-OLD", ws_tree="WS-NEW")
     att = rs.attachment(surf, st=st, ws_map=ws_map, now=now)
-    assert att["attached"] is False and any(r.startswith("env") for r in att["reasons"])
+    assert att["attached"] is True and att["reasons"] == []
 
 
 def test_long_turn_with_stale_env_not_detached_despite_frozen_record(monkeypatch, tmp_path):
@@ -104,15 +108,17 @@ def test_long_turn_with_stale_env_not_detached_despite_frozen_record(monkeypatch
     assert att["attached"] is True and att["reasons"] == []
 
 
-def test_long_turn_with_stale_env_still_detached_when_transcript_also_frozen(monkeypatch, tmp_path):
-    # STILL FLAGGED (the discriminator): the SAME running seat + stale env as above, holding record_age and
-    # env constant, but the TRANSCRIPT is frozen too (12m). Record AND transcript both quiet past the skew is
-    # a genuinely dark channel — the transcript gate keeps its teeth. Varying only transcript_age (30s vs 12m)
-    # isolates the new gate: advancing clears, frozen still condemns.
+def test_quiet_seat_with_stale_env_is_not_detached_after_env_retirement(monkeypatch, tmp_path):
+    # INVERTED 2026-07-25 (was test_long_turn_with_stale_env_still_detached_when_transcript_also_frozen).
+    # Both clocks quiet + stale env used to be the env rule's last stronghold. With the env trigger
+    # retired it reads ATTACHED, which is the deliberate trade: an idle dark agent is passively
+    # undetectable (its parent settles it with a driven probe) rather than every parked moved seat being
+    # condemned. The behavioral rule below still covers the case that actually matters — working while
+    # cmux is deaf.
     surf, st, ws_map, now = _seat(monkeypatch, tmp_path, life="running", record_age=720, transcript_age=720,
                                   env_ws="WS-OLD", ws_tree="WS-NEW")
     att = rs.attachment(surf, st=st, ws_map=ws_map, now=now)
-    assert att["attached"] is False and any(r.startswith("env") for r in att["reasons"])
+    assert att["attached"] is True and att["reasons"] == []
 
 
 # ==================== VERDICT 2 — stall (STUCK): via the real doctor sweep ====================

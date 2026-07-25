@@ -37,13 +37,15 @@
 #                long after its last turn, so mtime advances while the agent sits at the prompt. The
 #                mtime rule shipped in step 1 and read usage-ops and sidebar-build as detached while
 #                both were merely idle; the turn timestamp is the signal, the mtime is noise;
-#   env        — a deterministic DETECTOR, not the cause: ps eww shows a CMUX_WORKSPACE_ID different
-#                from the tree's workspace, which proves the surface was MOVED while live, and a moved
-#                surface is dark (conclusive at any idleness). Do NOT read it as the mechanism: the
-#                stale env was falsified as the cause on 2026-07-10 (probed post-move with the CORRECT
-#                current workspace id -> still no stamp). The break is surface-scoped, inside the cmux
-#                app; the env is a fellow-traveller of the move, which is why re-exporting it fixes
-#                nothing. See the remedy below.
+#   env        — RETIRED as a trigger 2026-07-25; now display-only (`env_workspace_stale`). It read a
+#                CMUX_WORKSPACE_ID/tree mismatch as proof the surface was moved-while-live and therefore
+#                dark. Both halves are now false: cmux 0.64.18+ heals a moved surface (native `fleet
+#                move`, 2026-07-16), and hooks address the surface by CMUX_SURFACE_ID, which a move does
+#                not change. The stale env was ALREADY known not to be the mechanism (falsified
+#                2026-07-10: probed post-move with the correct workspace id -> still no stamp), so once
+#                moves stopped going dark the signal had nothing left to detect. Proof it was firing on
+#                healthy seats: book-keeper (979296CC) re-stamped its record 115 min BETWEEN two
+#                env-detached flags, 2026-07-24. A dark surface never re-stamps.
 # The active-session pointer is NOT a signal in either direction (cmux-advisor, measured twice,
 # self-corrected once): its write is PATH-DEPENDENT — absent on a fresh-surface launch until the
 # first completed turn, yet replaced at SessionStart on an exec respawn — so it can be legitimately
@@ -767,12 +769,15 @@ def _transcript_age(rec, now):
 def attachment(surface, st=None, ws_map=None, now=None):
     """The I4 answer for a surface. Returns
         {attached: bool|None, reasons: [str], record_age_s, transcript_age_s, env_workspace,
-         active_ptr, ever_heard: bool|None}
+         env_workspace_stale, active_ptr, ever_heard: bool|None}
     attached is None when no live agent is present (no channel to judge). Detached iff:
-        behavioral: record frozen while the transcript advances (skew > ATTACH_SKEW_S), OR
-        env:        process env workspace != tree workspace (conclusive, any idleness).
-    An idle agent (both clocks frozen together) can never trip the behavioral path by construction,
-    and the env check is the only sound confirm for one. The active pointer is a forensic
+        behavioral: record frozen while the transcript advances (skew > ATTACH_SKEW_S).
+    That is now the ONLY trigger — the env check was retired 2026-07-25 (see the block above); a stale
+    CMUX_WORKSPACE_ID means "moved while live", which cmux heals, so it is reported as
+    `env_workspace_stale` and never condemns. An idle agent (both clocks frozen together) can never trip
+    the behavioral path by construction, so an idle dark agent is passively undetectable and its PARENT
+    settles it with a driven probe — accepted, because the alternative condemned healthy moved seats.
+    The active pointer is a forensic
     breadcrumb only (`ever_heard`: does the pointer name the live record's session?) — its write is
     path-dependent (first-turn on fresh surfaces, SessionStart on exec respawns), so it is unsound
     as a detector in both directions (cmux-advisor finding 1, self-corrected). A genuinely
@@ -800,20 +805,24 @@ def attachment(surface, st=None, ws_map=None, now=None):
             and (life != "running" or record_age > TURN_GRACE_S)):
         reasons.append("behavioral: transcript advancing while record frozen "
                        f"({record_age/60:.1f}m vs {tage/60:.1f}m)")
-    # env: conclusive for a DARK agent — its record is frozen HERE because its hooks write to another
-    # surfaceId. But a freshly-MOVED or crash-RESTORED agent carries a stale CMUX_WORKSPACE_ID env (a live
-    # process's env cannot be rewritten) while it keeps working — its record ADVANCES here (the 2026-07-16
-    # move specimen), OR its record freezes at the 'running' stamp of a long turn while its TRANSCRIPT keeps
-    # advancing (graph-view, flagged detached 3x/day while Berg-driven and completing turns). So trust the env
-    # mismatch only when the record AND the transcript are BOTH frozen past the skew (a genuinely quiet
-    # channel) — the SAME transcript-advance tooth the behavioral/stall gates use; an agent still advancing
-    # either clock is not actionably detached. Needs the tree to know where the surface is.
+    # env: RETIRED as a detachment trigger 2026-07-25 (Berg's call). It rested on one premise — "a moved
+    # surface is dark, conclusive at any idleness" (measured 2026-07-10, pre-native-move) — and the
+    # 2026-07-16 native `fleet move` rewrite falsified it: cmux 0.64.18+ heals the moved surface, and the
+    # hooks address it by CMUX_SURFACE_ID, which a move does NOT change. CMUX_WORKSPACE_ID goes stale (a
+    # live process's env cannot be rewritten) but nothing in the hook path reads it, so the mismatch now
+    # means only "this seat was moved while live" = HEALTHY. Receipt (book-keeper, surface 979296CC,
+    # 2026-07-24): flagged env-detached twice while parked, and its record RE-STAMPED 115 min BETWEEN the
+    # two flags — a dark surface never re-stamps. Every remaining firing shape is that false positive: a
+    # moved seat that later parks freezes both clocks past the skew, which is exactly a healthy idle agent.
+    # Keeping it cost two inspect round-trips on one seat in one day and emitted a remedy (`fleet recycle`)
+    # the REMEDY note above calls wrong. The field stays as a forensic/display breadcrumb, never a verdict.
+    # What still catches a genuinely dark agent: the behavioral rule above (working while cmux is deaf).
+    # An idle, env-correct, dark agent remains passively undetectable BY DESIGN — its parent settles it
+    # with a driven probe (see the doctrine block at the top of this file).
     tree_ws = workspace(surface, st=st, ws_map=ws_map)
     env_ws = _env_workspace(rec.get("pid"))
     out["env_workspace"] = env_ws
-    if (env_ws and tree_ws and env_ws.upper() != tree_ws.upper()
-            and record_age > ATTACH_SKEW_S and (tage is None or tage > ATTACH_SKEW_S)):
-        reasons.append(f"env: CMUX_WORKSPACE_ID {env_ws[:8]} != tree workspace {tree_ws[:8]}")
+    out["env_workspace_stale"] = bool(env_ws and tree_ws and env_ws.upper() != tree_ws.upper())
     # diagnostic, never proof: has any post-SessionStart hook been heard from the live session?
     aptr = active_ptr(surface, st)
     out["active_ptr"] = aptr
