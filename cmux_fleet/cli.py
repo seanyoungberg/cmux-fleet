@@ -6627,60 +6627,60 @@ def cmd_codex_login(argv):
 # VERB_USAGE is BOTH halves of help: `fleet --help` prints the joined values, and `fleet <verb> --help`
 # prints the one entry (see main()'s guard). Keep the two leading spaces and the insertion order — the
 # joined blob is the top-level help verbatim, and tests/test_help.py pins that it stays that way.
-USAGE_HEADER = ("usage: fleet <launch|config|ls|plugins|archive|revive|register|recycle|move|group|unstick|"
-                "sessions|broadcast|mute|unmute|rm|vitals|usage|find|graph|serve|paint|worktree|profile|"
-                "daemon|drive-child|peer-msg|child-digest|inbox|inbox-ack> ...")
 VERB_USAGE = {
     "launch": "  launch <role|--adhoc NAME> [--tool t] [--place p] [--parent s] [--effort L] [--model M] [--plugin NAME] [--provider NAME] [--brief \"<task>\"] [--prime T|--no-prime] [--dry-run] [-- <tool flags>]\n"
-              "                                                    spawns + sends a turn-one boot prompt (run /loom:prime); --brief queues a work brief to the child's inbox, surfaced via idle-wake AFTER prime",
+              "                                                    spawn a child and send its boot prompt; --brief queues a work brief to its inbox",
     "mint": "  mint <name> [--kind conductor|child] [--tool t] [--cwd DIR] [--group G] [--launch] [--dry-run] [-- <tool flags>]\n"
-            "                                                    DEFINE a new role (home dir + roster block) so a new top-level conductor needs no hand-edit; --launch also spawns it via the normal launch path",
-    "config": "  config <role|--adhoc NAME|--cwd DIR> [--tool t]   effective config (base settings + fleet adds)",
-    "ls": "  ls [--scope mine|all|conductors|children] [--json] live fleet x hook store; flags STALE + archived (default mine = you + your children; --scope all = the world)",
-    "plugins": "  plugins <add|reconcile|ls|show|describe> ...      the plugin INDEX: add-from-URL (safe: never enables) + reconcile + on-demand discovery",
+            "                                                    define a new role (home dir + roster block); --launch also spawns it",
+    "config": "  config <role|--adhoc NAME|--cwd DIR> [--tool t]   effective config for a role",
+    "ls": "  ls [--scope mine|all|conductors|children] [--json]   live agents x hook store; flags STALE + archived",
+    "plugins": "  plugins <add|reconcile|ls|show|describe> ...      manage the plugin index",
     "archive": "  archive <label>                                   park a live agent (revivable)",
     "revive": "  revive <label> [--fresh] [--session id] [--place p] [--parent s] [--plugin N] [-- <flags>]\n"
-              "                                                    bring a parked agent back (default RESUME last session; --fresh sheds; --session targets an arbitrary prior one)",
+              "                                                    bring a parked agent back; resumes its last session, --fresh sheds it",
     "register": "  register <label> [--surface UUID] [--parent s] [--session id]\n"
-                "                                                    pull a LIVE-but-unregistered agent into the registry (recovery for a skipped auto-register)",
+                "                                                    adopt a live but unregistered agent into the registry",
     "move": "  move <label> (--to-workspace WS | --own-workspace) [--name TITLE]\n"
-            "                                                    relocate a LIVE child natively — surface move + registry update, keeping pid/session/context/parent/group (cmux 0.64.18+ heals the moved surface; no archive/revive/fresh-surface). An ARCHIVED label has no surface: `fleet revive` it into the target instead",
-    "reparent": "  reparent <label> <parent-label|none> [--force]   surgically re-set a live agent's registry parent ONLY (none = top-level); everything else untouched. Another conductor's child needs --force (+ parent notified)",
-    "group": "  group <init [--name N] | add <label> [--name N]>  make THIS conductor's workspace a named group (init) or retrofit a live child into it (add); membership ops keep agents live (the safe lane)",
+            "                                                    relocate a live child, keeping pid/session/context",
+    "reparent": "  reparent <label> <parent-label|none> [--force]    re-set a live agent's registry parent; --force for another conductor's child",
+    "group": "  group <init [--name N] | add <label> [--name N]>  name this conductor's workspace group, or add a live child to it",
     "recycle": "  recycle [label] [--fresh] [--session id] [--effort L] [--model M] [--force] [--plugin NAME] [--prime T|--no-prime] [-- <flags>]\n"
-               "                                                    restart in place, same surface/identity (default self+RESUME; --fresh sheds; --plugin = index-aware plugin add, reaches linked + enabled)\n"
+               "                                                    restart in place, same surface and identity; defaults to self + resume\n"
                "  recycle --scope mine|all|conductors|children [--include-muted] [--dry-run]\n"
-               "                                                    BULK restart (sequential + gated, skips self + muted); mine = your children; cross-conductor = the safe topology",
-    "unstick": "  unstick [label] [--surface UUID] [--dry-run]      reap a frozen dead-pid hook-store ghost (SessionEnd-less death) so ls/recycle/doctor stop trusting a dead 'running'; never touches a LIVE record",
-    "reap-surfaces": "  reap-surfaces [--all] [--json] [--close]          DRY-RUN survey of orphaned bare-shell HUSK surfaces (fleet launch artifact + no live agent + no registry); gated on the fleet env prefix + tail guard; --close is review-gated",
-    "reconcile-restore": "  reconcile-restore [--close] [--json]            reconcile the registry against cmux's crash-restore snapshot: survey resume-orphans + husks; --close archives-first + closes the DETERMINISTIC husks (snapshot agent=nil + no live agent + not registered + fleet-origin), never a live agent/human shell",
-    "sessions": "  sessions <label> [--all] [--json]                 list resumable prior sessions for the agent's surface (id, age, size, snippet)",
+               "                                                    bulk restart, sequential; skips self + muted",
+    "unstick": "  unstick [label] [--surface UUID] [--dry-run]      clear a frozen dead-pid ghost record; never touches a live one",
+    "reap-surfaces": "  reap-surfaces [--all] [--json] [--close]          survey orphaned husk surfaces; --close closes them",
+    "reconcile-restore": "  reconcile-restore [--close] [--json]             reconcile the registry against cmux's crash-restore snapshot",
+    "sessions": "  sessions <label> [--all] [--json]                 list resumable prior sessions for an agent's surface",
     "broadcast": "  broadcast \"<msg>\" --scope mine|all|conductors|children [--no-wake] [--expect-reply] [--dry-run]\n"
-                 "                                                    input-safe heads-up to live agents (e.g. after a toml/floor change); never restarts them; --scope REQUIRED (an act)",
-    "mute": "  mute <label> | unmute <label> [| --scope mine]    stop/resume pushing a child's completions to its parent (parent reads on demand); --scope mine = all my children",
+                 "                                                    input-safe heads-up to live agents; --scope required",
+    "mute": "  mute <label> | unmute <label> [| --scope mine]    stop/resume pushing a child's completions to its parent",
     "rm": "  rm <label> [--detach] [--force] [--kill] [--wip-commit] [--with-group]\n"
-          "                                                    close + archive a label (revivable; refuses mid-turn, --force overrides); --detach drops the row only; --kill adds worktree teardown; --with-group dissolves its workspace-group",
-    "vitals": "  vitals [--scope mine|all|conductors|children] [--json] [--paint] [--no-probe] [--watch [--interval N]] cheapest-first triage table: blocked (waiting on YOU: yes/no/?) + ctx-remaining % (default mine)",
-    "usage": "  usage [--json]                                    per-provider subscription windows (5h + weekly bars, reset countdowns, metered/Fable flags, live attribution) from the daemon poller",
-    "codex-setup": "  codex-setup <acct>                       SUPERSEDED -> use `codex-login` (it set up the shared-home env-token model, which is the supersession bug)",
-    "conformance": "  conformance [--json] [--trials N] [--tool claude|codex|both] [--keep]   does THIS cmux build actually DO what the fleet depends on? Exercises every cmux capability the fleet uses against a LIVE cmux and reports PASS/FAIL/UNKNOWN — each check proving the EFFECT, never the invocation (exit 0 is not a pass, and our own cmuxq() DISCARDS the return code, so cmux's errors arrive as screen content). Run it on stable, run it on nightly, DIFF the two: that diff is the breaking-change report. Safe by construction: its own workspace, its own agents, its own throwaway fleet state, and structurally incapable of touching a fleet member",
-    "codex-sync": "  codex-sync [acct] [--check]                      bring each codex seat's HOME up to fleet spec, in one pass: the CITIZENSHIP doc ($CODEX_HOME/AGENTS.md — the only file a codex worker reads whatever its cwd, since it loads no claude plugins; fenced, so your own text survives) AND cmux's HOOK WIRING, installed and TRUSTED together (an untrusted hook does not run and does not say so, so no completion ever reaches the router). `fleet launch --tool codex` syncs the home it launches into, so this is for auditing (--check) and seeding",
-    "codex-login": "  codex-login [acct] [--timeout N] [--verify-only]  log codex SEATS into their OWN homes (each seat needs one: the backend keys a session per device, and the device id is per-home). NO acct = cycle every seat, SKIPPING any that already verify (a login supersedes, so re-logging a working seat breaks it). Opens a terminal tab with the login typed, waits, then VERIFIES with a backend 200 + the model actually speaking, and reports the account it really got",
-    "find": "  find <query> [--turns N] [--json]                 content-aware session lookup (label/role/cwd or transcript)",
-    "graph": "  graph [--scope mine|all|<label>] [--json] [--html] [--out FILE]  fleet parentage tree (text/JSON/HTML); default mine = your subtree; --scope all = full tree",
-    "groups": "  groups [--json]                                   the fleet's groups BY LABEL — members per cmux's REAL membership (not the stored `group` field); flags registry-vs-cmux divergence (ghost/unfiled)",
-    "serve": "  serve [--port N]                                  thin read-only localhost view (graph HTML + vitals.json); no daemon",
-    "paint": "  paint [--sidebar]                                 sync fleet state onto the cmux sidebar (status pills + ctx bars; --sidebar also feeds fleet.swift)",
-    "worktree": "  worktree <ls | clean <label> [--wip-commit]>      manage fleet-owned git worktrees (config-gated, default-off)",
-    "profile": "  profile <name> [--base DIR] [--root DIR] [--init]  emit env that pins ALL entrypoints at THIS build (eval it for multi-build isolation)",
-    "daemon": "  daemon <start|stop|status|restart> [--foreground] [--heartbeat [SECS]]  run the router as a detached daemon (survives shell exit + recycle); start --foreground for launchd",
-    "drive-child": "  drive-child <surface-uuid> <prompt...>            submit a prompt to a child's TUI (beats the paste-settle enter-race)",
+          "                                                    close + archive a label; --detach drops the row only; --kill adds worktree teardown",
+    "vitals": "  vitals [--scope ...] [--json] [--paint] [--no-probe] [--watch [--interval N]]   triage table: blocked + context remaining",
+    "usage": "  usage [--json]                                    per-provider subscription windows",
+    "codex-setup": "  codex-setup <acct>                               SUPERSEDED: use codex-login",
+    "conformance": "  conformance [--json] [--trials N] [--tool claude|codex|both] [--keep]\n"
+                   "                                                    exercise every cmux capability the fleet depends on (PASS/FAIL/UNKNOWN); diff stable vs nightly for breaking changes",
+    "codex-sync": "  codex-sync [acct] [--check]                       bring codex seats' homes up to spec: citizenship doc + hook wiring, trusted; --check audits",
+    "codex-login": "  codex-login [acct] [--timeout N] [--verify-only]  log codex seats into their own homes; no acct cycles all, skipping ones that verify",
+    "find": "  find <query> [--turns N] [--json]                 content-aware session lookup",
+    "graph": "  graph [--scope mine|all|<label>] [--json] [--html] [--out FILE]   fleet parentage tree",
+    "groups": "  groups [--json]                                   groups by label, per cmux's real membership; flags registry divergence",
+    "serve": "  serve [--port N]                                  read-only localhost view (graph + vitals)",
+    "paint": "  paint [--sidebar]                                 sync fleet state onto the cmux sidebar",
+    "worktree": "  worktree <ls | clean <label> [--wip-commit]>      manage fleet-owned git worktrees",
+    "profile": "  profile <name> [--base DIR] [--root DIR] [--init]   emit env pinning all entrypoints at this build",
+    "daemon": "  daemon <start|stop|status|restart> [--foreground] [--heartbeat [SECS]]   run the router as a detached daemon",
+    "drive-child": "  drive-child <surface-uuid> <prompt...>            submit a prompt to a child's TUI",
     "peer-msg": "  peer-msg <to-label>|--to-parent \"<body>\" [--no-reply] [--reply-to <id>] [--expect-reply] [--no-wake]\n"
-                "                                                    input-safe A2A: message a live PEER by label (or --to-parent: your registry-resolved conductor), into its context never its input box",
-    "child-digest": "  child-digest <session-frag> [N]                   print a child's last N transcript turns (the reliable content source)",
-    "inbox": "  inbox [--scope mine|<label>|all|conductors|children] [--json]  pending inbox on demand (default mine = yours; <label> peeks one; all = triage) — the catch-up read after a recycle",
-    "inbox-ack": "  inbox-ack <seq> [--peer|--stale|--doctor|--brief] [--surface UUID]  mark shown completions/alerts/peer msgs/briefs handled so they stop re-surfacing",
+                "                                                    message a live peer into its context, never its input box",
+    "child-digest": "  child-digest <session-frag> [N]                   print a child's last N transcript turns",
+    "inbox": "  inbox [--scope mine|<label>|all|conductors|children] [--json]   pending inbox; <label> peeks one",
+    "inbox-ack": "  inbox-ack <seq> [--peer|--stale|--doctor|--brief] [--surface UUID]   mark items handled so they stop re-surfacing",
 }
+# Derived so it cannot drift from the verb table (it listed 30 of 40 before).
+USAGE_HEADER = "usage: fleet <" + "|".join(VERB_USAGE) + "> ..."
 # `unmute` shares mute's entry (one blob line covers both verbs) — alias it so `fleet unmute --help`
 # resolves. Without this it would fall through the guard and (un)mute a label named '--help'.
 USAGE_ALIAS = {"unmute": "mute"}
